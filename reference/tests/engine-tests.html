@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>VGO engine tests</title></head>
+<body>
+<pre id="result">RUNNING</pre>
+<script src="../src/engine/numeric.js"></script>
+<script src="../src/engine/model.js"></script>
+<script src="../src/geometry/voronoi.js"></script>
+<script src="../src/geometry/legal-set.js"></script>
+<script src="../src/geometry/settled-contour.js"></script>
+<script src="../src/engine/analysis.js"></script>
+<script src="../src/engine/game.js"></script>
+<script src="../src/io/vgo-sgf.js"></script>
+<script>
+"use strict";
+(function () {
+  const failures = [];
+  let passed = 0;
+  function test(name, body) {
+    try { body(); passed++; }
+    catch (error) { failures.push(name + ': ' + error.message); }
+  }
+  function assert(condition, message) {
+    if (!condition) throw new Error(message || 'assertion failed');
+  }
+  function near(actual, expected, tolerance) {
+    assert(Math.abs(actual - expected) <= tolerance,
+      'expected ' + actual + ' to be within ' + tolerance + ' of ' + expected);
+  }
+  function position(stones, extra) {
+    return VGO.model.createPosition(Object.assign({ radius:0.05, stones:stones, toMove:'B' }, extra));
+  }
+
+  test('positions are deeply immutable', function () {
+    const value = position([{ x:0.25, y:0.25, c:'B' }]);
+    assert(Object.isFrozen(value) && Object.isFrozen(value.stones) && Object.isFrozen(value.stones[0]));
+    let threw = false;
+    try { value.stones.push({ x:0.5, y:0.5, c:'W' }); } catch (_) { threw = true; }
+    assert(threw, 'a frozen stone list accepted a mutation');
+  });
+
+  test('two-site geometry has exact area and sourced shared edges', function () {
+    const value = position([{ x:0.25, y:0.5, c:'B' }, { x:0.75, y:0.5, c:'W' }]);
+    const geometry = VGO.voronoi.compute(value);
+    near(geometry.cells[0].area, 0.5, 1e-12);
+    near(geometry.cells[1].area, 0.5, 1e-12);
+    assert(geometry.adj[0].has(1) && geometry.adj[1].has(0), 'shared edge was not adjacency');
+    assert(geometry.cells[0].edges.some(function (edge) {
+      return edge.source && edge.source.kind === 'bisector' && edge.j === 1;
+    }), 'shared edge lost its bisector provenance');
+    assert(geometry.diagnostics.unclassifiedEdges === 0, 'an edge was unclassified');
+  });
+
+  test('point contacts do not connect diagonal groups', function () {
+    const value = position([
+      { x:0.25, y:0.25, c:'B' }, { x:0.75, y:0.25, c:'W' },
+      { x:0.75, y:0.75, c:'B' }, { x:0.25, y:0.75, c:'W' },
+    ]);
+    const geometry = VGO.voronoi.compute(value);
+    assert(!geometry.adj[0].has(2), 'diagonal cells touching at one point became adjacent');
+    assert(geometry.group[0] !== geometry.group[2], 'diagonal black stones became one group');
+  });
+
+  test('placement boundaries are closed and overlap interiors are illegal', function () {
+    const value = position([{ x:0.5, y:0.5, c:'B' }], { radius:0.1 });
+    assert(VGO.legalSet.contains(value, 0.7, 0.5), 'exactly touching disks should be legal');
+    assert(!VGO.legalSet.contains(value, 0.69, 0.5), 'overlapping disks should be illegal');
+    assert(VGO.legalSet.contains(value, 0.1, 0.1), 'a disk tangent to two board edges should fit');
+  });
+
+  test('setup validation distinguishes invalid, tangent, and valid diagrams', function () {
+    const outside = position([{ x:0.02, y:0.5, c:'B' }], { radius:0.1 });
+    const duplicate = position([{ x:0.5, y:0.5, c:'B' }, { x:0.5, y:0.5, c:'W' }]);
+    const tangent = position([{ x:0.4, y:0.5, c:'B' }, { x:0.6, y:0.5, c:'W' }], { radius:0.1 });
+    const valid = position([{ x:0.2, y:0.2, c:'B' }, { x:0.8, y:0.8, c:'W' }]);
+    assert(!VGO.model.validate(outside).playable, 'out-of-board stone was accepted');
+    assert(!VGO.model.validate(duplicate).playable, 'duplicate centers were accepted');
+    assert(VGO.model.validate(tangent).playable, 'tangent stones were rejected');
+    assert(VGO.model.validate(valid).playable, 'valid diagram was rejected');
+  });
+
+  test('a fully covered legal set settles every group', function () {
+    const value = position([
+      { x:0.25, y:0.25, c:'B' }, { x:0.75, y:0.25, c:'W' },
+      { x:0.75, y:0.75, c:'B' }, { x:0.25, y:0.75, c:'W' },
+    ], { radius:0.25 });
+    const result = VGO.analysis.analyze(value);
+    assert(result.validation.playable, result.validation.issues.join('; '));
+    assert(result.legalVertices.length === 0, 'covered legal set unexpectedly has a vertex');
+    assert(result.settledGroups.size === 4, 'not every isolated group was settled');
+  });
+
+  test('a fully settled board produces a closed contour', function () {
+    const value = position([
+      { x:0.25, y:0.25, c:'B' }, { x:0.75, y:0.25, c:'W' },
+      { x:0.75, y:0.75, c:'B' }, { x:0.25, y:0.75, c:'W' },
+    ], { radius:0.25 });
+    const contour = VGO.settledContour.compute(value, 8);
+    assert(contour.openChains === 0 && contour.badVertices === 0, 'board contour topology is open');
+    assert(contour.loops.length === 1, 'settled board did not produce one boundary loop');
+  });
+
+  test('moves are pure transactions', function () {
+    const before = position([]);
+    const result = VGO.game.place(before, 0.5, 0.5);
+    assert(result.ok, result.reason);
+    assert(before.stones.length === 0 && before.toMove === 'B', 'input position was mutated');
+    assert(result.position.stones.length === 1 && result.position.toMove === 'W', 'move result is wrong');
+    assert(result.analysis.position === result.position, 'analysis does not describe the returned position');
+  });
+
+  test('two passes finish and preserve the score', function () {
+    const start = position([{ x:0.25, y:0.5, c:'B' }, { x:0.75, y:0.5, c:'W' }]);
+    const score = VGO.analysis.analyze(start).scores.B;
+    const first = VGO.game.pass(start);
+    const second = VGO.game.pass(first.position);
+    assert(first.ok && first.position.phase === 'playing' && first.position.toMove === 'W');
+    assert(second.ok && second.position.phase === 'finished');
+    near(second.analysis.scores.B, score, 1e-12);
+    assert(!VGO.game.pass(second.position).ok, 'post-game pass was accepted');
+    assert(!VGO.game.place(second.position, 0.5, 0.5).ok, 'post-game placement was accepted');
+  });
+
+  test('serialization round-trips and invalid diagrams stay identifiable', function () {
+    const start = position([{ x:0.2, y:0.3, c:'B' }, { x:0.8, y:0.7, c:'W' }], { toMove:'W' });
+    const roundTrip = VGO.sgf.parse(VGO.sgf.serialize(start));
+    assert(roundTrip.stones.length === 2 && roundTrip.toMove === 'W');
+    near(roundTrip.radius, start.radius, 1e-12);
+    const invalid = VGO.sgf.parse('(;FF[4]GM[VGO]SZ[1]RA[0.10000]PL[B]AB[0.5,0.5]AW[0.55,0.5])');
+    assert(!VGO.model.validate(invalid).playable, 'overlapping imported stones were accepted as playable');
+  });
+
+  const output = document.getElementById('result');
+  if (failures.length) {
+    output.dataset.status = 'fail';
+    output.textContent = 'FAIL ' + failures.length + '/' + (passed + failures.length) + '\n' + failures.join('\n');
+  } else {
+    output.dataset.status = 'pass';
+    output.textContent = 'PASS ' + passed + '/' + passed;
+  }
+})();
+</script>
+</body>
+</html>

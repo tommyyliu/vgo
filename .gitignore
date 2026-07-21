@@ -1,0 +1,8 @@
+/target/
+/.idea/
+/.venv/
+/.agents/
+/.uv-cache/
+Screenshot*.png
+__pycache__/
+*.py[cod]

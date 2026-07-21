@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>VGO UI tests</title></head>
+<body>
+<pre id="result">RUNNING</pre>
+<iframe id="app" src="../js-reference/voronoi_go.html" width="1100" height="800"></iframe>
+<script>
+"use strict";
+document.getElementById('app').addEventListener('load', function () {
+  const failures = [];
+  let passed = 0;
+  const doc = this.contentDocument;
+  function test(name, body) {
+    try { body(); passed++; }
+    catch (error) { failures.push(name + ': ' + error.message); }
+  }
+  function assert(condition, message) {
+    if (!condition) throw new Error(message || 'assertion failed');
+  }
+
+  test('reference app renders from extracted modules', function () {
+    assert(doc.querySelectorAll('#board circle').length === 6, 'boot stones did not render');
+    assert(doc.getElementById('turn').textContent === 'Black', 'initial turn is wrong');
+    assert(doc.getElementById('positionWarning').hidden, 'valid boot position has a warning');
+  });
+
+  test('pass pass concludes and undo reopens the game', function () {
+    doc.getElementById('pass').click();
+    doc.getElementById('pass').click();
+    assert(doc.getElementById('turnLabel').textContent === 'Result', 'two passes did not finish');
+    assert(doc.getElementById('pass').disabled, 'pass remained enabled after game end');
+    doc.getElementById('undo').click();
+    assert(doc.getElementById('turnLabel').textContent === 'Turn', 'undo did not reopen the game');
+    assert(doc.getElementById('turn').textContent === 'White', 'undo did not restore the one-pass turn');
+  });
+
+  test('undo after load restores the complete setup', function () {
+    const before = doc.getElementById('sgf').value;
+    doc.getElementById('sgf').value = before.replace(/RA\[[^\]]+\]/, 'RA[0.07143]');
+    doc.getElementById('load').click();
+    assert(doc.getElementById('radLbl').textContent === '50px', 'loaded radius did not reach the control');
+    doc.getElementById('undo').click();
+    assert(doc.getElementById('radLbl').textContent === '39px', 'undo did not restore the prior radius');
+  });
+
+  test('invalid imported diagrams remain visible but unplayable', function () {
+    doc.getElementById('sgf').value =
+      '(;FF[4]GM[VGO]SZ[1]RA[0.05000]PL[B]AB[0.50000,0.50000]AW[0.55000,0.50000])';
+    doc.getElementById('load').click();
+    assert(!doc.getElementById('positionWarning').hidden, 'invalid diagram warning is hidden');
+    assert(doc.getElementById('pass').disabled, 'pass is enabled for an invalid diagram');
+    assert(doc.querySelectorAll('#board circle').length === 2, 'invalid diagram was discarded');
+  });
+
+  const output = document.getElementById('result');
+  if (failures.length) {
+    output.dataset.status = 'fail';
+    output.textContent = 'FAIL ' + failures.length + '/' + (passed + failures.length) + '\n' + failures.join('\n');
+  } else {
+    output.dataset.status = 'pass';
+    output.textContent = 'PASS ' + passed + '/' + passed;
+  }
+});
+</script>
+</body>
+</html>

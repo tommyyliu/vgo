@@ -1,0 +1,14 @@
+[workspace]
+members = ["crates/vgo-core", "crates/vgo-search", "crates/vgo-selfplay"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.97"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+debug = true

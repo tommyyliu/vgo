@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Voronoi Go — reference implementation</title>
+<style>
+  :root { --bg:#0e1116; --panel:#171b22; --ink:#e6e9ef; --mut:#8b93a3;
+          --stoneB:#5aa2ec; --stoneW:#f0975a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .wrap { display:flex; gap:20px; padding:20px; align-items:flex-start; flex-wrap:wrap; }
+  #cv { width:700px; height:700px; background:#0e1116; border-radius:10px; overflow:hidden; cursor:crosshair; display:block; }
+  #cv text { font-family:monospace; }
+  .panel { background:var(--panel); border-radius:10px; padding:14px 16px; width:290px; }
+  h1 { font-size:15px; margin:0 0 10px; letter-spacing:.5px; }
+  .row { display:flex; justify-content:space-between; gap:12px; margin:4px 0; }
+  .swatch { display:inline-block; width:11px; height:11px; border-radius:50%; vertical-align:middle; margin-right:6px; }
+  .b { background:var(--stoneB); } .w { background:var(--stoneW); }
+  button { font:inherit; color:var(--ink); background:#252b36; border:1px solid #3a4150;
+           border-radius:6px; padding:6px 10px; cursor:pointer; }
+  button:hover { background:#2f3644; }
+  button:disabled { opacity:.5; cursor:default; }
+  label.ck { display:flex; align-items:center; gap:6px; margin:3px 0; color:var(--mut); cursor:pointer; }
+  .turn { font-weight:bold; }
+  .big { font-size:18px; }
+  .mut { color:var(--mut); }
+  input[type=range] { width:100%; accent-color:#5aa2ec; }
+  hr { border:0; border-top:1px solid #262c37; margin:12px 0; }
+  .bar { display:flex; height:8px; border-radius:4px; overflow:hidden; background:#242a34; margin:8px 0 2px; }
+  .bar span { display:block; height:100%; }
+  textarea { width:100%; height:56px; resize:vertical; background:#0f131a; color:#cbd2df; border:1px solid #303845;
+             border-radius:6px; padding:6px 8px; font:11px/1.35 ui-monospace,Consolas,monospace; }
+  .notice { margin:8px 0 0; padding:7px 8px; border-left:2px solid #ff8a8a; color:#ffb0b0;
+            background:#21181c; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <svg id="cv" viewBox="0 0 1 1" preserveAspectRatio="xMidYMid meet">
+    <g id="board"></g>
+    <g id="overlay">
+      <line id="snapLine" stroke="rgba(255,255,255,.4)" stroke-width="1" vector-effect="non-scaling-stroke"
+            stroke-dasharray="4 4" visibility="hidden"/>
+      <circle id="rawDot" r="0.004" fill="rgba(255,255,255,.5)" visibility="hidden"/>
+      <circle id="ghost" r="0" stroke-width="1.5" vector-effect="non-scaling-stroke" visibility="hidden"/>
+      <text id="flash" x="0.5" y="0.93" font-size="0.035" text-anchor="middle" fill="#ff8a8a" opacity="0">?</text>
+    </g>
+  </svg>
+  <div class="panel">
+    <h1>VORONOI GO — reference</h1>
+
+    <div class="row"><span id="turnLabel" class="turn">Turn</span><span id="turn" class="turn"></span></div>
+    <hr>
+    <div class="row big"><span><span class="swatch b"></span>Black</span><span id="scoreB"></span></div>
+    <div class="row big"><span><span class="swatch w"></span>White</span><span id="scoreW"></span></div>
+    <div class="bar"><span id="barB" style="background:var(--stoneB)"></span>
+                     <span id="barW" style="background:var(--stoneW)"></span></div>
+    <div class="row mut"><span>stones (B / W)</span><span id="counts"></span></div>
+    <div class="row mut"><span>captured this move</span><span id="captured"></span></div>
+    <div id="positionWarning" class="notice" hidden></div>
+    <hr>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button id="pass">Pass</button>
+      <button id="undo">Undo</button>
+      <button id="clear">Clear</button>
+    </div>
+    <hr>
+    <label class="ck"><input type="checkbox" id="ovRegions" checked> fill Voronoi regions</label>
+    <label class="ck"><input type="checkbox" id="ovBounds" checked> cell boundaries</label>
+    <label class="ck"><input type="checkbox" id="ovLock" checked> settled (uninteractable) shading</label>
+    <label class="ck"><input type="checkbox" id="ovFree"> legal-placement mask</label>
+    <label class="ck"><input type="checkbox" id="ovIds"> stone ids</label>
+    <label class="ck"><input type="checkbox" id="ovSnap" checked> snap to nearest legal spot</label>
+    <hr>
+    <div class="row mut"><span>settle detail</span><span id="resLbl"></span></div>
+    <input type="range" id="res" min="8" max="11" step="1" value="10">
+    <div class="row mut"><span>stone radius</span><span id="radLbl"></span></div>
+    <input type="range" id="rad" min="8" max="70" step="1" value="39">
+    <hr>
+    <div class="mut" style="font-size:12px">
+      Rendered as SVG: cells, edges and stones are exact vectors — crisp at any
+      zoom. Capture is analytic and unsampled. Shaded areas are <em>settled</em>
+      (no legal move can change them); their exact predicate is contoured with an
+      adaptive quadtree. A stone's whole disk must fit on the board.
+    </div>
+    <hr>
+    <div class="row mut"><span>position (VGO-SGF)</span></div>
+    <textarea id="sgf" spellcheck="false"></textarea>
+    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:6px;">
+      <button id="copy">Copy</button>
+      <button id="load">Load</button>
+      <button id="savePng">Save PNG</button>
+      <button id="saveSvg">Save SVG</button>
+    </div>
+  </div>
+</div>
+
+<script src="../src/engine/numeric.js"></script>
+<script src="../src/engine/model.js"></script>
+<script src="../src/geometry/voronoi.js"></script>
+<script src="../src/geometry/legal-set.js"></script>
+<script src="../src/geometry/settled-contour.js"></script>
+<script src="../src/engine/analysis.js"></script>
+<script src="../src/engine/game.js"></script>
+<script src="../src/io/vgo-sgf.js"></script>
+<script>
+"use strict";
+/* =========================================================================
+   VORONOI GO — interactive reference implementation
+   -------------------------------------------------------------------------
+   Domain     : the unit square [0,1]^2.
+   Stones     : identical disks of radius r; a stone is a center + color.
+                Disks may not overlap, so centers must be >= 2r apart.
+   Regions    : every point belongs to the nearest stone (a Voronoi diagram).
+                A player's SCORE is the total area of their stones' cells.
+   Connection : two same-color stones are one GROUP iff their cells share an
+                edge. A group's region only borders enemy cells / the board
+                edge, never a friendly cell (that would be the same group).
+   Legality   : a stone's whole disk must fit on the board, so its center lies
+                in [r,1-r]^2, and centers stay >= 2r apart (disks don't overlap).
+   Settled    : a group is settled iff no legal future stone of either color
+                 could change any of its region. A move removes all settled
+                 enemy groups, then removes settled mover groups as self-capture.
+
+   THREE representations, each used for what it is best at:
+
+     GEOMETRY (exact, vector) -- each cell is the unit square clipped by the
+        perpendicular bisector against every other stone (half-plane clipping).
+        Gives exact polygons, exact areas (shoelace), and exact adjacency (the
+        stone sitting across each edge). Rendered as crisp anti-aliased polygons.
+
+     CAPTURE (analytic) -- reduces to a finite vertex test (section 2): no
+        sampling and no dependence on contour detail.
+
+     INTERACTABILITY CONTOUR (exact predicate, adaptive vector approximation) --
+        A point x is interactable iff freeDist(x) < ndist(x) (nearest legal spot
+        closer than its own stone). The settled region { freeDist>=ndist } is
+        located with a Lipschitz-pruned quadtree and contoured at its leaves. In
+        open space it is exactly a disk of radius r around each stone; in a sealed
+        pocket it fills the whole cell (= capture). Detail only affects the
+        contour tolerance, not classification or the game.
+
+   RENDERING is SVG. The board uses viewBox "0 0 1 1", so every coordinate is a
+   board unit [0,1] with no scaling math; strokes use vector-effect
+   non-scaling-stroke for constant on-screen width at any zoom. The static board
+   (<g id="board">) is rebuilt only on changes; hovering just moves the ghost
+   overlay elements, so it stays smooth.
+   ========================================================================= */
+
+const cv      = document.getElementById('cv');
+const boardG  = document.getElementById('board');
+const SIZE    = 700;                    // reference px size, only for radius slider units
+
+const COLORS = {
+  B: { name:'Black', stone:'#5aa2ec', region:'#22405c' },
+  W: { name:'White', stone:'#f0975a', region:'#68391a' },
+};
+const RULES = VGO.model.DEFAULT_RULES;
+let state = VGO.model.createPosition({ stones: [], toMove: 'B', radius: 0.05 });
+let settleDepth = 10;
+const history = [];
+let lastCaptured = 0;
+let hover = null;                       // { rawX, rawY, x, y, legal, snapped }
+
+let A = null;   // authoritative, global analysis of the immutable position
+let G = null;   // geometry: { cells:[{poly,area,edges}], adj:[Set], group:Int32Array }
+let Q = null;   // settled contour: { loops, evaluations, openChains, badVertices, maxDepth }
+
+/* =========================================================================
+   1. PURE ENGINE ADAPTERS
+   ========================================================================= */
+const isLegalPlacement = (x, y) => A.validation.playable && VGO.legalSet.contains(state, x, y);
+const nearestLegal = (x, y) => A.validation.playable
+  ? VGO.legalSet.nearest(state, x, y)
+  : { x, y, legal:false, snapped:false };
+
+/* =========================================================================
+   3. SETTLED CONTOUR — exact predicate, adaptive geometric approximation
+
+   g(x) = dist(x,L) - dist(x,S) is 2-Lipschitz because both distance functions
+   are 1-Lipschitz. A center sample therefore proves a square has constant sign
+   whenever |g(center)| exceeds twice the center-to-corner distance. Only cells
+   that cannot be proved uniform reach the leaf resolution.
+   ========================================================================= */
+const computeSettledContour = depth => VGO.settledContour.compute(state, depth);
+function recomputeContour() {
+  let contour = computeSettledContour(settleDepth);
+  if ((contour.openChains || contour.badVertices) && settleDepth < 12)
+    contour = computeSettledContour(settleDepth + 1);
+  if (contour.openChains || contour.badVertices) {
+    console.warn('Settled contour topology diagnostic', {
+      position:VGO.sgf.serialize(state), radius:state.radius, depth:contour.maxDepth,
+      segments:contour.segments, openChains:contour.openChains,
+      badVertices:contour.badVertices, degreeHistogram:contour.degreeHistogram,
+    });
+  }
+  return contour;
+}
+/* =========================================================================
+   4. RECOMPUTE + MOVE TRANSACTIONS
+   ========================================================================= */
+function recompute() {
+  A = VGO.analysis.analyze(state);
+  G = A.geometry;
+  Q = recomputeContour();
+  if (G.diagnostics.unclassifiedEdges || G.diagnostics.degenerateEdges)
+    console.warn('Voronoi topology diagnostic', G.diagnostics);
+}
+
+function placeStone(x, y) {
+  const result = VGO.game.place(state, x, y, RULES);
+  if (!result.ok) {
+    if (result.reason === 'finished') flash('Game over — undo or clear to continue');
+    else if (result.reason === 'invalid-position') flash('Fix the invalid position before playing');
+    return false;
+  }
+  pushHistory(); state = result.position; A = result.analysis; G = A.geometry;
+  Q = recomputeContour();
+  lastCaptured = result.captured;
+  renderBoard();
+  const selfCapture = result.events.find(event => event.type === 'self-capture');
+  if (selfCapture) flash(`Self-capture — ${selfCapture.count} own stone${selfCapture.count === 1 ? '' : 's'} removed`);
+  return true;
+}
+
+/* =========================================================================
+   6. HISTORY
+   ========================================================================= */
+function pushHistory() { history.push(state); if (history.length > 500) history.shift(); }
+function undo(silent) {
+  const prev = history.pop(); if (!prev) return;
+  state = prev; lastCaptured = 0;
+  syncControlsFromState();
+  recompute(); renderBoard(); if (!silent) draw();
+}
+
+/* =========================================================================
+   7. RENDER — build the static SVG board (<g id="board">)
+   ========================================================================= */
+const opt = id => document.getElementById(id).checked;
+const f = v => (+v).toFixed(5);                          // compact coord formatting
+const NSS = 'vector-effect="non-scaling-stroke"';        // constant on-screen stroke width
+const polyD = poly => {                                  // svg path data for a closed polygon
+  let d = 'M' + f(poly[0][0]) + ' ' + f(poly[0][1]);
+  for (let k = 1; k < poly.length; k++) d += 'L' + f(poly[k][0]) + ' ' + f(poly[k][1]);
+  return d + 'Z';
+};
+
+function renderBoard() {
+  const S = state.stones, cells = G.cells, grp = G.group;
+  let svg = '';
+
+  // 1. filled cells (exact polygons)
+  if (opt('ovRegions'))
+    for (let i = 0; i < cells.length; i++) {
+      const poly = cells[i].poly; if (poly.length < 3) continue;
+      svg += `<path d="${polyD(poly)}" fill="${COLORS[S[i].c].region}"/>`;
+    }
+
+  // 2. legal-placement mask (debug), then settled region — both under the edges
+  if (opt('ovFree')) svg += freeMaskSVG();
+  if (opt('ovLock')) svg += settledSVG();
+
+  // 3. cell boundaries — soft between same-group cells, hard between groups
+  if (opt('ovBounds')) {
+    let soft = '', hard = '';
+    for (let i = 0; i < cells.length; i++) for (const e of cells[i].edges) {
+      if (e.j < 0) continue;                             // board edge: skip
+      const seg = `M${f(e.A[0])} ${f(e.A[1])}L${f(e.B[0])} ${f(e.B[1])}`;
+      if (grp[i] === grp[e.j]) soft += seg; else hard += seg;
+    }
+    if (soft) svg += `<path d="${soft}" fill="none" stroke="rgba(150,160,180,.35)" stroke-width="1" ${NSS}/>`;
+    if (hard) svg += `<path d="${hard}" fill="none" stroke="rgba(236,239,246,.92)" stroke-width="1.5" ${NSS}/>`;
+  }
+
+  // 4. stones (lighter than their territory so they pop)
+  const r = state.radius;
+  for (let i = 0; i < S.length; i++) {
+    svg += `<circle cx="${f(S[i].x)}" cy="${f(S[i].y)}" r="${f(r)}" fill="${COLORS[S[i].c].stone}" stroke="rgba(0,0,0,.6)" stroke-width="1.5" ${NSS}/>`;
+    if (opt('ovIds'))
+      svg += `<text x="${f(S[i].x)}" y="${f(S[i].y)}" font-size="0.02" font-family="monospace" text-anchor="middle" dominant-baseline="central" fill="rgba(0,0,0,.8)">${i}</text>`;
+  }
+
+  boardG.innerHTML = svg;
+  updateHUD();
+}
+
+// Legal-placement mask (debug): the one intentionally raster overlay.
+function freeMaskSVG() {
+  const K = 256;
+  const off = document.createElement('canvas'); off.width = K; off.height = K;
+  const c = off.getContext('2d'), img = c.createImageData(K, K), px = img.data;
+  for (let i = 0; i < K * K; i++) {
+    const bx = ((i % K) + 0.5) / K, by = (((i / K) | 0) + 0.5) / K;
+    const legal = isLegalPlacement(bx, by);
+    const j = i * 4; px[j] = 205; px[j + 1] = 214; px[j + 2] = 232; px[j + 3] = legal ? 42 : 0;
+  }
+  c.putImageData(img, 0, 0);
+  return `<image href="${off.toDataURL()}" x="0" y="0" width="1" height="1" preserveAspectRatio="none"/>`;
+}
+
+function settledSVG() {
+  const loops = Q.loops; if (!loops.length) return '';
+  let d = '';
+  for (const loop of loops) d += polyD(loop);
+  return `<path d="${d}" fill="rgba(4,6,10,0.40)" fill-rule="evenodd" ` +
+         `stroke="rgba(120,200,255,0.55)" stroke-width="1" ${NSS}/>`;
+}
+
+/* =========================================================================
+   8. DRAW — cheap overlay: just move the persistent ghost/snap SVG elements
+   ========================================================================= */
+const $ghost = document.getElementById('ghost');
+const $snap  = document.getElementById('snapLine');
+const $raw   = document.getElementById('rawDot');
+
+function draw() {
+  if (!hover || state.phase === 'finished') { $ghost.setAttribute('visibility', 'hidden'); $snap.setAttribute('visibility', 'hidden'); $raw.setAttribute('visibility', 'hidden'); return; }
+  const stone = COLORS[state.toMove].stone;
+  $ghost.setAttribute('cx', f(hover.x)); $ghost.setAttribute('cy', f(hover.y));
+  $ghost.setAttribute('r', f(state.radius));
+  $ghost.setAttribute('fill', hover.legal ? stone : 'rgba(220,60,60,.45)');
+  $ghost.setAttribute('fill-opacity', hover.legal ? '0.7' : '1');
+  $ghost.setAttribute('stroke', hover.legal ? 'rgba(255,255,255,.8)' : 'rgba(255,120,120,.9)');
+  $ghost.setAttribute('visibility', 'visible');
+  if (hover.snapped) {
+    $snap.setAttribute('x1', f(hover.rawX)); $snap.setAttribute('y1', f(hover.rawY));
+    $snap.setAttribute('x2', f(hover.x));    $snap.setAttribute('y2', f(hover.y));
+    $snap.setAttribute('visibility', 'visible');
+    $raw.setAttribute('cx', f(hover.rawX)); $raw.setAttribute('cy', f(hover.rawY)); $raw.setAttribute('visibility', 'visible');
+  } else { $snap.setAttribute('visibility', 'hidden'); $raw.setAttribute('visibility', 'hidden'); }
+}
+
+function updateHUD() {
+  const S = state.stones, ab = A.scores.B, aw = A.scores.W;
+  const pct = v => (100 * v).toFixed(1) + '%';
+  document.getElementById('scoreB').textContent = pct(ab);
+  document.getElementById('scoreW').textContent = pct(aw);
+  document.getElementById('barB').style.width = (100 * ab) + '%';
+  document.getElementById('barW').style.width = (100 * aw) + '%';
+  const nb = S.filter(s => s.c === 'B').length;
+  document.getElementById('counts').textContent = nb + ' / ' + (S.length - nb);
+  document.getElementById('captured').textContent = lastCaptured || '0';
+  const t = document.getElementById('turn'), tl = document.getElementById('turnLabel');
+  if (state.phase === 'finished') {
+    const tie = A.result.tie, winner = A.result.winner;
+    tl.textContent = 'Result';
+    t.textContent = tie ? 'Tie' : COLORS[winner].name + ' wins';
+    t.style.color = tie ? 'var(--ink)' : COLORS[winner].stone;
+  } else {
+    tl.textContent = 'Turn'; t.textContent = COLORS[state.toMove].name; t.style.color = COLORS[state.toMove].stone;
+  }
+  document.getElementById('pass').disabled = state.phase === 'finished' || !A.validation.playable;
+  const warning = document.getElementById('positionWarning');
+  warning.hidden = A.validation.playable;
+  warning.textContent = A.validation.playable ? '' : A.validation.issues[0] +
+    (A.validation.issues.length > 1 ? ` (+${A.validation.issues.length - 1} more)` : '');
+  const sgf = document.getElementById('sgf');
+  if (sgf && document.activeElement !== sgf) sgf.value = VGO.sgf.serialize(state);   // don't clobber while pasting
+}
+
+const $flash = document.getElementById('flash');
+let flashTimer = 0;
+function flash(m) {
+  $flash.textContent = m; $flash.setAttribute('opacity', '1');
+  clearTimeout(flashTimer); flashTimer = setTimeout(() => $flash.setAttribute('opacity', '0'), 1400);
+}
+
+function fromSGF(str) {
+  const loaded = VGO.sgf.parse(str, state);
+  pushHistory();
+  state = loaded; lastCaptured = 0;
+  syncControlsFromState(); recompute(); renderBoard(); draw();
+}
+
+/* ---- export the board as a standalone image (SVG stays vector; PNG rasterizes) ---- */
+function exportSVGString() {
+  const NS = 'http://www.w3.org/2000/svg';
+  const clone = cv.cloneNode(true);
+  clone.querySelector('#overlay').remove();
+  clone.setAttribute('xmlns', NS);
+  clone.setAttribute('width', SIZE); clone.setAttribute('height', SIZE);
+  const bg = document.createElementNS(NS, 'rect');
+  bg.setAttribute('x', 0); bg.setAttribute('y', 0); bg.setAttribute('width', 1); bg.setAttribute('height', 1); bg.setAttribute('fill', '#0e1116');
+  const bd = clone.querySelector('#board'); bd.insertBefore(bg, bd.firstChild);
+  return new XMLSerializer().serializeToString(clone);
+}
+function download(blob, name) { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); }
+function saveSVG() { download(new Blob([exportSVGString()], { type: 'image/svg+xml' }), 'voronoi_go.svg'); }
+function savePNG() {
+  const url = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(exportSVGString());
+  const img = new Image();
+  img.onload = () => {
+    const s = 2, c = document.createElement('canvas'); c.width = SIZE * s; c.height = SIZE * s;
+    const g = c.getContext('2d'); g.fillStyle = '#0e1116'; g.fillRect(0, 0, c.width, c.height);
+    g.drawImage(img, 0, 0, c.width, c.height);
+    c.toBlob(b => download(b, 'voronoi_go.png'), 'image/png');
+  };
+  img.src = url;
+}
+
+/* =========================================================================
+   9. INPUT + CONTROLS
+   ========================================================================= */
+function evtToBoard(e) { const r = cv.getBoundingClientRect(); return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }; }
+function updateHover(e) {
+  const p = evtToBoard(e);
+  const t = opt('ovSnap') ? nearestLegal(p.x, p.y) : { x: p.x, y: p.y, legal: isLegalPlacement(p.x, p.y), snapped: false };
+  hover = { rawX: p.x, rawY: p.y, x: t.x, y: t.y, legal: t.legal, snapped: t.snapped };
+}
+cv.addEventListener('mousemove', e => { updateHover(e); draw(); });
+cv.addEventListener('mouseleave', () => { hover = null; draw(); });
+cv.addEventListener('click', e => { updateHover(e); if (hover && hover.legal && placeStone(hover.x, hover.y)) { updateHover(e); draw(); } });
+
+document.getElementById('pass').onclick = () => {
+  const result = VGO.game.pass(state, RULES); if (!result.ok) return;
+  pushHistory(); state = result.position; A = result.analysis; G = A.geometry;
+  Q = recomputeContour(); lastCaptured = 0;
+  if (state.phase === 'finished') hover = null;
+  renderBoard(); draw();
+  if (state.phase === 'finished') flash('Final score — ' + document.getElementById('turn').textContent);
+};
+document.getElementById('undo').onclick  = () => undo(false);
+document.getElementById('clear').onclick = () => {
+  pushHistory(); state = VGO.model.createPosition({ radius:state.radius, stones:[], toMove:'B' });
+  lastCaptured = 0; recompute(); renderBoard(); draw();
+};
+
+for (const id of ['ovRegions', 'ovBounds', 'ovLock', 'ovFree', 'ovIds']) document.getElementById(id).onchange = () => { renderBoard(); draw(); };
+document.getElementById('ovSnap').onchange = () => draw();
+
+const $sgf = document.getElementById('sgf');
+document.getElementById('copy').onclick = () => { $sgf.select(); try { document.execCommand('copy'); } catch (e) {} flash('Copied position'); };
+document.getElementById('load').onclick = () => { try { fromSGF($sgf.value); } catch (e) { flash('Could not parse'); } };
+document.getElementById('savePng').onclick = savePNG;
+document.getElementById('saveSvg').onclick = saveSVG;
+
+const resEl = document.getElementById('res'), radEl = document.getElementById('rad');
+function syncSliders() {
+  settleDepth = +resEl.value;
+  document.getElementById('resLbl').textContent = (SIZE / (1 << settleDepth)).toFixed(1) + 'px cells';
+  const pixels = state.radius * SIZE;
+  const label = Number.isFinite(pixels)
+    ? (Math.abs(pixels - Math.round(pixels)) < .01 ? Math.round(pixels) : pixels.toFixed(1)) + 'px'
+    : 'invalid';
+  document.getElementById('radLbl').textContent = label;
+  cv.style.borderRadius = (Number.isFinite(pixels) ? Math.max(0, pixels) : 0) + 'px';
+}
+function syncControlsFromState() {
+  const pixels = state.radius * SIZE;
+  if (Number.isFinite(pixels)) {
+    radEl.min = Math.min(8, Math.floor(pixels));
+    radEl.max = Math.max(70, Math.ceil(pixels));
+    radEl.value = pixels;
+  }
+  syncSliders();
+}
+resEl.oninput = () => { syncSliders(); Q = recomputeContour(); renderBoard(); draw(); };
+radEl.oninput = () => {
+  state = VGO.model.update(state, { radius:(+radEl.value) / SIZE, passes:0, phase:'playing' });
+  syncSliders();
+  recompute(); renderBoard(); draw();
+};
+
+/* ---- boot with a small illustrative position ---------------------------- */
+state = VGO.model.createPosition({ radius:(+radEl.value) / SIZE, stones:[
+  { x:.30, y:.35, c:'B' }, { x:.45, y:.30, c:'B' }, { x:.40, y:.50, c:'B' },
+  { x:.70, y:.65, c:'W' }, { x:.60, y:.78, c:'W' }, { x:.80, y:.45, c:'W' },
+], toMove:'B' });
+syncSliders();
+recompute(); renderBoard(); draw();
+</script>
+</body>
+</html>

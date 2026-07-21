@@ -1,0 +1,12 @@
+[package]
+name = "vgo-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vgo-core = { path = "../vgo-core" }
+
+[lib]
+path = "src/lib.rs"
