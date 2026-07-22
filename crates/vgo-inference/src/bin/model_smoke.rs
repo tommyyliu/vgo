@@ -14,9 +14,39 @@ use std::{
 };
 
 use vgo_core::{Color, Phase, Point, Position};
-use vgo_inference::{PythonEvaluator, PythonProcessConfig, TorchDevice};
+use vgo_inference::{
+    BatchedEvaluator, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
+    PythonBatchService, PythonProcessConfig, TorchDevice,
+};
 use vgo_raster::RasterConfig;
 use vgo_search::{Action, EvaluationError, Evaluator, SearchConfig, search_with_evaluator};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InferenceRuntime {
+    Python,
+    Onnx,
+}
+
+impl InferenceRuntime {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Python => "python",
+            Self::Onnx => "onnx",
+        }
+    }
+}
+
+impl std::str::FromStr for InferenceRuntime {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "python" => Ok(Self::Python),
+            "onnx" => Ok(Self::Onnx),
+            _ => Err(format!("unsupported inference runtime: {value}")),
+        }
+    }
+}
 
 fn path_argument(arguments: &[String], name: &str, default: PathBuf) -> PathBuf {
     arguments
@@ -71,7 +101,7 @@ fn position_hash(position: &Position) -> u64 {
 }
 
 fn play_model_game(
-    evaluator: &PythonEvaluator,
+    evaluator: &BatchedEvaluator,
     seed: u64,
     simulations: u32,
     maximum_plies: u32,
@@ -121,6 +151,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "--checkpoint",
         root.join("artifacts/raster-demo/model.pt"),
     );
+    let model = path_argument(
+        &arguments,
+        "--model",
+        root.join("artifacts/raster-demo/model.onnx"),
+    );
+    let runtime = value_argument(&arguments, "--runtime", InferenceRuntime::Python)?;
+    let provider = value_argument(&arguments, "--provider", OnnxProvider::TensorRt)?;
+    let fp16 = value_argument(&arguments, "--fp16", true)?;
     let actors = value_argument(&arguments, "--actors", 64_usize)?;
     let games = value_argument(&arguments, "--games", actors.saturating_mul(8))?;
     let simulations = value_argument(&arguments, "--simulations", 8_u32)?;
@@ -146,18 +184,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("counts and resolution must be positive; radius must be in (0, 0.5]".into());
     }
 
-    let evaluator = PythonEvaluator::spawn(PythonProcessConfig {
-        python,
-        working_directory,
-        checkpoint,
-        raster: RasterConfig::square(resolution),
+    let raster = RasterConfig::square(resolution);
+    let broker = BrokerConfig {
+        raster,
         maximum_batch,
         maximum_delay: Duration::from_millis(maximum_delay_ms),
         queue_capacity: (actors * 4).max(maximum_batch * 2),
-        torch_threads,
-        device,
-        compile,
-    })?;
+    };
+    let evaluator = match runtime {
+        InferenceRuntime::Python => {
+            let service = PythonBatchService::spawn(&PythonProcessConfig {
+                python,
+                working_directory,
+                checkpoint,
+                raster,
+                maximum_batch,
+                maximum_delay: broker.maximum_delay,
+                queue_capacity: broker.queue_capacity,
+                torch_threads,
+                device,
+                compile,
+            })?;
+            BatchedEvaluator::spawn(broker, service)?
+        }
+        InferenceRuntime::Onnx => {
+            let service = OnnxBatchService::load(&OnnxServiceConfig {
+                model,
+                raster,
+                maximum_batch,
+                provider,
+                device_id: 0,
+                fp16,
+                cache_directory: root.join("artifacts/onnx-cache"),
+            })?;
+            BatchedEvaluator::spawn(broker, service)?
+        }
+    };
 
     let probe_barrier = Arc::new(Barrier::new(probe_requests + 1));
     let mut probe_handles = Vec::with_capacity(probe_requests);
@@ -238,6 +300,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actor_queue_nanoseconds = metrics.queue_nanoseconds - before_actors.queue_nanoseconds;
     let actor_inference_nanoseconds =
         metrics.inference_nanoseconds - before_actors.inference_nanoseconds;
+    let python_torch_threads = match runtime {
+        InferenceRuntime::Python => torch_threads.to_string(),
+        InferenceRuntime::Onnx => String::from("null"),
+    };
+    let python_device = match runtime {
+        InferenceRuntime::Python => format!("\"{}\"", device.as_str()),
+        InferenceRuntime::Onnx => String::from("null"),
+    };
+    let python_compiled = match runtime {
+        InferenceRuntime::Python => compile.to_string(),
+        InferenceRuntime::Onnx => String::from("null"),
+    };
 
     println!(
         concat!(
@@ -252,9 +326,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  \"simulations_per_move\": {},\n",
             "  \"maximum_batch_config\": {},\n",
             "  \"maximum_delay_ms\": {},\n",
-            "  \"torch_threads\": {},\n",
-            "  \"device\": \"{}\",\n",
-            "  \"compiled\": {},\n",
+            "  \"inference_runtime\": \"{}\",\n",
+            "  \"inference_provider\": \"{}\",\n",
+            "  \"inference_fp16\": {},\n",
+            "  \"python_torch_threads\": {},\n",
+            "  \"python_device\": {},\n",
+            "  \"python_compiled\": {},\n",
             "  \"raster_resolution\": {},\n",
             "  \"stone_radius\": {:.9},\n",
             "  \"input_bytes_per_position\": {},\n",
@@ -284,9 +361,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         simulations,
         maximum_batch,
         maximum_delay_ms,
-        torch_threads,
-        device.as_str(),
-        compile,
+        runtime.as_str(),
+        match runtime {
+            InferenceRuntime::Python => device.as_str(),
+            InferenceRuntime::Onnx => provider.as_str(),
+        },
+        runtime == InferenceRuntime::Onnx && fp16,
+        python_torch_threads,
+        python_device,
+        python_compiled,
         resolution,
         radius,
         10 * resolution * resolution * size_of::<f32>(),

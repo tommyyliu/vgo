@@ -1,0 +1,69 @@
+{
+  "schema": "vgo.onnx-tensorrt.v1",
+  "date": "2026-07-21",
+  "hardware": {
+    "processor": "AMD Ryzen 9 9950X 16-Core Processor",
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "gpu_memory_mebibytes": 16303
+  },
+  "software": {
+    "onnx_runtime": "1.24.2",
+    "tensorrt": "10.16.1.11",
+    "cuda": "13",
+    "ort_rust": "2.0.0-rc.12"
+  },
+  "input": {
+    "channels": 10,
+    "height": 128,
+    "width": 128,
+    "bytes_per_position": 655360,
+    "model_parameters": 59555
+  },
+  "isolated_fp16": [
+    {"batch": 1, "milliseconds_per_batch": 0.330867, "positions_per_second": 3022.358},
+    {"batch": 8, "milliseconds_per_batch": 1.557575, "positions_per_second": 5136.191},
+    {"batch": 16, "milliseconds_per_batch": 2.791354, "positions_per_second": 5731.985},
+    {"batch": 32, "milliseconds_per_batch": 5.567913, "positions_per_second": 5747.216}
+  ],
+  "parity": {
+    "onnx_cpu_vs_pytorch_cpu": {
+      "batch": 2,
+      "policy_max_absolute_difference": 0.000001907,
+      "value_max_absolute_difference": 0.000000179,
+      "top_one_equal": 2,
+      "top_one_total": 2
+    },
+    "tensorrt_fp16_vs_pytorch_cuda": {
+      "batch": 8,
+      "policy_max_absolute_difference": 0.016925454,
+      "value_max_absolute_difference": 0.000605816,
+      "top_one_equal": 5,
+      "top_one_total": 8,
+      "note": "Several fixtures are symmetric or nearly tied, so top-one identity is stricter than policy equivalence."
+    },
+    "tensorrt_fp32_vs_pytorch_cpu": {
+      "batch": 8,
+      "policy_max_absolute_difference": 0.006736636,
+      "value_max_absolute_difference": 0.000426583,
+      "top_one_equal": 6,
+      "top_one_total": 8
+    }
+  },
+  "end_to_end": {
+    "actors": 64,
+    "games": 64,
+    "simulations_per_move": 8,
+    "maximum_plies": 12,
+    "batch": 16,
+    "requests": 6656,
+    "average_batch": 16.0,
+    "evaluations_per_second": 4109.454,
+    "inference_milliseconds_per_batch": 3.163,
+    "failures": 0
+  },
+  "comparison": {
+    "python_subprocess_128x128_evaluations_per_second": 1452.098,
+    "onnx_tensorrt_evaluations_per_second": 4109.454,
+    "speedup": 2.830
+  }
+}

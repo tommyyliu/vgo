@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ort = { version = "=2.0.0-rc.12", features = ["cuda", "tensorrt"] }
+sha2 = "0.10"
 vgo-core = { path = "../vgo-core" }
 vgo-raster = { path = "../vgo-raster" }
 vgo-search = { path = "../vgo-search" }
@@ -20,3 +22,7 @@ path = "src/bin/model_smoke.rs"
 [[bin]]
 name = "vgo-stage-bench"
 path = "src/bin/stage_bench.rs"
+
+[[bin]]
+name = "vgo-onnx-bench"
+path = "src/bin/onnx_bench.rs"

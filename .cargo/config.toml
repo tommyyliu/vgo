@@ -1,0 +1,2 @@
+[env]
+ORT_CUDA_VERSION = { value = "13", force = false }

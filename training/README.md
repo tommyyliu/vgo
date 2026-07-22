@@ -68,6 +68,49 @@ uv run python -m vgo_training.benchmark_precision `
   --checkpoint ../artifacts/raster-demo/model.pt
 ```
 
+Export the checkpoint to a dynamic-batch ONNX artifact:
+
+```powershell
+uv run python -m vgo_training.export_onnx `
+  --checkpoint ../artifacts/raster-demo/model.pt `
+  --output ../artifacts/raster-demo/model.onnx --maximum-batch 32
+```
+
+The exported graph is self-describing: it records the raster schema, input
+shape, policy size, supported maximum batch, and source checkpoint digest.
+The Rust loader rejects a graph whose metadata does not match its configured
+raster or batch range.
+
+For local TensorRT inference, install the optional runtime libraries alongside
+the training environment:
+
+```powershell
+uv sync --extra tensorrt
+```
+
+TensorRT is a native Rust inference path; it does not import Python. The
+optional package is only a convenient way to install NVIDIA's matching native
+DLLs. A deployed self-play worker can provide those libraries directly.
+
+On Windows, expose the TensorRT and CUDA dependency directories before running
+the benchmark or model smoke test:
+
+```powershell
+$env:PATH = "$PWD\training\.venv\Lib\site-packages\tensorrt_libs;" +
+  "$PWD\training\.venv\Lib\site-packages\torch\lib;$env:CUDA_PATH\bin;$env:PATH"
+
+cargo run --release -p vgo-inference --bin vgo-onnx-bench -- `
+  --provider tensorrt --batch 32 --compare-python false
+
+cargo run --release -p vgo-inference --bin vgo-model-smoke -- `
+  --runtime onnx --provider tensorrt --fp16 true
+```
+
+`vgo-onnx-bench` times input packing, ONNX Runtime, and output collection. Use
+`--fp16 false` for an FP32 TensorRT parity check. TensorRT engine and timing
+caches are separated by model digest, precision, raster shape, and maximum
+batch under `artifacts/onnx-cache`.
+
 From the repository root, `vgo-stage-bench` separately measures Rust
 rasterization, request framing, and the warm subprocess service:
 

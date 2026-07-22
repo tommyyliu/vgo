@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
 mod executor;
+mod onnx;
 mod protocol;
 
 pub use executor::{BatchExecutor, CompletedBatch, InferenceBatch, ThreadedBatchExecutor};
+pub use onnx::{OnnxBatchService, OnnxProvider, OnnxServiceConfig};
 pub use protocol::{InferenceInput, InferenceOutput, encode_request_frame, read_response_frame};
 
 use std::{
@@ -67,6 +69,25 @@ pub struct PythonProcessConfig {
 
 pub trait BatchService: Send {
     fn infer(&mut self, batch: &[InferenceInput]) -> Result<Vec<InferenceOutput>, EvaluationError>;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BrokerConfig {
+    pub raster: RasterConfig,
+    pub maximum_batch: usize,
+    pub maximum_delay: Duration,
+    pub queue_capacity: usize,
+}
+
+impl From<&PythonProcessConfig> for BrokerConfig {
+    fn from(config: &PythonProcessConfig) -> Self {
+        Self {
+            raster: config.raster,
+            maximum_batch: config.maximum_batch,
+            maximum_delay: config.maximum_delay,
+            queue_capacity: config.queue_capacity,
+        }
+    }
 }
 
 pub struct PythonBatchService {
@@ -209,18 +230,20 @@ impl Drop for Inner {
 }
 
 #[derive(Clone)]
-pub struct PythonEvaluator {
+pub struct BatchedEvaluator {
     inner: Arc<Inner>,
 }
 
-impl PythonEvaluator {
-    pub fn spawn(config: PythonProcessConfig) -> Result<Self, EvaluationError> {
+impl BatchedEvaluator {
+    pub fn spawn(
+        config: BrokerConfig,
+        service: impl BatchService + 'static,
+    ) -> Result<Self, EvaluationError> {
         if config.maximum_batch == 0 || config.queue_capacity == 0 {
             return Err(EvaluationError::new(
                 "batch size and queue capacity must be positive",
             ));
         }
-        let service = PythonBatchService::spawn(&config)?;
         let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
         let metrics = Arc::new(AtomicMetrics::default());
         let broker_metrics = Arc::clone(&metrics);
@@ -246,7 +269,7 @@ impl PythonEvaluator {
     }
 }
 
-impl Evaluator for PythonEvaluator {
+impl Evaluator for BatchedEvaluator {
     fn evaluate(&self, position: &Position) -> Result<Evaluation, EvaluationError> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let encoding_started = Instant::now();
@@ -281,6 +304,31 @@ impl Evaluator for PythonEvaluator {
     }
 }
 
+#[derive(Clone)]
+pub struct PythonEvaluator {
+    evaluator: BatchedEvaluator,
+}
+
+impl PythonEvaluator {
+    pub fn spawn(config: PythonProcessConfig) -> Result<Self, EvaluationError> {
+        let service = PythonBatchService::spawn(&config)?;
+        Ok(Self {
+            evaluator: BatchedEvaluator::spawn(BrokerConfig::from(&config), service)?,
+        })
+    }
+
+    #[must_use]
+    pub fn metrics(&self) -> BrokerMetrics {
+        self.evaluator.metrics()
+    }
+}
+
+impl Evaluator for PythonEvaluator {
+    fn evaluate(&self, position: &Position) -> Result<Evaluation, EvaluationError> {
+        self.evaluator.evaluate(position)
+    }
+}
+
 struct DensePolicy {
     config: RasterConfig,
     logits: Vec<f32>,
@@ -297,7 +345,7 @@ impl Policy for DensePolicy {
 }
 
 fn run_broker(
-    config: PythonProcessConfig,
+    config: BrokerConfig,
     mut service: impl BatchService,
     receiver: Receiver<Request>,
     metrics: Arc<AtomicMetrics>,
@@ -335,11 +383,30 @@ fn run_broker(
             inputs.push(request.input);
             responses.push(request.response);
         }
+        let expected_ids = inputs.iter().map(InferenceInput::id).collect::<Vec<_>>();
         let started = Instant::now();
         let result = service.infer(&inputs);
         metrics
             .inference_nanoseconds
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let result = result.and_then(|outputs| {
+            if outputs.len() != expected_ids.len() {
+                return Err(EvaluationError::new(format!(
+                    "inference backend returned {} outputs for {} inputs",
+                    outputs.len(),
+                    expected_ids.len()
+                )));
+            }
+            for (index, (output, expected_id)) in outputs.iter().zip(&expected_ids).enumerate() {
+                if output.id() != *expected_id {
+                    return Err(EvaluationError::new(format!(
+                        "inference output {index} has request id {}, expected {expected_id}",
+                        output.id()
+                    )));
+                }
+            }
+            Ok(outputs)
+        });
         match result {
             Ok(outputs) => {
                 for (response, output) in responses.into_iter().zip(outputs) {
@@ -361,4 +428,61 @@ fn run_broker(
 
 fn io_error(error: std::io::Error) -> EvaluationError {
     EvaluationError::new(format!("inference transport: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vgo_core::Color;
+
+    struct ConstantService {
+        wrong_id: bool,
+    }
+
+    impl BatchService for ConstantService {
+        fn infer(
+            &mut self,
+            batch: &[InferenceInput],
+        ) -> Result<Vec<InferenceOutput>, EvaluationError> {
+            batch
+                .iter()
+                .map(|input| {
+                    InferenceOutput::new(input.id() + u64::from(self.wrong_id), 0.25, vec![0.0; 5])
+                })
+                .collect()
+        }
+    }
+
+    fn broker_config() -> BrokerConfig {
+        BrokerConfig {
+            raster: RasterConfig::square(2),
+            maximum_batch: 2,
+            maximum_delay: Duration::ZERO,
+            queue_capacity: 2,
+        }
+    }
+
+    #[test]
+    fn batched_evaluator_adapts_a_batch_service() {
+        let evaluator =
+            BatchedEvaluator::spawn(broker_config(), ConstantService { wrong_id: false }).unwrap();
+        let position = Position::new(0.1, Vec::new(), Color::Black);
+        let evaluation = evaluator.evaluate(&position).unwrap();
+        assert_eq!(evaluation.current_value, 0.25);
+        assert_eq!(evaluation.policy_logit(Action::Pass), 0.0);
+        assert_eq!(evaluator.metrics().requests, 1);
+    }
+
+    #[test]
+    fn broker_rejects_mismatched_request_ids() {
+        let evaluator =
+            BatchedEvaluator::spawn(broker_config(), ConstantService { wrong_id: true }).unwrap();
+        let position = Position::new(0.1, Vec::new(), Color::Black);
+        let error = match evaluator.evaluate(&position) {
+            Ok(_) => panic!("mismatched request id should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("expected"));
+        assert_eq!(evaluator.metrics().failures, 1);
+    }
 }
