@@ -18,7 +18,7 @@ global position analysis
 pure game transactions + serialization
         |
         v
-reference UI and approximate contour rendering
+reference UI and contour rendering
 ```
 
 Dependencies only point downward in this diagram. Engine modules do not read
@@ -53,7 +53,7 @@ zero-length contact is discarded before adjacency is formed, so cells meeting
 at only a vertex never connect groups.
 
 Capture uses the finite cell-vertex criterion proved in `AXIOMS.md`. It does
-not use the quadtree contour.
+not use the settled contour.
 
 ## Transactions
 
@@ -71,13 +71,23 @@ unrestricted repetition, two-pass ending, and Voronoi-area scoring.
 
 ## Rendering
 
-`VGO.settledContour.compute(position, depth)` is pure but approximate. It uses
-the exact settled-point predicate and a Lipschitz-pruned quadtree to create SVG
-loops. Its output is presentation data only. Topology diagnostics are retried
-once at greater depth and then logged with the complete serialized position.
+`VGO.settledContour.compute(position, knownVertices)` is pure and analytic. It
+samples no field and iterates to no root. A15 removes the Voronoi partition: the
+settled set is the union over stones of `{ x : ||x-s|| <= dist(x,L) }`, because a
+non-nearest stone only makes the test harder. A16 makes each of those regions
+star-shaped about its stone, so a two-dimensional level set becomes one scalar
+equation per direction, and A17 solves that equation in closed form as a minimum
+over the A6 candidate families. A candidate is admitted only once the center
+realising it is verified legal, which is exactly what restricts a full circle or
+line to the surviving part of `boundary L`, so `boundary L` is never built.
 
-The HTML page owns only UI concerns: history, hover state, contour detail,
-controls, SVG construction, and downloads.
+Loops are closed and simple by construction and carry no sampling depth, so
+there is no contour topology to diagnose or repair. They overlap, so the union
+is a nonzero-winding fill rather than an even-odd one. The output remains
+presentation data only; capture does not use it.
+
+The HTML page owns only UI concerns: history, hover state, controls, SVG
+construction, and downloads.
 
 ## Numerical boundary
 

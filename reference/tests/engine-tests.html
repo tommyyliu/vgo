@@ -112,9 +112,43 @@
       { x:0.25, y:0.25, c:'B' }, { x:0.75, y:0.25, c:'W' },
       { x:0.75, y:0.75, c:'B' }, { x:0.25, y:0.75, c:'W' },
     ], { radius:0.25 });
-    const contour = VGO.settledContour.compute(value, 8);
+    const contour = VGO.settledContour.compute(value);
     assert(contour.openChains === 0 && contour.badVertices === 0, 'board contour topology is open');
     assert(contour.loops.length === 1, 'settled board did not produce one boundary loop');
+  });
+
+  test('settled regions are star-shaped about their stone and reach at least r', function () {
+    const value = position([{ x:0.3, y:0.4, c:'B' }, { x:0.65, y:0.55, c:'W' }], { radius:0.06 });
+    const contour = VGO.settledContour.compute(value);
+    assert(contour.loops.length === 2, 'expected one region per stone');
+    value.stones.forEach(function (stone, index) {
+      const loop = contour.loops[index];
+      assert(loop.length >= 3, 'region ' + index + ' is degenerate');
+      let previous = Math.atan2(loop[0][1] - stone.y, loop[0][0] - stone.x);
+      let turned = 0;
+      loop.forEach(function (point) {
+        const distance = Math.hypot(point[0] - stone.x, point[1] - stone.y);
+        // A16: T >= r, up to the legal-set epsilon recorded in the numerical policy.
+        assert(distance >= value.radius - VGO.numeric.coordinateEpsilon,
+          'region ' + index + ' came inside the stone disk: ' + distance);
+        const angle = Math.atan2(point[1] - stone.y, point[0] - stone.x);
+        let step = angle - previous;
+        while (step <= -Math.PI) step += 2 * Math.PI;
+        while (step > Math.PI) step -= 2 * Math.PI;
+        assert(step >= -1e-9, 'region ' + index + ' is not sampled at increasing angle');
+        turned += step; previous = angle;
+      });
+      assert(Math.abs(turned) < 2 * Math.PI, 'region ' + index + ' wound past one revolution');
+    });
+  });
+
+  test('an isolated stone settles exactly its radius-r disk', function () {
+    // A16: T(u) = r exactly when s + 2r u is legal, which it is in open space.
+    const value = position([{ x:0.5, y:0.5, c:'B' }], { radius:0.05 });
+    const loop = VGO.settledContour.compute(value).loops[0];
+    loop.forEach(function (point) {
+      near(Math.hypot(point[0] - 0.5, point[1] - 0.5), 0.05, 1e-9);
+    });
   });
 
   test('moves are pure transactions', function () {

@@ -19,7 +19,7 @@ Status values:
 | 002 | [Validate setup positions](002-validate-setup-positions.md) | High | Developer | Done |
 | 003 | [Restore setup state on Undo](003-restore-setup-state-on-undo.md) | Medium | Developer | Done |
 | 004 | [Permanent rule regression suite](004-rule-regression-suite.md) | High | Developer | In progress |
-| 005 | [Contour topology diagnostics](005-contour-topology-diagnostics.md) | Medium | Developer | In progress |
+| 005 | [Contour topology diagnostics](005-contour-topology-diagnostics.md) | Medium | Developer | Done |
 | 006 | [Repetition and ko policy](006-repetition-and-ko.md) | Low | Human + Developer | Needs human input |
 | 007 | [Geometry performance](007-geometry-performance.md) | Low | Developer | Deferred |
 

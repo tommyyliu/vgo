@@ -1,0 +1,55 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>debug</title></head>
+<body><pre id="out">RUNNING</pre>
+<script src="../../reference/src/engine/numeric.js"></script>
+<script src="../../reference/src/engine/model.js"></script>
+<script src="../../reference/src/geometry/voronoi.js"></script>
+<script src="../../reference/src/geometry/legal-set.js"></script>
+<script src="../../reference/src/geometry/settled-contour.js"></script>
+<script src="../../reference/src/engine/analysis.js"></script>
+<script src="../../reference/src/engine/game.js"></script>
+<script src="harness/corpus.js"></script>
+<script>
+"use strict";
+const lines = [];
+const log = s => lines.push(s);
+
+const target = new URLSearchParams(location.search).get("case") || "corner";
+const item = CORPUS.build().find(c => c.name === target);
+const position = item.position;
+const r = position.radius, dia = 2 * r;
+const vertices = VGO.legalSet.vertices(position);
+
+log("case " + target + ": " + position.stones.length + " stones, r=" + r.toFixed(5));
+log("global legal vertices: " + vertices.length);
+log("dist(stone0, L) = " + VGO.legalSet.distance(position, position.stones[0].x, position.stones[0].y, vertices));
+log("");
+
+// True radial boundary by bisection on the monotone h, for reference.
+function trueT(s, ux, uy) {
+  const h = t => VGO.legalSet.distance(position, s.x + t * ux, s.y + t * uy, vertices) - t;
+  let low = 0, high = dia, guard = 0;
+  while (h(high) > 0 && guard++ < 20) { low = high; high *= 2; }
+  if (guard >= 20) return Infinity;
+  for (let i = 0; i < 40; i++) { const m = (low + high) / 2; if (h(m) > 0) low = m; else high = m; }
+  return (low + high) / 2;
+}
+
+const RAYS = 32;
+for (let index = 0; index < position.stones.length; index++) {
+  const s = position.stones[index];
+  const values = [];
+  for (let a = 0; a < RAYS; a++) {
+    const th = 2 * Math.PI * a / RAYS;
+    values.push(trueT(s, Math.cos(th), Math.sin(th)) / r);
+  }
+  const finite = values.filter(Number.isFinite);
+  log("stone " + index + " (" + s.x.toFixed(4) + "," + s.y.toFixed(4) + ")  T/r min=" +
+      (finite.length ? Math.min.apply(null, finite).toFixed(3) : "-") +
+      " max=" + (finite.length ? Math.max.apply(null, finite).toFixed(3) : "-") +
+      " infinite rays=" + (RAYS - finite.length));
+  log("   T/r: " + values.map(v => Number.isFinite(v) ? v.toFixed(2) : "inf").join(" "));
+}
+document.getElementById("out").textContent = lines.join("\n");
+</script>
+</body></html>

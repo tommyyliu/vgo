@@ -1,6 +1,6 @@
 # 005: Contour Topology Diagnostics
 
-- Status: In progress
+- Status: Done
 - Priority: Medium
 - Owner: Developer
 
@@ -25,10 +25,21 @@ This affects visualization only, not capture or move legality.
 - If real failures remain after retry, create a follow-up ticket for canonical
   edge IDs and directed half-edge stitching.
 
-## Progress
+## Resolution
 
-Diagnostics now include the VGO-SGF position, radius, depth, segment count,
-open-chain count, bad-vertex count, and vertex-degree histogram. A failure is
-retried once at greater depth before being logged. The fully settled board has
-a permanent closure test; the remaining singular and narrow fixtures are still
-open.
+Dissolved rather than completed. The sampled renderer was replaced by the
+analytic construction of A15-A17, which emits one closed, simple loop per stone
+by direct construction. There is no marching-squares stitching, no sampling
+depth, and therefore no open chain or bad vertex that could arise: both counters
+are structurally zero and the retry path is gone.
+
+The acceptance criteria are void with the mechanism that produced them. What
+they were protecting — settled shading silently vanishing — is now impossible,
+since a loop is emitted per stone with a radial boundary that A16 proves is
+single-valued and at least `r`.
+
+Degenerate contacts are covered instead by engine fixtures for exact tangency,
+an isolated stone settling exactly its radius-`r` disk, and the star-shape and
+radius-floor invariants. Exact hexagonal and square packings at spacing `2r`,
+which make every contact tangent, are covered in
+`experiments/settled-contour/`.

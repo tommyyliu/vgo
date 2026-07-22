@@ -242,6 +242,103 @@ consecutive passes equal the scores immediately before the first pass.
 and their areas are functions only of those values, so every cell and score is
 unchanged by either pass.
 
+## A15. The settled set needs no Voronoi partition
+
+**Claim.** With at least one stone,
+
+```text
+Z(S) = union over s in S of R_s(S),
+R_s(S) = { x in D : ||x-s|| <= dist(x,L(S)) }.
+```
+
+**Proof.** If `x` lies in `R_s` for any stone `s`, then
+`dist(x,L(S)) >= ||x-s|| >= d_S(x)`, because `d_S` is the minimum over all
+stones; so `x` lies in `Z(S)`. Conversely, if `x` lies in `Z(S)`, choose a
+nearest stone `s`. Then `||x-s|| = d_S(x) <= dist(x,L(S))`, so `x` lies in
+`R_s`. A non-nearest stone only makes the test harder, never easier, so the
+union may be taken over every stone without first deciding cell ownership.
+
+Consequences:
+
+- Locating the settled region needs no cells, no adjacency, and no groups.
+- The regions may overlap; their union, not their sum, is the settled set. Since
+  each `x` in `Z(S)` lies in `R_s` for its own nearest stone, the intersections
+  `R_s ∩ V_s` do partition `Z(S)`.
+- This is a statement about the settled point set only. It does not make capture
+  local, and it does not weaken A10.
+
+## A16. Each per-stone settled region is star-shaped and contains the disk
+
+**Claim.** Fix a stone `s` and a unit vector `u`, and write `x(t) = s + t u`.
+Then `h(t) = dist(x(t),L(S)) - t` is non-increasing, `h(0) >= 2r`, and
+
+```text
+{ t >= 0 : x(t) in R_s(S) } = [0, T(u)]    with  T(u) >= r.
+```
+
+`T(u) = r` exactly when `s + 2r u` is a legal center. `T(u)` may be infinite,
+and because `D` is convex a ray leaves `D` once and never re-enters, so
+truncating `T(u)` at the exit distance changes nothing inside `D`.
+
+**Proof.** `dist(.,L(S))` is 1-Lipschitz, so for `t2 > t1`,
+`dist(x(t2),L) <= dist(x(t1),L) + (t2-t1)`, hence `h(t2) <= h(t1)`. The
+separation requirement of `s` itself removes the open disk `B(s,2r)` from
+`L(S)`, giving `h(0) = dist(s,L(S)) >= 2r`. Since `h` decreases at rate at most
+`2`, `h(t) >= 2r - 2t`, which is positive for `t < r`; monotonicity then makes
+`{ h >= 0 }` an interval containing `0`, so `T(u) >= r`. If `s + 2r u` is legal
+then `dist(x(r),L) <= ||r u - 2r u|| = r`, so `h(r) <= 0` and `T(u) = r`.
+Conversely if `T(u) = r`, the realising legal center `c` satisfies
+`||c - x(r)|| = r` and hence `||c-s|| <= 2r`, while legality forces
+`||c-s|| >= 2r`; equality puts `c` on the ray, so `c = s + 2r u`.
+
+Consequence: `R_s(S)` is star-shaped about `s` with a single-valued radial
+boundary. Locating a two-dimensional level set becomes one scalar equation per
+direction.
+
+## A17. The radial boundary is a minimum of closed-form feature roots
+
+**Claim.** With `s`, `u`, `x(t)` and `T(u)` as in A16,
+
+```text
+T(u) = min over c in L(S) of t_c,
+t_c = ||c-s||^2 / (2 u.(c-s))   when u.(c-s) > 0, and infinity otherwise.
+```
+
+The minimum is attained by a point of the A6 candidate family, and each family
+member has a closed-form root:
+
+```text
+exclusion circle, centre q    t = (4r^2 - ||s-q||^2) / (2(u.(s-q) -/+ 2r))
+inset edge line X             t = (X - s_x) / (1 -/+ u_x), likewise for Y
+vertex v of L(S)              t = ||v-s||^2 / (2 u.(v-s))
+```
+
+For `q = s` the first reduces to `t = r`, recovering A16's disk. A candidate is
+admissible only when the point realising it is a legal center.
+
+**Proof.** `dist(x(t),L) = min over c in L of ||x(t)-c||`, so `h = min_c h_c`
+with `h_c(t) = ||x(t)-c|| - t`, each non-increasing because distance to a point
+is 1-Lipschitz. Expanding `||x(t)-c||^2 = t^2` gives
+`||s-c||^2 + 2t u.(s-c) = 0`, hence the displayed `t_c`. Since every `h_c` is
+non-increasing and `h(T) = 0`, we get `h_c(T) >= 0` for every `c`, so
+`T <= t_c` always, with equality at a minimiser. At `t = T` we have
+`dist(x(T),L) = T >= r > 0`, so `x(T)` is not in `L(S)` and A6 applies: a
+closest point belongs to the enumerated family. Substituting the closed-form
+distance to a circle or to a line and setting it equal to `t` produces the
+displayed roots; in the circle case the `t^2` terms cancel and the root is
+linear in `t`.
+
+Consequences:
+
+- The boundary is computed without sampling and without iteration.
+- Admissibility is decided by a legality test on the realising point, which is
+  exactly the restriction of a full circle or full line to the surviving part of
+  `boundary L(S)`. The boundary of `L(S)` never has to be constructed, so no
+  enclosure combinatorics among three or more stones is ever enumerated.
+- Every admissible candidate yields an upper bound on `T(u)`, so a partial scan
+  is always safe; and `t_c >= ||c-s||/2` by the triangle inequality, so visiting
+  candidates in increasing distance from `s` permits an exact early stop.
+
 ## Numerical policy
 
 The claims above use exact arithmetic. JavaScript `Number` arithmetic does not
@@ -263,3 +360,12 @@ settles every comparison exactly for the coordinates produced by the geometry
 engine. Equality is not an escape because A5 requires a strict inequality. No
 numeric tolerance is added to `rho`, and the former fixed capture deadband is
 not part of the implementation or rules.
+
+Legal-center membership admits a center at distance `2r - coordinateEpsilon`, so
+the radius computed from A17 satisfies `T(u) >= r - coordinateEpsilon/2` rather
+than `T(u) >= r` exactly. This affects the shaded settled region only. It does
+not enter capture, which is decided by A5 through the comparison above.
+
+A16 and A17 assume every stone carries the same radius `r`, so that every
+exclusion circle has radius `2r`. The closed forms would have to be rederived
+for a variant with per-stone radii.

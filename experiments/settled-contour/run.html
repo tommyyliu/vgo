@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>settled contour bench</title>
+<style>body{margin:0;background:#0e1116;color:#e6e9ef;font:12px/1.4 ui-monospace,Consolas,monospace}
+pre{padding:16px;white-space:pre}</style></head>
+<body>
+<pre id="out">RUNNING</pre>
+
+<!-- the reference engine, untouched -->
+<script src="../../reference/src/engine/numeric.js"></script>
+<script src="../../reference/src/engine/model.js"></script>
+<script src="../../reference/src/geometry/voronoi.js"></script>
+<script src="../../reference/src/geometry/legal-set.js"></script>
+<script src="../../reference/src/geometry/settled-contour.js"></script>
+<script src="../../reference/src/engine/analysis.js"></script>
+<script src="../../reference/src/engine/game.js"></script>
+
+<!-- harness -->
+<script src="harness/corpus.js"></script>
+<script src="harness/oracle.js"></script>
+<script src="harness/bench.js"></script>
+
+<!-- candidates -->
+<script src="candidates/v0-quadtree.js"></script>
+<script src="candidates/v1-star.js"></script>
+<script src="candidates/v2-analytic.js"></script>
+<script src="candidates/v3-adaptive.js"></script>
+<script src="candidates/v4-pruned.js"></script>
+
+
+<script>
+"use strict";
+(function () {
+  const params = new URLSearchParams(location.search);
+  const list = function (key) {
+    const value = params.get(key);
+    return value ? value.split(",") : null;
+  };
+  const output = document.getElementById("out");
+  try {
+    output.textContent = BENCH.run({
+      side: Number(params.get("side")) || 300,
+      budget: Number(params.get("budget")) || 900,
+      candidates: list("candidates"),
+      cases: list("cases"),
+    });
+    output.dataset.status = "done";
+  } catch (error) {
+    output.textContent = "HARNESS ERROR\n" + (error && error.stack ? error.stack : error);
+    output.dataset.status = "error";
+  }
+})();
+</script>
+</body>
+</html>
