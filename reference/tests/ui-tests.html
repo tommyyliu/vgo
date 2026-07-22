@@ -52,6 +52,30 @@ document.getElementById('app').addEventListener('load', function () {
     assert(doc.querySelectorAll('#board circle').length === 2, 'invalid diagram was discarded');
   });
 
+  test('hovering a move previews its outcome without committing it', function () {
+    const win = document.getElementById('app').contentWindow;
+    doc.getElementById('sgf').value =
+      '(;FF[4]GM[VGO]SZ[1]RA[0.05000]PL[B]AB[0.30000,0.35000]AW[0.70000,0.65000])';
+    doc.getElementById('load').click();
+    const stones = doc.querySelectorAll('#board circle').length;
+    const score = doc.getElementById('scoreB').textContent;
+
+    const board = doc.getElementById('cv'), rect = board.getBoundingClientRect();
+    board.dispatchEvent(new win.MouseEvent('mousemove', {
+      clientX: rect.left + rect.width * 0.5,
+      clientY: rect.top + rect.height * 0.5,
+    }));
+    win.renderPreview();                       // the page defers this to an animation frame
+    assert(doc.querySelectorAll('#preview path').length > 0, 'hover drew no preview geometry');
+    assert(doc.getElementById('pvB').textContent.includes('%'), 'hover showed no preview score');
+    assert(doc.querySelectorAll('#board circle').length === stones, 'preview committed a stone');
+    assert(doc.getElementById('scoreB').textContent === score, 'preview altered the live score');
+
+    board.dispatchEvent(new win.MouseEvent('mouseleave'));
+    assert(doc.getElementById('preview').innerHTML === '', 'preview outlived the pointer');
+    assert(doc.getElementById('pvB').textContent === '', 'preview score outlived the pointer');
+  });
+
   const output = document.getElementById('result');
   if (failures.length) {
     output.dataset.status = 'fail';

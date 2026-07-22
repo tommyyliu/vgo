@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>VGO game tree tests</title></head>
+<body>
+<pre id="result">RUNNING</pre>
+<script src="../src/engine/numeric.js"></script>
+<script src="../src/engine/model.js"></script>
+<script src="../src/geometry/voronoi.js"></script>
+<script src="../src/geometry/legal-set.js"></script>
+<script src="../src/geometry/settled-contour.js"></script>
+<script src="../src/engine/analysis.js"></script>
+<script src="../src/engine/game.js"></script>
+<script src="../src/io/vgo-sgf.js"></script>
+<script src="../src/io/game-tree.js"></script>
+<script>
+"use strict";
+(function () {
+  const failures = [];
+  let passed = 0;
+  function test(name, body) {
+    try { body(); passed++; }
+    catch (error) { failures.push(name + ': ' + error.message); }
+  }
+  function assert(condition, message) {
+    if (!condition) throw new Error(message || 'assertion failed');
+  }
+  function start(radius) {
+    return VGO.gameTree.create(
+      VGO.model.createPosition({ stones: [], toMove: 'B', radius: radius || 0.16666666666666666 })
+    );
+  }
+
+  test('a played move produces a child holding the resulting position', function () {
+    const root = start();
+    const step = VGO.gameTree.play(root, 0.5, 0.5);
+    assert(step.ok, step.reason);
+    assert(step.created, 'first play should create a node');
+    assert(root.children.length === 1, 'root did not gain a child');
+    assert(step.node.parent === root, 'child lost its parent');
+    assert(step.node.position.stones.length === 1, 'move did not place a stone');
+    assert(root.position.stones.length === 0, 'the parent position was mutated');
+    assert(VGO.gameTree.ply(step.node) === 1, 'ply is wrong');
+  });
+
+  test('replaying a move navigates instead of forking', function () {
+    const root = start();
+    const first = VGO.gameTree.play(root, 0.5, 0.5);
+    const again = VGO.gameTree.play(root, 0.5, 0.5);
+    assert(again.ok && !again.created, 'the second play should reuse the node');
+    assert(again.node === first.node, 'navigation returned a different node');
+    assert(root.children.length === 1, 'the tree forked on an identical move');
+  });
+
+  test('a different move from the same node creates a variation', function () {
+    const root = start();
+    const main = VGO.gameTree.play(root, 0.5, 0.5).node;
+    const side = VGO.gameTree.play(root, 0.3, 0.3).node;
+    assert(root.children.length === 2, 'variation was not recorded');
+    assert(VGO.gameTree.isMainline(main), 'the first move should be the main line');
+    assert(!VGO.gameTree.isMainline(side), 'the second move should be a variation');
+    assert(VGO.gameTree.siblings(side).length === 2, 'siblings are wrong');
+    assert(VGO.gameTree.promote(side), 'promotion failed');
+    assert(VGO.gameTree.isMainline(side), 'promotion did not change the main line');
+    assert(!VGO.gameTree.isMainline(main), 'the old main line was not demoted');
+    assert(root.children.length === 2, 'promotion discarded a variation');
+  });
+
+  test('an illegal move is rejected without touching the tree', function () {
+    const root = start();
+    const first = VGO.gameTree.play(root, 0.5, 0.5).node;
+    const overlap = VGO.gameTree.play(first, 0.5, 0.5);
+    assert(!overlap.ok, 'an overlapping placement was accepted');
+    assert(first.children.length === 0, 'a rejected move still grew the tree');
+  });
+
+  test('passes are nodes and two of them finish the game', function () {
+    const root = start();
+    const once = VGO.gameTree.pass(root);
+    assert(once.ok && once.node.move.pass, 'pass did not record a move');
+    const twice = VGO.gameTree.pass(once.node);
+    assert(twice.ok, 'second pass was rejected');
+    assert(twice.node.position.phase === 'finished', 'two passes did not finish');
+    assert(VGO.gameTree.mainline(root).length === 3, 'mainline should be root plus two passes');
+  });
+
+  test('a record round-trips through SGF with its variations', function () {
+    const root = start();
+    const first = VGO.gameTree.play(root, 0.5, 0.5).node;
+    VGO.gameTree.play(first, 0.2, 0.2);
+    VGO.gameTree.play(first, 0.8, 0.8);
+    VGO.gameTree.pass(first);
+    const text = VGO.sgf.serializeRecord(root);
+    assert(text.indexOf(';B[') > 0, 'no move node was written');
+    assert(text.indexOf(';W[]') > 0, 'a pass was not written as an empty value');
+    assert((text.match(/\(/g) || []).length === 4, 'variations were not parenthesised: ' + text);
+
+    const rebuilt = VGO.gameTree.fromRecord(VGO.sgf.parseRecord(text), VGO.model.DEFAULT_RULES);
+    assert(rebuilt.rejected.length === 0, 'replay rejected a move: ' + JSON.stringify(rebuilt.rejected));
+    assert(VGO.gameTree.count(rebuilt.root) === VGO.gameTree.count(root), 'node count changed');
+    assert(rebuilt.root.children[0].children.length === 3, 'variation count changed');
+    assert(VGO.sgf.serializeRecord(rebuilt.root) === text, 'record is not stable across a round trip');
+  });
+
+  test('a record still parses as a plain position', function () {
+    const root = start();
+    const next = VGO.gameTree.play(root, 0.5, 0.5).node;
+    VGO.gameTree.play(next, 0.2, 0.2);
+    const text = VGO.sgf.serializeRecord(root);
+    const position = VGO.sgf.parse(text);
+    assert(position.stones.length === 0, 'the setup should be the empty starting board');
+    // VGO-SGF writes coordinates with five decimals, so 1/6 returns as 0.16667.
+    assert(Math.abs(position.radius - root.position.radius) < 1e-5, 'radius was lost');
+  });
+
+  test('coordinates round-trip to the precision the format actually carries', function () {
+    const root = start(0.1);
+    VGO.gameTree.play(root, 1 / 3, 0.5);
+    const rebuilt = VGO.gameTree.fromRecord(
+      VGO.sgf.parseRecord(VGO.sgf.serializeRecord(root)), VGO.model.DEFAULT_RULES);
+    assert(rebuilt.rejected.length === 0, 'a five-decimal coordinate failed to replay');
+    const stone = rebuilt.root.children[0].position.stones[0];
+    assert(Math.abs(stone.x - 1 / 3) < 1e-5, 'x drifted beyond the format precision');
+    assert(Math.abs(stone.x - 1 / 3) > 0, 'expected five-decimal rounding, not exactness');
+  });
+
+  test('a setup position survives a record round trip', function () {
+    const setup = VGO.model.createPosition({
+      stones: [{ x: 0.3, y: 0.3, c: 'B' }, { x: 0.7, y: 0.7, c: 'W' }],
+      toMove: 'B', radius: 0.1,
+    });
+    const root = VGO.gameTree.create(setup);
+    VGO.gameTree.play(root, 0.5, 0.5);
+    const rebuilt = VGO.gameTree.fromRecord(
+      VGO.sgf.parseRecord(VGO.sgf.serializeRecord(root)), VGO.model.DEFAULT_RULES);
+    assert(rebuilt.root.position.stones.length === 2, 'setup stones were lost');
+    assert(rebuilt.root.children.length === 1, 'the move was lost');
+  });
+
+  test('an out-of-turn move is reported rather than applied', function () {
+    const text = '(;FF[4]GM[VGO]SZ[1]RA[0.16667]PL[B];W[0.50000,0.50000])';
+    const rebuilt = VGO.gameTree.fromRecord(VGO.sgf.parseRecord(text), VGO.model.DEFAULT_RULES);
+    assert(rebuilt.rejected.length === 1, 'out-of-turn move was not reported');
+    assert(rebuilt.rejected[0].reason === 'out-of-turn', 'wrong rejection reason');
+    assert(rebuilt.root.children.length === 0, 'out-of-turn move was applied anyway');
+  });
+
+  test('malformed records are refused', function () {
+    let threw = 0;
+    for (const text of ['(;FF[4]GM[VGO]SZ[1]RA[0.1]PL[B]', 'not sgf at all', '(;FF[4]GM[VGO];B[0.5])']) {
+      try { VGO.sgf.parseRecord(text); } catch (error) { threw++; }
+    }
+    assert(threw === 3, 'a malformed record was accepted');
+  });
+
+  const output = document.getElementById('result');
+  if (failures.length) {
+    output.dataset.status = 'fail';
+    output.textContent = 'FAIL ' + failures.length + '/' + (passed + failures.length) + '\n' + failures.join('\n');
+  } else {
+    output.dataset.status = 'pass';
+    output.textContent = 'PASS ' + passed + '/' + passed;
+  }
+})();
+</script>
+</body>
+</html>

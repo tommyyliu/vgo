@@ -38,4 +38,5 @@ function Invoke-BrowserTest([string]$Page) {
 }
 
 Invoke-BrowserTest "engine-tests.html"
+Invoke-BrowserTest "game-tree-tests.html"
 Invoke-BrowserTest "ui-tests.html"

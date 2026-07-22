@@ -33,12 +33,27 @@
              border-radius:6px; padding:6px 8px; font:11px/1.35 ui-monospace,Consolas,monospace; }
   .notice { margin:8px 0 0; padding:7px 8px; border-left:2px solid #ff8a8a; color:#ffb0b0;
             background:#21181c; font-size:12px; }
+  .pv { color:#78c8ff; margin-left:7px; font-weight:normal; }
+  .pv:empty { margin-left:0; }
+  .nav { display:flex; gap:5px; margin:6px 0; }
+  .nav button { flex:1; padding:5px 0; font-size:12px; }
+  .moves { max-height:150px; overflow:auto; background:#0f131a; border:1px solid #262c37;
+           border-radius:6px; padding:4px; font-size:11px; }
+  .mv { padding:2px 5px; border-radius:3px; cursor:pointer; white-space:nowrap;
+        overflow:hidden; text-overflow:ellipsis; }
+  .mv:hover { background:#20262f; }
+  .mv.now { background:#2a3a4e; color:#cfe6ff; }
+  .mv.off { color:#8b93a3; }
+  .alt { color:#f0975a; }
+  .vars { display:flex; gap:5px; flex-wrap:wrap; margin-top:6px; }
+  .vars button { padding:3px 7px; font-size:11px; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <svg id="cv" viewBox="0 0 1 1" preserveAspectRatio="xMidYMid meet">
     <g id="board"></g>
+    <g id="preview"></g>
     <g id="overlay">
       <line id="snapLine" stroke="rgba(255,255,255,.4)" stroke-width="1" vector-effect="non-scaling-stroke"
             stroke-dasharray="4 4" visibility="hidden"/>
@@ -52,12 +67,12 @@
 
     <div class="row"><span id="turnLabel" class="turn">Turn</span><span id="turn" class="turn"></span></div>
     <hr>
-    <div class="row big"><span><span class="swatch b"></span>Black</span><span id="scoreB"></span></div>
-    <div class="row big"><span><span class="swatch w"></span>White</span><span id="scoreW"></span></div>
+    <div class="row big"><span><span class="swatch b"></span>Black</span><span><span id="scoreB"></span><span id="pvB" class="pv"></span></span></div>
+    <div class="row big"><span><span class="swatch w"></span>White</span><span><span id="scoreW"></span><span id="pvW" class="pv"></span></span></div>
     <div class="bar"><span id="barB" style="background:var(--stoneB)"></span>
                      <span id="barW" style="background:var(--stoneW)"></span></div>
     <div class="row mut"><span>stones (B / W)</span><span id="counts"></span></div>
-    <div class="row mut"><span>captured this move</span><span id="captured"></span></div>
+    <div class="row mut"><span>captured this move</span><span><span id="captured"></span><span id="pvCaptured" class="pv"></span></span></div>
     <div id="positionWarning" class="notice" hidden></div>
     <hr>
     <div style="display:flex; gap:8px; flex-wrap:wrap;">
@@ -66,23 +81,33 @@
       <button id="clear">Clear</button>
     </div>
     <hr>
+    <div class="row mut"><span>game tree</span><span id="treeInfo"></span></div>
+    <div class="nav">
+      <button id="navStart" title="first move">&#9198;</button>
+      <button id="navBack" title="back one move">&#9664;</button>
+      <button id="navForward" title="forward along this line">&#9654;</button>
+      <button id="navEnd" title="end of this line">&#9197;</button>
+    </div>
+    <div id="moves" class="moves"></div>
+    <div id="vars" class="vars"></div>
+    <hr>
     <label class="ck"><input type="checkbox" id="ovRegions" checked> fill Voronoi regions</label>
     <label class="ck"><input type="checkbox" id="ovBounds" checked> cell boundaries</label>
     <label class="ck"><input type="checkbox" id="ovLock" checked> settled (uninteractable) shading</label>
     <label class="ck"><input type="checkbox" id="ovFree"> legal-placement mask</label>
     <label class="ck"><input type="checkbox" id="ovIds"> stone ids</label>
     <label class="ck"><input type="checkbox" id="ovSnap" checked> snap to nearest legal spot</label>
+    <label class="ck"><input type="checkbox" id="ovPreview" checked> preview hovered move</label>
     <hr>
-    <div class="row mut"><span>settle detail</span><span id="resLbl"></span></div>
-    <input type="range" id="res" min="8" max="11" step="1" value="10">
     <div class="row mut"><span>stone radius</span><span id="radLbl"></span></div>
     <input type="range" id="rad" min="8" max="70" step="1" value="39">
     <hr>
     <div class="mut" style="font-size:12px">
       Rendered as SVG: cells, edges and stones are exact vectors — crisp at any
       zoom. Capture is analytic and unsampled. Shaded areas are <em>settled</em>
-      (no legal move can change them); their exact predicate is contoured with an
-      adaptive quadtree. A stone's whole disk must fit on the board.
+      (no legal move can change them); their boundary is solved in closed form,
+      not sampled. Hovering shows what the move would settle. A stone's whole
+      disk must fit on the board.
     </div>
     <hr>
     <div class="row mut"><span>position (VGO-SGF)</span></div>
@@ -104,6 +129,7 @@
 <script src="../src/engine/analysis.js"></script>
 <script src="../src/engine/game.js"></script>
 <script src="../src/io/vgo-sgf.js"></script>
+<script src="../src/io/game-tree.js"></script>
 <script>
 "use strict";
 /* =========================================================================
@@ -158,8 +184,21 @@ const COLORS = {
 };
 const RULES = VGO.model.DEFAULT_RULES;
 let state = VGO.model.createPosition({ stones: [], toMove: 'B', radius: 0.05 });
-let settleDepth = 10;
-const history = [];
+
+/* The record is a tree, not a list. `current` is where we are standing in it and
+   `state` mirrors its position, so the rest of the page reads exactly as before.
+
+   `documents` is a separate, small stack for whole-record operations — load,
+   clear, a radius change. Those replace the tree outright rather than adding a
+   move, so Undo means "back one move" while a move exists above us, and
+   "restore the previous record" once we are at the root. */
+let tree = VGO.gameTree.create(state);
+let current = tree;
+const documents = [];
+const capturedAt = node =>
+  (!node.parent || node.move.pass)
+    ? 0
+    : node.parent.position.stones.length + 1 - node.position.stones.length;
 let lastCaptured = 0;
 let hover = null;                       // { rawX, rawY, x, y, legal, snapped }
 
@@ -176,63 +215,84 @@ const nearestLegal = (x, y) => A.validation.playable
   : { x, y, legal:false, snapped:false };
 
 /* =========================================================================
-   3. SETTLED CONTOUR — exact predicate, adaptive geometric approximation
+   3. SETTLED CONTOUR — analytic
 
-   g(x) = dist(x,L) - dist(x,S) is 2-Lipschitz because both distance functions
-   are 1-Lipschitz. A center sample therefore proves a square has constant sign
-   whenever |g(center)| exceeds twice the center-to-corner distance. Only cells
-   that cannot be proved uniform reach the leaf resolution.
+   A15 drops the Voronoi partition, A16 makes each stone's settled region
+   star-shaped about it, and A17 solves the radial boundary in closed form. The
+   page just asks for it; there is no sampling depth to choose and no topology
+   to repair, so the loops are closed and simple by construction.
+
+   It is cheap enough (well under a millisecond for a normal position) to run on
+   a hovered move as well as on the committed board.
    ========================================================================= */
-const computeSettledContour = depth => VGO.settledContour.compute(state, depth);
-function recomputeContour() {
-  let contour = computeSettledContour(settleDepth);
-  if ((contour.openChains || contour.badVertices) && settleDepth < 12)
-    contour = computeSettledContour(settleDepth + 1);
-  if (contour.openChains || contour.badVertices) {
-    console.warn('Settled contour topology diagnostic', {
-      position:VGO.sgf.serialize(state), radius:state.radius, depth:contour.maxDepth,
-      segments:contour.segments, openChains:contour.openChains,
-      badVertices:contour.badVertices, degreeHistogram:contour.degreeHistogram,
-    });
-  }
-  return contour;
-}
+const contourFor = (position, analysis) =>
+  VGO.settledContour.compute(position, analysis && analysis.legalVertices);
 /* =========================================================================
    4. RECOMPUTE + MOVE TRANSACTIONS
    ========================================================================= */
 function recompute() {
   A = VGO.analysis.analyze(state);
   G = A.geometry;
-  Q = recomputeContour();
+  Q = contourFor(state, A);
   if (G.diagnostics.unclassifiedEdges || G.diagnostics.degenerateEdges)
     console.warn('Voronoi topology diagnostic', G.diagnostics);
 }
 
+// Moving to a node is the only way `state` changes, so every path through the
+// page — playing, navigating, loading — leaves the same invariants behind.
+function goTo(node, silent) {
+  current = node;
+  state = node.position;
+  lastCaptured = capturedAt(node);
+  recompute();
+  renderBoard();
+  if (!silent) draw();
+}
+
 function placeStone(x, y) {
-  const result = VGO.game.place(state, x, y, RULES);
-  if (!result.ok) {
-    if (result.reason === 'finished') flash('Game over — undo or clear to continue');
-    else if (result.reason === 'invalid-position') flash('Fix the invalid position before playing');
+  const before = snapshot();
+  const outcome = VGO.gameTree.play(current, x, y, RULES);
+  if (outcome.ok) pushUndo(before);
+  if (!outcome.ok) {
+    if (outcome.reason === 'finished') flash('Game over — step back or clear to continue');
+    else if (outcome.reason === 'invalid-position') flash('Fix the invalid position before playing');
     return false;
   }
-  pushHistory(); state = result.position; A = result.analysis; G = A.geometry;
-  Q = recomputeContour();
-  lastCaptured = result.captured;
-  renderBoard();
-  const selfCapture = result.events.find(event => event.type === 'self-capture');
-  if (selfCapture) flash(`Self-capture — ${selfCapture.count} own stone${selfCapture.count === 1 ? '' : 's'} removed`);
+  const branched = outcome.created && current.children.length > 1;
+  goTo(outcome.node, true);
+  if (branched) flash('New variation');
+  else if (outcome.result) {
+    const selfCapture = outcome.result.events.find(event => event.type === 'self-capture');
+    if (selfCapture) flash(`Self-capture — ${selfCapture.count} own stone${selfCapture.count === 1 ? '' : 's'} removed`);
+  }
   return true;
 }
 
 /* =========================================================================
-   6. HISTORY
+   6. NAVIGATION AND UNDO
+
+   Undo reverses the last *edit* — a move, a load, a clear, a radius change —
+   and nothing else. Walking the tree is not an edit, so browsing a game never
+   fills the undo stack, and Undo after loading a record undoes the load rather
+   than stepping back through moves that arrived with it.
    ========================================================================= */
-function pushHistory() { history.push(state); if (history.length > 500) history.shift(); }
-function undo(silent) {
-  const prev = history.pop(); if (!prev) return;
-  state = prev; lastCaptured = 0;
+function snapshot() { return { tree: tree, current: current }; }
+function pushUndo(taken) {
+  documents.push(taken);
+  if (documents.length > 500) documents.shift();
+}
+function setDocument(root, node) {
+  tree = root;
+  goTo(node || root, true);
   syncControlsFromState();
-  recompute(); renderBoard(); if (!silent) draw();
+}
+function undo(silent) {
+  const previous = documents.pop();
+  if (!previous) return;
+  tree = previous.tree;
+  goTo(previous.current, true);
+  syncControlsFromState();
+  if (!silent) draw();
 }
 
 /* =========================================================================
@@ -283,6 +343,7 @@ function renderBoard() {
   }
 
   boardG.innerHTML = svg;
+  clearPreview();                                        // any preview described the previous board
   updateHUD();
 }
 
@@ -300,11 +361,18 @@ function freeMaskSVG() {
   return `<image href="${off.toDataURL()}" x="0" y="0" width="1" height="1" preserveAspectRatio="none"/>`;
 }
 
+// The per-stone regions of A15 overlap, so their union is a nonzero-winding
+// fill. A hole in the settled set is covered by no loop and stays unfilled.
+const loopsD = loops => loops.reduce((d, loop) => d + polyD(loop), '');
+const loopArea = loop => {                               // shoelace, sign-independent
+  let sum = 0;
+  for (let i = 0, j = loop.length - 1; i < loop.length; j = i++)
+    sum += (loop[j][0] - loop[i][0]) * (loop[j][1] + loop[i][1]);
+  return Math.abs(sum) / 2;
+};
 function settledSVG() {
-  const loops = Q.loops; if (!loops.length) return '';
-  let d = '';
-  for (const loop of loops) d += polyD(loop);
-  return `<path d="${d}" fill="rgba(4,6,10,0.40)" fill-rule="evenodd" ` +
+  if (!Q.loops.length) return '';
+  return `<path d="${loopsD(Q.loops)}" fill="rgba(4,6,10,0.40)" fill-rule="${Q.fillRule}" ` +
          `stroke="rgba(120,200,255,0.55)" stroke-width="1" ${NSS}/>`;
 }
 
@@ -316,7 +384,7 @@ const $snap  = document.getElementById('snapLine');
 const $raw   = document.getElementById('rawDot');
 
 function draw() {
-  if (!hover || state.phase === 'finished') { $ghost.setAttribute('visibility', 'hidden'); $snap.setAttribute('visibility', 'hidden'); $raw.setAttribute('visibility', 'hidden'); return; }
+  if (!hover || state.phase === 'finished') { $ghost.setAttribute('visibility', 'hidden'); $snap.setAttribute('visibility', 'hidden'); $raw.setAttribute('visibility', 'hidden'); clearPreview(); return; }
   const stone = COLORS[state.toMove].stone;
   $ghost.setAttribute('cx', f(hover.x)); $ghost.setAttribute('cy', f(hover.y));
   $ghost.setAttribute('r', f(state.radius));
@@ -330,6 +398,140 @@ function draw() {
     $snap.setAttribute('visibility', 'visible');
     $raw.setAttribute('cx', f(hover.rawX)); $raw.setAttribute('cy', f(hover.rawY)); $raw.setAttribute('visibility', 'visible');
   } else { $snap.setAttribute('visibility', 'hidden'); $raw.setAttribute('visibility', 'hidden'); }
+  schedulePreview();
+}
+
+/* =========================================================================
+   8b. MOVE PREVIEW — the pure transaction, run but never committed
+
+   VGO.game.place() is a pure function, so the hovered move can be resolved
+   exactly and then thrown away. The preview therefore inherits the real rules:
+   real capture, real self-capture, real scores — never a UI approximation.
+
+   Two costs are deliberately avoided. The transaction is memoized on the
+   snapped point (snapping collapses most mouse movement onto a point already
+   resolved) and re-rendered at most once per animation frame. The settled
+   contour is NOT recomputed: its quadtree is the most expensive object on the
+   page and shading is a property of the committed board, not of a hover.
+
+   Only boundaries that actually MOVE are drawn. Adding a stone re-clips every
+   cell, but a half-plane that binds nothing leaves its polygon's vertices
+   untouched, so unchanged edges match their current segment exactly and drop
+   out of the diff. What is left is precisely the part of the board that the
+   move would redraw.
+   ========================================================================= */
+const previewG   = document.getElementById('preview');
+const $pvB       = document.getElementById('pvB');
+const $pvW       = document.getElementById('pvW');
+const $pvCapture = document.getElementById('pvCaptured');
+let previewCache = { position:null, key:'', data:null };   // position identity == cache generation
+let previewFrame = 0;
+
+const stoneKey = (x, y, c) => x + '|' + y + '|' + c;
+const segKey = (a, b) => {                                 // undirected, endpoint-order independent
+  const p = f(a[0]) + ',' + f(a[1]), q = f(b[0]) + ',' + f(b[1]);
+  return p < q ? p + ';' + q : q + ';' + p;
+};
+
+function previewData() {
+  if (!hover || !hover.legal || !opt('ovPreview') || state.phase !== 'playing') return null;
+  const key = hover.x + ',' + hover.y;                     // full precision: a snap repeats exactly
+  if (previewCache.position === state && previewCache.key === key) return previewCache.data;
+  const result = VGO.game.place(state, hover.x, hover.y, RULES);
+  const data = result.ok ? buildPreview(result) : null;
+  previewCache = { position:state, key:key, data:data };
+  return data;
+}
+
+function buildPreview(result) {
+  const after = result.position, afterA = result.analysis;
+
+  // Survivors are matched by coordinate: model.createPosition() re-freezes every
+  // stone, so object identity does not survive a transaction.
+  const survivors = new Set();
+  for (const s of after.stones) survivors.add(stoneKey(s.x, s.y, s.c));
+  const doomed = state.stones.filter(s => !survivors.has(stoneKey(s.x, s.y, s.c)));
+  const selfCaptured = !survivors.has(stoneKey(hover.x, hover.y, state.toMove));
+
+  const current = new Set();
+  for (const cell of G.cells) for (const e of cell.edges) current.add(segKey(e.A, e.B));
+  let moved = '';
+  const cells = afterA.geometry.cells;
+  for (let i = 0; i < cells.length; i++) for (const e of cells[i].edges) {
+    if (e.j < 0 || e.j < i) continue;                      // board edge, or the twin already emitted
+    if (current.has(segKey(e.A, e.B))) continue;           // this boundary does not move
+    moved += `M${f(e.A[0])} ${f(e.A[1])}L${f(e.B[0])} ${f(e.B[1])}`;
+  }
+
+  /* The settled region the move would produce. A15-A17 make this a closed-form
+     sweep, so shading that used to cost a quadtree is now affordable on a hover.
+
+     Only regions that actually change are drawn. In open space a stone settles
+     exactly its own radius-r disk (A16), which the stone already covers, so
+     drawing every region would ring the whole board for no information. What is
+     worth seeing is the move's own region and the neighbours it grows — by A8
+     a non-capturing move can only enlarge them. */
+  const settled = contourFor(after, afterA);
+  const indexed = settled.loops.length === after.stones.length &&
+                  Q.loops.length === state.stones.length;
+  let settledLoops = settled.loops;
+  if (indexed) {
+    const before = new Map();
+    state.stones.forEach((s, i) => before.set(stoneKey(s.x, s.y, s.c), loopArea(Q.loops[i])));
+    settledLoops = settled.loops.filter((loop, i) => {
+      const s = after.stones[i];
+      const previous = before.get(stoneKey(s.x, s.y, s.c));
+      return previous === undefined || Math.abs(loopArea(loop) - previous) > 1e-7;
+    });
+  }
+
+  return { moved:moved, doomed:doomed, selfCaptured:selfCaptured,
+           settledLoops:settledLoops, settledRule:settled.fillRule,
+           scores:afterA.scores, captured:result.captured };
+}
+
+function schedulePreview() {
+  if (previewFrame) return;
+  previewFrame = requestAnimationFrame(() => { previewFrame = 0; renderPreview(); });
+}
+
+function renderPreview() {
+  const data = previewData();
+  if (!data) { clearPreview(); return; }
+  const r = state.radius, arm = 0.62 * r;
+  let svg = '';
+
+  // Settled first, so the moved boundaries and capture marks read on top of it.
+  if (opt('ovLock') && data.settledLoops.length)
+    svg += `<path d="${loopsD(data.settledLoops)}" fill="rgba(120,200,255,.16)" ` +
+           `fill-rule="${data.settledRule}" stroke="rgba(150,215,255,.8)" ` +
+           `stroke-width="1.5" stroke-dasharray="3 3" ${NSS}/>`;
+
+  if (data.moved)
+    svg += `<path d="${data.moved}" fill="none" stroke="rgba(120,200,255,.85)" stroke-width="1.5" ` +
+           `stroke-dasharray="5 4" ${NSS}/>`;
+
+  const cross = (x, y, color) =>
+    `<circle cx="${f(x)}" cy="${f(y)}" r="${f(r)}" fill="rgba(14,17,22,.55)"/>` +
+    `<path d="M${f(x - arm)} ${f(y - arm)}L${f(x + arm)} ${f(y + arm)}` +
+    `M${f(x - arm)} ${f(y + arm)}L${f(x + arm)} ${f(y - arm)}" fill="none" stroke="${color}" ` +
+    `stroke-width="2" stroke-linecap="round" ${NSS}/>`;
+
+  for (const s of data.doomed) svg += cross(s.x, s.y, 'rgba(255,138,138,.95)');
+  if (data.selfCaptured) svg += cross(hover.x, hover.y, 'rgba(255,190,120,.95)');
+
+  previewG.innerHTML = svg;
+  const pct = v => (100 * v).toFixed(1) + '%';
+  $pvB.textContent = '→ ' + pct(data.scores.B);
+  $pvW.textContent = '→ ' + pct(data.scores.W);
+  $pvCapture.textContent = data.captured                 // silent when the move takes nothing
+    ? '→ ' + data.captured + (data.selfCaptured ? ' (self)' : '')
+    : '';
+}
+
+function clearPreview() {
+  previewG.innerHTML = '';
+  $pvB.textContent = ''; $pvW.textContent = ''; $pvCapture.textContent = '';
 }
 
 function updateHUD() {
@@ -356,8 +558,10 @@ function updateHUD() {
   warning.hidden = A.validation.playable;
   warning.textContent = A.validation.playable ? '' : A.validation.issues[0] +
     (A.validation.issues.length > 1 ? ` (+${A.validation.issues.length - 1} more)` : '');
+  renderMoves();
   const sgf = document.getElementById('sgf');
-  if (sgf && document.activeElement !== sgf) sgf.value = VGO.sgf.serialize(state);   // don't clobber while pasting
+  // The whole record, not just the position on screen, so a copy carries the game.
+  if (sgf && document.activeElement !== sgf) sgf.value = VGO.sgf.serializeRecord(tree);
 }
 
 const $flash = document.getElementById('flash');
@@ -367,11 +571,18 @@ function flash(m) {
   clearTimeout(flashTimer); flashTimer = setTimeout(() => $flash.setAttribute('opacity', '0'), 1400);
 }
 
+// A record and a bare position are the same text to the reader: a position is
+// just a record with no move nodes, so one path handles both.
 function fromSGF(str) {
-  const loaded = VGO.sgf.parse(str, state);
-  pushHistory();
-  state = loaded; lastCaptured = 0;
-  syncControlsFromState(); recompute(); renderBoard(); draw();
+  const record = VGO.sgf.parseRecord(str, state);
+  const rebuilt = VGO.gameTree.fromRecord(record, RULES);
+  pushUndo(snapshot());
+  setDocument(rebuilt.root, VGO.gameTree.mainline(rebuilt.root).pop());
+  draw();
+  if (rebuilt.rejected.length) {
+    flash(`${rebuilt.rejected.length} move${rebuilt.rejected.length === 1 ? '' : 's'} could not be replayed`);
+    console.warn('Rejected moves while loading a record', rebuilt.rejected);
+  }
 }
 
 /* ---- export the board as a standalone image (SVG stays vector; PNG rasterizes) ---- */
@@ -379,6 +590,7 @@ function exportSVGString() {
   const NS = 'http://www.w3.org/2000/svg';
   const clone = cv.cloneNode(true);
   clone.querySelector('#overlay').remove();
+  clone.querySelector('#preview').remove();              // a hover must never enter a saved board
   clone.setAttribute('xmlns', NS);
   clone.setAttribute('width', SIZE); clone.setAttribute('height', SIZE);
   const bg = document.createElementNS(NS, 'rect');
@@ -414,21 +626,94 @@ cv.addEventListener('mouseleave', () => { hover = null; draw(); });
 cv.addEventListener('click', e => { updateHover(e); if (hover && hover.legal && placeStone(hover.x, hover.y)) { updateHover(e); draw(); } });
 
 document.getElementById('pass').onclick = () => {
-  const result = VGO.game.pass(state, RULES); if (!result.ok) return;
-  pushHistory(); state = result.position; A = result.analysis; G = A.geometry;
-  Q = recomputeContour(); lastCaptured = 0;
-  if (state.phase === 'finished') hover = null;
-  renderBoard(); draw();
+  const before = snapshot();
+  const outcome = VGO.gameTree.pass(current, RULES); if (!outcome.ok) return;
+  pushUndo(before);
+  if (outcome.node.position.phase === 'finished') hover = null;
+  goTo(outcome.node);
   if (state.phase === 'finished') flash('Final score — ' + document.getElementById('turn').textContent);
 };
 document.getElementById('undo').onclick  = () => undo(false);
 document.getElementById('clear').onclick = () => {
-  pushHistory(); state = VGO.model.createPosition({ radius:state.radius, stones:[], toMove:'B' });
-  lastCaptured = 0; recompute(); renderBoard(); draw();
+  pushUndo(snapshot());
+  setDocument(VGO.gameTree.create(
+    VGO.model.createPosition({ radius:state.radius, stones:[], toMove:'B' })));
+  draw();
 };
+
+/* ---- tree navigation ---------------------------------------------------- */
+const $moves = document.getElementById('moves');
+const $vars = document.getElementById('vars');
+const $treeInfo = document.getElementById('treeInfo');
+let listed = [];                                   // move-list index -> node
+
+const moveLabel = node => {
+  if (!node.move) return 'start';
+  const taken = capturedAt(node);
+  const where = node.move.pass ? 'pass' : `${f(node.move.x).slice(0, 5)},${f(node.move.y).slice(0, 5)}`;
+  return `${node.move.c} ${where}${taken ? ` ×${taken}` : ''}`;
+};
+
+function renderMoves() {
+  // The line under the cursor: how we got here, then this node's main line on.
+  const travelled = VGO.gameTree.path(current);
+  const ahead = VGO.gameTree.mainline(current).slice(1);
+  listed = travelled.concat(ahead);
+  let html = '';
+  listed.forEach((node, index) => {
+    if (!node.move) return;
+    const alternatives = node.parent.children.length - 1;
+    const classes = 'mv' + (node === current ? ' now' : '') + (index > travelled.length - 1 ? ' off' : '');
+    html += `<div class="${classes}" data-index="${index}">${index}. ${moveLabel(node)}` +
+            (alternatives ? ` <span class="alt">⑂${alternatives}</span>` : '') + '</div>';
+  });
+  $moves.innerHTML = html || '<div class="mv off">no moves yet</div>';
+  const now = $moves.querySelector('.now');
+  if (now) now.scrollIntoView({ block: 'nearest' });
+
+  const siblings = current.parent ? current.parent.children : [];
+  $vars.innerHTML = siblings.length > 1
+    ? siblings.map((node, index) =>
+        `<button data-sibling="${index}"${node === current ? ' disabled' : ''}>` +
+        `${index === 0 ? '★ ' : ''}${moveLabel(node)}</button>`).join('') +
+      (VGO.gameTree.isMainline(current) ? '' : '<button data-promote="1">promote</button>')
+    : '';
+
+  const total = VGO.gameTree.count(tree) - 1;
+  const branches = VGO.gameTree.find(tree, node => node.children.length > 1) ? ' · branched' : '';
+  $treeInfo.textContent = `ply ${VGO.gameTree.ply(current)} of ${total}${branches}`;
+  document.getElementById('navStart').disabled = !current.parent;
+  document.getElementById('navBack').disabled = !current.parent;
+  document.getElementById('navForward').disabled = !current.children.length;
+  document.getElementById('navEnd').disabled = !current.children.length;
+}
+
+$moves.onclick = event => {
+  const row = event.target.closest('.mv');
+  if (!row || !row.dataset.index) return;
+  goTo(listed[+row.dataset.index]);
+};
+$vars.onclick = event => {
+  const button = event.target.closest('button');
+  if (!button) return;
+  if (button.dataset.promote) { VGO.gameTree.promote(current); renderMoves(); draw(); return; }
+  if (button.dataset.sibling) goTo(current.parent.children[+button.dataset.sibling]);
+};
+document.getElementById('navStart').onclick = () => goTo(tree);
+document.getElementById('navBack').onclick = () => { if (current.parent) goTo(current.parent); };
+document.getElementById('navForward').onclick = () => { if (current.children.length) goTo(current.children[0]); };
+document.getElementById('navEnd').onclick = () => goTo(VGO.gameTree.mainline(current).pop());
+window.addEventListener('keydown', event => {
+  if (event.target.tagName === 'TEXTAREA') return;
+  if (event.key === 'ArrowLeft' && current.parent) goTo(current.parent);
+  else if (event.key === 'ArrowRight' && current.children.length) goTo(current.children[0]);
+  else return;
+  event.preventDefault();
+});
 
 for (const id of ['ovRegions', 'ovBounds', 'ovLock', 'ovFree', 'ovIds']) document.getElementById(id).onchange = () => { renderBoard(); draw(); };
 document.getElementById('ovSnap').onchange = () => draw();
+document.getElementById('ovPreview').onchange = () => draw();
 
 const $sgf = document.getElementById('sgf');
 document.getElementById('copy').onclick = () => { $sgf.select(); try { document.execCommand('copy'); } catch (e) {} flash('Copied position'); };
@@ -436,10 +721,8 @@ document.getElementById('load').onclick = () => { try { fromSGF($sgf.value); } c
 document.getElementById('savePng').onclick = savePNG;
 document.getElementById('saveSvg').onclick = saveSVG;
 
-const resEl = document.getElementById('res'), radEl = document.getElementById('rad');
+const radEl = document.getElementById('rad');
 function syncSliders() {
-  settleDepth = +resEl.value;
-  document.getElementById('resLbl').textContent = (SIZE / (1 << settleDepth)).toFixed(1) + 'px cells';
   const pixels = state.radius * SIZE;
   const label = Number.isFinite(pixels)
     ? (Math.abs(pixels - Math.round(pixels)) < .01 ? Math.round(pixels) : pixels.toFixed(1)) + 'px'
@@ -456,20 +739,22 @@ function syncControlsFromState() {
   }
   syncSliders();
 }
-resEl.oninput = () => { syncSliders(); Q = recomputeContour(); renderBoard(); draw(); };
+// Changing the radius rewrites the board every move was made on, so it starts a
+// new record from the position on screen rather than editing one in place.
 radEl.oninput = () => {
-  state = VGO.model.update(state, { radius:(+radEl.value) / SIZE, passes:0, phase:'playing' });
+  const resized = VGO.model.update(state, { radius:(+radEl.value) / SIZE, passes:0, phase:'playing' });
+  pushUndo(snapshot());
+  setDocument(VGO.gameTree.create(resized));
   syncSliders();
-  recompute(); renderBoard(); draw();
+  draw();
 };
 
 /* ---- boot with a small illustrative position ---------------------------- */
-state = VGO.model.createPosition({ radius:(+radEl.value) / SIZE, stones:[
+setDocument(VGO.gameTree.create(VGO.model.createPosition({ radius:(+radEl.value) / SIZE, stones:[
   { x:.30, y:.35, c:'B' }, { x:.45, y:.30, c:'B' }, { x:.40, y:.50, c:'B' },
   { x:.70, y:.65, c:'W' }, { x:.60, y:.78, c:'W' }, { x:.80, y:.45, c:'W' },
-], toMove:'B' });
-syncSliders();
-recompute(); renderBoard(); draw();
+], toMove:'B' })));
+draw();
 </script>
 </body>
 </html>
