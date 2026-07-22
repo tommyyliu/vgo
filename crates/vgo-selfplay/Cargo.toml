@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 clap.workspace = true
+sha2 = "0.10"
 vgo-core = { path = "../vgo-core" }
 vgo-inference = { path = "../vgo-inference" }
 vgo-raster = { path = "../vgo-raster" }
@@ -26,3 +27,7 @@ path = "src/model_smoke.rs"
 [[bin]]
 name = "vgo-generate-demo"
 path = "src/generate_demo.rs"
+
+[[bin]]
+name = "vgo-arena"
+path = "src/arena.rs"

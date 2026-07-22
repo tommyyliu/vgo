@@ -12,6 +12,9 @@ by Rust.
 
 No simulator or game-rule implementation belongs here.
 
+The end-to-end replay, training, export, arena, promotion, and restart workflow
+is documented in [`../docs/RL_LOOP.md`](../docs/RL_LOOP.md).
+
 ## Raster training canary
 
 Generate MCTS-labeled examples from the repository root:

@@ -10,8 +10,9 @@ import numpy as np
 import torch
 from torch import nn
 
-from .dataset import RasterDataset, load_dataset
+from .dataset import RasterDataset, load_datasets
 from .model import RasterPolicyValueNet
+from .serve import load_model
 
 
 def policy_cross_entropy(
@@ -50,29 +51,81 @@ def metrics(
     }
 
 
+def subset(dataset: RasterDataset, indices: torch.Tensor) -> RasterDataset:
+    return RasterDataset(
+        states=dataset.states[indices],
+        policies=dataset.policies[indices],
+        policy_masks=dataset.policy_masks[indices],
+        values=dataset.values[indices],
+        selected_actions=dataset.selected_actions[indices],
+        game_ids=dataset.game_ids[indices],
+        plies=dataset.plies[indices],
+        seeds=dataset.seeds[indices],
+        height=dataset.height,
+        width=dataset.width,
+        sources=dataset.sources,
+    )
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text, encoding="ascii")
+    temporary.replace(path)
+
+
 def train(arguments: argparse.Namespace) -> dict[str, object]:
     random.seed(arguments.seed)
     np.random.seed(arguments.seed)
     torch.manual_seed(arguments.seed)
     torch.set_num_threads(arguments.threads)
     device = torch.device(arguments.device)
-    dataset = load_dataset(arguments.dataset)
-    model = RasterPolicyValueNet(
-        channels=dataset.channels,
-        width=arguments.model_width,
-        blocks=arguments.blocks,
-    ).to(device)
+    dataset = load_datasets(arguments.datasets)
+    generator = torch.Generator().manual_seed(arguments.seed)
+    split = torch.randperm(dataset.samples, generator=generator)
+    validation_samples = 0
+    if dataset.samples > 1 and arguments.validation_fraction > 0.0:
+        validation_samples = max(1, round(dataset.samples * arguments.validation_fraction))
+        validation_samples = min(validation_samples, dataset.samples - 1)
+    validation_indices = split[:validation_samples]
+    training_indices = split[validation_samples:]
+    training = subset(dataset, training_indices)
+    validation = subset(dataset, validation_indices) if validation_samples else training
+
+    parent_checkpoint = None
+    if arguments.initial_checkpoint is not None:
+        model, parent = load_model(arguments.initial_checkpoint.resolve(strict=True))
+        if (
+            int(parent["channels"]),
+            int(parent["height"]),
+            int(parent["width"]),
+        ) != (dataset.channels, dataset.height, dataset.width):
+            raise ValueError("initial checkpoint does not match replay raster shape")
+        parent_checkpoint = str(arguments.initial_checkpoint.resolve())
+        model_width = int(parent["model_width"])
+        blocks = int(parent["blocks"])
+    else:
+        model_width = arguments.model_width
+        blocks = arguments.blocks
+        model = RasterPolicyValueNet(
+            channels=dataset.channels,
+            width=model_width,
+            blocks=blocks,
+        )
+    model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=arguments.learning_rate)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=arguments.epochs,
         eta_min=arguments.learning_rate * 0.01,
     )
-    generator = torch.Generator().manual_seed(arguments.seed)
-    initial = metrics(model, dataset, device)
+    initial_training = metrics(model, training, device)
+    initial_validation = metrics(model, validation, device)
     best_epoch = 0
-    best = initial
-    best_score = initial["policy_kl"] + initial["value_mae"]
+    best = initial_validation
+    best_score = (
+        initial_validation["policy_kl"]
+        + arguments.value_weight * initial_validation["value_mae"]
+    )
     best_state = {
         name: value.detach().cpu().clone() for name, value in model.state_dict().items()
     }
@@ -80,13 +133,13 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
 
     model.train()
     for epoch in range(1, arguments.epochs + 1):
-        permutation = torch.randperm(dataset.samples, generator=generator)
-        for start in range(0, dataset.samples, arguments.batch_size):
+        permutation = torch.randperm(training.samples, generator=generator)
+        for start in range(0, training.samples, arguments.batch_size):
             indices = permutation[start : start + arguments.batch_size]
-            states = dataset.states[indices].to(device)
-            policy_targets = dataset.policies[indices].to(device)
-            policy_masks = dataset.policy_masks[indices].to(device)
-            value_targets = dataset.values[indices].to(device)
+            states = training.states[indices].to(device)
+            policy_targets = training.policies[indices].to(device)
+            policy_masks = training.policy_masks[indices].to(device)
+            value_targets = training.values[indices].to(device)
             logits, values = model(states)
             policy_loss = policy_cross_entropy(logits, policy_targets, policy_masks)
             value_loss = nn.functional.mse_loss(values, value_targets)
@@ -96,8 +149,8 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
             optimizer.step()
         scheduler.step()
         if epoch == 1 or epoch % arguments.report_every == 0 or epoch == arguments.epochs:
-            current = metrics(model, dataset, device)
-            score = current["policy_kl"] + current["value_mae"]
+            current = metrics(model, validation, device)
+            score = current["policy_kl"] + arguments.value_weight * current["value_mae"]
             if score < best_score:
                 best_epoch = epoch
                 best = current
@@ -115,57 +168,73 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
 
     elapsed = time.perf_counter() - started
     model.load_state_dict(best_state)
-    final = metrics(model, dataset, device)
+    final_training = metrics(model, training, device)
+    final_validation = metrics(model, validation, device)
     output = Path(arguments.output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint = {
+        "schema": "vgo.raster-policy-value.v1",
+        "channels": dataset.channels,
+        "height": dataset.height,
+        "width": dataset.width,
+        "model_width": model_width,
+        "blocks": blocks,
+        "state_dict": model.state_dict(),
+        "parent_checkpoint": parent_checkpoint,
+        "replay_sources": list(dataset.sources),
+    }
+    temporary = output.with_suffix(output.suffix + ".tmp")
     torch.save(
-        {
-            "schema": "vgo.raster-policy-value.v1",
-            "channels": dataset.channels,
-            "height": dataset.height,
-            "width": dataset.width,
-            "model_width": arguments.model_width,
-            "blocks": arguments.blocks,
-            "state_dict": model.state_dict(),
-        },
-        output,
+        checkpoint,
+        temporary,
     )
+    temporary.replace(output)
     report = {
-        "schema": "vgo.training-canary.v1",
-        "dataset": str(arguments.dataset),
+        "schema": "vgo.training-run.v2",
+        "datasets": list(dataset.sources),
         "checkpoint": str(output),
+        "parent_checkpoint": parent_checkpoint,
         "device": str(device),
         "samples": dataset.samples,
+        "training_samples": training.samples,
+        "validation_samples": validation_samples,
         "shape": list(dataset.states.shape),
         "parameters": sum(parameter.numel() for parameter in model.parameters()),
         "epochs": arguments.epochs,
         "batch_size": arguments.batch_size,
+        "learning_rate": arguments.learning_rate,
+        "value_weight": arguments.value_weight,
+        "selection_metric": "policy_kl + value_weight * value_mae",
         "wall_seconds": elapsed,
         "best_epoch": best_epoch,
-        "initial": initial,
-        "best": best,
-        "final": final,
+        "initial_training": initial_training,
+        "initial_validation": initial_validation,
+        "best_validation": best,
+        "final_training": final_training,
+        "final_validation": final_validation,
     }
-    report_path = output.with_suffix(".json")
-    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="ascii")
+    report_path = output.with_suffix(output.suffix + ".json")
+    atomic_write_text(report_path, json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
     return report
 
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("dataset", type=Path)
+    parser.add_argument("datasets", type=Path, nargs="+")
     parser.add_argument("--output", type=Path, default=Path("../artifacts/raster-demo/model.pt"))
+    parser.add_argument("--initial-checkpoint", type=Path)
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=3e-3)
-    parser.add_argument("--value-weight", type=float, default=1.0)
+    parser.add_argument("--value-weight", type=float, default=0.25)
     parser.add_argument("--model-width", type=int, default=32)
     parser.add_argument("--blocks", type=int, default=3)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--report-every", type=int, default=20)
+    parser.add_argument("--validation-fraction", type=float, default=0.1)
     return parser.parse_args()
 
 

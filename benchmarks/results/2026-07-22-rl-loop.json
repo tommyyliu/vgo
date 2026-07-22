@@ -1,0 +1,100 @@
+{
+  "schema": "vgo.rl-loop-benchmark.v1",
+  "date": "2026-07-22",
+  "hardware": {
+    "processor": "AMD Ryzen 9 9950X 16-Core Processor",
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "gpu_memory_mebibytes": 16303
+  },
+  "training": {
+    "resolution": 128,
+    "channels": 10,
+    "samples": 1920,
+    "new_samples": 768,
+    "generation_simulations": 128,
+    "epochs": 50,
+    "initial_validation_policy_kl": 0.5880563259124756,
+    "final_validation_policy_kl": 0.49439120292663574,
+    "initial_validation_value_mae": 0.3598872125148773,
+    "final_validation_value_mae": 0.3247414827346802,
+    "checkpoint_sha256": "18a767e7928558d117aa93060cf8bb323fedcf34b7211212498967faed4008b",
+    "onnx_sha256": "dfa59467cc5b6ad6083e538011314f7a20344e0bcd07157616c0c951420e960"
+  },
+  "fixed_seed_single_actor_baseline": {
+    "opponent": "naive",
+    "pairs": 60,
+    "games": 120,
+    "simulations_per_move": 16,
+    "maximum_plies": 48,
+    "resolution": 128,
+    "seed": 950001,
+    "provider": "tensorrt",
+    "fp16": true,
+    "threads": 1,
+    "initial_model": {
+      "completed": 120,
+      "truncated": 0,
+      "wins": 73,
+      "losses": 6,
+      "draws": 41,
+      "score": 0.779167,
+      "score_ci95": [0.696939, 0.844076],
+      "average_plies": 7.6,
+      "wall_seconds": 97.073,
+      "model_evaluations": 6187,
+      "model_batches": 6187,
+      "failures": 0
+    },
+    "refined_model": {
+      "completed": 119,
+      "truncated": 1,
+      "wins": 115,
+      "losses": 4,
+      "draws": 0,
+      "score": 0.966387,
+      "score_ci95": [0.916751, 0.986852],
+      "average_plies": 12.2,
+      "wall_seconds": 171.125,
+      "model_evaluations": 10903,
+      "model_batches": 10903,
+      "failures": 0
+    }
+  },
+  "fixed_seed_single_actor_head_to_head": {
+    "candidate": "refined_model",
+    "opponent": "initial_model",
+    "pairs": 40,
+    "games": 80,
+    "completed": 80,
+    "truncated": 0,
+    "simulations_per_move": 16,
+    "maximum_plies": 48,
+    "resolution": 128,
+    "seed": 955001,
+    "provider": "tensorrt",
+    "fp16": true,
+    "threads": 1,
+    "candidate_wins": 44,
+    "candidate_losses": 36,
+    "draws": 0,
+    "candidate_score": 0.55,
+    "score_ci95": [0.441195, 0.654223],
+    "average_plies": 15.575,
+    "wall_seconds": 302.598669,
+    "model_evaluations": 9818,
+    "model_batches": 9818,
+    "failures": 0,
+    "interpretation": "Directionally positive; this sample does not exclude an even match."
+  },
+  "artifacts": {
+    "initial_model": "artifacts/rl-run-2026-07-22/iteration-000/model/candidate.onnx",
+    "refined_model": "artifacts/rl-refine-2026-07-22/iteration-000/model/candidate.onnx",
+    "refined_run": "artifacts/rl-refine-2026-07-22/run.json",
+    "human_viewable_rasters": "artifacts/rl-refine-2026-07-22/iteration-000/replay/images"
+  },
+  "notes": [
+    "Both baseline measurements use the same seeds, opponent, search budget, and single-actor execution.",
+    "A single refined-model game reached the maximum ply bound and is excluded from the score.",
+    "The faster concurrent promotion arena is useful for screening but can vary under FP16 when batch composition changes nearly tied logits."
+  ]
+}

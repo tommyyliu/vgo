@@ -1,26 +1,71 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    convert::Infallible,
+    collections::BTreeMap,
     fs::{self, File},
-    io::{BufWriter, Write},
+    io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
 };
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
+use sha2::{Digest, Sha256};
 use vgo_core::{Color, Position};
-use vgo_raster::{
-    CHANNEL_COUNT, CHANNELS, DATASET_MAGIC, DATASET_VERSION, RasterConfig, SemanticRaster,
-    action_pixel, rasterize,
+use vgo_inference::{
+    BatchedEvaluator, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
 };
-use vgo_search::{Action, SearchConfig, SearchResult, search};
+use vgo_raster::{CHANNEL_COUNT, CHANNELS, RasterConfig, SemanticRaster, action_pixel, rasterize};
+use vgo_search::{
+    Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, SearchResult,
+    search_with_evaluator,
+};
 use vgo_selfplay::play_game as run_playout;
+
+const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
+const REPLAY_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenerationRuntime {
+    Naive,
+    Onnx,
+}
+
+impl GenerationRuntime {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Naive => "naive",
+            Self::Onnx => "onnx",
+        }
+    }
+}
+
+impl std::str::FromStr for GenerationRuntime {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "naive" => Ok(Self::Naive),
+            "onnx" => Ok(Self::Onnx),
+            _ => Err(format!("unsupported generation runtime: {value}")),
+        }
+    }
+}
 
 struct PendingSample {
     raster: SemanticRaster,
     policy: Vec<f32>,
     policy_mask: Vec<f32>,
     to_move: Color,
+    selected_action: u32,
+    game: u64,
+    ply: u32,
+    seed: u64,
 }
 
 struct LabeledSample {
@@ -28,6 +73,16 @@ struct LabeledSample {
     policy: Vec<f32>,
     policy_mask: Vec<f32>,
     value: f32,
+    selected_action: u32,
+    game: u64,
+    ply: u32,
+    seed: u64,
+}
+
+struct GameSamples {
+    index: u64,
+    samples: Vec<LabeledSample>,
+    completed: bool,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -49,6 +104,24 @@ struct Config {
     examples: usize,
     #[arg(long, default_value = "artifacts/raster-demo")]
     output: PathBuf,
+    #[arg(long, default_value = "naive")]
+    runtime: GenerationRuntime,
+    #[arg(long)]
+    model: Option<PathBuf>,
+    #[arg(long, default_value = "tensorrt")]
+    provider: OnnxProvider,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    fp16: bool,
+    #[arg(long, default_value_t = 8)]
+    maximum_batch: usize,
+    #[arg(long, default_value_t = 1)]
+    delay_ms: u64,
+    #[arg(long, default_value_t = 8)]
+    actors: usize,
+    #[arg(long)]
+    maximum_games: Option<u64>,
+    #[arg(long, default_value = "artifacts/onnx-cache")]
+    cache_directory: PathBuf,
 }
 
 fn policy_target(result: &SearchResult, config: RasterConfig) -> (Vec<f32>, Vec<f32>) {
@@ -70,64 +143,144 @@ fn policy_target(result: &SearchResult, config: RasterConfig) -> (Vec<f32>, Vec<
     (policy, policy_mask)
 }
 
-fn generate(config: &Config) -> (Vec<LabeledSample>, usize, usize) {
+fn action_index(action: Action, config: RasterConfig) -> u32 {
+    match action {
+        Action::Pass => config.pixels() as u32,
+        Action::Place(point) => action_pixel(point.x, point.y, config) as u32,
+    }
+}
+
+fn generate_game(
+    config: &Config,
+    evaluator: &dyn Evaluator,
+    game_index: u64,
+) -> Result<GameSamples, EvaluationError> {
     let raster_config = RasterConfig::square(config.resolution);
-    let mut samples = Vec::with_capacity(config.samples);
-    let mut completed_games = 0;
-    let mut discarded_games = 0;
-    let mut game_index = 0_u64;
-
-    while samples.len() < config.samples {
-        let game_seed = config.seed.wrapping_add(game_index);
-        game_index += 1;
-        let mut pending = Vec::new();
-        let playout = run_playout(
-            Position::new(config.radius, Vec::new(), Color::Black),
-            config.maximum_plies,
-            |position, _ply| {
-                Ok::<_, Infallible>(search(
-                    position,
-                    SearchConfig::canary(config.simulations),
-                    game_seed,
-                ))
+    let game_seed = config.seed.wrapping_add(game_index);
+    let mut pending = Vec::new();
+    let playout = run_playout(
+        Position::new(config.radius, Vec::new(), Color::Black),
+        config.maximum_plies,
+        |position, _ply| {
+            search_with_evaluator(
+                position,
+                SearchConfig::canary(config.simulations),
+                game_seed,
+                evaluator,
+            )
+        },
+        |step| {
+            let (policy, policy_mask) = policy_target(step.search, raster_config);
+            pending.push(PendingSample {
+                raster: rasterize(step.position, raster_config),
+                policy,
+                policy_mask,
+                to_move: step.position.to_move(),
+                selected_action: action_index(step.action, raster_config),
+                game: game_index,
+                ply: step.ply,
+                seed: game_seed,
+            });
+        },
+    )?;
+    let Some(outcome) = playout.outcome else {
+        return Ok(GameSamples {
+            index: game_index,
+            samples: Vec::new(),
+            completed: false,
+        });
+    };
+    let black_value = outcome.black_utility() as f32;
+    let samples = pending
+        .into_iter()
+        .map(|sample| LabeledSample {
+            raster: sample.raster,
+            policy: sample.policy,
+            policy_mask: sample.policy_mask,
+            value: if sample.to_move == Color::Black {
+                black_value
+            } else {
+                -black_value
             },
-            |step| {
-                let (policy, policy_mask) = policy_target(step.search, raster_config);
-                pending.push(PendingSample {
-                    raster: rasterize(step.position, raster_config),
-                    policy,
-                    policy_mask,
-                    to_move: step.position.to_move(),
-                });
-            },
-        )
-        .expect("infallible search");
+            selected_action: sample.selected_action,
+            game: sample.game,
+            ply: sample.ply,
+            seed: sample.seed,
+        })
+        .collect();
+    Ok(GameSamples {
+        index: game_index,
+        samples,
+        completed: true,
+    })
+}
 
-        if let Some(outcome) = playout.outcome {
-            let black_value = outcome.black_utility() as f32;
-            completed_games += 1;
-            for sample in pending {
-                let value = if sample.to_move == Color::Black {
-                    black_value
-                } else {
-                    -black_value
-                };
-                samples.push(LabeledSample {
-                    raster: sample.raster,
-                    policy: sample.policy,
-                    policy_mask: sample.policy_mask,
-                    value,
-                });
-                if samples.len() == config.samples {
+fn generate(
+    config: &Config,
+    evaluator: Arc<dyn Evaluator>,
+) -> Result<(Vec<LabeledSample>, usize, usize), EvaluationError> {
+    let maximum_games = config
+        .maximum_games
+        .unwrap_or_else(|| (config.samples as u64).saturating_mul(8));
+    let next_game = Arc::new(AtomicU64::new(0));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = mpsc::channel();
+    let mut handles = Vec::with_capacity(config.actors);
+    for _ in 0..config.actors {
+        let config = config.clone();
+        let evaluator = Arc::clone(&evaluator);
+        let next_game = Arc::clone(&next_game);
+        let stopped = Arc::clone(&stopped);
+        let sender = sender.clone();
+        handles.push(thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let index = next_game.fetch_add(1, Ordering::Relaxed);
+                if index >= maximum_games {
+                    break;
+                }
+                if sender
+                    .send(generate_game(&config, evaluator.as_ref(), index))
+                    .is_err()
+                {
                     break;
                 }
             }
-        } else {
-            discarded_games += 1;
+        }));
+    }
+    drop(sender);
+
+    let mut samples = Vec::with_capacity(config.samples);
+    let mut completed_games = 0;
+    let mut discarded_games = 0;
+    let mut expected_game = 0_u64;
+    let mut pending = BTreeMap::new();
+    while samples.len() < config.samples {
+        let game = receiver.recv().map_err(|_| {
+            EvaluationError::new(format!(
+                "replay exhausted {maximum_games} game attempts after {completed_games} completed and {discarded_games} discarded games"
+            ))
+        })??;
+        pending.insert(game.index, game);
+        while let Some(game) = pending.remove(&expected_game) {
+            expected_game += 1;
+            if game.completed {
+                completed_games += 1;
+                samples.extend(game.samples);
+                if samples.len() >= config.samples {
+                    samples.truncate(config.samples);
+                    break;
+                }
+            } else {
+                discarded_games += 1;
+            }
         }
     }
-
-    (samples, completed_games, discarded_games)
+    stopped.store(true, Ordering::Relaxed);
+    drop(receiver);
+    for handle in handles {
+        handle.join().expect("replay worker");
+    }
+    Ok((samples, completed_games, discarded_games))
 }
 
 fn write_f32(writer: &mut impl Write, value: f32) -> std::io::Result<()> {
@@ -135,11 +288,18 @@ fn write_f32(writer: &mut impl Write, value: f32) -> std::io::Result<()> {
 }
 
 fn write_dataset(path: &Path, samples: &[LabeledSample]) -> std::io::Result<()> {
+    let temporary = path.with_extension("vgo.tmp");
+    if path.exists() || temporary.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("replay output already exists: {}", path.display()),
+        ));
+    }
     let config = samples[0].raster.config();
-    let mut writer = BufWriter::new(File::create(path)?);
-    writer.write_all(&DATASET_MAGIC)?;
+    let mut writer = BufWriter::new(File::create(&temporary)?);
+    writer.write_all(&REPLAY_MAGIC)?;
     for value in [
-        DATASET_VERSION,
+        REPLAY_VERSION,
         samples.len() as u32,
         CHANNEL_COUNT as u32,
         config.height as u32,
@@ -159,15 +319,40 @@ fn write_dataset(path: &Path, samples: &[LabeledSample]) -> std::io::Result<()> 
             write_f32(&mut writer, value)?;
         }
         write_f32(&mut writer, sample.value)?;
+        writer.write_all(&sample.selected_action.to_le_bytes())?;
+        writer.write_all(&sample.game.to_le_bytes())?;
+        writer.write_all(&sample.ply.to_le_bytes())?;
+        writer.write_all(&sample.seed.to_le_bytes())?;
     }
-    writer.flush()
+    writer.flush()?;
+    writer.into_inner()?.sync_all()?;
+    fs::rename(temporary, path)
 }
 
-fn write_manifest(path: &Path, config: &Config, samples: &[LabeledSample]) -> std::io::Result<()> {
-    let mut writer = BufWriter::new(File::create(path)?);
+fn write_manifest(
+    path: &Path,
+    config: &Config,
+    samples: &[LabeledSample],
+    completed_games: usize,
+    discarded_games: usize,
+    dataset_sha256: &str,
+    model_sha256: Option<&str>,
+) -> std::io::Result<()> {
+    let temporary = path.with_extension("json.tmp");
+    if path.exists() || temporary.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("replay manifest already exists: {}", path.display()),
+        ));
+    }
+    let mut writer = BufWriter::new(File::create(&temporary)?);
     writeln!(writer, "{{")?;
-    writeln!(writer, "  \"schema\": \"vgo.raster-dataset.v2\",")?;
+    writeln!(writer, "  \"schema\": \"vgo.replay-shard.v1\",")?;
+    writeln!(writer, "  \"dataset\": \"dataset.vgo\",")?;
+    writeln!(writer, "  \"dataset_sha256\": \"{dataset_sha256}\",")?;
     writeln!(writer, "  \"samples\": {},", samples.len())?;
+    writeln!(writer, "  \"completed_games\": {completed_games},")?;
+    writeln!(writer, "  \"discarded_games\": {discarded_games},")?;
     writeln!(writer, "  \"channels\": {},", CHANNEL_COUNT)?;
     writeln!(writer, "  \"height\": {},", config.resolution)?;
     writeln!(writer, "  \"width\": {},", config.resolution)?;
@@ -178,6 +363,14 @@ fn write_manifest(path: &Path, config: &Config, samples: &[LabeledSample]) -> st
     )?;
     writeln!(writer, "  \"simulations\": {},", config.simulations)?;
     writeln!(writer, "  \"radius\": {},", config.radius)?;
+    writeln!(writer, "  \"seed\": {},", config.seed)?;
+    writeln!(writer, "  \"maximum_plies\": {},", config.maximum_plies)?;
+    writeln!(writer, "  \"actors\": {},", config.actors)?;
+    writeln!(writer, "  \"evaluator\": \"{}\",", config.runtime.as_str())?;
+    match model_sha256 {
+        Some(digest) => writeln!(writer, "  \"model_sha256\": \"{digest}\",")?,
+        None => writeln!(writer, "  \"model_sha256\": null,")?,
+    }
     writeln!(
         writer,
         "  \"orientation\": \"row 0 samples y near 0; column 0 samples x near 0\","
@@ -202,7 +395,23 @@ fn write_manifest(path: &Path, config: &Config, samples: &[LabeledSample]) -> st
     }
     writeln!(writer, "  ]")?;
     writeln!(writer, "}}")?;
-    writer.flush()
+    writer.flush()?;
+    writer.into_inner()?.sync_all()?;
+    fs::rename(temporary, path)
+}
+
+fn file_sha256(path: &Path) -> std::io::Result<String> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn write_bmp(
@@ -303,13 +512,64 @@ fn main() -> std::io::Result<()> {
     assert!(config.samples > 0);
     assert!(config.resolution > 0);
     assert!(config.simulations > 0);
+    assert!(config.maximum_batch > 0);
+    assert!(config.actors > 0);
+    assert!(config.maximum_games.is_none_or(|games| games > 0));
     fs::create_dir_all(&config.output)?;
 
-    let (samples, completed_games, discarded_games) = generate(&config);
+    let raster = RasterConfig::square(config.resolution);
+    let model_path = config.model.as_deref();
+    let evaluator: Arc<dyn Evaluator> = match config.runtime {
+        GenerationRuntime::Naive => Arc::new(NaiveEvaluator),
+        GenerationRuntime::Onnx => {
+            let model = model_path.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--model is required for ONNX generation",
+                )
+            })?;
+            let service = OnnxBatchService::load(&OnnxServiceConfig {
+                model: model.to_path_buf(),
+                raster,
+                maximum_batch: config.maximum_batch,
+                provider: config.provider,
+                device_id: 0,
+                fp16: config.fp16,
+                cache_directory: config.cache_directory.clone(),
+            })
+            .map_err(std::io::Error::other)?;
+            Arc::new(
+                BatchedEvaluator::spawn(
+                    BrokerConfig {
+                        maximum_delay: Duration::from_millis(config.delay_ms),
+                        queue_capacity: (config.actors * 4).max(config.maximum_batch * 2),
+                    },
+                    service,
+                )
+                .map_err(std::io::Error::other)?,
+            )
+        }
+    };
+    let model_sha256 = if config.runtime == GenerationRuntime::Onnx {
+        model_path.map(file_sha256).transpose()?
+    } else {
+        None
+    };
+    let (samples, completed_games, discarded_games) =
+        generate(&config, evaluator).map_err(std::io::Error::other)?;
     let dataset_path = config.output.join("dataset.vgo");
     write_dataset(&dataset_path, &samples)?;
-    write_manifest(&config.output.join("manifest.json"), &config, &samples)?;
+    let dataset_sha256 = file_sha256(&dataset_path)?;
     write_examples(&config.output.join("images"), &samples, config.examples)?;
+    write_manifest(
+        &config.output.join("manifest.json"),
+        &config,
+        &samples,
+        completed_games,
+        discarded_games,
+        &dataset_sha256,
+        model_sha256.as_deref(),
+    )?;
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     write!(output, "{{\n  \"dataset\": ")?;
@@ -321,6 +581,9 @@ fn main() -> std::io::Result<()> {
             "  \"samples\": {},\n",
             "  \"completed_games\": {},\n",
             "  \"discarded_games\": {},\n",
+            "  \"dataset_sha256\": \"{}\",\n",
+            "  \"evaluator\": \"{}\",\n",
+            "  \"actors\": {},\n",
             "  \"channels\": {},\n",
             "  \"resolution\": {},\n",
             "  \"policy_size\": {},\n",
@@ -330,6 +593,9 @@ fn main() -> std::io::Result<()> {
         samples.len(),
         completed_games,
         discarded_games,
+        dataset_sha256,
+        config.runtime.as_str(),
+        config.actors,
         CHANNEL_COUNT,
         config.resolution,
         config.resolution * config.resolution + 1,

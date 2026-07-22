@@ -31,6 +31,7 @@ def export(arguments: argparse.Namespace) -> dict[str, object]:
     checkpoint_path = arguments.checkpoint.resolve(strict=True)
     output_path = arguments.output.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
     model, checkpoint = load_model(checkpoint_path)
     channels = int(checkpoint["channels"])
     height = int(checkpoint["height"])
@@ -53,8 +54,8 @@ def export(arguments: argparse.Namespace) -> dict[str, object]:
         opset_version=20,
         external_data=False,
     )
-    program.save(output_path, external_data=False)
-    model_proto = onnx.load(output_path, load_external_data=False)
+    program.save(temporary_path, external_data=False)
+    model_proto = onnx.load(temporary_path, load_external_data=False)
     properties = {
         "vgo.schema": "vgo.raster-policy-value.onnx.v1",
         "vgo.checkpoint_sha256": checkpoint_digest,
@@ -67,7 +68,8 @@ def export(arguments: argparse.Namespace) -> dict[str, object]:
     }
     onnx.helper.set_model_props(model_proto, properties)
     onnx.checker.check_model(model_proto, full_check=True)
-    onnx.save_model(model_proto, output_path, save_as_external_data=False)
+    onnx.save_model(model_proto, temporary_path, save_as_external_data=False)
+    temporary_path.replace(output_path)
 
     manifest = {
         "schema": "vgo.onnx-manifest.v1",
@@ -99,8 +101,10 @@ def export(arguments: argparse.Namespace) -> dict[str, object]:
             "parameters": sum(parameter.numel() for parameter in model.parameters()),
         },
     }
-    manifest_path = output_path.with_suffix(".json")
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="ascii")
+    manifest_path = output_path.with_suffix(output_path.suffix + ".json")
+    manifest_temporary = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    manifest_temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="ascii")
+    manifest_temporary.replace(manifest_path)
     print(json.dumps(manifest, indent=2))
     return manifest
 
