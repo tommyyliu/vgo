@@ -59,14 +59,27 @@ as evaluator errors; search never substitutes neutral predictions silently.
 
 ## Broker
 
-Callers submit through a bounded synchronous channel. The broker takes the first
-request, waits up to a short deadline for peers, caps the batch, rasterizes the
-positions, performs one subprocess exchange, and returns each output to its
-waiting search thread.
+Each actor rasterizes its position before submitting through a bounded
+synchronous channel. The broker takes the first encoded request, waits up to a
+short deadline for peers, caps the batch, performs one subprocess exchange, and
+returns each output to its waiting search thread. Encoding therefore scales
+with actors rather than occupying the single broker.
+
+The implementation exposes three independent contracts:
+
+- `InferenceInput` and `InferenceOutput` are the encoded request boundary;
+- `BatchService` synchronously evaluates an already-encoded batch;
+- `BatchExecutor` separates batch submission from completion, declares its slot
+  capacity, and permits out-of-order completion by sequence number.
+
+The current subprocess is a capacity-one `BatchService`. A threaded executor
+adapter demonstrates the asynchronous contract; a future CUDA implementation
+can provide multiple pinned-memory/stream slots without changing actors,
+encoding, batching, or response routing.
 
 Metrics count requests, batches, positions, maximum batch occupancy, failures,
-total queue nanoseconds, and total subprocess-exchange nanoseconds. Queue and
-inference durations are sums, so divide by positions or batches as appropriate.
+summed parallel encoding nanoseconds, total queue nanoseconds, and total
+subprocess-exchange nanoseconds. Summed durations may exceed wall time.
 
 ## Verified smoke path
 
@@ -121,12 +134,74 @@ the bottleneck; evaluations per second is the portable capacity measure.
 All sweep results and exact parameters are retained in
 [`../benchmarks/results/2026-07-21-selfplay-scaling.json`](../benchmarks/results/2026-07-21-selfplay-scaling.json).
 
+## GPU stages
+
+The CUDA environment uses PyTorch 2.13, CUDA 13.0, and `torch.compile` on an RTX
+5070 Ti. Windows installs `triton-windows` 3.7 to match PyTorch's compiler
+version. CUDA is explicit: a missing accelerator fails service startup instead
+of silently selecting CPU.
+
+The release stage benchmarks isolate identical 10x48x48 inputs:
+
+| Stage | Batch | Throughput |
+|---|---:|---:|
+| Rust raster, one thread | 1 | 16,510 positions/s |
+| Rust raster, 16 threads | 1 | 192,357 positions/s |
+| Contiguous request framing | 16 | 50,197 positions/s |
+| Compiled GPU model only | 16 | 52,135 positions/s |
+| Warm framed subprocess | 16 | 10,385 positions/s |
+| Warm framed subprocess | 32 | 12,330 positions/s |
+| Warm framed subprocess | 64 | 12,754 positions/s |
+
+Compiled model throughput at batch 16 increases from 56,461 positions/s with
+one execution slot to 71,816 with two and 78,248 with four. Two slots capture
+most of the concurrency benefit. The framed service does not yet exploit those
+slots: it reads, copies, executes, copies back, and writes each batch in
+lockstep.
+
+After moving rasterization to actors and constructing one contiguous frame per
+batch, 64 actors with batch 32 sustained **7,965 evaluations/s** over 512 games.
+Batch 16 sustained 7,695; 128 actors or batch 64 regressed. On all 96 retained
+semantic examples, compiled CUDA preserved the CPU and eager-CUDA top policy
+action. Raw stage data is retained in
+[`../benchmarks/results/2026-07-21-gpu-inference-stages.json`](../benchmarks/results/2026-07-21-gpu-inference-stages.json).
+
+### Resolution scaling
+
+The active small-game canary now separates game and representation scale: stone
+radius remains `1/6`, while the raster is 128x128. One 10-channel `f32` input is
+655,360 bytes, and batch 8 is 5,242,880 bytes before framing. Relative to 48x48,
+the tensor is 7.11 times larger.
+
+At 128x128, 16 Rust raster threads sustained 27,662 to 28,833 positions/s and
+request framing sustained 7,473 to 7,605 positions/s at 4.56 to 4.64 GiB/s.
+The compiled GPU model peaked at 8,714 positions/s with batch 8, while the warm
+subprocess service reached 1,880 positions/s. Two simultaneous batch-16 model
+slots regressed from 7,887 to 7,186 positions/s, indicating that model compute
+is already saturated at this resolution. End-to-end self-play with 64 actors
+and batch 8 sustained 1,452 evaluations/s across 61,440 requests with no
+failures. Raw results are retained in
+[`../benchmarks/results/2026-07-21-raster-resolution-scaling.json`](../benchmarks/results/2026-07-21-raster-resolution-scaling.json).
+
+The current subprocess path performs several avoidable copies around the one
+necessary host-to-device transfer: it materializes a byte frame, crosses an OS
+pipe, copies each payload into a NumPy batch, copies pageable host memory to the
+GPU, and mirrors the process for outputs. An in-process ONNX executor should use
+reusable pinned input/output slabs and I/O binding. Initially, individual actor
+rasters still require one host gather into the contiguous input slab. A later
+batched raster encoder can write directly into assigned slab rows, leaving one
+asynchronous host-to-device transfer and one device-to-host transfer per batch.
+`vgo-raster::rasterize_into` provides the caller-owned destination required for
+that direct-write path.
+
 ## Remaining production work
 
 - Add an explicit startup handshake carrying schema and model versions.
 - Support checkpoint replacement only at a documented actor synchronization
   point.
-- Benchmark accelerator services and larger models across batch windows and
-  actor counts.
+- Implement a two-slot pinned-memory CUDA executor and overlap service transfer,
+  execution, and response work.
+- Evaluate shared memory or another bulk local transport after pipelining.
+- Benchmark larger models across batch windows and actor counts.
 - Move immutable trajectory writing from the demo generator into self-play.
 - Attach per-game model versions and protocol failures to replay metadata.

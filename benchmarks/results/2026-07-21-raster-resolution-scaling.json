@@ -1,0 +1,76 @@
+{
+  "schema": "vgo.raster-resolution-scaling.v1",
+  "date": "2026-07-21",
+  "hardware": {
+    "processor": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_processors": 32,
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "gpu_memory_mebibytes": 16303
+  },
+  "software": {
+    "python": "3.14.0",
+    "pytorch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "triton_windows": "3.7.1.post27"
+  },
+  "game": {
+    "stone_radius": 0.16666666666666666,
+    "description": "small 3x3-like canary game"
+  },
+  "input": {
+    "channels": 10,
+    "height": 128,
+    "width": 128,
+    "bytes_per_position": 655360,
+    "size_relative_to_48x48": 7.111111111111111,
+    "model_parameters": 59555
+  },
+  "training_canary": {
+    "samples": 96,
+    "epochs": 120,
+    "wall_seconds": 8.544510,
+    "policy_kl": 0.090302706,
+    "policy_top1": 0.677083373,
+    "value_mae": 0.181741521
+  },
+  "model_only": [
+    {"batch": 1, "eager_positions_per_second": 1482.387, "compiled_positions_per_second": 5419.202},
+    {"batch": 8, "eager_positions_per_second": 6634.581, "compiled_positions_per_second": 8713.936},
+    {"batch": 16, "eager_positions_per_second": 6291.310, "compiled_positions_per_second": 7920.745},
+    {"batch": 32, "eager_positions_per_second": 4208.706, "compiled_positions_per_second": 5850.437}
+  ],
+  "compiled_slots": {
+    "batch_per_slot": 16,
+    "samples": [
+      {"slots": 1, "positions_per_second": 7887.441},
+      {"slots": 2, "positions_per_second": 7186.187}
+    ]
+  },
+  "rust_raster": {
+    "samples": 3000,
+    "single_thread_positions_per_second": 2434.055,
+    "sixteen_thread_positions_per_second": 27661.905
+  },
+  "framing_and_service": [
+    {"batch": 8, "frame_bytes": 5242972, "framing_positions_per_second": 7605.199, "framing_gibibytes_per_second": 4.642, "service_positions_per_second": 1880.234},
+    {"batch": 16, "frame_bytes": 10485916, "framing_positions_per_second": 7473.424, "framing_gibibytes_per_second": 4.561, "service_positions_per_second": 1750.744},
+    {"batch": 32, "frame_bytes": 20971804, "framing_positions_per_second": 7556.833, "framing_gibibytes_per_second": 4.612, "service_positions_per_second": 1576.191}
+  ],
+  "end_to_end": {
+    "actors": 64,
+    "games": 512,
+    "simulations_per_move": 8,
+    "batch": 8,
+    "requests": 61440,
+    "average_batch": 8.0,
+    "evaluations_per_second": 1452.098,
+    "encoding_milliseconds_per_position_summed": 0.742357,
+    "inference_milliseconds_per_batch": 5.407413,
+    "failures": 0
+  },
+  "copy_budget_at_8000_positions_per_second": {
+    "input_gigabytes_per_second": 5.24288,
+    "policy_output_gigabytes_per_second": 0.52432,
+    "note": "Decimal GB/s; policy has 16385 float32 values per position."
+  }
+}

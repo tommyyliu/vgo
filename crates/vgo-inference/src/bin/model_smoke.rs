@@ -3,6 +3,7 @@
 use std::{
     collections::HashSet,
     env,
+    mem::size_of,
     path::PathBuf,
     sync::{
         Arc, Barrier,
@@ -13,7 +14,7 @@ use std::{
 };
 
 use vgo_core::{Color, Phase, Point, Position};
-use vgo_inference::{PythonEvaluator, PythonProcessConfig};
+use vgo_inference::{PythonEvaluator, PythonProcessConfig, TorchDevice};
 use vgo_raster::RasterConfig;
 use vgo_search::{Action, EvaluationError, Evaluator, SearchConfig, search_with_evaluator};
 
@@ -74,8 +75,9 @@ fn play_model_game(
     seed: u64,
     simulations: u32,
     maximum_plies: u32,
+    radius: f64,
 ) -> Result<(bool, u32), EvaluationError> {
-    let mut position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+    let mut position = Position::new(radius, Vec::new(), Color::Black);
     let mut seen = HashSet::new();
     seen.insert(position_hash(&position));
     for ply in 0..maximum_plies {
@@ -119,35 +121,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "--checkpoint",
         root.join("artifacts/raster-demo/model.pt"),
     );
-    let actors = value_argument(&arguments, "--actors", 32_usize)?;
-    let games = value_argument(&arguments, "--games", actors)?;
+    let actors = value_argument(&arguments, "--actors", 64_usize)?;
+    let games = value_argument(&arguments, "--games", actors.saturating_mul(8))?;
     let simulations = value_argument(&arguments, "--simulations", 8_u32)?;
     let maximum_plies = value_argument(&arguments, "--max-plies", 48_u32)?;
-    let maximum_batch = value_argument(&arguments, "--maximum-batch", 16_usize)?;
+    let maximum_batch = value_argument(&arguments, "--maximum-batch", 8_usize)?;
     let maximum_delay_ms = value_argument(&arguments, "--delay-ms", 1_u64)?;
-    let torch_threads = value_argument(&arguments, "--torch-threads", 16_usize)?;
+    let torch_threads = value_argument(&arguments, "--torch-threads", 1_usize)?;
+    let device = value_argument(&arguments, "--device", TorchDevice::Cuda)?;
+    let compile = value_argument(&arguments, "--compile", true)?;
     let probe_requests = value_argument(&arguments, "--probe-requests", 1_usize)?;
+    let resolution = value_argument(&arguments, "--resolution", 128_usize)?;
+    let radius = value_argument(&arguments, "--radius", 1.0 / 6.0)?;
     if actors == 0
         || games == 0
         || simulations == 0
         || maximum_plies == 0
         || maximum_batch == 0
         || torch_threads == 0
+        || resolution == 0
+        || !(0.0_f64..=0.5).contains(&radius)
+        || radius == 0.0
     {
-        return Err(
-            "actor, game, simulation, ply, batch, and thread counts must be positive".into(),
-        );
+        return Err("counts and resolution must be positive; radius must be in (0, 0.5]".into());
     }
 
     let evaluator = PythonEvaluator::spawn(PythonProcessConfig {
         python,
         working_directory,
         checkpoint,
-        raster: RasterConfig::square(48),
+        raster: RasterConfig::square(resolution),
         maximum_batch,
         maximum_delay: Duration::from_millis(maximum_delay_ms),
         queue_capacity: (actors * 4).max(maximum_batch * 2),
         torch_threads,
+        device,
+        compile,
     })?;
 
     let probe_barrier = Arc::new(Barrier::new(probe_requests + 1));
@@ -156,7 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let evaluator = evaluator.clone();
         let barrier = Arc::clone(&probe_barrier);
         probe_handles.push(thread::spawn(move || {
-            let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+            let position = Position::new(radius, Vec::new(), Color::Black);
             barrier.wait();
             let evaluation = evaluator.evaluate(&position).expect("model evaluation");
             (
@@ -174,7 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let first = probe_outputs.first().copied().unwrap_or((0.0, 0.0, 0.0));
     assert!(probe_outputs.iter().all(|output| *output == first));
 
-    let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+    let position = Position::new(radius, Vec::new(), Color::Black);
     let warmup_search = search_with_evaluator(&position, SearchConfig::canary(4), 91, &evaluator)?;
     let before_actors = evaluator.metrics();
     let next_game = Arc::new(AtomicUsize::new(0));
@@ -197,6 +206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     1_000 + game as u64,
                     simulations,
                     maximum_plies,
+                    radius,
                 )?);
             }
             Ok::<_, EvaluationError>(reports)
@@ -223,6 +233,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = evaluator.metrics();
     let actor_requests = metrics.requests - before_actors.requests;
     let actor_batches = metrics.batches - before_actors.batches;
+    let actor_encoding_nanoseconds =
+        metrics.encoding_nanoseconds - before_actors.encoding_nanoseconds;
     let actor_queue_nanoseconds = metrics.queue_nanoseconds - before_actors.queue_nanoseconds;
     let actor_inference_nanoseconds =
         metrics.inference_nanoseconds - before_actors.inference_nanoseconds;
@@ -241,6 +253,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  \"maximum_batch_config\": {},\n",
             "  \"maximum_delay_ms\": {},\n",
             "  \"torch_threads\": {},\n",
+            "  \"device\": \"{}\",\n",
+            "  \"compiled\": {},\n",
+            "  \"raster_resolution\": {},\n",
+            "  \"stone_radius\": {:.9},\n",
+            "  \"input_bytes_per_position\": {},\n",
             "  \"completed_games\": {},\n",
             "  \"actor_plies\": {},\n",
             "  \"actor_wall_seconds\": {:.6},\n",
@@ -252,6 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  \"games_per_second\": {:.3},\n",
             "  \"plies_per_second\": {:.3},\n",
             "  \"evaluations_per_second\": {:.3},\n",
+            "  \"encoding_milliseconds_total\": {:.3},\n",
             "  \"queue_milliseconds_total\": {:.3},\n",
             "  \"inference_milliseconds_total\": {:.3}\n",
             "}}"
@@ -267,6 +285,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         maximum_batch,
         maximum_delay_ms,
         torch_threads,
+        device.as_str(),
+        compile,
+        resolution,
+        radius,
+        10 * resolution * resolution * size_of::<f32>(),
         completed_games,
         actor_plies,
         actor_wall_seconds,
@@ -278,6 +301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         completed_games as f64 / actor_wall_seconds,
         actor_plies as f64 / actor_wall_seconds,
         actor_requests as f64 / actor_wall_seconds,
+        actor_encoding_nanoseconds as f64 / 1_000_000.0,
         actor_queue_nanoseconds as f64 / 1_000_000.0,
         actor_inference_nanoseconds as f64 / 1_000_000.0,
     );

@@ -35,6 +35,30 @@ The exact simulator remains authoritative. The raster is the single
 model-facing state used for training, replay, inference, policy coordinates,
 and diagnostics.
 
+Raster resolution is independent of stone radius. The active throughput canary
+uses radius `1/6`, which has a small 3x3-like effective game size, sampled at
+128x128. This deliberately exercises the memory and convolution pipeline at a
+resolution representative of larger future games without increasing the early
+self-play search space.
+
+## Numeric precision
+
+The raster does not need `f32` storage precision. Channels 0-3 and 9 are
+binary/ternary in practice, channels 4-6 and 8 are bounded in `[0, 1]`, and
+channel 7 is bounded in `[-1, 1]`. A channel-aware one-byte encoding can use
+unsigned fixed-point for unit channels and signed fixed-point for legal
+clearance, with worst-case reconstruction errors of about `0.00196` and
+`0.00394`, respectively.
+
+On the 96-position 128x128 canary, FP16 round-trip preserved the model's sampled
+top action on all positions. FP8 E4M3 and channel-aware fixed 8-bit each
+preserved 94 of 96, but fixed 8-bit produced 9.6 times less mean policy-logit
+change and 19 times less mean value change than FP8. E5M2 and fixed 4-bit were
+materially worse. These are sensitivity results for one overfit canary, not a
+final gameplay validation; adoption still requires training on the encoded
+form and comparison on held-out replay and self-play outcomes. Reproduce the
+measurement with `vgo_training.benchmark_precision`.
+
 ## Policy coordinates
 
 The network emits `height * width` placement logits and one final pass logit.

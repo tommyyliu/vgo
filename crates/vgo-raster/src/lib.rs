@@ -100,6 +100,11 @@ impl SemanticRaster {
     }
 
     #[must_use]
+    pub fn into_data(self) -> Vec<f32> {
+        self.data
+    }
+
+    #[must_use]
     pub fn channel(&self, channel: usize) -> &[f32] {
         let pixels = self.config.pixels();
         &self.data[channel * pixels..(channel + 1) * pixels]
@@ -158,10 +163,20 @@ impl SemanticRaster {
 
 #[must_use]
 pub fn rasterize(position: &Position, config: RasterConfig) -> SemanticRaster {
+    let mut data = vec![0.0_f32; CHANNEL_COUNT * config.pixels()];
+    rasterize_into(position, config, &mut data);
+    SemanticRaster { config, data }
+}
+
+/// Writes a semantic raster into caller-owned contiguous channel-first storage.
+///
+/// Reusable or pinned inference buffers can use this entry point to avoid an
+/// intermediate per-position allocation and host-side gather.
+pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
     assert!(config.width > 0 && config.height > 0);
     assert!(position.validate().is_playable());
     let pixels = config.pixels();
-    let mut data = vec![0.0_f32; CHANNEL_COUNT * pixels];
+    assert_eq!(data.len(), CHANNEL_COUNT * pixels);
     let radius = position.radius();
     let distance_scale = (4.0 * radius).max(f64::EPSILON);
 
@@ -190,32 +205,20 @@ pub fn rasterize(position: &Position, config: RasterConfig) -> SemanticRaster {
                 }
             }
 
-            set(
-                &mut data,
-                pixels,
-                0,
-                pixel,
-                inside(current_distance, radius),
-            );
-            set(
-                &mut data,
-                pixels,
-                1,
-                pixel,
-                inside(opponent_distance, radius),
-            );
+            set(data, pixels, 0, pixel, inside(current_distance, radius));
+            set(data, pixels, 1, pixel, inside(opponent_distance, radius));
             let (current_area, opponent_area) = ownership(current_distance, opponent_distance);
-            set(&mut data, pixels, 2, pixel, current_area);
-            set(&mut data, pixels, 3, pixel, opponent_area);
+            set(data, pixels, 2, pixel, current_area);
+            set(data, pixels, 3, pixel, opponent_area);
             set(
-                &mut data,
+                data,
                 pixels,
                 4,
                 pixel,
                 normalized_distance(current_distance, distance_scale),
             );
             set(
-                &mut data,
+                data,
                 pixels,
                 5,
                 pixel,
@@ -226,7 +229,7 @@ pub fn rasterize(position: &Position, config: RasterConfig) -> SemanticRaster {
             } else {
                 0.0
             };
-            set(&mut data, pixels, 6, pixel, ridge);
+            set(data, pixels, 6, pixel, ridge);
 
             let board_clearance = (x - radius)
                 .min(1.0 - radius - x)
@@ -239,15 +242,15 @@ pub fn rasterize(position: &Position, config: RasterConfig) -> SemanticRaster {
             };
             let legal_clearance = board_clearance.min(stone_clearance);
             set(
-                &mut data,
+                data,
                 pixels,
                 7,
                 pixel,
                 (legal_clearance / radius).clamp(-1.0, 1.0) as f32,
             );
-            set(&mut data, pixels, 8, pixel, (2.0 * radius) as f32);
+            set(data, pixels, 8, pixel, (2.0 * radius) as f32);
             set(
-                &mut data,
+                data,
                 pixels,
                 9,
                 pixel,
@@ -255,8 +258,6 @@ pub fn rasterize(position: &Position, config: RasterConfig) -> SemanticRaster {
             );
         }
     }
-
-    SemanticRaster { config, data }
 }
 
 #[must_use]
@@ -336,7 +337,7 @@ fn to_u8(value: f32) -> u8 {
 mod tests {
     use vgo_core::{Color, Position, Stone};
 
-    use super::{CHANNEL_COUNT, RasterConfig, action_pixel, rasterize};
+    use super::{CHANNEL_COUNT, RasterConfig, action_pixel, rasterize, rasterize_into};
 
     #[test]
     fn raster_has_stable_shape_and_ranges() {
@@ -390,5 +391,19 @@ mod tests {
         assert_eq!(action_pixel(0.1, 0.1, config), 0);
         assert_eq!(action_pixel(0.9, 0.9, config), 7);
         assert_eq!(action_pixel(1.0, 1.0, config), 7);
+    }
+
+    #[test]
+    fn caller_owned_raster_matches_owned_raster() {
+        let position = Position::new(
+            0.1,
+            vec![Stone::new(0.25, 0.75, Color::Black)],
+            Color::White,
+        );
+        let config = RasterConfig::square(16);
+        let expected = rasterize(&position, config);
+        let mut data = vec![f32::NAN; CHANNEL_COUNT * config.pixels()];
+        rasterize_into(&position, config, &mut data);
+        assert_eq!(data, expected.data());
     }
 }

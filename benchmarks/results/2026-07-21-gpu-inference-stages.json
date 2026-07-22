@@ -1,0 +1,78 @@
+{
+  "schema": "vgo.gpu-inference-stages.v1",
+  "date": "2026-07-21",
+  "base_revision": "adef341",
+  "hardware": {
+    "processor": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_processors": 32,
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "gpu_memory_mebibytes": 16303
+  },
+  "software": {
+    "python": "3.14.0",
+    "pytorch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "triton_windows": "3.7.1.post27"
+  },
+  "input": {
+    "channels": 10,
+    "height": 48,
+    "width": 48,
+    "bytes_per_position": 92160,
+    "model_parameters": 59555
+  },
+  "model_only": [
+    {"batch": 1, "eager_positions_per_second": 3124.356, "compiled_positions_per_second": 7722.288},
+    {"batch": 8, "eager_positions_per_second": 16370.293, "compiled_positions_per_second": 41013.442},
+    {"batch": 16, "eager_positions_per_second": 31975.162, "compiled_positions_per_second": 52135.027},
+    {"batch": 32, "eager_positions_per_second": 29489.981, "compiled_positions_per_second": 66373.131},
+    {"batch": 64, "eager_positions_per_second": 54368.066, "compiled_positions_per_second": 68714.642}
+  ],
+  "compiled_slots": {
+    "batch_per_slot": 16,
+    "samples": [
+      {"slots": 1, "positions_per_second": 56461.169},
+      {"slots": 2, "positions_per_second": 71816.170},
+      {"slots": 4, "positions_per_second": 78248.381}
+    ]
+  },
+  "rust_stages": {
+    "raster_positions_per_second_single_thread": 16510.148,
+    "raster_positions_per_second_16_threads": 192356.521,
+    "batch_16_frame_bytes": 1474716,
+    "batch_16_framing_positions_per_second": 50197.275,
+    "batch_16_framing_gibibytes_per_second": 4.309
+  },
+  "warm_service": [
+    {"batch": 16, "positions_per_second": 10384.814, "milliseconds_per_batch": 1.541},
+    {"batch": 32, "positions_per_second": 12330.007, "milliseconds_per_batch": 2.595},
+    {"batch": 64, "positions_per_second": 12753.639, "milliseconds_per_batch": 5.018}
+  ],
+  "end_to_end": {
+    "games_per_sample": 512,
+    "simulations_per_move": 8,
+    "maximum_delay_milliseconds": 1,
+    "samples": [
+      {"actors": 64, "batch": 16, "evaluations_per_second": 7694.848, "average_batch": 15.502},
+      {"actors": 64, "batch": 32, "evaluations_per_second": 7965.367, "average_batch": 29.144},
+      {"actors": 128, "batch": 32, "evaluations_per_second": 7421.419, "average_batch": 28.705},
+      {"actors": 128, "batch": 64, "evaluations_per_second": 7288.695, "average_batch": 49.251}
+    ]
+  },
+  "parity": {
+    "representative_positions": 96,
+    "cpu_compiled_top_policy_equal": 96,
+    "eager_compiled_top_policy_equal": 96,
+    "cpu_compiled_policy_max_absolute_difference": 0.027606964111328125,
+    "cpu_compiled_value_max_absolute_difference": 0.00017434358596801758,
+    "eager_compiled_policy_max_absolute_difference": 0.002872467041015625,
+    "eager_compiled_value_max_absolute_difference": 0.0
+  },
+  "recommendation": {
+    "actors": 64,
+    "batch": 32,
+    "maximum_delay_milliseconds": 1,
+    "compiled": true,
+    "next_executor_slots": 2
+  }
+}

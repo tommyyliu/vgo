@@ -335,7 +335,7 @@ fn main() -> std::io::Result<()> {
     let arguments = env::args().collect::<Vec<_>>();
     let config = Config {
         samples: parse_value(&arguments, "--samples", 96),
-        resolution: parse_value(&arguments, "--resolution", 48),
+        resolution: parse_value(&arguments, "--resolution", 128),
         simulations: parse_value(&arguments, "--simulations", 100),
         maximum_plies: parse_value(&arguments, "--max-plies", 48),
         radius: parse_value(&arguments, "--radius", 1.0 / 6.0),

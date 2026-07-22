@@ -18,7 +18,7 @@
     "raster_shape": [10, 48, 48]
   },
   "common_game_config": {
-    "board_radius": 0.16666666666666666,
+    "stone_radius": 0.16666666666666666,
     "maximum_plies": 48,
     "simulations_per_move": 8,
     "deterministic_game_seeds_begin_at": 1000

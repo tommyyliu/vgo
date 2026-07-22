@@ -1,0 +1,29 @@
+{
+  "schema": "vgo.raster-precision.v1",
+  "date": "2026-07-21",
+  "dataset": {
+    "samples": 96,
+    "shape": [96, 10, 128, 128],
+    "baseline_bytes_per_position": 655360
+  },
+  "checkpoint": {
+    "parameters": 59555,
+    "note": "The model was trained on float32 inputs; formats are round-trip sensitivity tests."
+  },
+  "formats": [
+    {"name": "fp16", "bytes_per_position": 327680, "state_max_absolute_error": 0.000244141, "policy_mean_absolute_difference": 0.000099060, "policy_sampled_top1_agreement": 1.0, "value_mean_absolute_difference": 0.000006761},
+    {"name": "bfloat16", "bytes_per_position": 327680, "state_max_absolute_error": 0.001953125, "policy_mean_absolute_difference": 0.000576302, "policy_sampled_top1_agreement": 0.968750, "value_mean_absolute_difference": 0.000058939},
+    {"name": "fp8_e4m3fn", "bytes_per_position": 163840, "state_max_absolute_error": 0.031249762, "policy_mean_absolute_difference": 0.008495302, "policy_sampled_top1_agreement": 0.979167, "value_mean_absolute_difference": 0.000904898},
+    {"name": "fp8_e5m2", "bytes_per_position": 163840, "state_max_absolute_error": 0.062499523, "policy_mean_absolute_difference": 0.032675166, "policy_sampled_top1_agreement": 0.885417, "value_mean_absolute_difference": 0.002287011},
+    {"name": "symmetric_int8", "bytes_per_position": 163840, "state_max_absolute_error": 0.003937006, "policy_mean_absolute_difference": 0.002020531, "policy_sampled_top1_agreement": 0.968750, "value_mean_absolute_difference": 0.000249430},
+    {"name": "channel_fixed8", "bytes_per_position": 163840, "state_max_absolute_error": 0.003937006, "policy_mean_absolute_difference": 0.000881766, "policy_sampled_top1_agreement": 0.979167, "value_mean_absolute_difference": 0.000046531},
+    {"name": "centered_snorm8", "bytes_per_position": 163840, "state_max_absolute_error": 0.003937006, "policy_mean_absolute_difference": 0.001028115, "policy_sampled_top1_agreement": 0.947917, "value_mean_absolute_difference": 0.000071798},
+    {"name": "symmetric_int4", "bytes_per_position": 81920, "state_max_absolute_error": 0.071428299, "policy_mean_absolute_difference": 0.056070272, "policy_sampled_top1_agreement": 0.822917, "value_mean_absolute_difference": 0.003411122}
+  ],
+  "recommendation": {
+    "safe_baseline": "fp16",
+    "one_byte_candidate": "channel_fixed8",
+    "compute_precision": "Benchmark FP16 and calibrated FP8 separately in TensorRT.",
+    "required_follow_up": "Train on encoded inputs and validate held-out search and self-play behavior."
+  }
+}

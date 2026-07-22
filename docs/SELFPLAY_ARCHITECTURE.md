@@ -49,6 +49,7 @@ and yields rather than calling Python directly.
 
 The broker:
 
+- receives already-encoded tensors produced in parallel by actors;
 - combines requests until a maximum batch size or latency deadline;
 - applies backpressure when too many batches are in flight;
 - preserves request IDs so results return to the correct trees;
@@ -57,6 +58,12 @@ The broker:
 
 Search, simulation, state encoding, symmetry transforms, trajectory assembly,
 and replay serialization remain native and parallelizable.
+
+The batch execution interface reports capacity separately from submission and
+completion. Sequence numbers permit out-of-order completed batches. The current
+process transport has one blocking slot; the intended GPU transport has a small
+pool of pinned host buffers and CUDA streams so encoding, transfer, model
+execution, and response handling can overlap.
 
 ## Python inference service
 
