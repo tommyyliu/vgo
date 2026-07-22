@@ -27,8 +27,9 @@ over the continuous-action game defined in [`reference/RULES.md`](reference/RULE
   import it.
 - [`todo/`](todo/README.md) tracks known rule, geometry, and visualization work.
 
-Run the complete Rust verification with `cargo test --workspace` and the
-self-play canary using the command in [`benchmarks/README.md`](benchmarks/README.md).
+[`docs/RUNNING.md`](docs/RUNNING.md) collects every command for tests, the
+reinforcement-learning loop, strength measurement and the benchmarks, along with
+the failure modes that are confusing the first time.
 The model-facing channel contract is documented in
 [`docs/RASTER_REPRESENTATION.md`](docs/RASTER_REPRESENTATION.md).
 The model execution boundaries are documented in
