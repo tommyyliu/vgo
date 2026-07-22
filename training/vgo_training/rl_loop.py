@@ -45,9 +45,38 @@ def runtime_environment() -> dict[str, str]:
         cuda = environment.get("CUDA_PATH")
         if cuda:
             candidates.append(Path(cuda) / "bin")
-    existing = [str(path) for path in candidates if path.exists()]
+        existing = [str(path) for path in candidates if path.exists()]
+        if existing:
+            environment["PATH"] = os.pathsep.join(existing + [environment.get("PATH", "")])
+        return environment
+
+    # On Linux the ort crate is built with `load-dynamic`, so the Rust binaries
+    # dlopen libonnxruntime.so at runtime from ORT_DYLIB_PATH. Blackwell (sm_120)
+    # GPUs need a from-source build; see docs/NVRTX_HANDOFF.md. The CUDA runtime
+    # libraries the provider needs live in the training venv, so they must be on
+    # LD_LIBRARY_PATH for the child processes. Both are configurable via the
+    # environment; we only fill in what the caller has not already set.
+    packages = Path(sys.prefix) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    # Prefer the TensorRT-enabled onnxruntime build (superset: it also carries the
+    # CUDA provider), falling back to the CUDA-only build if only that is present.
+    onnxruntime_dir = packages / "onnxruntime_trt"
+    if not onnxruntime_dir.exists():
+        onnxruntime_dir = packages / "onnxruntime_blackwell"
+    library_dirs = [
+        onnxruntime_dir,
+        packages / "tensorrt_libs",
+        packages / "nvidia" / "cu13" / "lib",
+        packages / "nvidia" / "cudnn" / "lib",
+        packages / "torch" / "lib",
+    ]
+    existing = [str(path) for path in library_dirs if path.exists()]
     if existing:
-        environment["PATH"] = os.pathsep.join(existing + [environment.get("PATH", "")])
+        prior = environment.get("LD_LIBRARY_PATH", "")
+        parts = existing + ([prior] if prior else [])
+        environment["LD_LIBRARY_PATH"] = os.pathsep.join(parts)
+    dylib = onnxruntime_dir / "libonnxruntime.so"
+    if "ORT_DYLIB_PATH" not in environment and dylib.exists():
+        environment["ORT_DYLIB_PATH"] = str(dylib)
     return environment
 
 

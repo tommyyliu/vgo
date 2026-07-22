@@ -6,7 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-ort = { version = "=2.0.0-rc.12", features = ["cuda", "tensorrt"] }
+# Blackwell (sm_120) has no prebuilt onnxruntime with matching kernels, so we
+# load a self-built libonnxruntime.so at runtime via ORT_DYLIB_PATH instead of
+# the crate's downloaded binary. The CUDA and TensorRT EPs still register
+# through the dynamically loaded library. See docs/NVRTX_HANDOFF.md.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "std", "ndarray", "tracing", "api-24"] }
 sha2 = "0.10"
 vgo-core = { path = "../vgo-core" }
 vgo-raster = { path = "../vgo-raster" }
