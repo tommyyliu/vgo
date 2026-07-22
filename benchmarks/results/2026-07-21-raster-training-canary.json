@@ -1,0 +1,48 @@
+{
+  "schema": "vgo.training-canary.v1",
+  "date": "2026-07-21",
+  "dataset": {
+    "schema": "vgo.raster-dataset.v2",
+    "samples": 96,
+    "unique_states": 84,
+    "completed_games": 13,
+    "discarded_games": 0,
+    "search_simulations": 100,
+    "radius": 0.16666666666666666,
+    "shape": [96, 10, 48, 48],
+    "policy_size": 2305,
+    "candidate_masked_policy": true
+  },
+  "model": {
+    "type": "residual_cnn",
+    "width": 32,
+    "residual_blocks": 3,
+    "parameters": 59555,
+    "device": "cpu"
+  },
+  "training": {
+    "epochs": 240,
+    "batch_size": 16,
+    "initial_learning_rate": 0.003,
+    "schedule": "cosine_to_1_percent",
+    "value_loss_weight": 2.0,
+    "seed": 7,
+    "wall_seconds": 27.30106229998637,
+    "best_epoch": 240
+  },
+  "initial": {
+    "policy_kl": 0.48932790756225586,
+    "policy_top1": 0.1666666716337204,
+    "value_mae": 0.9967016577720642
+  },
+  "best": {
+    "policy_kl": 0.05389738082885742,
+    "policy_top1": 0.8125,
+    "value_mae": 0.1314220279455185
+  },
+  "notes": [
+    "Policy loss is normalized only across sampled candidate pixels and pass.",
+    "The empty raster occurs 13 times with twelve +1 and one -1 terminal labels, so value labels contain deliberate trajectory variance.",
+    "Generated tensors, BMP diagnostics, and checkpoint are under artifacts/raster-demo and are not committed."
+  ]
+}

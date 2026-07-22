@@ -14,6 +14,10 @@ over the continuous-action game defined in [`reference/RULES.md`](reference/RULE
 - [`benchmarks/`](benchmarks/README.md) defines implementation-neutral workloads
   used to compare candidate simulator backends.
 - [`crates/vgo-core/`](crates/vgo-core) is the exact Rust rules engine,
+  [`crates/vgo-inference/`](crates/vgo-inference) batches model evaluations
+  through the versioned Python subprocess protocol,
+  [`crates/vgo-raster/`](crates/vgo-raster) produces the canonical semantic
+  tensor and RGB diagnostics,
   [`crates/vgo-search/`](crates/vgo-search) provides deterministic candidates and
   progressive-widening MCTS, and [`crates/vgo-selfplay/`](crates/vgo-selfplay)
   contains the paired canary arena.
@@ -23,3 +27,7 @@ over the continuous-action game defined in [`reference/RULES.md`](reference/RULE
 
 Run the complete Rust verification with `cargo test --workspace` and the
 self-play canary using the command in [`benchmarks/README.md`](benchmarks/README.md).
+The model-facing channel contract is documented in
+[`docs/RASTER_REPRESENTATION.md`](docs/RASTER_REPRESENTATION.md).
+The live Rust/Python boundary is documented in
+[`docs/INFERENCE_PROTOCOL.md`](docs/INFERENCE_PROTOCOL.md).

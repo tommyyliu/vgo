@@ -1,8 +1,6 @@
 use std::collections::HashSet;
 
-use vgo_core::{GameEvent, Point, Position, is_legal_placement, legal_set_vertices, pass, place};
-
-const SELF_CAPTURE_LOGIT_PENALTY: f64 = 24.0;
+use vgo_core::{Point, Position, is_legal_placement, legal_set_vertices, pass, place};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
@@ -32,7 +30,6 @@ pub enum CandidateSource {
 pub struct Candidate {
     pub action: Action,
     pub source: CandidateSource,
-    pub policy_logit: f64,
 }
 
 pub struct CandidateSequence {
@@ -70,14 +67,16 @@ impl CandidateSequence {
             return Some(Candidate {
                 action: Action::Pass,
                 source: CandidateSource::Pass,
-                policy_logit: 0.0,
             });
         }
 
         while let Some(point) = self.anchors.get(self.anchor_index).copied() {
             self.anchor_index += 1;
             if self.mark_new(point) {
-                return Some(self.candidate(point, CandidateSource::LegalVertex));
+                return Some(Candidate {
+                    action: Action::Place(point),
+                    source: CandidateSource::LegalVertex,
+                });
             }
         }
 
@@ -90,7 +89,10 @@ impl CandidateSequence {
             let unit_y = (radical_inverse(index, 3) + self.shift_y).fract();
             let point = Point::new(radius + width * unit_x, radius + width * unit_y);
             if is_legal_placement(&self.position, point.x, point.y) && self.mark_new(point) {
-                return Some(self.candidate(point, CandidateSource::AreaSequence));
+                return Some(Candidate {
+                    action: Action::Place(point),
+                    source: CandidateSource::AreaSequence,
+                });
             }
         }
         None
@@ -102,25 +104,6 @@ impl CandidateSequence {
             (point.y * 1.0e12).round() as i64,
         ))
     }
-
-    fn candidate(&self, point: Point, source: CandidateSource) -> Candidate {
-        let transition = place(&self.position, point.x, point.y)
-            .expect("candidate points are checked for placement legality");
-        let self_captures = transition
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                GameEvent::SelfCapture { count, .. } => Some(*count),
-                _ => None,
-            })
-            .sum::<usize>();
-        Candidate {
-            action: Action::Place(point),
-            source,
-            policy_logit: spread_logit(&self.position, point)
-                - SELF_CAPTURE_LOGIT_PENALTY * self_captures as f64,
-        }
-    }
 }
 
 #[must_use]
@@ -129,19 +112,6 @@ pub fn generate_candidates(position: &Position, budget: usize, match_seed: u64) 
     std::iter::from_fn(|| sequence.next_candidate())
         .take(budget)
         .collect()
-}
-
-fn spread_logit(position: &Position, point: Point) -> f64 {
-    let clearance = if position.stones().is_empty() {
-        point.x.min(1.0 - point.x).min(point.y).min(1.0 - point.y)
-    } else {
-        position
-            .stones()
-            .iter()
-            .map(|stone| (point.x - stone.x).hypot(point.y - stone.y))
-            .fold(f64::INFINITY, f64::min)
-    };
-    8.0 * (clearance - 2.0 * position.radius())
 }
 
 fn radical_inverse(mut index: u64, base: u64) -> f64 {

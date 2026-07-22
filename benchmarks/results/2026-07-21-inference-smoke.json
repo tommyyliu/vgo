@@ -1,0 +1,41 @@
+{
+  "schema": "vgo.inference-smoke.v1",
+  "date": "2026-07-21",
+  "transport": "framed child-process stdin/stdout",
+  "device": "cpu",
+  "raster_shape": [10, 48, 48],
+  "maximum_batch": 16,
+  "maximum_delay_milliseconds": 5,
+  "queue_capacity": 64,
+  "torch_threads": 2,
+  "direct_parity": {
+    "current_value": 0.829572319984436,
+    "pass_logit": 1.9069772958755493,
+    "center_logit": 2.3635425567626953,
+    "framed_values_match_displayed_precision": true
+  },
+  "concurrent_request_probe": {
+    "requests": 16,
+    "formed_one_batch": true,
+    "outputs_identical": true
+  },
+  "search_probe": {
+    "simulations": 16,
+    "evaluations": 14
+  },
+  "actor_probe": {
+    "actors": 16,
+    "completed_games": 16,
+    "plies": 187,
+    "wall_seconds": 2.943226
+  },
+  "broker": {
+    "requests": 1493,
+    "batches": 194,
+    "average_batch": 7.695876288659793,
+    "maximum_batch": 16,
+    "failures": 0,
+    "queue_milliseconds_total": 10879.919,
+    "inference_milliseconds_total": 2556.173
+  }
+}

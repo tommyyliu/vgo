@@ -1,0 +1,18 @@
+[package]
+name = "vgo-inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vgo-core = { path = "../vgo-core" }
+vgo-raster = { path = "../vgo-raster" }
+vgo-search = { path = "../vgo-search" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vgo-model-smoke"
+path = "src/bin/model_smoke.rs"

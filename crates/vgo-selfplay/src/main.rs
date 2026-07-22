@@ -111,6 +111,7 @@ impl MatchReport {
                 "  \"repetitions\": {},\n",
                 "  \"repetition_avoids\": {},\n",
                 "  \"search_simulations\": {},\n",
+                "  \"evaluations\": {},\n",
                 "  \"expanded_nodes\": {},\n",
                 "  \"generated_candidates\": {},\n",
                 "  \"terminal_leaves\": {},\n",
@@ -140,6 +141,7 @@ impl MatchReport {
             self.repetitions,
             self.repetition_avoids,
             self.search.simulations,
+            self.search.evaluations,
             self.search.expanded_nodes,
             self.search.generated_candidates,
             self.search.terminal_leaves,
@@ -154,6 +156,7 @@ impl MatchReport {
 
 fn add_search_stats(total: &mut SearchStats, next: SearchStats) {
     total.simulations += next.simulations;
+    total.evaluations += next.evaluations;
     total.expanded_nodes += next.expanded_nodes;
     total.generated_candidates += next.generated_candidates;
     total.terminal_leaves += next.terminal_leaves;

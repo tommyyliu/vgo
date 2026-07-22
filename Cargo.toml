@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/vgo-core", "crates/vgo-search", "crates/vgo-selfplay"]
+members = [
+    "crates/vgo-core",
+    "crates/vgo-inference",
+    "crates/vgo-raster",
+    "crates/vgo-search",
+    "crates/vgo-selfplay",
+]
 resolver = "3"
 
 [workspace.package]

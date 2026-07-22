@@ -1,6 +1,7 @@
 /target/
+/artifacts/
 /.idea/
-/.venv/
+.venv/
 /.agents/
 /.uv-cache/
 Screenshot*.png

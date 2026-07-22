@@ -1,6 +1,9 @@
 use vgo_core::{Analysis, Color, Phase, Position};
 
-use crate::{Action, Candidate, CandidateSequence, CandidateSource};
+use crate::{
+    Action, Candidate, CandidateSequence, CandidateSource, Evaluation, EvaluationError, Evaluator,
+    NaiveEvaluator,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SearchConfig {
@@ -31,6 +34,7 @@ impl SearchConfig {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SearchStats {
     pub simulations: u32,
+    pub evaluations: u64,
     pub expanded_nodes: u64,
     pub generated_candidates: u64,
     pub terminal_leaves: u64,
@@ -66,6 +70,7 @@ impl SearchResult {
 
 struct Child {
     candidate: Candidate,
+    policy_logit: f64,
     prior: f64,
     visits: u32,
     black_value_sum: f64,
@@ -89,10 +94,17 @@ struct Node {
     candidates: CandidateSequence,
     candidates_exhausted: bool,
     terminal_black_value: Option<f64>,
+    evaluation: Option<Evaluation>,
 }
 
 impl Node {
-    fn new(position: Position, analysis: Option<&Analysis>, match_seed: u64) -> Self {
+    fn new(
+        position: Position,
+        analysis: Option<&Analysis>,
+        match_seed: u64,
+        evaluator: &dyn Evaluator,
+        stats: &mut SearchStats,
+    ) -> Result<Self, EvaluationError> {
         let terminal_black_value = if position.phase() == Phase::Finished {
             Some(
                 analysis
@@ -102,14 +114,34 @@ impl Node {
         } else {
             None
         };
+        let evaluation = if terminal_black_value.is_some() {
+            None
+        } else {
+            stats.evaluations += 1;
+            Some(evaluator.evaluate(&position)?)
+        };
         let candidates = CandidateSequence::new(&position, match_seed);
-        Self {
+        Ok(Self {
             position,
             visits: 0,
             children: Vec::new(),
             candidates,
             candidates_exhausted: false,
             terminal_black_value,
+            evaluation,
+        })
+    }
+
+    fn black_evaluation(&self) -> f64 {
+        let current_value = self
+            .evaluation
+            .as_ref()
+            .expect("nonterminal nodes are evaluated")
+            .current_value;
+        if self.position.to_move() == Color::Black {
+            current_value
+        } else {
+            -current_value
         }
     }
 
@@ -123,8 +155,14 @@ impl Node {
             .min(config.maximum_candidates);
         while self.children.len() < desired && !self.candidates_exhausted {
             if let Some(candidate) = self.candidates.next_candidate() {
+                let policy_logit = self
+                    .evaluation
+                    .as_ref()
+                    .expect("playable nodes are evaluated")
+                    .policy_logit(candidate.action);
                 self.children.push(Child {
                     candidate,
+                    policy_logit,
                     prior: 0.0,
                     visits: 0,
                     black_value_sum: 0.0,
@@ -167,14 +205,14 @@ impl Node {
 fn normalize_priors(children: &mut [Child]) {
     let maximum = children
         .iter()
-        .map(|child| child.candidate.policy_logit)
+        .map(|child| child.policy_logit)
         .fold(f64::NEG_INFINITY, f64::max);
     let total: f64 = children
         .iter()
-        .map(|child| (child.candidate.policy_logit - maximum).exp())
+        .map(|child| (child.policy_logit - maximum).exp())
         .sum();
     for child in children {
-        child.prior = (child.candidate.policy_logit - maximum).exp() / total;
+        child.prior = (child.policy_logit - maximum).exp() / total;
     }
 }
 
@@ -200,30 +238,39 @@ fn simulate(
     node: &mut Node,
     config: SearchConfig,
     match_seed: u64,
+    evaluator: &dyn Evaluator,
     depth: u32,
     stats: &mut SearchStats,
-) -> f64 {
+) -> Result<f64, EvaluationError> {
     stats.maximum_depth = stats.maximum_depth.max(depth);
     if let Some(value) = node.terminal_black_value {
         stats.terminal_leaves += 1;
         node.visits += 1;
-        return value;
+        return Ok(value);
     }
     if depth >= config.maximum_depth {
         stats.depth_limited_leaves += 1;
         node.visits += 1;
-        return 0.0;
+        return Ok(node.black_evaluation());
     }
 
     node.widen(config, stats);
     let child_index = node.select_child(config);
     let child = &mut node.children[child_index];
     let black_value = if let Some(child_node) = child.node.as_mut() {
-        simulate(child_node, config, match_seed, depth + 1, stats)
+        simulate(child_node, config, match_seed, evaluator, depth + 1, stats)?
     } else {
         let transition = child.candidate.action.apply(&node.position);
-        let child_node = Node::new(transition.position, Some(&transition.analysis), match_seed);
-        let value = child_node.terminal_black_value.unwrap_or(0.0);
+        let child_node = Node::new(
+            transition.position,
+            Some(&transition.analysis),
+            match_seed,
+            evaluator,
+            stats,
+        )?;
+        let value = child_node
+            .terminal_black_value
+            .unwrap_or_else(|| child_node.black_evaluation());
         if child_node.terminal_black_value.is_some() {
             stats.terminal_leaves += 1;
         }
@@ -235,20 +282,30 @@ fn simulate(
     child.visits += 1;
     child.black_value_sum += black_value;
     node.visits += 1;
-    black_value
+    Ok(black_value)
 }
 
 #[must_use]
 pub fn search(position: &Position, config: SearchConfig, match_seed: u64) -> SearchResult {
+    search_with_evaluator(position, config, match_seed, &NaiveEvaluator)
+        .expect("the in-process naive evaluator is infallible")
+}
+
+pub fn search_with_evaluator(
+    position: &Position,
+    config: SearchConfig,
+    match_seed: u64,
+    evaluator: &dyn Evaluator,
+) -> Result<SearchResult, EvaluationError> {
     assert_eq!(
         position.phase(),
         Phase::Playing,
         "cannot search a finished position"
     );
-    let mut root = Node::new(position.clone(), None, match_seed);
     let mut stats = SearchStats::default();
+    let mut root = Node::new(position.clone(), None, match_seed, evaluator, &mut stats)?;
     for _ in 0..config.simulations {
-        simulate(&mut root, config, match_seed, 0, &mut stats);
+        simulate(&mut root, config, match_seed, evaluator, 0, &mut stats)?;
         stats.simulations += 1;
     }
     let children = root
@@ -266,18 +323,44 @@ pub fn search(position: &Position, config: SearchConfig, match_seed: u64) -> Sea
         .first()
         .map(|index| children[*index].action)
         .expect("search produces at least the pass child");
-    SearchResult {
+    Ok(SearchResult {
         action: best,
         children,
         stats,
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use vgo_core::{Color, Position};
 
-    use super::{SearchConfig, search};
+    use crate::{Action, Evaluation, EvaluationError, Evaluator, Policy};
+
+    use super::{SearchConfig, search, search_with_evaluator};
+
+    struct FlatPolicy;
+
+    impl Policy for FlatPolicy {
+        fn logit(&self, _action: Action) -> f64 {
+            0.0
+        }
+    }
+
+    struct ConstantEvaluator(f64);
+
+    impl Evaluator for ConstantEvaluator {
+        fn evaluate(&self, _position: &Position) -> Result<Evaluation, EvaluationError> {
+            Ok(Evaluation::new(self.0, Box::new(FlatPolicy)))
+        }
+    }
+
+    struct FailingEvaluator;
+
+    impl Evaluator for FailingEvaluator {
+        fn evaluate(&self, _position: &Position) -> Result<Evaluation, EvaluationError> {
+            Err(EvaluationError::new("expected failure"))
+        }
+    }
 
     #[test]
     fn search_uses_the_requested_simulation_budget() {
@@ -307,5 +390,28 @@ mod tests {
         let small_actions: Vec<_> = small.children.iter().map(|child| child.action).collect();
         let large_actions: Vec<_> = large.children.iter().map(|child| child.action).collect();
         assert_eq!(small_actions, large_actions[..small_actions.len()]);
+    }
+
+    #[test]
+    fn leaf_values_are_converted_from_current_player_to_black() {
+        let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+        let result = search_with_evaluator(
+            &position,
+            SearchConfig::canary(1),
+            5,
+            &ConstantEvaluator(0.75),
+        )
+        .expect("constant evaluator succeeds");
+        assert_eq!(result.children[0].action, Action::Pass);
+        assert_eq!(result.children[0].black_value, -0.75);
+        assert_eq!(result.stats.evaluations, 2);
+    }
+
+    #[test]
+    fn evaluator_errors_abort_search() {
+        let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+        let error = search_with_evaluator(&position, SearchConfig::canary(1), 5, &FailingEvaluator)
+            .expect_err("failing evaluator must abort search");
+        assert_eq!(error, EvaluationError::new("expected failure"));
     }
 }

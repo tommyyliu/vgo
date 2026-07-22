@@ -1,0 +1,17 @@
+[package]
+name = "vgo-raster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vgo-core = { path = "../vgo-core" }
+vgo-search = { path = "../vgo-search" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vgo-generate-demo"
+path = "src/bin/generate_demo.rs"

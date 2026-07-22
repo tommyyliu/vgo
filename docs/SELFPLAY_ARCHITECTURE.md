@@ -7,14 +7,17 @@ The first two benchmark layers are implemented:
 - `vgo-core` owns exact Voronoi geometry, legal placement, global capture and
   self-capture, pass/pass termination, and scoring;
 - `vgo-search` owns deterministic prefix candidates, a naive spread evaluator,
-  and progressive-widening MCTS;
+  progressive-widening MCTS, and an explicit fallible evaluator boundary;
+- `vgo-inference` owns a bounded batching broker and framed Python subprocess
+  transport;
 - `vgo-canary` runs parallel color-swapped matches and emits machine-readable
   search and gameplay metrics.
 
-The canary deliberately uses no Python process. Its neutral nonterminal value
-and exact terminal value isolate the simulator and search before an inference
-protocol, tensor encoder, or replay writer is introduced. Acceptance results
-are retained under [`../benchmarks/results/`](../benchmarks/results/).
+The original canary deliberately uses no Python process. Its neutral
+nonterminal value and exact terminal value continue to isolate simulator and
+search behavior. A separate model smoke path now runs the trained raster CNN
+through the broker described in [`INFERENCE_PROTOCOL.md`](INFERENCE_PROTOCOL.md).
+Acceptance results are retained under [`../benchmarks/results/`](../benchmarks/results/).
 
 ## Ownership boundary
 

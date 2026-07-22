@@ -7,6 +7,23 @@ name = "vgo-core"
 version = "0.1.0"
 
 [[package]]
+name = "vgo-inference"
+version = "0.1.0"
+dependencies = [
+ "vgo-core",
+ "vgo-raster",
+ "vgo-search",
+]
+
+[[package]]
+name = "vgo-raster"
+version = "0.1.0"
+dependencies = [
+ "vgo-core",
+ "vgo-search",
+]
+
+[[package]]
 name = "vgo-search"
 version = "0.1.0"
 dependencies = [
