@@ -83,11 +83,50 @@ five-millisecond batch window, and a maximum batch size of 16:
 Raw metrics are retained in
 [`../benchmarks/results/2026-07-21-inference-smoke.json`](../benchmarks/results/2026-07-21-inference-smoke.json).
 
+## CPU scaling
+
+The parameterized release benchmark runs with:
+
+```powershell
+cargo run --release -p vgo-inference --bin vgo-model-smoke -- `
+  --actors 64 --games 256 --simulations 8 `
+  --maximum-batch 16 --delay-ms 1 --torch-threads 16
+```
+
+On a 16-core/32-thread Ryzen 9 9950X using PyTorch 2.13 CPU inference,
+32 actors sustained 2,279 evaluations per second and 64 actors sustained
+2,319. Increasing to 128 actors reduced throughput to 2,196. The efficient
+default is therefore 32 actors; 64 actors are useful when maximum throughput is
+more important than actor count and scheduling overhead.
+
+Three additional 64-actor runs sustained 2,474 to 2,485 evaluations per second,
+with a mean of 2,481 and no failures. The sweep values are the conservative
+comparison between configurations; the repeated range is the best estimate of
+steady-state capacity on this machine.
+
+For this 59,555-parameter CNN and 10x48x48 input, batches larger than 16 are
+counterproductive on CPU. At 64 actors, a batch cap of 16 sustained 2,317
+evaluations per second, compared with 2,127 at 32 and 1,655 at 64. A one- or
+two-millisecond collection window fills batches without meaningful idle time;
+zero delay produced average batches of only 2.2 and 1,302 evaluations per
+second.
+
+These are end-to-end actor results: each evaluation includes Rust state
+analysis and rasterization, framed process transport, Python tensor assembly,
+model inference, and MCTS consumption. At eight simulations per move the tuned
+run completed about 29 short 3x3-board games per second. Games per second will
+fall approximately in proportion to the simulation budget once inference is
+the bottleneck; evaluations per second is the portable capacity measure.
+
+All sweep results and exact parameters are retained in
+[`../benchmarks/results/2026-07-21-selfplay-scaling.json`](../benchmarks/results/2026-07-21-selfplay-scaling.json).
+
 ## Remaining production work
 
 - Add an explicit startup handshake carrying schema and model versions.
 - Support checkpoint replacement only at a documented actor synchronization
   point.
-- Benchmark CPU and accelerator services across batch windows and actor counts.
+- Benchmark accelerator services and larger models across batch windows and
+  actor counts.
 - Move immutable trajectory writing from the demo generator into self-play.
 - Attach per-game model versions and protocol failures to replay metadata.

@@ -1,0 +1,118 @@
+{
+  "schema": "vgo.selfplay-scaling.v1",
+  "date": "2026-07-21",
+  "base_revision": "909f9b98f89f36255c2c86e3f40331e75de9b628",
+  "build": "release",
+  "hardware": {
+    "processor": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_processors": 32,
+    "accelerator": null
+  },
+  "software": {
+    "rustc": "1.97.1",
+    "python": "3.14.0",
+    "pytorch": "2.13.0+cpu"
+  },
+  "model": {
+    "parameters": 59555,
+    "raster_shape": [10, 48, 48]
+  },
+  "common_game_config": {
+    "board_radius": 0.16666666666666666,
+    "maximum_plies": 48,
+    "simulations_per_move": 8,
+    "deterministic_game_seeds_begin_at": 1000
+  },
+  "initial_actor_sweep": {
+    "games": 32,
+    "maximum_batch": 32,
+    "maximum_delay_milliseconds": 2,
+    "torch_threads": 4,
+    "samples": [
+      {"actors": 1, "seconds": 44.925238, "games_per_second": 0.712, "evaluations_per_second": 63.639, "average_batch": 1.000},
+      {"actors": 2, "seconds": 22.099901, "games_per_second": 1.448, "evaluations_per_second": 129.367, "average_batch": 1.995},
+      {"actors": 4, "seconds": 11.587839, "games_per_second": 2.762, "evaluations_per_second": 246.724, "average_batch": 3.767},
+      {"actors": 8, "seconds": 5.977027, "games_per_second": 5.354, "evaluations_per_second": 478.331, "average_batch": 7.256},
+      {"actors": 16, "seconds": 3.572608, "games_per_second": 8.957, "evaluations_per_second": 800.256, "average_batch": 12.166},
+      {"actors": 32, "seconds": 2.697950, "games_per_second": 11.861, "evaluations_per_second": 1059.694, "average_batch": 15.972}
+    ]
+  },
+  "torch_thread_sweep": {
+    "actors": 32,
+    "games": 64,
+    "maximum_batch": 32,
+    "maximum_delay_milliseconds": 2,
+    "samples": [
+      {"torch_threads": 1, "evaluations_per_second": 565.312},
+      {"torch_threads": 2, "evaluations_per_second": 706.584},
+      {"torch_threads": 4, "evaluations_per_second": 986.875},
+      {"torch_threads": 8, "evaluations_per_second": 1173.221},
+      {"torch_threads": 16, "evaluations_per_second": 1262.642}
+    ]
+  },
+  "batch_cap_sweep": {
+    "actors": 64,
+    "games": 256,
+    "maximum_delay_milliseconds": 2,
+    "torch_threads": 16,
+    "samples": [
+      {"maximum_batch": 16, "evaluations_per_second": 2316.677, "average_batch": 14.962},
+      {"maximum_batch": 32, "evaluations_per_second": 2126.548, "average_batch": 26.736},
+      {"maximum_batch": 64, "evaluations_per_second": 1655.203, "average_batch": 42.402}
+    ]
+  },
+  "batch_window_sweep": {
+    "actors": 64,
+    "games": 256,
+    "maximum_batch": 16,
+    "torch_threads": 16,
+    "samples": [
+      {"maximum_delay_milliseconds": 0, "evaluations_per_second": 1302.228, "average_batch": 2.228},
+      {"maximum_delay_milliseconds": 1, "evaluations_per_second": 2324.204, "average_batch": 14.972},
+      {"maximum_delay_milliseconds": 2, "evaluations_per_second": 2312.570, "average_batch": 14.983},
+      {"maximum_delay_milliseconds": 5, "evaluations_per_second": 2212.020, "average_batch": 14.962}
+    ]
+  },
+  "tuned_actor_sweep": {
+    "games": 256,
+    "maximum_batch": 16,
+    "maximum_delay_milliseconds": 1,
+    "torch_threads": 16,
+    "samples": [
+      {"actors": 16, "seconds": 10.846832, "games_per_second": 23.417, "evaluations_per_second": 2001.506, "average_batch": 14.789},
+      {"actors": 32, "seconds": 9.527854, "games_per_second": 26.659, "evaluations_per_second": 2278.582, "average_batch": 14.952},
+      {"actors": 64, "seconds": 9.360690, "games_per_second": 27.135, "evaluations_per_second": 2319.273, "average_batch": 14.972},
+      {"actors": 128, "seconds": 9.885579, "games_per_second": 25.694, "evaluations_per_second": 2196.128, "average_batch": 14.620}
+    ]
+  },
+  "tuned_repetitions": {
+    "actors": 64,
+    "games": 256,
+    "maximum_batch": 16,
+    "maximum_delay_milliseconds": 1,
+    "torch_threads": 16,
+    "samples": [
+      {"seconds": 8.737697, "games_per_second": 29.069, "evaluations_per_second": 2484.636},
+      {"seconds": 8.774123, "games_per_second": 28.949, "evaluations_per_second": 2474.321},
+      {"seconds": 8.735041, "games_per_second": 29.078, "evaluations_per_second": 2485.392}
+    ],
+    "mean_evaluations_per_second": 2481.450,
+    "minimum_evaluations_per_second": 2474.321,
+    "maximum_evaluations_per_second": 2485.392
+  },
+  "integrity": {
+    "failures": 0,
+    "completed_games_per_tuned_sample": 254,
+    "plies_per_tuned_sample": 2744,
+    "evaluations_per_tuned_sample": 21710,
+    "deterministic_workload_matched_across_actor_counts": true
+  },
+  "recommendation": {
+    "efficient_actors": 32,
+    "maximum_throughput_actors": 64,
+    "maximum_batch": 16,
+    "maximum_delay_milliseconds": 1,
+    "torch_threads": 16,
+    "mean_repeated_evaluations_per_second": 2481.450
+  }
+}
