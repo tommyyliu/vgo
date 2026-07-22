@@ -1,12 +1,14 @@
 # Python Training
 
-This directory will contain model definition, inference serving, replay input,
-and optimization code. It deliberately has no Rust package dependency.
+This directory contains model definition, replay input, optimization, ONNX
+export, and a retained inference service for protocol diagnostics. It
+deliberately has no Rust package dependency.
 
-The Python inference service communicates with the Rust self-play executable
-through the versioned batch protocol described in
-[`docs/SELFPLAY_ARCHITECTURE.md`](../docs/SELFPLAY_ARCHITECTURE.md). Training
-reads immutable replay shards written by Rust.
+The production self-play path loads exported ONNX models directly in Rust. The
+Python service communicates through the versioned batch protocol described in
+[`docs/INFERENCE_PROTOCOL.md`](../docs/INFERENCE_PROTOCOL.md) and remains useful
+for output parity and transport benchmarks. Training reads replay shards written
+by Rust.
 
 No simulator or game-rule implementation belongs here.
 
@@ -15,7 +17,7 @@ No simulator or game-rule implementation belongs here.
 Generate MCTS-labeled examples from the repository root:
 
 ```powershell
-cargo run --release -p vgo-raster --bin vgo-generate-demo -- `
+cargo run --release -p vgo-selfplay --bin vgo-generate-demo -- `
   --samples 96 --resolution 128 --simulations 100 --output artifacts/raster-demo
 ```
 
@@ -48,7 +50,7 @@ uv run python -m vgo_training.serve `
 ```
 
 Run the complete Rust-side boundary and actor smoke test from the repository
-root with `cargo run --release -p vgo-inference --bin vgo-model-smoke`. The
+root with `cargo run --release -p vgo-selfplay --bin vgo-model-smoke`. The
 active canary uses radius `1/6` and a 128x128 raster by default. `--radius` and
 `--resolution` are independent so a small game can exercise a larger inference
 tensor.
@@ -102,7 +104,7 @@ $env:PATH = "$PWD\training\.venv\Lib\site-packages\tensorrt_libs;" +
 cargo run --release -p vgo-inference --bin vgo-onnx-bench -- `
   --provider tensorrt --batch 32 --compare-python false
 
-cargo run --release -p vgo-inference --bin vgo-model-smoke -- `
+cargo run --release -p vgo-selfplay --bin vgo-model-smoke -- `
   --runtime onnx --provider tensorrt --fp16 true
 ```
 

@@ -19,15 +19,16 @@
         if (aliveGroups.has(group)) continue;
         for (const vertex of geometry.cells[i].poly) {
           const stone = position.stones[i];
-          const influenceRadius = Math.hypot(vertex[0] - stone.x, vertex[1] - stone.y);
-          const freeDistance = legalSet.distance(position, vertex[0], vertex[1], freeVertices);
-          if (freeDistance < influenceRadius - N.captureMargin) {
+          const witness = legalSet.escapeWitness(
+            position, vertex[0], vertex[1], stone.x, stone.y, freeVertices
+          );
+          if (witness) {
             aliveGroups.add(group);
             evidence.set(group, {
               stone: i,
               vertex: vertex,
-              freeDistance: freeDistance,
-              influenceRadius: influenceRadius,
+              freeDistance: Math.hypot(vertex[0] - witness[0], vertex[1] - witness[1]),
+              influenceRadius: Math.hypot(vertex[0] - stone.x, vertex[1] - stone.y),
             });
             break;
           }

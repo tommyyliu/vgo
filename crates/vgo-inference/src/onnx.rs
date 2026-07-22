@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use vgo_raster::{CHANNEL_COUNT, RasterConfig};
 use vgo_search::EvaluationError;
 
-use crate::{BatchService, InferenceInput, InferenceOutput};
+use crate::{BatchContract, BatchService, InferenceInput, InferenceOutput};
 
 const MODEL_SCHEMA: &str = "vgo.raster-policy-value.onnx.v1";
 
@@ -130,6 +130,13 @@ impl OnnxBatchService {
 }
 
 impl BatchService for OnnxBatchService {
+    fn contract(&self) -> BatchContract {
+        BatchContract {
+            raster: self.raster,
+            maximum_batch: self.maximum_batch,
+        }
+    }
+
     fn infer(&mut self, batch: &[InferenceInput]) -> Result<Vec<InferenceOutput>, EvaluationError> {
         if batch.is_empty() || batch.len() > self.maximum_batch {
             return Err(EvaluationError::new(format!(

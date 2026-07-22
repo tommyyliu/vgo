@@ -1,15 +1,30 @@
-# Batched Inference Protocol
+# Inference Boundaries
 
 ## Ownership
 
 `vgo-search` defines an evaluator interface. A nonterminal node requests one
 player-relative value and a policy function; terminal nodes always use exact
-Rust scoring and never call a model. The built-in `NaiveEvaluator` preserves the
-original canary path, while `vgo-inference` implements the same interface with a
-long-lived Python subprocess.
+Rust scoring and never call a model. `vgo-inference` implements that interface
+with a shared broker over either native ONNX Runtime or a long-lived Python
+subprocess. The built-in `NaiveEvaluator` preserves the model-free canary.
 
-Rust owns rasterization, request IDs, batching, backpressure, and response
-routing. Python owns checkpoint loading and batched neural-network execution.
+Rust owns rasterization, request IDs, batching, backpressure, response routing,
+and production model execution. Python owns training and ONNX export. Its
+subprocess service is retained for output parity and transport benchmarks.
+
+## Native ONNX contract
+
+`OnnxBatchService` loads a model once in the Rust process and exposes the same
+`BatchService` contract as the Python backend. Before serving it validates the
+raster schema, channel count, spatial dimensions, dense policy size, maximum
+batch, tensor names, and source-checkpoint digest embedded by the exporter.
+CUDA and TensorRT are explicit providers; unavailable requested acceleration is
+an error rather than a CPU fallback.
+
+The current implementation passes a contiguous host tensor to ONNX Runtime and
+collects owned outputs. TensorRT engine and timing caches are separated by model
+digest, precision, raster shape, and maximum batch. Reusable pinned buffers and
+device I/O binding remain later throughput work.
 
 ## Transport
 
@@ -61,9 +76,9 @@ as evaluator errors; search never substitutes neutral predictions silently.
 
 Each actor rasterizes its position before submitting through a bounded
 synchronous channel. The broker takes the first encoded request, waits up to a
-short deadline for peers, caps the batch, performs one subprocess exchange, and
-returns each output to its waiting search thread. Encoding therefore scales
-with actors rather than occupying the single broker.
+short deadline for peers, caps the batch using the backend's declared contract,
+performs one service call, and returns each output to its waiting search thread.
+Encoding therefore scales with actors rather than occupying the single broker.
 
 The implementation exposes three independent contracts:
 
@@ -72,10 +87,10 @@ The implementation exposes three independent contracts:
 - `BatchExecutor` separates batch submission from completion, declares its slot
   capacity, and permits out-of-order completion by sequence number.
 
-The current subprocess is a capacity-one `BatchService`. A threaded executor
-adapter demonstrates the asynchronous contract; a future CUDA implementation
-can provide multiple pinned-memory/stream slots without changing actors,
-encoding, batching, or response routing.
+Both current backends are capacity-one `BatchService` implementations. A
+threaded executor adapter demonstrates the asynchronous contract; a future GPU
+implementation can provide multiple pinned-memory/stream slots without
+changing actors, encoding, batching, or response routing.
 
 Metrics count requests, batches, positions, maximum batch occupancy, failures,
 summed parallel encoding nanoseconds, total queue nanoseconds, and total
@@ -101,7 +116,7 @@ Raw metrics are retained in
 The parameterized release benchmark runs with:
 
 ```powershell
-cargo run --release -p vgo-inference --bin vgo-model-smoke -- `
+cargo run --release -p vgo-selfplay --bin vgo-model-smoke -- `
   --actors 64 --games 256 --simulations 8 `
   --maximum-batch 16 --delay-ms 1 --torch-threads 16
 ```
@@ -183,25 +198,27 @@ and batch 8 sustained 1,452 evaluations/s across 61,440 requests with no
 failures. Raw results are retained in
 [`../benchmarks/results/2026-07-21-raster-resolution-scaling.json`](../benchmarks/results/2026-07-21-raster-resolution-scaling.json).
 
-The current subprocess path performs several avoidable copies around the one
-necessary host-to-device transfer: it materializes a byte frame, crosses an OS
-pipe, copies each payload into a NumPy batch, copies pageable host memory to the
-GPU, and mirrors the process for outputs. An in-process ONNX executor should use
-reusable pinned input/output slabs and I/O binding. Initially, individual actor
-rasters still require one host gather into the contiguous input slab. A later
-batched raster encoder can write directly into assigned slab rows, leaving one
-asynchronous host-to-device transfer and one device-to-host transfer per batch.
-`vgo-raster::rasterize_into` provides the caller-owned destination required for
-that direct-write path.
+The subprocess path performs several avoidable copies around the one necessary
+host-to-device transfer: it materializes a byte frame, crosses an OS pipe,
+copies into NumPy, and uses pageable host memory. The native ONNX/TensorRT path
+removes Python and pipe overhead. At 128x128 and batch 16 it sustained 5,732
+positions/s in isolation and 4,109 evaluations/s through 64 self-play actors,
+2.83 times the prior subprocess result. Raw data is retained in
+[`../benchmarks/results/2026-07-21-onnx-tensorrt.json`](../benchmarks/results/2026-07-21-onnx-tensorrt.json).
+
+The native path still gathers actor rasters into a contiguous host tensor and
+returns owned output tensors. Reusable pinned input/output slabs and I/O binding
+would leave one asynchronous host-to-device and device-to-host transfer per
+batch. `vgo-raster::rasterize_into` provides the caller-owned destination needed
+for direct writes into assigned slab rows.
 
 ## Remaining production work
 
-- Add an explicit startup handshake carrying schema and model versions.
-- Support checkpoint replacement only at a documented actor synchronization
-  point.
-- Implement a two-slot pinned-memory CUDA executor and overlap service transfer,
-  execution, and response work.
-- Evaluate shared memory or another bulk local transport after pipelining.
-- Benchmark larger models across batch windows and actor counts.
-- Move immutable trajectory writing from the demo generator into self-play.
-- Attach per-game model versions and protocol failures to replay metadata.
+- Write immutable, checksummed trajectory shards from the shared playout.
+- Pin a model digest for each generation and attach it to replay metadata.
+- Publish checkpoint replacement only between generation or arena runs.
+- Implement pinned reusable slabs and I/O binding before adding multiple GPU
+  execution slots.
+- Benchmark the learned production model across batch windows and actor counts.
+- Retain the Python protocol as a parity oracle; optimize it only if a measured
+  workflow still depends on it.

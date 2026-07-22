@@ -15,7 +15,7 @@ Status values:
 
 | ID | Ticket | Priority | Owner | Status |
 | --- | --- | --- | --- | --- |
-| 001 | [Robust capture comparison](001-robust-capture-comparison.md) | High | Developer | Open |
+| 001 | [Robust capture comparison](001-robust-capture-comparison.md) | High | Developer | Resolved |
 | 002 | [Validate setup positions](002-validate-setup-positions.md) | High | Developer | Done |
 | 003 | [Restore setup state on Undo](003-restore-setup-state-on-undo.md) | Medium | Developer | Done |
 | 004 | [Permanent rule regression suite](004-rule-regression-suite.md) | High | Developer | In progress |

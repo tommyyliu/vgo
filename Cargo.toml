@@ -14,6 +14,9 @@ edition = "2024"
 license = "MIT"
 rust-version = "1.97"
 
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+
 [profile.release]
 codegen-units = 1
 lto = "thin"

@@ -68,6 +68,23 @@
     assert(VGO.legalSet.contains(value, 0.1, 0.1), 'a disk tangent to two board edges should fit');
   });
 
+  test('capture boundary comparison is strict and robust', function () {
+    const escape = VGO.numeric.strictlyCloser(0, 0, 1 - 5e-8, 0, 1, 0);
+    const capture = VGO.numeric.strictlyCloser(0, 0, 1 + 5e-8, 0, 1, 0);
+    const oneUlpEscape = VGO.numeric.strictlyCloser(0, 0, 1 - Number.EPSILON / 2, 0, 1, 0);
+    const oneUlpCapture = VGO.numeric.strictlyCloser(0, 0, 1 + Number.EPSILON, 0, 1, 0);
+    const tie = VGO.numeric.strictlyCloser(0.25, 0.25, 0.75, 0.75, 0.75, 0.75);
+    assert(escape.isStrictlyLess, 'an escape inside the former deadband was rejected');
+    assert(!capture.isStrictlyLess, 'a candidate beyond the threshold was accepted');
+    assert(oneUlpEscape.isStrictlyLess && oneUlpEscape.usedExactFallback,
+      'the exact fallback lost a one-ULP escape');
+    assert(!oneUlpCapture.isStrictlyLess && oneUlpCapture.usedExactFallback,
+      'the exact fallback accepted a one-ULP capture');
+    assert(!tie.isStrictlyLess, 'an exact tie transferred positive area');
+    assert(tie.usedExactFallback, 'an indeterminate tie skipped the exact fallback');
+    assert(escape.errorBound > 0 && tie.errorBound > 0, 'comparison error was not bounded');
+  });
+
   test('setup validation distinguishes invalid, tangent, and valid diagrams', function () {
     const outside = position([{ x:0.02, y:0.5, c:'B' }], { radius:0.1 });
     const duplicate = position([{ x:0.5, y:0.5, c:'B' }, { x:0.5, y:0.5, c:'W' }]);

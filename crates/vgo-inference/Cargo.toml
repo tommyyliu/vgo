@@ -16,10 +16,6 @@ vgo-search = { path = "../vgo-search" }
 path = "src/lib.rs"
 
 [[bin]]
-name = "vgo-model-smoke"
-path = "src/bin/model_smoke.rs"
-
-[[bin]]
 name = "vgo-stage-bench"
 path = "src/bin/stage_bench.rs"
 

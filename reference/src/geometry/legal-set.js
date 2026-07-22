@@ -84,14 +84,12 @@
     return result;
   }
 
-  function distance(position, x, y, knownVertices) {
-    if (contains(position, x, y)) return 0;
+  function visitCandidates(position, x, y, knownVertices, visit) {
+    if (contains(position, x, y) && visit(x, y)) return true;
     const r = position.radius;
     const diameter = 2 * r;
-    let best = Infinity;
 
-    for (let i = 0; i < position.stones.length; i++) {
-      const stone = position.stones[i];
+    for (const stone of position.stones) {
       const dx = x - stone.x, dy = y - stone.y;
       const radialDistance = Math.hypot(dx, dy);
       const directions = radialDistance < N.edgeEpsilon
@@ -100,23 +98,42 @@
       for (const direction of directions) {
         const candidateX = stone.x + diameter * direction[0];
         const candidateY = stone.y + diameter * direction[1];
-        if (contains(position, candidateX, candidateY)) {
-          best = Math.min(best, Math.hypot(x - candidateX, y - candidateY));
+        if (contains(position, candidateX, candidateY) && visit(candidateX, candidateY)) {
+          return true;
         }
       }
     }
 
-    const feet = [[r, y], [1 - r, y], [x, r], [x, 1 - r]];
-    for (const foot of feet) {
-      if (contains(position, foot[0], foot[1])) {
-        best = Math.min(best, Math.hypot(x - foot[0], y - foot[1]));
+    for (const candidate of [[r, y], [1 - r, y], [x, r], [x, 1 - r]]) {
+      if (contains(position, candidate[0], candidate[1]) && visit(candidate[0], candidate[1])) {
+        return true;
       }
     }
-    const candidates = knownVertices || vertices(position);
-    for (const vertex of candidates) {
-      best = Math.min(best, Math.hypot(x - vertex[0], y - vertex[1]));
+    for (const candidate of knownVertices || vertices(position)) {
+      if (visit(candidate[0], candidate[1])) return true;
     }
+    return false;
+  }
+
+  function distance(position, x, y, knownVertices) {
+    let best = Infinity;
+    visitCandidates(position, x, y, knownVertices, function (candidateX, candidateY) {
+      best = Math.min(best, Math.hypot(x - candidateX, y - candidateY));
+      return false;
+    });
     return best;
+  }
+
+  function escapeWitness(position, vertexX, vertexY, stoneX, stoneY, knownVertices) {
+    let witness = null;
+    visitCandidates(position, vertexX, vertexY, knownVertices, function (x, y) {
+      if (N.strictlyCloser(vertexX, vertexY, x, y, stoneX, stoneY).isStrictlyLess) {
+        witness = [x, y];
+        return true;
+      }
+      return false;
+    });
+    return witness;
   }
 
   function nearest(position, x, y) {
@@ -162,6 +179,7 @@
     contains: contains,
     vertices: vertices,
     distance: distance,
+    escapeWitness: escapeWitness,
     nearest: nearest,
   });
 })(globalThis);

@@ -1,106 +1,78 @@
-# Next Milestone: Model Boundary Canary
+# Next Milestone: Closed Learning Loop
 
 ## Goal
 
-Replace the in-process naive evaluator with a versioned, batched model boundary
-without changing deterministic search behavior. Rust continues to own games,
-candidate generation, MCTS, and replay production. Python receives tensors and
-candidate features, returns policy/value predictions, and can train from replay
-files without importing the Rust simulator.
-
-This milestone validates the system boundary before model quality becomes a
-variable.
+Generate production self-play shards in Rust, train a checkpoint in Python,
+export it to ONNX, and measure the candidate model against the incumbent in a
+held-out Rust arena. The first quality gate is modest: on the radius-`1/6`
+canary, a trained model should beat the naive spread evaluator under equal
+search budgets.
 
 ## Completed foundation
 
-- The player-relative ten-channel contract and scalar pixel-center rasterizer
-  are implemented in `vgo-raster`.
-- RGB overview and per-channel diagnostics are derived from the tensor itself.
-- Version 2 demo shards carry raster states, dense policy targets, sampled-pixel
-  masks, and current-player terminal values.
-- Python loads the Rust format without a simulator dependency, and a 59,555
-  parameter residual CNN successfully fits the first 96-sample canary.
+- Rust owns exact gameplay, a canonical whole-game playout, deterministic
+  progressive-widening MCTS, and parallel actors.
+- The ten-channel 128x128 semantic raster and dense pixel policy contract are
+  frozen and inspectable as RGB diagnostics.
+- Python can load Rust demo data, train the residual policy/value network, and
+  export a self-describing dynamic-batch ONNX graph.
+- Rust validates and executes that graph in-process through ONNX Runtime with
+  CUDA or TensorRT, while the Python subprocess remains available for parity.
+- The batching broker derives raster and batch limits from the selected backend
+  and rejects malformed or mismatched outputs.
 
-See [`RASTER_REPRESENTATION.md`](RASTER_REPRESENTATION.md) for the frozen state
-and policy-grid semantics. The remaining work in this milestone is production
-batching, transport, broader fixtures, and integration into MCTS.
+## 1. Production replay shards
 
-## 1. Freeze the model contract
+Move trajectory output from the demo writer into a generation runner. Shards
+must be immutable and atomic, with a versioned header, model digest, checksums,
+search configuration, seeds, per-ply masks/visits/actions, terminal utility, and
+enough position identity to audit repetition handling. Interrupted shards must
+be detectable and safely ignored.
 
-Write a versioned schema covering:
+## 2. Replay sampler and trainer
 
-- player-relative board tensors, dimensions, channels, dtypes, and coordinate
-  orientation;
-- dense placement logits on the raster grid plus one pass logit;
-- sampled candidate pixels and masks used to gather inference logits and define
-  training normalization;
-- value on a documented current-player `[-1, 1]` utility scale;
-- request IDs, model version, and explicit error responses.
+Load many shards without a Rust extension. Define train/validation separation,
+uniform position sampling as the baseline, bounded replay retention, and metrics
+for policy loss on sampled actions, value calibration, and held-out agreement.
+Sampling policy belongs in Python and must be recorded in training metadata.
 
-Keep schema semantics independent of transport so local pipes can later become
-shared memory without changing the model API.
+## 3. Checkpoint publication
 
-## 2. Build the Rust encoder
+Train to a temporary `.pt` path, export and validate ONNX, then publish the model
+and manifest atomically. A generation run pins one model digest for its entire
+lifetime. Workers never observe a partially written or mid-game replacement.
 
-Implement scalar CPU reference encoding first, with a batch-oriented public API.
-Use analytic geometry at pixel centers rather than rendering APIs. Add golden
-fixtures for empty, boundary-heavy, capture, self-capture, and finished states,
-including checksums and symmetry tests.
+## 4. Iteration driver
 
-Benchmark positions per second across candidate raster sizes and batch sizes.
-Choose the initial resolution from measured cost and information loss rather
-than assuming one upfront.
+Add an explicit driver for:
 
-## 3. Add an evaluator abstraction and broker - complete
+```text
+generate -> validate replay -> train -> export -> smoke -> arena -> accept/reject
+```
 
-Make MCTS depend on an evaluator trait rather than the current hard-coded
-policy/value functions. Implement:
+Each stage consumes immutable inputs and writes a machine-readable result. A
+failed stage leaves the incumbent and prior replay usable.
 
-- an in-process naive evaluator preserving today's behavior;
-- a deterministic fake batched evaluator for broker tests;
-- a broker that batches requests by size or a short latency deadline, applies
-  backpressure, and routes responses by request ID.
+## 5. Held-out arena
 
-Keep search randomness derived from game and position seeds, never request
-arrival order.
-
-## 4. Connect the Python service - boundary complete
-
-Create a small service with no simulator dependency. Its first implementation
-reproduces the naive spread logits and neutral nonterminal value from supplied
-features. Compare its outputs and selected root actions against the in-process
-evaluator on fixed fixtures and games.
-
-The offline raster policy/value network already exists. Only after service
-parity is established should its outputs replace the naive evaluator in search.
-
-## 5. Write auditable replay shards
-
-Rust writes immutable shards containing encoded tensors, candidate features,
-root visits, selected action, player perspective, terminal outcome, search
-budget, seed, schema version, and model version. Python validates and loads a
-shard using only its training dependencies.
-
-Retain enough raw position data and checksums to diagnose encoder changes, but
-do not require Python to reconstruct game rules.
+Compare candidate and incumbent with color-swapped games, fixed unseen seeds,
+equal simulations, and confidence intervals. Keep the existing 1000-vs-10
+naive canary as an engine/search regression; it is separate from model
+promotion.
 
 ## Acceptance gate
 
-- [x] Direct Python and framed-service checkpoint outputs match.
-- [x] Out-of-order response IDs route to the correct callers.
-- [x] At least 16 concurrent actors complete games without deadlock or mismatched
-  responses.
-- [x] Broker metrics report queue and combined transport/evaluation time.
-- [ ] Split encoding, transport, and model execution into separate timings.
-- [x] Python loads a Rust-written demo shard and verifies shapes, masks, and
-  offsets without a Rust extension.
-- [ ] Add shard checksums and production self-play trajectory metadata.
-- [x] The existing 1000-vs-10 canary remains above its acceptance threshold through
-  the in-process evaluator path.
+- [ ] Rust writes checksummed, atomic replay shards with model and search
+  provenance.
+- [ ] Python validates and trains from multiple shards without simulator code.
+- [ ] Exported ONNX output matches the source checkpoint on held-out examples.
+- [ ] One command completes generation through arena evaluation and emits a
+  reproducible run manifest.
+- [ ] The first trained candidate beats the naive evaluator at equal search
+  budgets on held-out seeds.
+- [ ] Existing Rust, browser, inference-parity, and 1000-vs-10 canaries remain
+  green.
 
-## Following milestone
-
-Run a closed learning loop on the radius-`1/6` board scale. Its acceptance test
-is that a trained checkpoint beats the naive evaluator under equal search
-budgets, with a held-out arena rather than training-set fit as the decision
-metric.
+Pipelined GPU slots, pinned I/O binding, richer replay prioritization, and model
+promotion against a learned incumbent follow measurement of this simple closed
+loop.

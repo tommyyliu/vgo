@@ -1,19 +1,20 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::HashSet,
-    env,
+    convert::Infallible,
     fs::{self, File},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
 };
 
-use vgo_core::{Color, Phase, Position};
+use clap::Parser;
+use vgo_core::{Color, Position};
 use vgo_raster::{
     CHANNEL_COUNT, CHANNELS, DATASET_MAGIC, DATASET_VERSION, RasterConfig, SemanticRaster,
     action_pixel, rasterize,
 };
 use vgo_search::{Action, SearchConfig, SearchResult, search};
+use vgo_selfplay::play_game as run_playout;
 
 struct PendingSample {
     raster: SemanticRaster,
@@ -29,24 +30,25 @@ struct LabeledSample {
     value: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Parser)]
+#[command(about = "Generate a labeled semantic-raster dataset from self-play")]
 struct Config {
+    #[arg(long, default_value_t = 96)]
     samples: usize,
+    #[arg(long, default_value_t = 128)]
     resolution: usize,
+    #[arg(long, default_value_t = 100)]
     simulations: u32,
+    #[arg(long = "max-plies", default_value_t = 48)]
     maximum_plies: u32,
+    #[arg(long, default_value_t = 1.0 / 6.0)]
     radius: f64,
+    #[arg(long, default_value_t = 50_001)]
     seed: u64,
+    #[arg(long, default_value_t = 4)]
     examples: usize,
+    #[arg(long, default_value = "artifacts/raster-demo")]
     output: PathBuf,
-}
-
-fn parse_value<T: std::str::FromStr>(arguments: &[String], name: &str, default: T) -> T {
-    arguments
-        .windows(2)
-        .find(|pair| pair[0] == name)
-        .and_then(|pair| pair[1].parse().ok())
-        .unwrap_or(default)
 }
 
 fn policy_target(result: &SearchResult, config: RasterConfig) -> (Vec<f32>, Vec<f32>) {
@@ -68,55 +70,6 @@ fn policy_target(result: &SearchResult, config: RasterConfig) -> (Vec<f32>, Vec<
     (policy, policy_mask)
 }
 
-fn hash_word(mut hash: u64, word: u64) -> u64 {
-    for byte in word.to_le_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-fn position_hash(position: &Position) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325;
-    hash = hash_word(hash, position.radius().to_bits());
-    hash = hash_word(hash, u64::from(position.consecutive_passes()));
-    hash = hash_word(hash, u64::from(position.to_move() == Color::White));
-    let mut stones = position
-        .stones()
-        .iter()
-        .map(|stone| {
-            (
-                stone.x.to_bits(),
-                stone.y.to_bits(),
-                u64::from(stone.color == Color::White),
-            )
-        })
-        .collect::<Vec<_>>();
-    stones.sort_unstable();
-    for (x, y, color) in stones {
-        hash = hash_word(hash, x);
-        hash = hash_word(hash, y);
-        hash = hash_word(hash, color);
-    }
-    hash
-}
-
-fn choose_unseen(
-    position: &Position,
-    result: &SearchResult,
-    seen: &HashSet<u64>,
-) -> vgo_core::MoveResult {
-    for action in result.actions_by_preference(position.to_move()) {
-        let transition = action.apply(position);
-        if transition.position.phase() == Phase::Finished
-            || !seen.contains(&position_hash(&transition.position))
-        {
-            return transition;
-        }
-    }
-    Action::Pass.apply(position)
-}
-
 fn generate(config: &Config) -> (Vec<LabeledSample>, usize, usize) {
     let raster_config = RasterConfig::square(config.resolution);
     let mut samples = Vec::with_capacity(config.samples);
@@ -127,35 +80,31 @@ fn generate(config: &Config) -> (Vec<LabeledSample>, usize, usize) {
     while samples.len() < config.samples {
         let game_seed = config.seed.wrapping_add(game_index);
         game_index += 1;
-        let mut position = Position::new(config.radius, Vec::new(), Color::Black);
-        let mut seen = HashSet::new();
-        seen.insert(position_hash(&position));
         let mut pending = Vec::new();
-        let mut terminal_black_value = None;
+        let playout = run_playout(
+            Position::new(config.radius, Vec::new(), Color::Black),
+            config.maximum_plies,
+            |position, _ply| {
+                Ok::<_, Infallible>(search(
+                    position,
+                    SearchConfig::canary(config.simulations),
+                    game_seed,
+                ))
+            },
+            |step| {
+                let (policy, policy_mask) = policy_target(step.search, raster_config);
+                pending.push(PendingSample {
+                    raster: rasterize(step.position, raster_config),
+                    policy,
+                    policy_mask,
+                    to_move: step.position.to_move(),
+                });
+            },
+        )
+        .expect("infallible search");
 
-        for _ in 0..config.maximum_plies {
-            let result = search(
-                &position,
-                SearchConfig::canary(config.simulations),
-                game_seed,
-            );
-            let (policy, policy_mask) = policy_target(&result, raster_config);
-            pending.push(PendingSample {
-                raster: rasterize(&position, raster_config),
-                policy,
-                policy_mask,
-                to_move: position.to_move(),
-            });
-            let transition = choose_unseen(&position, &result, &seen);
-            position = transition.position;
-            if position.phase() == Phase::Finished {
-                terminal_black_value = Some(transition.analysis.outcome.black_utility() as f32);
-                break;
-            }
-            seen.insert(position_hash(&position));
-        }
-
-        if let Some(black_value) = terminal_black_value {
+        if let Some(outcome) = playout.outcome {
+            let black_value = outcome.black_utility() as f32;
             completed_games += 1;
             for sample in pending {
                 let value = if sample.to_move == Color::Black {
@@ -331,22 +280,26 @@ fn write_examples(
     Ok(())
 }
 
+fn write_json_string(writer: &mut impl Write, value: &str) -> std::io::Result<()> {
+    writer.write_all(b"\"")?;
+    for character in value.chars() {
+        match character {
+            '"' => writer.write_all(b"\\\"")?,
+            '\\' => writer.write_all(b"\\\\")?,
+            '\u{08}' => writer.write_all(b"\\b")?,
+            '\u{0c}' => writer.write_all(b"\\f")?,
+            '\n' => writer.write_all(b"\\n")?,
+            '\r' => writer.write_all(b"\\r")?,
+            '\t' => writer.write_all(b"\\t")?,
+            control if control <= '\u{1f}' => write!(writer, "\\u{:04x}", control as u32)?,
+            ordinary => write!(writer, "{ordinary}")?,
+        }
+    }
+    writer.write_all(b"\"")
+}
+
 fn main() -> std::io::Result<()> {
-    let arguments = env::args().collect::<Vec<_>>();
-    let config = Config {
-        samples: parse_value(&arguments, "--samples", 96),
-        resolution: parse_value(&arguments, "--resolution", 128),
-        simulations: parse_value(&arguments, "--simulations", 100),
-        maximum_plies: parse_value(&arguments, "--max-plies", 48),
-        radius: parse_value(&arguments, "--radius", 1.0 / 6.0),
-        seed: parse_value(&arguments, "--seed", 50_001),
-        examples: parse_value(&arguments, "--examples", 4),
-        output: PathBuf::from(parse_value(
-            &arguments,
-            "--output",
-            String::from("artifacts/raster-demo"),
-        )),
-    };
+    let config = Config::parse();
     assert!(config.samples > 0);
     assert!(config.resolution > 0);
     assert!(config.simulations > 0);
@@ -357,10 +310,14 @@ fn main() -> std::io::Result<()> {
     write_dataset(&dataset_path, &samples)?;
     write_manifest(&config.output.join("manifest.json"), &config, &samples)?;
     write_examples(&config.output.join("images"), &samples, config.examples)?;
-    println!(
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    write!(output, "{{\n  \"dataset\": ")?;
+    write_json_string(&mut output, &dataset_path.to_string_lossy())?;
+    writeln!(
+        output,
         concat!(
-            "{{\n",
-            "  \"dataset\": \"{}\",\n",
+            ",\n",
             "  \"samples\": {},\n",
             "  \"completed_games\": {},\n",
             "  \"discarded_games\": {},\n",
@@ -370,7 +327,6 @@ fn main() -> std::io::Result<()> {
             "  \"examples\": {}\n",
             "}}"
         ),
-        dataset_path.display(),
         samples.len(),
         completed_games,
         discarded_games,
@@ -378,6 +334,18 @@ fn main() -> std::io::Result<()> {
         config.resolution,
         config.resolution * config.resolution + 1,
         config.examples.min(samples.len()),
-    );
+    )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Config;
+
+    #[test]
+    fn malformed_cli_values_are_rejected() {
+        assert!(Config::try_parse_from(["vgo-generate-demo", "--resolution", "large"]).is_err());
+    }
 }

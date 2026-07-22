@@ -1,8 +1,6 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::HashSet,
-    env,
     mem::size_of,
     path::PathBuf,
     sync::{
@@ -13,13 +11,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use vgo_core::{Color, Phase, Point, Position};
+use clap::{ArgAction, Parser};
+use vgo_core::{Color, Point, Position};
 use vgo_inference::{
     BatchedEvaluator, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
     PythonBatchService, PythonProcessConfig, TorchDevice,
 };
 use vgo_raster::RasterConfig;
 use vgo_search::{Action, EvaluationError, Evaluator, SearchConfig, search_with_evaluator};
+use vgo_selfplay::play_game as run_playout;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InferenceRuntime {
@@ -48,56 +48,54 @@ impl std::str::FromStr for InferenceRuntime {
     }
 }
 
-fn path_argument(arguments: &[String], name: &str, default: PathBuf) -> PathBuf {
-    arguments
-        .windows(2)
-        .find(|pair| pair[0] == name)
-        .map_or(default, |pair| PathBuf::from(&pair[1]))
+#[derive(Debug, Parser)]
+struct Arguments {
+    #[arg(long, default_value = "training/.venv/Scripts/python.exe")]
+    python: PathBuf,
+    #[arg(long, default_value = "training")]
+    training: PathBuf,
+    #[arg(long, default_value = "artifacts/raster-demo/model.pt")]
+    checkpoint: PathBuf,
+    #[arg(long, default_value = "artifacts/raster-demo/model.onnx")]
+    model: PathBuf,
+    #[arg(long, default_value = "python")]
+    runtime: InferenceRuntime,
+    #[arg(long, default_value = "tensorrt")]
+    provider: OnnxProvider,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    fp16: bool,
+    #[arg(long, default_value_t = 64)]
+    actors: usize,
+    #[arg(long)]
+    games: Option<usize>,
+    #[arg(long, default_value_t = 8)]
+    simulations: u32,
+    #[arg(long = "max-plies", default_value_t = 48)]
+    maximum_plies: u32,
+    #[arg(long, default_value_t = 8)]
+    maximum_batch: usize,
+    #[arg(long, default_value_t = 1)]
+    delay_ms: u64,
+    #[arg(long, default_value_t = 1)]
+    torch_threads: usize,
+    #[arg(long, default_value = "cuda")]
+    device: TorchDevice,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    compile: bool,
+    #[arg(long, default_value_t = 1)]
+    probe_requests: usize,
+    #[arg(long, default_value_t = 128)]
+    resolution: usize,
+    #[arg(long, default_value_t = 1.0 / 6.0)]
+    radius: f64,
 }
 
-fn value_argument<T>(arguments: &[String], name: &str, default: T) -> Result<T, String>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    let Some(pair) = arguments.windows(2).find(|pair| pair[0] == name) else {
-        return Ok(default);
-    };
-    pair[1]
-        .parse()
-        .map_err(|error| format!("invalid value for {name}: {error}"))
-}
-
-fn hash_word(mut hash: u64, word: u64) -> u64 {
-    for byte in word.to_le_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+fn rooted(root: &std::path::Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
     }
-    hash
-}
-
-fn position_hash(position: &Position) -> u64 {
-    let mut hash = hash_word(0xcbf2_9ce4_8422_2325, position.radius().to_bits());
-    hash = hash_word(hash, u64::from(position.consecutive_passes()));
-    hash = hash_word(hash, u64::from(position.to_move() == Color::White));
-    let mut stones = position
-        .stones()
-        .iter()
-        .map(|stone| {
-            (
-                stone.x.to_bits(),
-                stone.y.to_bits(),
-                u64::from(stone.color == Color::White),
-            )
-        })
-        .collect::<Vec<_>>();
-    stones.sort_unstable();
-    for (x, y, color) in stones {
-        hash = hash_word(hash, x);
-        hash = hash_word(hash, y);
-        hash = hash_word(hash, color);
-    }
-    hash
 }
 
 fn play_model_game(
@@ -107,70 +105,39 @@ fn play_model_game(
     maximum_plies: u32,
     radius: f64,
 ) -> Result<(bool, u32), EvaluationError> {
-    let mut position = Position::new(radius, Vec::new(), Color::Black);
-    let mut seen = HashSet::new();
-    seen.insert(position_hash(&position));
-    for ply in 0..maximum_plies {
-        let result = search_with_evaluator(
-            &position,
-            SearchConfig::canary(simulations),
-            seed,
-            evaluator,
-        )?;
-        let mut selected = None;
-        for action in result.actions_by_preference(position.to_move()) {
-            let transition = action.apply(&position);
-            if transition.position.phase() == Phase::Finished
-                || !seen.contains(&position_hash(&transition.position))
-            {
-                selected = Some(transition);
-                break;
-            }
-        }
-        let transition = selected.unwrap_or_else(|| Action::Pass.apply(&position));
-        position = transition.position;
-        if position.phase() == Phase::Finished {
-            return Ok((true, ply + 1));
-        }
-        seen.insert(position_hash(&position));
-    }
-    Ok((false, maximum_plies))
+    let report = run_playout(
+        Position::new(radius, Vec::new(), Color::Black),
+        maximum_plies,
+        |position, _| {
+            search_with_evaluator(position, SearchConfig::canary(simulations), seed, evaluator)
+        },
+        |_| {},
+    )?;
+    Ok((report.completed(), report.stats.plies))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let arguments = env::args().collect::<Vec<_>>();
-    let root = env::current_dir()?;
-    let python = path_argument(
-        &arguments,
-        "--python",
-        root.join("training/.venv/Scripts/python.exe"),
-    );
-    let working_directory = path_argument(&arguments, "--training", root.join("training"));
-    let checkpoint = path_argument(
-        &arguments,
-        "--checkpoint",
-        root.join("artifacts/raster-demo/model.pt"),
-    );
-    let model = path_argument(
-        &arguments,
-        "--model",
-        root.join("artifacts/raster-demo/model.onnx"),
-    );
-    let runtime = value_argument(&arguments, "--runtime", InferenceRuntime::Python)?;
-    let provider = value_argument(&arguments, "--provider", OnnxProvider::TensorRt)?;
-    let fp16 = value_argument(&arguments, "--fp16", true)?;
-    let actors = value_argument(&arguments, "--actors", 64_usize)?;
-    let games = value_argument(&arguments, "--games", actors.saturating_mul(8))?;
-    let simulations = value_argument(&arguments, "--simulations", 8_u32)?;
-    let maximum_plies = value_argument(&arguments, "--max-plies", 48_u32)?;
-    let maximum_batch = value_argument(&arguments, "--maximum-batch", 8_usize)?;
-    let maximum_delay_ms = value_argument(&arguments, "--delay-ms", 1_u64)?;
-    let torch_threads = value_argument(&arguments, "--torch-threads", 1_usize)?;
-    let device = value_argument(&arguments, "--device", TorchDevice::Cuda)?;
-    let compile = value_argument(&arguments, "--compile", true)?;
-    let probe_requests = value_argument(&arguments, "--probe-requests", 1_usize)?;
-    let resolution = value_argument(&arguments, "--resolution", 128_usize)?;
-    let radius = value_argument(&arguments, "--radius", 1.0 / 6.0)?;
+    let arguments = Arguments::parse();
+    let root = std::env::current_dir()?;
+    let python = rooted(&root, arguments.python);
+    let working_directory = rooted(&root, arguments.training);
+    let checkpoint = rooted(&root, arguments.checkpoint);
+    let model = rooted(&root, arguments.model);
+    let runtime = arguments.runtime;
+    let provider = arguments.provider;
+    let fp16 = arguments.fp16;
+    let actors = arguments.actors;
+    let games = arguments.games.unwrap_or_else(|| actors.saturating_mul(8));
+    let simulations = arguments.simulations;
+    let maximum_plies = arguments.maximum_plies;
+    let maximum_batch = arguments.maximum_batch;
+    let maximum_delay_ms = arguments.delay_ms;
+    let torch_threads = arguments.torch_threads;
+    let device = arguments.device;
+    let compile = arguments.compile;
+    let probe_requests = arguments.probe_requests;
+    let resolution = arguments.resolution;
+    let radius = arguments.radius;
     if actors == 0
         || games == 0
         || simulations == 0
@@ -186,8 +153,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let raster = RasterConfig::square(resolution);
     let broker = BrokerConfig {
-        raster,
-        maximum_batch,
         maximum_delay: Duration::from_millis(maximum_delay_ms),
         queue_capacity: (actors * 4).max(maximum_batch * 2),
     };
@@ -199,8 +164,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 checkpoint,
                 raster,
                 maximum_batch,
-                maximum_delay: broker.maximum_delay,
-                queue_capacity: broker.queue_capacity,
                 torch_threads,
                 device,
                 compile,

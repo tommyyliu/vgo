@@ -1,10 +1,4 @@
-use std::{
-    env,
-    hint::black_box,
-    path::PathBuf,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{env, hint::black_box, path::PathBuf, thread, time::Instant};
 
 use vgo_core::{Color, Position, Stone};
 use vgo_inference::{
@@ -188,8 +182,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         checkpoint,
         raster: raster_config,
         maximum_batch: batch,
-        maximum_delay: Duration::ZERO,
-        queue_capacity: batch * 2,
         torch_threads: 1,
         device,
         compile,

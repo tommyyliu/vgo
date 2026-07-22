@@ -6,9 +6,23 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+clap.workspace = true
 vgo-core = { path = "../vgo-core" }
+vgo-inference = { path = "../vgo-inference" }
+vgo-raster = { path = "../vgo-raster" }
 vgo-search = { path = "../vgo-search" }
+
+[lib]
+path = "src/lib.rs"
 
 [[bin]]
 name = "vgo-canary"
 path = "src/main.rs"
+
+[[bin]]
+name = "vgo-model-smoke"
+path = "src/model_smoke.rs"
+
+[[bin]]
+name = "vgo-generate-demo"
+path = "src/generate_demo.rs"

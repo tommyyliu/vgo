@@ -60,40 +60,33 @@ pub struct PythonProcessConfig {
     pub checkpoint: PathBuf,
     pub raster: RasterConfig,
     pub maximum_batch: usize,
-    pub maximum_delay: Duration,
-    pub queue_capacity: usize,
     pub torch_threads: usize,
     pub device: TorchDevice,
     pub compile: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchContract {
+    pub raster: RasterConfig,
+    pub maximum_batch: usize,
+}
+
 pub trait BatchService: Send {
+    fn contract(&self) -> BatchContract;
     fn infer(&mut self, batch: &[InferenceInput]) -> Result<Vec<InferenceOutput>, EvaluationError>;
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct BrokerConfig {
-    pub raster: RasterConfig,
-    pub maximum_batch: usize,
     pub maximum_delay: Duration,
     pub queue_capacity: usize,
-}
-
-impl From<&PythonProcessConfig> for BrokerConfig {
-    fn from(config: &PythonProcessConfig) -> Self {
-        Self {
-            raster: config.raster,
-            maximum_batch: config.maximum_batch,
-            maximum_delay: config.maximum_delay,
-            queue_capacity: config.queue_capacity,
-        }
-    }
 }
 
 pub struct PythonBatchService {
     child: Child,
     writer: Option<BufWriter<ChildStdin>>,
     reader: BufReader<ChildStdout>,
+    contract: BatchContract,
 }
 
 impl PythonBatchService {
@@ -143,11 +136,19 @@ impl PythonBatchService {
             child,
             writer: Some(BufWriter::new(stdin)),
             reader: BufReader::new(stdout),
+            contract: BatchContract {
+                raster: config.raster,
+                maximum_batch: config.maximum_batch,
+            },
         })
     }
 }
 
 impl BatchService for PythonBatchService {
+    fn contract(&self) -> BatchContract {
+        self.contract
+    }
+
     fn infer(&mut self, batch: &[InferenceInput]) -> Result<Vec<InferenceOutput>, EvaluationError> {
         let frame = encode_request_frame(batch)?;
         let writer = self
@@ -239,18 +240,23 @@ impl BatchedEvaluator {
         config: BrokerConfig,
         service: impl BatchService + 'static,
     ) -> Result<Self, EvaluationError> {
-        if config.maximum_batch == 0 || config.queue_capacity == 0 {
+        if config.queue_capacity == 0 {
+            return Err(EvaluationError::new("queue capacity must be positive"));
+        }
+        let contract = service.contract();
+        if contract.maximum_batch == 0 || contract.raster.width == 0 || contract.raster.height == 0
+        {
             return Err(EvaluationError::new(
-                "batch size and queue capacity must be positive",
+                "inference service contract dimensions must be positive",
             ));
         }
         let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
         let metrics = Arc::new(AtomicMetrics::default());
         let broker_metrics = Arc::clone(&metrics);
-        let raster = config.raster;
+        let raster = contract.raster;
         let join = thread::Builder::new()
             .name(String::from("vgo-inference-broker"))
-            .spawn(move || run_broker(config, service, receiver, broker_metrics))
+            .spawn(move || run_broker(config, contract, service, receiver, broker_metrics))
             .map_err(|error| EvaluationError::new(format!("start inference broker: {error}")))?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -304,31 +310,6 @@ impl Evaluator for BatchedEvaluator {
     }
 }
 
-#[derive(Clone)]
-pub struct PythonEvaluator {
-    evaluator: BatchedEvaluator,
-}
-
-impl PythonEvaluator {
-    pub fn spawn(config: PythonProcessConfig) -> Result<Self, EvaluationError> {
-        let service = PythonBatchService::spawn(&config)?;
-        Ok(Self {
-            evaluator: BatchedEvaluator::spawn(BrokerConfig::from(&config), service)?,
-        })
-    }
-
-    #[must_use]
-    pub fn metrics(&self) -> BrokerMetrics {
-        self.evaluator.metrics()
-    }
-}
-
-impl Evaluator for PythonEvaluator {
-    fn evaluate(&self, position: &Position) -> Result<Evaluation, EvaluationError> {
-        self.evaluator.evaluate(position)
-    }
-}
-
 struct DensePolicy {
     config: RasterConfig,
     logits: Vec<f32>,
@@ -346,15 +327,16 @@ impl Policy for DensePolicy {
 
 fn run_broker(
     config: BrokerConfig,
+    contract: BatchContract,
     mut service: impl BatchService,
     receiver: Receiver<Request>,
     metrics: Arc<AtomicMetrics>,
 ) {
     while let Ok(first) = receiver.recv() {
-        let mut batch = Vec::with_capacity(config.maximum_batch);
+        let mut batch = Vec::with_capacity(contract.maximum_batch);
         batch.push(first);
         let deadline = Instant::now() + config.maximum_delay;
-        while batch.len() < config.maximum_batch {
+        while batch.len() < contract.maximum_batch {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 break;
             };
@@ -440,6 +422,13 @@ mod tests {
     }
 
     impl BatchService for ConstantService {
+        fn contract(&self) -> BatchContract {
+            BatchContract {
+                raster: RasterConfig::square(2),
+                maximum_batch: 2,
+            }
+        }
+
         fn infer(
             &mut self,
             batch: &[InferenceInput],
@@ -455,8 +444,6 @@ mod tests {
 
     fn broker_config() -> BrokerConfig {
         BrokerConfig {
-            raster: RasterConfig::square(2),
-            maximum_batch: 2,
             maximum_delay: Duration::ZERO,
             queue_capacity: 2,
         }

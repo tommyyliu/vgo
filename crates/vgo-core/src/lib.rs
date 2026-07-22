@@ -14,5 +14,5 @@ pub use legal_set::{
     vertices as legal_set_vertices,
 };
 pub use model::{Color, Phase, Position, Stone, Validation, ValidationIssue};
-pub use numeric::{CAPTURE_MARGIN, COORDINATE_EPSILON};
+pub use numeric::COORDINATE_EPSILON;
 pub use voronoi::{Cell, Edge, EdgeSource, Geometry, Point};

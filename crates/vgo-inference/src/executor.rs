@@ -161,12 +161,19 @@ mod tests {
     use vgo_raster::{RasterConfig, rasterize};
 
     use super::{BatchExecutor, InferenceBatch, ThreadedBatchExecutor};
-    use crate::{BatchService, InferenceInput, InferenceOutput};
+    use crate::{BatchContract, BatchService, InferenceInput, InferenceOutput};
     use vgo_search::EvaluationError;
 
     struct EchoService;
 
     impl BatchService for EchoService {
+        fn contract(&self) -> BatchContract {
+            BatchContract {
+                raster: RasterConfig::square(2),
+                maximum_batch: 1,
+            }
+        }
+
         fn infer(
             &mut self,
             batch: &[InferenceInput],

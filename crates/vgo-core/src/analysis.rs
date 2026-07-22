@@ -77,18 +77,21 @@ impl Analysis {
                 }
                 let stone = position.stones()[stone_index];
                 for &vertex in &cell.polygon {
-                    let influence_radius = (vertex.x - stone.x).hypot(vertex.y - stone.y);
-                    let free_distance =
-                        legal_set::distance(position, vertex, Some(&legal_vertices));
-                    if free_distance < influence_radius - numeric::CAPTURE_MARGIN {
+                    let stone_point = Point::new(stone.x, stone.y);
+                    if let Some(witness) = legal_set::escape_witness(
+                        position,
+                        vertex,
+                        stone_point,
+                        Some(&legal_vertices),
+                    ) {
                         alive_groups.insert(group);
                         survival_evidence.insert(
                             group,
                             SurvivalEvidence {
                                 stone: stone_index,
                                 vertex,
-                                free_distance,
-                                influence_radius,
+                                free_distance: vertex.distance(witness),
+                                influence_radius: vertex.distance(stone_point),
                             },
                         );
                         break;

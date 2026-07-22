@@ -1,126 +1,105 @@
 # Self-Play Architecture
 
-## Current milestone
+## Current system
 
-The first two benchmark layers are implemented:
+Rust owns the complete gameplay and inference-serving loop:
 
-- `vgo-core` owns exact Voronoi geometry, legal placement, global capture and
+- `vgo-core` owns geometry, legal placement, global opponent capture,
   self-capture, pass/pass termination, and scoring;
-- `vgo-search` owns deterministic prefix candidates, a naive spread evaluator,
-  progressive-widening MCTS, and an explicit fallible evaluator boundary;
-- `vgo-inference` owns a bounded batching broker and framed Python subprocess
-  transport;
-- `vgo-canary` runs parallel color-swapped matches and emits machine-readable
-  search and gameplay metrics.
+- `vgo-raster` owns the semantic tensor and human-readable diagnostics;
+- `vgo-search` owns deterministic candidate generation, evaluators, and
+  progressive-widening MCTS;
+- `vgo-inference` owns bounded batching and interchangeable native ONNX or
+  framed Python batch services;
+- `vgo-selfplay` owns the one canonical complete-game playout, repetition
+  avoidance, arenas, model smoke tests, and trajectory generation.
 
-The original canary deliberately uses no Python process. Its neutral
-nonterminal value and exact terminal value continue to isolate simulator and
-search behavior. A separate model smoke path now runs the trained raster CNN
-through the broker described in [`INFERENCE_PROTOCOL.md`](INFERENCE_PROTOCOL.md).
-Acceptance results are retained under [`../benchmarks/results/`](../benchmarks/results/).
+The naive canary uses no model runtime and isolates engine/search behavior. The
+model smoke path uses the same playout with either ONNX Runtime/TensorRT or the
+Python parity service.
 
 ## Ownership boundary
 
-Rust owns the complete data-generation loop:
-
 ```text
-game actors -> MCTS -> candidate widening -> exact transitions
-                   \-> inference broker -> Python model service
-game actors -> completed trajectories -> replay shard writer
+actor threads -> shared playout -> MCTS -> inference broker -> BatchService
+                       |                              |          |-- ONNX/TensorRT
+                       |                              |          `-- Python debug
+                       `-> completed trajectory -> replay writer
+
+Python trainer -> atomic .pt checkpoint -> ONNX export -> Rust worker startup
 ```
 
-Python owns model execution and optimization:
+Python never imports the simulator. Rust never implements neural-network
+layers. Their durable boundaries are replay files and a self-describing ONNX
+artifact. The framed subprocess protocol is retained for parity checks and
+stage benchmarks rather than required for deployment.
+
+## Playout contract
+
+`vgo-selfplay::play_game` is the sole owner of whole-game progression. Callers
+provide a search function and an optional per-ply observer. The playout owns:
+
+- exact position fingerprints and repetition avoidance;
+- preferred-action fallback to pass;
+- transition application and event accounting;
+- pass/pass termination and the maximum-ply bound;
+- accumulated search and gameplay statistics.
+
+The canary, model smoke test, and demo dataset generator therefore cannot drift
+on game semantics. MCTS still owns tree-local simulation; that is a different
+scope from an externally visible game trajectory.
+
+## Inference contract
+
+Actors rasterize positions before submitting them to a shared bounded broker.
+Every `BatchService` declares the raster shape and maximum batch it accepts, so
+the broker cannot be configured inconsistently with its backend. The broker
+collects requests until the batch cap or latency deadline, invokes the service,
+and routes validated outputs by request ID.
+
+The current broker has one synchronous service slot. Actor-side search and
+rasterization are parallel, but a submitted evaluation blocks its actor until
+that shared batch completes. Multiple in-flight GPU slots, pinned slabs, and I/O
+binding remain performance work; their executor interface already separates
+submission from sequence-keyed completion.
+
+The native ONNX loader validates model metadata, raster schema, tensor names and
+shapes, maximum batch, source digest, and finite outputs before or during use.
+TensorRT engine and timing caches are namespaced by model and execution
+configuration. See [`INFERENCE_PROTOCOL.md`](INFERENCE_PROTOCOL.md).
+
+## Training and replay
+
+Python owns optimization and export. Rust will write immutable, chunked replay
+shards containing enough information to train and audit each decision:
 
 ```text
-inference service <- versioned batches from Rust
-trainer <- replay shards written by Rust
-trainer -> atomic model checkpoints -> inference service
+semantic raster and sampled policy mask
+root visit target and selected action
+player perspective and terminal utility
+search budget, RNG seed, schema version, and model digest
 ```
 
-Python does not import the simulator. Rust does not implement neural-network
-layers. Their contracts are versioned data formats and a batch inference
-protocol.
-
-## Rust self-play process
-
-One process may host many actor threads. Each actor owns a game and search tree.
-When a leaf needs evaluation, it submits a request to a shared inference broker
-and yields rather than calling Python directly.
-
-The broker:
-
-- receives already-encoded tensors produced in parallel by actors;
-- combines requests until a maximum batch size or latency deadline;
-- applies backpressure when too many batches are in flight;
-- preserves request IDs so results return to the correct trees;
-- records model version, queue delay, encoding time, and inference time;
-- may later coalesce duplicate position evaluations.
-
-Search, simulation, state encoding, symmetry transforms, trajectory assembly,
-and replay serialization remain native and parallelizable.
-
-The batch execution interface reports capacity separately from submission and
-completion. Sequence numbers permit out-of-order completed batches. The current
-process transport has one blocking slot; the intended GPU transport has a small
-pool of pinned host buffers and CUDA streams so encoding, transfer, model
-execution, and response handling can overlap.
-
-## Python inference service
-
-The service accepts contiguous batched features and candidate metadata. It
-returns value predictions and policy outputs without knowing game rules.
-
-The first protocol should support:
-
-```text
-request:  protocol version, model version, request IDs,
-          state tensor, candidate offsets and features
-response: request IDs, value outputs, proposal outputs, candidate logits
-```
-
-Tensor shapes, dtypes, channel meanings, coordinate conventions, and player
-perspective must be part of a checked model-interface schema. We should begin
-with a simple local transport and preserve the ability to replace it with
-shared memory after profiling.
-
-Model updates occur between games or at another explicit synchronization point.
-A trajectory records the model version that generated every search target.
-
-## Replay boundary
-
-Rust writes immutable, chunked replay shards. Python reads them without a Rust
-extension. Each record contains enough data to reproduce training targets and
-audit sampling behavior:
-
-```text
-position or canonical state features
-candidate coordinates, sources, and proposal probabilities
-root visit counts and selected action
-player perspective and terminal score
-search budget, RNG seed, and model version
-```
-
-The precise storage format should be selected after representative records are
-available. Selection criteria are streaming writes, Python and Rust support,
-schema evolution, partial recovery, and efficient variable-length candidates.
+The current demo dataset proves the representation and loader contract, but it
+is not the production replay format: it lacks atomic shard publication,
+checksums, model identity, and full trajectory metadata.
 
 ## Failure semantics
 
-- A model-service disconnect stops or drains actors; it never substitutes
-  arbitrary values silently.
-- Timeouts and dropped evaluations are counted and attached to run metadata.
-- A protocol or model-schema mismatch fails before self-play begins.
-- A replay shard is published atomically only after its checksum and footer are
-  complete.
+- Backend startup or schema mismatch fails before games begin.
+- A disconnect, malformed output, wrong request ID, or non-finite prediction is
+  an evaluator error; search never substitutes a neutral result silently.
+- Model replacement occurs only between explicit generation or arena runs.
+- A production replay shard will be published only after its checksum and
+  footer are complete.
 
 ## Benchmark layers
 
-Measure the system at four boundaries:
+1. Core analysis and transitions in one Rust thread.
+2. Parallel search with a deterministic in-process evaluator.
+3. Rasterization, input packing, and backend inference as separate stages.
+4. End-to-end model self-play through the shared broker.
+5. Replay serialization and trainer consumption once production shards exist.
 
-1. Engine analysis and transitions in one Rust thread.
-2. Parallel Rust search with a deterministic fake evaluator.
-3. Rust-to-Python batching with a trivial tensor model.
-4. End-to-end self-play with the real model and replay writer.
-
-This separates simulator speed from batching, transport, GPU inference, and
-storage bottlenecks.
+These boundaries distinguish game-state cost from search, batching, GPU
+execution, and storage throughput.

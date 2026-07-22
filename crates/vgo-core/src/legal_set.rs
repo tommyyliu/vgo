@@ -38,6 +38,61 @@ pub fn contains(position: &Position, x: f64, y: f64) -> bool {
         && clear_of_stones(position, x, y, None, None)
 }
 
+fn visit_candidates(
+    position: &Position,
+    point: Point,
+    known_vertices: Option<&[Point]>,
+    mut visit: impl FnMut(Point) -> bool,
+) -> bool {
+    if contains(position, point.x, point.y) && visit(point) {
+        return true;
+    }
+    let radius = position.radius();
+    let diameter = 2.0 * radius;
+
+    for stone in position.stones() {
+        let dx = point.x - stone.x;
+        let dy = point.y - stone.y;
+        let radial_distance = dx.hypot(dy);
+        let directions: &[(f64, f64)] = if radial_distance < numeric::EDGE_EPSILON {
+            &[(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
+        } else {
+            &[(dx / radial_distance, dy / radial_distance)]
+        };
+        for &(ux, uy) in directions {
+            let candidate = Point::new(stone.x + diameter * ux, stone.y + diameter * uy);
+            if contains(position, candidate.x, candidate.y) && visit(candidate) {
+                return true;
+            }
+        }
+    }
+
+    for candidate in [
+        Point::new(radius, point.y),
+        Point::new(1.0 - radius, point.y),
+        Point::new(point.x, radius),
+        Point::new(point.x, 1.0 - radius),
+    ] {
+        if contains(position, candidate.x, candidate.y) && visit(candidate) {
+            return true;
+        }
+    }
+
+    let owned_vertices;
+    let candidates = if let Some(known) = known_vertices {
+        known
+    } else {
+        owned_vertices = vertices(position);
+        &owned_vertices
+    };
+    for &candidate in candidates {
+        if visit(candidate) {
+            return true;
+        }
+    }
+    false
+}
+
 #[must_use]
 pub fn vertices(position: &Position) -> Vec<Point> {
     let stones = position.stones();
@@ -125,52 +180,31 @@ pub fn vertices(position: &Position) -> Vec<Point> {
 
 #[must_use]
 pub fn distance(position: &Position, point: Point, known_vertices: Option<&[Point]>) -> f64 {
-    if contains(position, point.x, point.y) {
-        return 0.0;
-    }
-    let radius = position.radius();
-    let diameter = 2.0 * radius;
     let mut best = f64::INFINITY;
-
-    for stone in position.stones() {
-        let dx = point.x - stone.x;
-        let dy = point.y - stone.y;
-        let radial_distance = dx.hypot(dy);
-        let directions: &[(f64, f64)] = if radial_distance < numeric::EDGE_EPSILON {
-            &[(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
-        } else {
-            &[(dx / radial_distance, dy / radial_distance)]
-        };
-        for &(ux, uy) in directions {
-            let candidate = Point::new(stone.x + diameter * ux, stone.y + diameter * uy);
-            if contains(position, candidate.x, candidate.y) {
-                best = best.min(point.distance(candidate));
-            }
-        }
-    }
-
-    let feet = [
-        Point::new(radius, point.y),
-        Point::new(1.0 - radius, point.y),
-        Point::new(point.x, radius),
-        Point::new(point.x, 1.0 - radius),
-    ];
-    for foot in feet {
-        if contains(position, foot.x, foot.y) {
-            best = best.min(point.distance(foot));
-        }
-    }
-    let owned_vertices;
-    let candidates = if let Some(known) = known_vertices {
-        known
-    } else {
-        owned_vertices = vertices(position);
-        &owned_vertices
-    };
-    for &vertex in candidates {
-        best = best.min(point.distance(vertex));
-    }
+    visit_candidates(position, point, known_vertices, |candidate| {
+        best = best.min(point.distance(candidate));
+        false
+    });
     best
+}
+
+#[must_use]
+pub(crate) fn escape_witness(
+    position: &Position,
+    vertex: Point,
+    stone: Point,
+    known_vertices: Option<&[Point]>,
+) -> Option<Point> {
+    let mut witness = None;
+    visit_candidates(position, vertex, known_vertices, |candidate| {
+        if numeric::strictly_closer(vertex, candidate, stone).is_strictly_less {
+            witness = Some(candidate);
+            true
+        } else {
+            false
+        }
+    });
+    witness
 }
 
 #[cfg(test)]

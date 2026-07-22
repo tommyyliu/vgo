@@ -251,8 +251,15 @@ make them literally exact. In particular, the exact A5 comparison is
 delta(v) < rho(s,v)    // group has an escape
 ```
 
-The current implementation centralizes a fixed `captureMargin` around that
-comparison in `src/engine/numeric.js`. That deadband is an implementation
-approximation and must not be treated as a rule or as part of `rho`. A future
-robust implementation should use an explicit error bound and higher-precision
-fallback for comparisons that remain indeterminate.
+The implementation compares squared distances in two stages. First it encloses
+each subtraction, square, sum, and final signed margin with outward-rounded
+binary64 intervals. A strictly positive lower bound proves an escape; a
+nonpositive upper bound proves capture. If the interval contains zero, it
+reconstructs every input binary64 value as an exact dyadic rational and compares
+the two squared distances with arbitrary-size integer arithmetic.
+
+Thus the fast path carries an explicit rounding-error bound, while the fallback
+settles every comparison exactly for the coordinates produced by the geometry
+engine. Equality is not an escape because A5 requires a strict inequality. No
+numeric tolerance is added to `rho`, and the former fixed capture deadband is
+not part of the implementation or rules.
