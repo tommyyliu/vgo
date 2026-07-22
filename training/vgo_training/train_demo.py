@@ -24,30 +24,63 @@ def policy_cross_entropy(
 
 @torch.no_grad()
 def metrics(
-    model: nn.Module, dataset: RasterDataset, device: torch.device
+    model: nn.Module, dataset: RasterDataset, device: torch.device, batch_size: int
 ) -> dict[str, float]:
+    """Held-out metrics, accumulated one batch at a time.
+
+    Every quantity here is a mean over samples, so a sum of per-batch means
+    weighted by batch size and divided by the sample count reproduces the
+    whole-set value exactly. Evaluating the split in a single forward pass
+    instead made evaluation memory scale with the replay window rather than with
+    the batch size, which capped how far the window could grow independently of
+    the device.
+    """
     model.eval()
-    states = dataset.states.to(device)
-    targets = dataset.policies.to(device)
-    masks = dataset.policy_masks.to(device)
-    values = dataset.values.to(device)
-    logits, predictions = model(states)
-    cross_entropy = policy_cross_entropy(logits, targets, masks)
-    target_entropy = -(targets * targets.clamp_min(1e-12).log()).sum(dim=1).mean()
-    return {
-        "loss": float(cross_entropy + nn.functional.mse_loss(predictions, values)),
-        "policy_cross_entropy": float(cross_entropy),
-        "policy_target_entropy": float(target_entropy),
-        "policy_kl": float(cross_entropy - target_entropy),
-        "policy_top1": float(
+    total = dataset.samples
+    if total <= 0:
+        raise ValueError("cannot compute metrics over an empty dataset")
+    if batch_size <= 0:
+        raise ValueError("metrics batch size must be positive")
+
+    cross_entropy_total = 0.0
+    target_entropy_total = 0.0
+    squared_error_total = 0.0
+    top1_total = 0.0
+    absolute_error_total = 0.0
+
+    for start in range(0, total, batch_size):
+        stop = min(start + batch_size, total)
+        count = stop - start
+        states = dataset.states[start:stop].to(device)
+        targets = dataset.policies[start:stop].to(device)
+        masks = dataset.policy_masks[start:stop].to(device)
+        values = dataset.values[start:stop].to(device)
+        logits, predictions = model(states)
+        # Reuses the training objective so the two can never drift apart.
+        cross_entropy_total += float(policy_cross_entropy(logits, targets, masks)) * count
+        target_entropy_total += float(
+            -(targets * targets.clamp_min(1e-12).log()).sum(dim=1).mean()
+        ) * count
+        squared_error_total += float(nn.functional.mse_loss(predictions, values)) * count
+        top1_total += float(
             (
                 logits.masked_fill(~masks, torch.finfo(logits.dtype).min).argmax(dim=1)
                 == targets.argmax(dim=1)
             )
             .float()
             .mean()
-        ),
-        "value_mae": float((predictions - values).abs().mean()),
+        ) * count
+        absolute_error_total += float((predictions - values).abs().mean()) * count
+
+    cross_entropy = cross_entropy_total / total
+    target_entropy = target_entropy_total / total
+    return {
+        "loss": cross_entropy + squared_error_total / total,
+        "policy_cross_entropy": cross_entropy,
+        "policy_target_entropy": target_entropy,
+        "policy_kl": cross_entropy - target_entropy,
+        "policy_top1": top1_total / total,
+        "value_mae": absolute_error_total / total,
     }
 
 
@@ -118,8 +151,8 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         T_max=arguments.epochs,
         eta_min=arguments.learning_rate * 0.01,
     )
-    initial_training = metrics(model, training, device)
-    initial_validation = metrics(model, validation, device)
+    initial_training = metrics(model, training, device, arguments.batch_size)
+    initial_validation = metrics(model, validation, device, arguments.batch_size)
     best_epoch = 0
     best = initial_validation
     best_score = (
@@ -149,7 +182,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
             optimizer.step()
         scheduler.step()
         if epoch == 1 or epoch % arguments.report_every == 0 or epoch == arguments.epochs:
-            current = metrics(model, validation, device)
+            current = metrics(model, validation, device, arguments.batch_size)
             score = current["policy_kl"] + arguments.value_weight * current["value_mae"]
             if score < best_score:
                 best_epoch = epoch
@@ -168,8 +201,8 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
 
     elapsed = time.perf_counter() - started
     model.load_state_dict(best_state)
-    final_training = metrics(model, training, device)
-    final_validation = metrics(model, validation, device)
+    final_training = metrics(model, training, device, arguments.batch_size)
+    final_validation = metrics(model, validation, device, arguments.batch_size)
     output = Path(arguments.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
