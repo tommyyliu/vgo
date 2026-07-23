@@ -7,7 +7,10 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import random
 import time
+
+from .bradley_terry import fit_ratings
 
 
 def atomic_json(path: Path, value: object) -> None:
@@ -269,6 +272,95 @@ def arena_command(
     return command
 
 
+def update_elo_pool(
+    arguments: argparse.Namespace,
+    root: Path,
+    output: Path,
+    candidate_onnx: Path,
+    iteration: int,
+    past_generations: list[tuple[int, Path]],
+    environment: dict[str, str],
+) -> dict[str, float]:
+    """Play the new generation against a light random sample of past generations,
+    append the results to a persistent match history, and re-fit Bradley-Terry
+    ratings for every generation. Pure telemetry — never gates promotion. Returns
+    {generation_index: elo} (empty until there is at least one past generation).
+
+    Resilient by design: a failed sample match is skipped, not fatal, so a flaky
+    arena never crashes the training loop over telemetry.
+    """
+    if arguments.elo_pool_samples <= 0 or not past_generations:
+        return {}
+    elo_dir = output / "elo"
+    elo_dir.mkdir(parents=True, exist_ok=True)
+    matches_path = elo_dir / "matches.jsonl"
+
+    sample = random.Random(arguments.arena_seed + iteration * 977)
+    opponents = sample.sample(
+        past_generations, min(arguments.elo_pool_samples, len(past_generations))
+    )
+    new_records: list[dict[str, object]] = []
+    for slot, (opponent_iteration, opponent_onnx) in enumerate(opponents):
+        if not Path(opponent_onnx).exists():
+            continue
+        command = rust_command(root, "vgo-arena") + [
+            "--candidate", str(candidate_onnx),
+            "--opponent", str(opponent_onnx),
+            "--pairs", str(arguments.elo_pool_pairs),
+            "--simulations", str(arguments.arena_simulations),
+            "--max-plies", str(arguments.maximum_plies),
+            "--threads", str(arguments.arena_actors),
+            "--resolution", str(arguments.resolution),
+            "--radius", str(arguments.radius),
+            "--seed", str(arguments.arena_seed + iteration * 10_000 + 7_000 + slot),
+            "--maximum-batch", str(arguments.maximum_batch),
+            "--delay-ms", str(arguments.delay_ms),
+            "--provider", arguments.provider,
+            "--fp16", str(arguments.fp16).lower(),
+            "--cache-directory", str((root / "artifacts" / "onnx-cache").resolve()),
+        ]
+        try:
+            result = run_json_command(
+                command,
+                cwd=root,
+                log_path=elo_dir / f"iter{iteration:03d}-vs{opponent_iteration:03d}.log",
+                environment=environment,
+            )
+        except Exception as error:  # noqa: BLE001 — telemetry must not kill the loop
+            print(f"[elo] skipped match vs gen {opponent_iteration}: {error}", flush=True)
+            continue
+        # Only count decisive completed games; a truncated game is not a result.
+        record = {
+            "a": iteration,
+            "b": opponent_iteration,
+            "a_wins": int(result.get("candidate_wins", 0)),
+            "b_wins": int(result.get("candidate_losses", 0)),
+            "draws": int(result.get("draws", 0)),
+        }
+        new_records.append(record)
+
+    if new_records:
+        with matches_path.open("a", encoding="ascii") as handle:
+            for record in new_records:
+                handle.write(json.dumps(record) + "\n")
+
+    matches: list[dict] = []
+    if matches_path.exists():
+        for line in matches_path.read_text(encoding="ascii").splitlines():
+            line = line.strip()
+            if line:
+                matches.append(json.loads(line))
+    if not matches:
+        return {}
+    ratings = fit_ratings(matches, anchor=0)
+    ranked = dict(sorted(ratings.items()))
+    atomic_json(elo_dir / "ratings.json", {str(k): round(v, 1) for k, v in ranked.items()})
+    current = ratings.get(iteration)
+    if current is not None:
+        print(f"[elo] gen {iteration} rating = {current:+.0f}", flush=True)
+    return {str(k): round(v, 1) for k, v in ranked.items()}
+
+
 def run(arguments: argparse.Namespace) -> dict[str, object]:
     validate_arguments(arguments)
     training = Path(__file__).resolve().parents[1]
@@ -310,6 +402,8 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
     else:
         atomic_json(config_path, run_config)
     iterations: list[dict[str, object]] = []
+    # (iteration_index, onnx_path) for every completed generation — the Elo pool.
+    past_generations: list[tuple[int, Path]] = []
     started = time.perf_counter()
 
     for iteration in range(arguments.iterations):
@@ -320,6 +414,7 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
         report = json.loads(report_path.read_text(encoding="ascii"))
         iterations.append(report)
         replay_paths.append(iteration_path / "replay" / "dataset.vgo")
+        past_generations.append((iteration, iteration_path / "model" / "candidate.onnx"))
         if report.get("accepted"):
             incumbent_checkpoint = Path(str(report["incumbent_checkpoint"]))
             incumbent_onnx = Path(str(report["incumbent_onnx"]))
@@ -483,7 +578,11 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
             atomic_json(progress_path, progress)
         export_report = progress["export"]
 
-        if "baseline_arena" not in progress:
+        # The baseline (vs-naive) arena drives promotion only when there is no
+        # incumbent yet (iteration 0). Once an incumbent exists it is pure
+        # telemetry, so --skip-baseline-arena drops it to save serial arena time.
+        run_baseline = incumbent_onnx is None or not arguments.skip_baseline_arena
+        if run_baseline and "baseline_arena" not in progress:
             progress["baseline_arena"] = run_json_command(
                 arena_command(
                     arguments,
@@ -497,7 +596,7 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
                 environment=environment,
             )
             atomic_json(progress_path, progress)
-        baseline_arena = progress["baseline_arena"]
+        baseline_arena = progress.get("baseline_arena")
         if incumbent_onnx is None:
             promotion_arena = baseline_arena
         else:
@@ -524,6 +623,12 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
         if accepted:
             incumbent_checkpoint = checkpoint
             incumbent_onnx = onnx
+
+        elo_ratings = update_elo_pool(
+            arguments, root, output, onnx, iteration, past_generations, environment
+        )
+        past_generations.append((iteration, onnx))
+
         iteration_report = {
             "schema": "vgo.rl-iteration.v1",
             "iteration": iteration,
@@ -540,11 +645,15 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
             "accepted": accepted,
             "incumbent_checkpoint": str(incumbent_checkpoint) if incumbent_checkpoint else None,
             "incumbent_onnx": str(incumbent_onnx) if incumbent_onnx else None,
+            "elo": elo_ratings,
         }
         atomic_json(iteration_path / "iteration.json", iteration_report)
         iterations.append(iteration_report)
+        baseline_text = (
+            f"{baseline_arena['candidate_score']:.3f}" if baseline_arena else "skipped"
+        )
         print(
-            f"iteration={iteration} baseline_score={baseline_arena['candidate_score']:.3f} "
+            f"iteration={iteration} baseline_score={baseline_text} "
             f"promotion_score={promotion_arena['candidate_score']:.3f} accepted={accepted}",
             flush=True,
         )
@@ -588,6 +697,20 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--report-every", type=int, default=10)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--skip-baseline-arena",
+        action="store_true",
+        help="skip the vs-naive arena once an incumbent exists (it is telemetry, "
+        "not a promotion gate, from iteration 1 on)",
+    )
+    parser.add_argument(
+        "--elo-pool-samples",
+        type=int,
+        default=0,
+        help="past generations to play the new net against each iteration for Elo "
+        "tracking (0 disables); pure telemetry, does not gate promotion",
+    )
+    parser.add_argument("--elo-pool-pairs", type=int, default=1)
     parser.add_argument("--arena-pairs", type=int, default=16)
     parser.add_argument("--arena-simulations", type=int, default=16)
     parser.add_argument("--actors", type=int, default=8)
