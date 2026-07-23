@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 from .dataset import RasterDataset, load_datasets
-from .model import RasterPolicyValueNet
+from .model import build_model
 from .serve import load_model
 
 
@@ -136,10 +136,13 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         parent_checkpoint = str(arguments.initial_checkpoint.resolve())
         model_width = int(parent["model_width"])
         blocks = int(parent["blocks"])
+        architecture = str(parent.get("architecture", "flat"))
     else:
         model_width = arguments.model_width
         blocks = arguments.blocks
-        model = RasterPolicyValueNet(
+        architecture = arguments.architecture
+        model = build_model(
+            architecture=architecture,
             channels=dataset.channels,
             width=model_width,
             blocks=blocks,
@@ -212,6 +215,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         "width": dataset.width,
         "model_width": model_width,
         "blocks": blocks,
+        "architecture": architecture,
         "state_dict": model.state_dict(),
         "parent_checkpoint": parent_checkpoint,
         "replay_sources": list(dataset.sources),
@@ -263,6 +267,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--value-weight", type=float, default=0.25)
     parser.add_argument("--model-width", type=int, default=32)
     parser.add_argument("--blocks", type=int, default=3)
+    parser.add_argument("--architecture", choices=("flat", "unet"), default="flat")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=7)

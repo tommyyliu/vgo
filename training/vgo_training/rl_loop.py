@@ -422,6 +422,8 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
             str(arguments.model_width),
             "--blocks",
             str(arguments.blocks),
+            "--architecture",
+            arguments.architecture,
             "--threads",
             str(arguments.training_threads),
             "--device",
@@ -579,6 +581,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=2e-3)
     parser.add_argument("--warm-learning-rate", type=float, default=5e-4)
     parser.add_argument("--value-weight", type=float, default=0.25)
+    parser.add_argument("--architecture", choices=("flat", "unet"), default="flat")
     parser.add_argument("--model-width", type=int, default=32)
     parser.add_argument("--blocks", type=int, default=3)
     parser.add_argument("--training-threads", type=int, default=4)

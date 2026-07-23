@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .model import RasterPolicyValueNet
+from .model import RasterPolicyValueNet, build_model
 
 
 REQUEST_MAGIC = b"VGOIFR01"
@@ -30,9 +30,10 @@ def read_exact(stream, size: int, *, allow_eof: bool = False) -> bytes | None:
     return data
 
 
-def load_model(checkpoint_path: Path) -> tuple[RasterPolicyValueNet, dict[str, object]]:
+def load_model(checkpoint_path: Path) -> tuple[nn.Module, dict[str, object]]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    model = RasterPolicyValueNet(
+    model = build_model(
+        architecture=str(checkpoint.get("architecture", "flat")),
         channels=int(checkpoint["channels"]),
         width=int(checkpoint["model_width"]),
         blocks=int(checkpoint["blocks"]),

@@ -96,6 +96,7 @@ def export(arguments: argparse.Namespace) -> dict[str, object]:
             {"name": "values", "dtype": "float32", "shape": ["batch"]},
         ],
         "model": {
+            "architecture": str(checkpoint.get("architecture", "flat")),
             "width": model_width,
             "blocks": blocks,
             "parameters": sum(parameter.numel() for parameter in model.parameters()),
