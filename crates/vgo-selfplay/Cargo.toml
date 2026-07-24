@@ -31,3 +31,7 @@ path = "src/generate_demo.rs"
 [[bin]]
 name = "vgo-arena"
 path = "src/arena.rs"
+
+[[bin]]
+name = "vgo-playout-duel"
+path = "src/playout_duel.rs"

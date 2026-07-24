@@ -1,0 +1,108 @@
+{
+  "schema": "vgo.playout-scaling.v1",
+  "date": "2026-07-24",
+  "result": "pass",
+  "purpose": "Check that MCTS search depth buys strength on the coarse-to-fine candidate path, by playing one model against itself at two playout budgets. Both seats share a single evaluator, so the comparison isolates search from policy quality. The legacy candidate path is measured at the same settings as a control.",
+  "harness": "vgo-playout-duel",
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "driver": "595.80",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "rustc": "1.97.1",
+    "build": "release",
+    "provider": "tensorrt",
+    "fp16": true
+  },
+  "model": {
+    "path": "artifacts/coarse-pw-night1/iteration-004/model/candidate.onnx",
+    "architecture": "unet",
+    "model_width": 64,
+    "blocks": 8,
+    "trained_with_coarse_pool": 8
+  },
+  "configuration": {
+    "resolution": 128,
+    "radius": 0.05555555555555555,
+    "maximum_plies": 160,
+    "maximum_batch": 64,
+    "threads": 4,
+    "delay_ms": 1,
+    "pairs": 40,
+    "games": 80,
+    "seed": 900001
+  },
+  "runs": [
+    {
+      "path": "coarse",
+      "coarse_pool": 8,
+      "high_simulations": 128,
+      "low_simulations": 16,
+      "games": 80,
+      "completed": 80,
+      "truncated": 0,
+      "high_wins": 73,
+      "low_wins": 5,
+      "draws": 2,
+      "high_score": 0.925,
+      "score_ci95": [0.845880, 0.965175],
+      "average_plies": 33.413,
+      "wall_seconds": 224.705
+    },
+    {
+      "path": "legacy",
+      "coarse_pool": 0,
+      "high_simulations": 128,
+      "low_simulations": 16,
+      "games": 80,
+      "completed": 78,
+      "truncated": 2,
+      "high_wins": 70,
+      "low_wins": 1,
+      "draws": 7,
+      "high_score": 0.942308,
+      "score_ci95": [0.866932, 0.976161],
+      "average_plies": 54.562,
+      "wall_seconds": 412.233
+    },
+    {
+      "path": "coarse",
+      "coarse_pool": 8,
+      "high_simulations": 128,
+      "low_simulations": 64,
+      "games": 80,
+      "completed": 79,
+      "truncated": 1,
+      "high_wins": 63,
+      "low_wins": 14,
+      "draws": 2,
+      "high_score": 0.810127,
+      "score_ci95": [0.710074, 0.881418],
+      "average_plies": 69.312,
+      "wall_seconds": 783.819
+    },
+    {
+      "path": "legacy",
+      "coarse_pool": 0,
+      "high_simulations": 128,
+      "low_simulations": 64,
+      "games": 80,
+      "completed": 71,
+      "truncated": 9,
+      "high_wins": 50,
+      "low_wins": 18,
+      "draws": 3,
+      "high_score": 0.725352,
+      "score_ci95": [0.612005, 0.815565],
+      "average_plies": 100.713,
+      "wall_seconds": 1236.759
+    }
+  ],
+  "notes": [
+    "Search scales on the coarse path: 92.5% at 8x budget and 81.0% at 2x budget, both with confidence intervals clear of 0.5. The coarse->fine sampler is not blocking depth from converting into strength.",
+    "At 8x the two paths are statistically indistinguishable (coarse 92.5%, legacy 94.2%, overlapping intervals on 80 games). At the harder 2x ratio the coarse path scores higher (81.0% vs 72.5%), but those intervals also overlap, so this run does not establish a scaling advantage on its own.",
+    "The legacy 2x control is the weakest measurement here: 9 of 80 games hit the ply limit and were excluded, leaving 71 completed and an average of 100.7 plies against a 160 limit. Truncation censors exactly the games the deep seat was grinding out, so 72.5% is a floor rather than a clean estimate. Rerun at a higher --max-plies before treating the coarse-vs-legacy gap at 2x as real.",
+    "At equal simulation counts the coarse path is consistently faster and more decisive: 224.7s vs 412.2s at 8x and 783.8s vs 1236.8s at 2x, with far shorter games (33.4 vs 54.6 plies at 8x, 69.3 vs 100.7 at 2x) and fewer truncations (0 and 1, against 2 and 9). Legacy games drift toward the ply limit.",
+    "Geometry must match the training run. Driving this model at the default radius 1/6 instead of 1/18 puts the raster out of distribution and inference returns NaN.",
+    "Games are colour-swapped in pairs and truncated games are excluded from the score, so `completed` rather than `games` is the denominator."
+  ]
+}
