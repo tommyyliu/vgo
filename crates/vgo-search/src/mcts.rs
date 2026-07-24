@@ -2,7 +2,7 @@ use vgo_core::{Analysis, Color, Phase, Position};
 
 use crate::{
     Action, Candidate, CandidateSequence, CandidateSource, Evaluation, EvaluationError, Evaluator,
-    NaiveEvaluator,
+    FineGrid, NaiveEvaluator,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -14,6 +14,10 @@ pub struct SearchConfig {
     pub widening_exponent: f64,
     pub exploration: f64,
     pub maximum_depth: u32,
+    /// Coarse pool factor for coarse->fine candidate sampling. When > 0 and the
+    /// policy exposes a fine grid, candidates are drawn from the net's own map
+    /// instead of the legacy quasi-random sequence. 0 keeps the legacy behaviour.
+    pub coarse_pool: usize,
 }
 
 impl SearchConfig {
@@ -27,6 +31,7 @@ impl SearchConfig {
             widening_exponent: 0.5,
             exploration: 1.5,
             maximum_depth: 64,
+            coarse_pool: 0,
         }
     }
 }
@@ -72,6 +77,10 @@ struct Child {
     candidate: Candidate,
     policy_logit: f64,
     prior: f64,
+    /// Sampling probability beta = P_coarse * P_fine for coarse->fine candidates,
+    /// or None for legacy (quasi-random) candidates. Recorded for the
+    /// Sampled-AlphaZero importance correction on the policy target.
+    beta: Option<f64>,
     visits: u32,
     black_value_sum: f64,
     node: Option<Box<Node>>,
@@ -95,6 +104,10 @@ struct Node {
     candidates_exhausted: bool,
     terminal_black_value: Option<f64>,
     evaluation: Option<Evaluation>,
+    /// Counter-based RNG state for coarse->fine candidate sampling, seeded from
+    /// the match seed and this node's position so sampling is deterministic per
+    /// (match, position) yet advances across widen calls.
+    sample_rng: u64,
 }
 
 impl Node {
@@ -121,6 +134,8 @@ impl Node {
             Some(evaluator.evaluate(&position)?)
         };
         let candidates = CandidateSequence::new(&position, match_seed);
+        let sample_rng =
+            crate::candidates::splitmix64(match_seed ^ crate::candidates::position_hash(&position));
         Ok(Self {
             position,
             visits: 0,
@@ -129,6 +144,7 @@ impl Node {
             candidates_exhausted: false,
             terminal_black_value,
             evaluation,
+            sample_rng,
         })
     }
 
@@ -153,6 +169,21 @@ impl Node {
             .initial_candidates
             .max(progressive)
             .min(config.maximum_candidates);
+
+        if config.coarse_pool > 0 {
+            if let Some(grid) = self
+                .evaluation
+                .as_ref()
+                .expect("playable nodes are evaluated")
+                .fine_grid(&self.position, config.coarse_pool)
+            {
+                self.widen_coarse_fine(&grid, desired, stats);
+                normalize_priors(&mut self.children);
+                return;
+            }
+            // Policy is not spatial (e.g. naive): fall through to the legacy path.
+        }
+
         while self.children.len() < desired && !self.candidates_exhausted {
             if let Some(candidate) = self.candidates.next_candidate() {
                 let policy_logit = self
@@ -164,6 +195,7 @@ impl Node {
                     candidate,
                     policy_logit,
                     prior: 0.0,
+                    beta: None,
                     visits: 0,
                     black_value_sum: 0.0,
                     node: None,
@@ -174,6 +206,94 @@ impl Node {
             }
         }
         normalize_priors(&mut self.children);
+    }
+
+    /// Widen using coarse->fine sampling from the net's own policy map. Draws
+    /// candidates with replacement until `desired` distinct placements exist (or
+    /// the draw budget is spent), deduping by cell and recording each candidate's
+    /// exact sampling probability beta. The pass action is always available.
+    fn widen_coarse_fine(&mut self, grid: &FineGrid, desired: usize, stats: &mut SearchStats) {
+        // Ensure Pass is a candidate exactly once (it is not part of the grid).
+        if !self
+            .children
+            .iter()
+            .any(|child| matches!(child.candidate.action, Action::Pass))
+        {
+            let policy_logit = self
+                .evaluation
+                .as_ref()
+                .expect("playable nodes are evaluated")
+                .policy_logit(Action::Pass);
+            self.children.push(Child {
+                candidate: Candidate {
+                    action: Action::Pass,
+                    source: CandidateSource::Pass,
+                },
+                policy_logit,
+                prior: 0.0,
+                beta: None,
+                visits: 0,
+                black_value_sum: 0.0,
+                node: None,
+            });
+        }
+
+        // Draw with replacement until we have `desired` placement children or the
+        // draw budget (a small multiple of desired, to bound repeats) is spent.
+        let placements = self
+            .children
+            .iter()
+            .filter(|c| matches!(c.candidate.action, Action::Place(_)))
+            .count();
+        let want = desired.saturating_sub(placements);
+        if want == 0 {
+            return;
+        }
+        let budget = want.saturating_mul(8).max(want);
+        let mut rng = self.sample_rng;
+        let mut next = || {
+            rng = crate::candidates::splitmix64(rng);
+            crate::candidates::unit_f64(rng)
+        };
+        let mut added = 0;
+        for _ in 0..budget {
+            if added >= want {
+                break;
+            }
+            let sample = crate::coarse_fine::sample_candidates(grid, 1, &mut next);
+            let Some(sample) = sample.into_iter().next() else {
+                break;
+            };
+            let action = Action::Place(sample.point);
+            // Dedup by cell: skip a placement whose cell already has a child.
+            let already = self.children.iter().any(|child| match child.candidate.action {
+                Action::Place(existing) => grid.same_cell(existing, sample.point),
+                Action::Pass => false,
+            });
+            if already {
+                continue;
+            }
+            let policy_logit = self
+                .evaluation
+                .as_ref()
+                .expect("playable nodes are evaluated")
+                .policy_logit(action);
+            self.children.push(Child {
+                candidate: Candidate {
+                    action,
+                    source: CandidateSource::AreaSequence,
+                },
+                policy_logit,
+                prior: 0.0,
+                beta: Some(sample.beta),
+                visits: 0,
+                black_value_sum: 0.0,
+                node: None,
+            });
+            stats.generated_candidates += 1;
+            added += 1;
+        }
+        self.sample_rng = rng;
     }
 
     fn select_child(&self, config: SearchConfig) -> usize {
@@ -346,6 +466,50 @@ mod tests {
         }
     }
 
+    /// A spatial test policy backed by a uniform fine grid, so coarse->fine
+    /// sampling has a map to draw from.
+    struct GridPolicy {
+        width: usize,
+        height: usize,
+    }
+
+    impl Policy for GridPolicy {
+        fn logit(&self, _action: Action) -> f64 {
+            0.0
+        }
+
+        fn fine_grid(
+            &self,
+            position: &Position,
+            coarse: usize,
+        ) -> Option<crate::FineGrid> {
+            Some(crate::FineGrid::build(
+                position,
+                self.width,
+                self.height,
+                coarse,
+                |_, _| 0.0,
+            ))
+        }
+    }
+
+    struct GridEvaluator {
+        width: usize,
+        height: usize,
+    }
+
+    impl Evaluator for GridEvaluator {
+        fn evaluate(&self, _position: &Position) -> Result<Evaluation, EvaluationError> {
+            Ok(Evaluation::new(
+                0.0,
+                Box::new(GridPolicy {
+                    width: self.width,
+                    height: self.height,
+                }),
+            ))
+        }
+    }
+
     struct ConstantEvaluator(f64);
 
     impl Evaluator for ConstantEvaluator {
@@ -360,6 +524,37 @@ mod tests {
         fn evaluate(&self, _position: &Position) -> Result<Evaluation, EvaluationError> {
             Err(EvaluationError::new("expected failure"))
         }
+    }
+
+    #[test]
+    fn coarse_fine_widening_draws_candidates_from_the_map() {
+        let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+        let mut config = SearchConfig::canary(64);
+        config.coarse_pool = 4; // enable coarse->fine sampling
+        let evaluator = GridEvaluator {
+            width: 32,
+            height: 32,
+        };
+        let result = search_with_evaluator(&position, config, 7, &evaluator)
+            .expect("coarse-fine search completes");
+        assert_eq!(result.stats.simulations, 64);
+        // It must produce real placement candidates plus pass, all legal.
+        let placements = result
+            .children
+            .iter()
+            .filter(|c| matches!(c.action, Action::Place(_)))
+            .count();
+        assert!(placements >= 2, "expected several placements, got {placements}");
+        assert!(
+            result
+                .children
+                .iter()
+                .any(|c| matches!(c.action, Action::Pass)),
+            "pass must remain a candidate"
+        );
+        // The visit budget is honoured.
+        let total: u32 = result.children.iter().map(|c| c.visits).sum();
+        assert!(total > 0);
     }
 
     #[test]

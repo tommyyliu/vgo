@@ -126,14 +126,14 @@ fn radical_inverse(mut index: u64, base: u64) -> f64 {
     value
 }
 
-fn splitmix64(mut value: u64) -> u64 {
+pub(crate) fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
 
-fn unit_f64(value: u64) -> f64 {
+pub(crate) fn unit_f64(value: u64) -> f64 {
     (value >> 11) as f64 * (1.0 / ((1_u64 << 53) as f64))
 }
 
@@ -145,7 +145,7 @@ fn hash_word(mut hash: u64, word: u64) -> u64 {
     hash
 }
 
-fn position_hash(position: &Position) -> u64 {
+pub(crate) fn position_hash(position: &Position) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325;
     hash = hash_word(hash, position.radius().to_bits());
     hash = hash_word(hash, u64::from(position.consecutive_passes()));

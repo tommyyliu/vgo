@@ -62,6 +62,24 @@ impl FineGrid {
         Self { width, height, coarse, logits, legal }
     }
 
+    /// Grid dimensions, for callers that need to map points back to cells.
+    #[must_use]
+    pub fn dims(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    /// Whether two points fall in the same fine cell of this grid.
+    #[must_use]
+    pub fn same_cell(&self, a: Point, b: Point) -> bool {
+        self.cell_of(a) == self.cell_of(b)
+    }
+
+    fn cell_of(&self, p: Point) -> (usize, usize) {
+        let col = ((p.x * self.width as f64).floor() as usize).min(self.width - 1);
+        let row = ((p.y * self.height as f64).floor() as usize).min(self.height - 1);
+        (row, col)
+    }
+
     fn coarse_dims(&self) -> (usize, usize) {
         // ceil division so partial edge cells are covered.
         (

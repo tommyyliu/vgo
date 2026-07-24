@@ -23,7 +23,7 @@ use std::{
 
 use vgo_core::Position;
 use vgo_raster::{RasterConfig, action_pixel, rasterize};
-use vgo_search::{Action, Evaluation, EvaluationError, Evaluator, Policy};
+use vgo_search::{Action, Evaluation, EvaluationError, Evaluator, FineGrid, Policy};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TorchDevice {
@@ -322,6 +322,14 @@ impl Policy for DensePolicy {
             Action::Place(point) => action_pixel(point.x, point.y, self.config),
         };
         f64::from(self.logits[index])
+    }
+
+    fn fine_grid(&self, position: &vgo_core::Position, coarse: usize) -> Option<FineGrid> {
+        let width = self.config.width;
+        let height = self.config.height;
+        Some(FineGrid::build(position, width, height, coarse, |row, col| {
+            self.logits[row * width + col]
+        }))
     }
 }
 

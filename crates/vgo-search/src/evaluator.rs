@@ -2,12 +2,20 @@ use std::{error::Error, fmt};
 
 use vgo_core::{GameEvent, Position};
 
-use crate::Action;
+use crate::{Action, FineGrid};
 
 const SELF_CAPTURE_LOGIT_PENALTY: f64 = 24.0;
 
 pub trait Policy: Send + Sync {
     fn logit(&self, action: Action) -> f64;
+
+    /// A dense fine grid of placement logits for coarse->fine candidate sampling,
+    /// if this policy is spatial. `coarse` is the pool factor. Policies that are
+    /// not backed by a spatial map (e.g. the naive heuristic) return `None`, and
+    /// the search falls back to the legacy candidate sequence.
+    fn fine_grid(&self, _position: &Position, _coarse: usize) -> Option<FineGrid> {
+        None
+    }
 }
 
 pub struct Evaluation {
@@ -30,6 +38,12 @@ impl Evaluation {
         let logit = self.policy.logit(action);
         assert!(logit.is_finite(), "policy logits must be finite");
         logit
+    }
+
+    /// The policy's fine grid for coarse->fine candidate sampling, if spatial.
+    #[must_use]
+    pub fn fine_grid(&self, position: &Position, coarse: usize) -> Option<FineGrid> {
+        self.policy.fine_grid(position, coarse)
     }
 }
 
