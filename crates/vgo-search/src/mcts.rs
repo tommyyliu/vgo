@@ -18,6 +18,18 @@ pub struct SearchConfig {
     /// policy exposes a fine grid, candidates are drawn from the net's own map
     /// instead of the legacy quasi-random sequence. 0 keeps the legacy behaviour.
     pub coarse_pool: usize,
+    /// Softmax temperature applied to root visit counts when choosing the played
+    /// move: the move is drawn with probability proportional to
+    /// `visits^(1 / temperature)`. Zero is deterministic argmax, which is what
+    /// arenas and any promotion-grade measurement want. Self-play generation
+    /// wants a positive value for the opening plies so the same board does not
+    /// always produce the same game. See `temperature_plies`.
+    pub temperature: f64,
+    /// Number of opening plies over which `temperature` applies. From this ply
+    /// onward selection is deterministic argmax regardless of `temperature`.
+    /// Sampling late endgame moves throws away won positions for no diversity
+    /// benefit, because by then the visit distribution is what we want to trust.
+    pub temperature_plies: u32,
 }
 
 impl SearchConfig {
@@ -32,6 +44,8 @@ impl SearchConfig {
             exploration: 1.5,
             maximum_depth: 64,
             coarse_pool: 0,
+            temperature: 0.0,
+            temperature_plies: 0,
         }
     }
 }
@@ -68,14 +82,41 @@ pub struct SearchResult {
     pub action: Action,
     pub children: Vec<ChildSummary>,
     pub stats: SearchStats,
+    /// Child indices in the order the caller should try them. Under deterministic
+    /// selection this is visit-count order; under a positive temperature the head
+    /// of the list is drawn from `visits^(1 / temperature)` instead. Held so that
+    /// a caller rejecting the first action (repetition avoidance) falls back
+    /// through the same order the selection policy produced.
+    order: Vec<usize>,
 }
 
 impl SearchResult {
+    /// Build a result whose selection order is deterministic visit order. For
+    /// callers (mainly tests) that assemble a result directly rather than by
+    /// searching; `search_at_ply` sets the order from the selection policy.
     #[must_use]
-    pub fn actions_by_preference(&self, to_move: Color) -> Vec<Action> {
-        preferred_child_indices(&self.children, to_move)
-            .into_iter()
-            .map(|index| self.children[index].action)
+    pub fn from_children(
+        action: Action,
+        children: Vec<ChildSummary>,
+        stats: SearchStats,
+        to_move: Color,
+    ) -> Self {
+        let order = preferred_child_indices(&children, to_move);
+        Self {
+            action,
+            children,
+            stats,
+            order,
+        }
+    }
+
+    /// Actions in selection order. `to_move` is retained for API compatibility;
+    /// the order is already resolved from the searching player's perspective.
+    #[must_use]
+    pub fn actions_by_preference(&self, _to_move: Color) -> Vec<Action> {
+        self.order
+            .iter()
+            .map(|&index| self.children[index].action)
             .collect()
     }
 }
@@ -367,6 +408,74 @@ fn preferred_child_indices(children: &[ChildSummary], to_move: Color) -> Vec<usi
     indices
 }
 
+/// Order children by sampling without replacement from `visits^(1 / temperature)`.
+///
+/// Only children with visits participate in the draw; unvisited children keep
+/// their deterministic ordering at the tail, so a caller falling back through the
+/// list for repetition avoidance still degrades to visit order rather than to
+/// noise. `temperature <= 0` never reaches here.
+fn sampled_child_indices(
+    children: &[ChildSummary],
+    to_move: Color,
+    temperature: f64,
+    rng_state: u64,
+) -> Vec<usize> {
+    let deterministic = preferred_child_indices(children, to_move);
+    let exponent = 1.0 / temperature;
+    // Scale by the maximum visit count before exponentiating: visits^(1/t) with a
+    // small temperature overflows f64 for even modest visit counts (128^100), and
+    // the distribution is unchanged by dividing through by the max first.
+    let maximum = children
+        .iter()
+        .map(|child| child.visits)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let mut pool = deterministic
+        .iter()
+        .copied()
+        .filter(|&index| children[index].visits > 0)
+        .map(|index| {
+            let share = f64::from(children[index].visits) / f64::from(maximum);
+            (index, share.powf(exponent))
+        })
+        .collect::<Vec<_>>();
+
+    let mut rng = rng_state;
+    let mut next = || {
+        rng = crate::candidates::splitmix64(rng);
+        crate::candidates::unit_f64(rng)
+    };
+
+    let mut order = Vec::with_capacity(children.len());
+    while !pool.is_empty() {
+        let total: f64 = pool.iter().map(|&(_, weight)| weight).sum();
+        if !(total > 0.0) || !total.is_finite() {
+            // Degenerate weights (all zero, or non-finite): fall back to the
+            // deterministic order for whatever remains.
+            order.extend(pool.iter().map(|&(index, _)| index));
+            break;
+        }
+        let mut target = next() * total;
+        let mut chosen = pool.len() - 1;
+        for (position, &(_, weight)) in pool.iter().enumerate() {
+            target -= weight;
+            if target < 0.0 {
+                chosen = position;
+                break;
+            }
+        }
+        order.push(pool.remove(chosen).0);
+    }
+    // Unvisited children, in deterministic order, after every visited one.
+    order.extend(
+        deterministic
+            .into_iter()
+            .filter(|&index| children[index].visits == 0),
+    );
+    order
+}
+
 fn simulate(
     node: &mut Node,
     config: SearchConfig,
@@ -430,6 +539,23 @@ pub fn search_with_evaluator(
     match_seed: u64,
     evaluator: &dyn Evaluator,
 ) -> Result<SearchResult, EvaluationError> {
+    search_at_ply(position, config, match_seed, evaluator, 0)
+}
+
+/// Search a position that occurs at `ply` of the game.
+///
+/// Identical to [`search_with_evaluator`] except that the ply decides whether
+/// `config.temperature` applies: temperature is used while `ply <
+/// config.temperature_plies` and selection is deterministic afterwards. Callers
+/// that do not track a ply (arenas, one-off analysis) get deterministic
+/// selection, which is what a promotion-grade measurement requires.
+pub fn search_at_ply(
+    position: &Position,
+    config: SearchConfig,
+    match_seed: u64,
+    evaluator: &dyn Evaluator,
+    ply: u32,
+) -> Result<SearchResult, EvaluationError> {
     assert_eq!(
         position.phase(),
         Phase::Playing,
@@ -454,7 +580,21 @@ pub fn search_with_evaluator(
             beta: child.beta,
         })
         .collect::<Vec<_>>();
-    let best = preferred_child_indices(&children, position.to_move())
+    let sampling = config.temperature > 0.0 && ply < config.temperature_plies;
+    let order = if sampling {
+        // Seed from the match, the position, and the ply so the draw is
+        // reproducible for a given (match, position, ply) yet differs from the
+        // candidate-sampling stream at the same node.
+        let seed = crate::candidates::splitmix64(
+            match_seed
+                ^ crate::candidates::position_hash(position)
+                ^ u64::from(ply).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        );
+        sampled_child_indices(&children, position.to_move(), config.temperature, seed)
+    } else {
+        preferred_child_indices(&children, position.to_move())
+    };
+    let best = order
         .first()
         .map(|index| children[*index].action)
         .expect("search produces at least the pass child");
@@ -462,6 +602,7 @@ pub fn search_with_evaluator(
         action: best,
         children,
         stats,
+        order,
     })
 }
 
@@ -476,7 +617,119 @@ mod tests {
 
     use crate::{Action, Evaluation, EvaluationError, Evaluator, Policy};
 
-    use super::{Node, SearchConfig, SearchStats, search, search_with_evaluator};
+    use super::{
+        ChildSummary, Node, SearchConfig, SearchStats, sampled_child_indices, search,
+        search_at_ply, search_with_evaluator,
+    };
+
+    fn child(action: Action, visits: u32) -> ChildSummary {
+        ChildSummary {
+            action,
+            source: crate::CandidateSource::AreaSequence,
+            prior: 0.0,
+            visits,
+            black_value: 0.0,
+            proposal_count: 0,
+            beta: None,
+        }
+    }
+
+    fn place(x: f64) -> Action {
+        Action::Place(vgo_core::Point::new(x, 0.5))
+    }
+
+    /// Sampling must reach the low-visit move sometimes and the high-visit move
+    /// usually. A distribution that always returns argmax is the bug we are
+    /// fixing; one that ignores visits entirely is equally wrong.
+    #[test]
+    fn temperature_sampling_follows_visit_counts() {
+        let children = vec![child(place(0.1), 90), child(place(0.2), 10)];
+        let mut first_is_top = 0_u32;
+        let trials = 400_u32;
+        for seed in 0..u64::from(trials) {
+            let order = sampled_child_indices(&children, Color::Black, 1.0, seed);
+            assert_eq!(order.len(), 2, "every visited child must be ordered");
+            if order[0] == 0 {
+                first_is_top += 1;
+            }
+        }
+        let share = f64::from(first_is_top) / f64::from(trials);
+        assert!(
+            (0.80..0.97).contains(&share),
+            "90/10 visits should pick the leader ~90% of the time, got {share:.3}"
+        );
+    }
+
+    /// A low temperature must concentrate on the visit leader without becoming
+    /// literally deterministic, and must not overflow on large visit counts.
+    #[test]
+    fn low_temperature_concentrates_without_overflow() {
+        let children = vec![child(place(0.1), 5_000), child(place(0.2), 2_500)];
+        let mut leader = 0;
+        for seed in 0..200 {
+            let order = sampled_child_indices(&children, Color::Black, 0.1, seed);
+            assert_eq!(order.len(), 2);
+            if order[0] == 0 {
+                leader += 1;
+            }
+        }
+        assert!(leader >= 195, "2:1 visits at t=0.1 should be near-certain");
+    }
+
+    /// Unvisited children must stay behind every visited one so that repetition
+    /// fallback degrades to visit order rather than to noise.
+    #[test]
+    fn unvisited_children_sort_last() {
+        let children = vec![child(place(0.1), 0), child(place(0.2), 7), child(place(0.3), 3)];
+        for seed in 0..50 {
+            let order = sampled_child_indices(&children, Color::Black, 1.0, seed);
+            assert_eq!(order.len(), 3);
+            assert_eq!(order[2], 0, "the zero-visit child must be last");
+        }
+    }
+
+    /// Same seed, same order: replay and debugging depend on it.
+    #[test]
+    fn sampling_is_reproducible_for_a_seed() {
+        let children = vec![child(place(0.1), 40), child(place(0.2), 30), child(place(0.3), 20)];
+        let first = sampled_child_indices(&children, Color::Black, 1.0, 12_345);
+        let again = sampled_child_indices(&children, Color::Black, 1.0, 12_345);
+        assert_eq!(first, again);
+    }
+
+    /// Temperature must not leak into arenas: past `temperature_plies`, and for
+    /// the plain entry point, selection is deterministic.
+    #[test]
+    fn temperature_applies_only_within_the_opening() {
+        let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+        let mut config = SearchConfig::canary(32);
+        config.temperature = 1.5;
+        config.temperature_plies = 4;
+
+        let late = (0..6)
+            .map(|_| {
+                search_at_ply(&position, config, 7, &crate::NaiveEvaluator, 10)
+                    .expect("naive search is infallible")
+                    .action
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            late.windows(2).all(|pair| pair[0] == pair[1]),
+            "past temperature_plies selection must be deterministic"
+        );
+
+        let plain = (0..6)
+            .map(|_| {
+                search_with_evaluator(&position, config, 7, &crate::NaiveEvaluator)
+                    .expect("naive search is infallible")
+                    .action
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            plain.windows(2).all(|pair| pair[0] == pair[1]),
+            "search_with_evaluator must ignore temperature"
+        );
+    }
 
     struct FlatPolicy;
 
