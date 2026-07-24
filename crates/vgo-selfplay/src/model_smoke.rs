@@ -174,6 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let service = OnnxBatchService::load(&OnnxServiceConfig {
                 model,
                 raster,
+                policy: None,
                 maximum_batch,
                 provider,
                 device_id: 0,

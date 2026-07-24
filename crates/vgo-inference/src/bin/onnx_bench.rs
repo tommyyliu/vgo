@@ -129,6 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut service = OnnxBatchService::load(&OnnxServiceConfig {
         model,
         raster: raster_config,
+        policy: None,
         maximum_batch: batch,
         provider,
         device_id: 0,

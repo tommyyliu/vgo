@@ -23,7 +23,7 @@ use vgo_inference::{
 use vgo_raster::{CHANNEL_COUNT, CHANNELS, RasterConfig, SemanticRaster, action_pixel, rasterize};
 use vgo_search::{
     Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, SearchResult,
-    search_with_evaluator,
+    search_at_ply,
 };
 use vgo_selfplay::play_game as run_playout;
 
@@ -100,13 +100,28 @@ struct GameSamples {
 struct Config {
     #[arg(long, default_value_t = 96)]
     samples: usize,
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 96)]
     resolution: usize,
-    #[arg(long, default_value_t = 100)]
+    /// Placement grid the policy head emits, independent of the render
+    /// resolution. The board is only ~9 stones across, so 128x128 of placement
+    /// precision mostly splits single moves across many cells while spreading
+    /// the fixed proposal budget too thin to ever revisit one. Rendering stays
+    /// at `--resolution` so the Voronoi boundary channels keep their detail.
+    #[arg(long, default_value_t = 32)]
+    policy_resolution: usize,
+    #[arg(long, default_value_t = 256)]
     simulations: u32,
     /// Fine cells per coarse sampling region; zero uses legacy candidates.
     #[arg(long, default_value_t = 0)]
     coarse_pool: usize,
+    /// Softmax temperature on root visit counts for the opening plies. Zero is
+    /// deterministic argmax, which makes every game from a given position
+    /// identical; a positive value is what gives self-play its diversity.
+    #[arg(long, default_value_t = 1.0)]
+    temperature: f64,
+    /// Plies over which `--temperature` applies; selection is argmax afterwards.
+    #[arg(long, default_value_t = 30)]
+    temperature_plies: u32,
     #[arg(long = "max-plies", default_value_t = 48)]
     maximum_plies: u32,
     #[arg(long, default_value_t = 1.0 / 6.0)]
@@ -195,9 +210,16 @@ fn action_index(action: Action, config: RasterConfig) -> u32 {
     }
 }
 
-fn search_config(simulations: u32, coarse_pool: usize) -> SearchConfig {
+fn search_config(
+    simulations: u32,
+    coarse_pool: usize,
+    temperature: f64,
+    temperature_plies: u32,
+) -> SearchConfig {
     let mut config = SearchConfig::canary(simulations);
     config.coarse_pool = coarse_pool;
+    config.temperature = temperature;
+    config.temperature_plies = temperature_plies;
     config
 }
 
@@ -212,11 +234,19 @@ fn validate_config(config: &Config) -> Result<(), &'static str> {
     {
         return Err("generation counts, simulations, and dimensions must be positive");
     }
-    if config.coarse_pool > config.resolution {
-        return Err("--coarse-pool must not exceed --resolution");
+    if config.policy_resolution == 0 {
+        return Err("--policy-resolution must be positive");
+    }
+    // The pool counts fine cells per coarse region on the policy grid, which is
+    // what the sampler actually walks -- not the render raster.
+    if config.coarse_pool > config.policy_resolution {
+        return Err("--coarse-pool must not exceed --policy-resolution");
     }
     if !config.radius.is_finite() || config.radius <= 0.0 || config.radius >= 0.5 {
         return Err("--radius must be finite and between zero and one half");
+    }
+    if !config.temperature.is_finite() || config.temperature < 0.0 {
+        return Err("--temperature must be finite and not negative");
     }
     Ok(())
 }
@@ -227,15 +257,23 @@ fn generate_game(
     game_index: u64,
 ) -> Result<GameSamples, EvaluationError> {
     let raster_config = RasterConfig::square(config.resolution);
-    let search_config = search_config(config.simulations, config.coarse_pool);
+    // Policy targets, the recorded action index, and the replay policy vector all
+    // live on the placement grid, which may be coarser than the render raster.
+    let policy_config = RasterConfig::square(config.policy_resolution);
+    let search_config = search_config(
+        config.simulations,
+        config.coarse_pool,
+        config.temperature,
+        config.temperature_plies,
+    );
     let game_seed = config.seed.wrapping_add(game_index);
     let mut pending = Vec::new();
     let playout = run_playout(
         Position::new(config.radius, Vec::new(), Color::Black),
         config.maximum_plies,
-        |position, _ply| search_with_evaluator(position, search_config, game_seed, evaluator),
+        |position, ply| search_at_ply(position, search_config, game_seed, evaluator, ply),
         |step| {
-            let target = policy_target(step.search, raster_config);
+            let target = policy_target(step.search, policy_config);
             pending.push(PendingSample {
                 raster: rasterize(step.position, raster_config),
                 policy: target.policy,
@@ -244,7 +282,7 @@ fn generate_game(
                 beta: target.beta,
                 proposal_counts: target.proposal_counts,
                 to_move: step.position.to_move(),
-                selected_action: action_index(step.action, raster_config),
+                selected_action: action_index(step.action, policy_config),
                 game: game_index,
                 ply: step.ply,
                 seed: game_seed,
@@ -367,6 +405,10 @@ fn write_dataset(path: &Path, samples: &[LabeledSample]) -> std::io::Result<()> 
         ));
     }
     let config = samples[0].raster.config();
+    // The policy vector lives on the placement grid, which may be coarser than
+    // the raster, so its own length is the authority for the header -- not
+    // `config.pixels() + 1`.
+    let policy_size = samples[0].policy.len();
     let mut writer = BufWriter::new(File::create(&temporary)?);
     writer.write_all(&REPLAY_MAGIC)?;
     for value in [
@@ -375,7 +417,7 @@ fn write_dataset(path: &Path, samples: &[LabeledSample]) -> std::io::Result<()> 
         CHANNEL_COUNT as u32,
         config.height as u32,
         config.width as u32,
-        (config.pixels() + 1) as u32,
+        policy_size as u32,
     ] {
         writer.write_all(&value.to_le_bytes())?;
     }
@@ -440,10 +482,16 @@ fn write_manifest(
     writeln!(
         writer,
         "  \"policy_size\": {},",
-        config.resolution * config.resolution + 1
+        config.policy_resolution * config.policy_resolution + 1
     )?;
     writeln!(writer, "  \"simulations\": {},", config.simulations)?;
     writeln!(writer, "  \"coarse_pool\": {},", config.coarse_pool)?;
+    writeln!(writer, "  \"temperature\": {},", config.temperature)?;
+    writeln!(
+        writer,
+        "  \"temperature_plies\": {},",
+        config.temperature_plies
+    )?;
     writeln!(writer, "  \"radius\": {},", config.radius)?;
     writeln!(writer, "  \"seed\": {},", config.seed)?;
     writeln!(writer, "  \"maximum_plies\": {},", config.maximum_plies)?;
@@ -619,6 +667,7 @@ fn main() -> std::io::Result<()> {
                 )
             })?;
             let service = OnnxBatchService::load(&OnnxServiceConfig {
+                policy: Some(RasterConfig::square(config.policy_resolution)),
                 model: model.to_path_buf(),
                 raster,
                 maximum_batch: config.maximum_batch,
@@ -675,6 +724,8 @@ fn main() -> std::io::Result<()> {
             "  \"evaluator\": \"{}\",\n",
             "  \"actors\": {},\n",
             "  \"coarse_pool\": {},\n",
+            "  \"temperature\": {},\n",
+            "  \"temperature_plies\": {},\n",
             "  \"channels\": {},\n",
             "  \"resolution\": {},\n",
             "  \"policy_size\": {},\n",
@@ -688,9 +739,11 @@ fn main() -> std::io::Result<()> {
         config.runtime.as_str(),
         config.actors,
         config.coarse_pool,
+        config.temperature,
+        config.temperature_plies,
         CHANNEL_COUNT,
         config.resolution,
-        config.resolution * config.resolution + 1,
+        config.policy_resolution * config.policy_resolution + 1,
         config.examples.min(samples.len()),
     )?;
     Ok(())
@@ -722,16 +775,34 @@ mod tests {
 
     #[test]
     fn coarse_sampling_is_applied_to_search_config() {
-        let configured = search_config(37, 8);
+        let configured = search_config(37, 8, 1.0, 30);
         assert_eq!(configured.simulations, 37);
         assert_eq!(configured.coarse_pool, 8);
+        assert_eq!(configured.temperature, 1.0);
+        assert_eq!(configured.temperature_plies, 30);
+    }
+
+    /// Generation defaults to sampled opening moves. A zero default here would
+    /// silently reproduce the deterministic self-play this change exists to fix.
+    #[test]
+    fn generation_defaults_to_a_positive_opening_temperature() {
+        let default = Config::try_parse_from(["vgo-generate-demo"]).expect("default CLI parses");
+        assert!(default.temperature > 0.0);
+        assert!(default.temperature_plies > 0);
+    }
+
+    #[test]
+    fn negative_temperature_is_rejected() {
+        let configured =
+            Config::try_parse_from(["vgo-generate-demo", "--temperature=-1"]).expect("CLI parses");
+        assert!(validate_config(&configured).is_err());
     }
 
     #[test]
     fn invalid_coarse_sampling_config_is_rejected_before_generation() {
         let oversized_pool = Config::try_parse_from([
             "vgo-generate-demo",
-            "--resolution",
+            "--policy-resolution",
             "16",
             "--coarse-pool",
             "17",
@@ -739,8 +810,22 @@ mod tests {
         .expect("CLI syntax parses");
         assert_eq!(
             validate_config(&oversized_pool),
-            Err("--coarse-pool must not exceed --resolution")
+            Err("--coarse-pool must not exceed --policy-resolution")
         );
+
+        // The placement grid is independent of the render raster, so a pool
+        // exceeding the raster is legitimate as long as it fits the policy grid.
+        let decoupled = Config::try_parse_from([
+            "vgo-generate-demo",
+            "--resolution",
+            "16",
+            "--policy-resolution",
+            "32",
+            "--coarse-pool",
+            "17",
+        ])
+        .expect("CLI syntax parses");
+        assert_eq!(validate_config(&decoupled), Ok(()));
     }
 
     #[test]
@@ -776,9 +861,9 @@ mod tests {
             beta: Some(0.125),
             proposal_count,
         };
-        let result = SearchResult {
-            action: Action::Pass,
-            children: vec![
+        let result = SearchResult::from_children(
+            Action::Pass,
+            vec![
                 sampled(Point::new(0.1, 0.1), 2, 2),
                 sampled(Point::new(0.2, 0.2), 1, 3),
                 ChildSummary {
@@ -791,8 +876,9 @@ mod tests {
                     proposal_count: 0,
                 },
             ],
-            stats: SearchStats::default(),
-        };
+            SearchStats::default(),
+            vgo_core::Color::Black,
+        );
 
         let target = policy_target(&result, RasterConfig::square(2));
 

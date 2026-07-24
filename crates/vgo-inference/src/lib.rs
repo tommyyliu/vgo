@@ -68,6 +68,9 @@ pub struct PythonProcessConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BatchContract {
     pub raster: RasterConfig,
+    /// Placement grid the policy head emits. Equal to `raster` unless the model
+    /// was exported with a decoupled (coarser) policy grid.
+    pub policy: RasterConfig,
     pub maximum_batch: usize,
 }
 
@@ -138,6 +141,9 @@ impl PythonBatchService {
             reader: BufReader::new(stdout),
             contract: BatchContract {
                 raster: config.raster,
+                // The Python service protocol has no separate policy grid; its
+                // policy output is always raster-sized.
+                policy: config.raster,
                 maximum_batch: config.maximum_batch,
             },
         })
@@ -217,6 +223,8 @@ struct Inner {
     sender: Option<SyncSender<Request>>,
     next_id: AtomicU64,
     raster: RasterConfig,
+    /// Placement grid for policy indexing; may be coarser than `raster`.
+    policy_grid: RasterConfig,
     metrics: Arc<AtomicMetrics>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -244,7 +252,11 @@ impl BatchedEvaluator {
             return Err(EvaluationError::new("queue capacity must be positive"));
         }
         let contract = service.contract();
-        if contract.maximum_batch == 0 || contract.raster.width == 0 || contract.raster.height == 0
+        if contract.maximum_batch == 0
+            || contract.raster.width == 0
+            || contract.raster.height == 0
+            || contract.policy.width == 0
+            || contract.policy.height == 0
         {
             return Err(EvaluationError::new(
                 "inference service contract dimensions must be positive",
@@ -254,6 +266,7 @@ impl BatchedEvaluator {
         let metrics = Arc::new(AtomicMetrics::default());
         let broker_metrics = Arc::clone(&metrics);
         let raster = contract.raster;
+        let policy_grid = contract.policy;
         let join = thread::Builder::new()
             .name(String::from("vgo-inference-broker"))
             .spawn(move || run_broker(config, contract, service, receiver, broker_metrics))
@@ -263,6 +276,7 @@ impl BatchedEvaluator {
                 sender: Some(sender),
                 next_id: AtomicU64::new(1),
                 raster,
+                policy_grid,
                 metrics,
                 join: Mutex::new(Some(join)),
             }),
@@ -303,7 +317,7 @@ impl Evaluator for BatchedEvaluator {
         Ok(Evaluation::new(
             current_value,
             Box::new(DensePolicy {
-                config: self.inner.raster,
+                config: self.inner.policy_grid,
                 logits: policy,
             }),
         ))
@@ -311,6 +325,8 @@ impl Evaluator for BatchedEvaluator {
 }
 
 struct DensePolicy {
+    /// Placement grid the logits are laid out on. This is the policy grid, which
+    /// may be coarser than the rendered raster.
     config: RasterConfig,
     logits: Vec<f32>,
 }
@@ -437,6 +453,7 @@ mod tests {
         fn contract(&self) -> BatchContract {
             BatchContract {
                 raster: RasterConfig::square(2),
+                policy: RasterConfig::square(2),
                 maximum_batch: 2,
             }
         }

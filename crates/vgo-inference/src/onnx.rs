@@ -52,6 +52,12 @@ impl std::str::FromStr for OnnxProvider {
 pub struct OnnxServiceConfig {
     pub model: PathBuf,
     pub raster: RasterConfig,
+    /// Placement grid the model's policy head emits, which need not match the
+    /// render resolution. A ~9-across board does not need 128x128 of placement
+    /// precision, and a coarser policy grid concentrates the fixed number of
+    /// coarse->fine proposal draws over far fewer cells. `None` means the policy
+    /// grid equals the raster, which is the pre-decoupling behaviour.
+    pub policy: Option<RasterConfig>,
     pub maximum_batch: usize,
     pub provider: OnnxProvider,
     pub device_id: i32,
@@ -62,6 +68,7 @@ pub struct OnnxServiceConfig {
 pub struct OnnxBatchService {
     session: Session,
     raster: RasterConfig,
+    policy: RasterConfig,
     maximum_batch: usize,
     provider: OnnxProvider,
 }
@@ -118,6 +125,7 @@ impl OnnxBatchService {
         Ok(Self {
             session,
             raster: config.raster,
+            policy: config.policy.unwrap_or(config.raster),
             maximum_batch: config.maximum_batch,
             provider: config.provider,
         })
@@ -127,12 +135,18 @@ impl OnnxBatchService {
     pub const fn provider(&self) -> OnnxProvider {
         self.provider
     }
+
+    #[must_use]
+    pub const fn policy_grid(&self) -> RasterConfig {
+        self.policy
+    }
 }
 
 impl BatchService for OnnxBatchService {
     fn contract(&self) -> BatchContract {
         BatchContract {
             raster: self.raster,
+            policy: self.policy,
             maximum_batch: self.maximum_batch,
         }
     }
@@ -176,7 +190,7 @@ impl BatchService for OnnxBatchService {
         let (value_shape, values) = outputs["values"]
             .try_extract_tensor::<f32>()
             .map_err(|error| evaluation_error("extract ONNX value output", error))?;
-        let policy_size = self.raster.pixels() + 1;
+        let policy_size = self.policy.pixels() + 1;
         if **policy_shape != [batch.len() as i64, policy_size as i64]
             || **value_shape != [batch.len() as i64]
         {
@@ -276,11 +290,12 @@ fn validate_model(session: &Session, config: &OnnxServiceConfig) -> Result<(), E
             "ONNX checkpoint digest metadata is invalid",
         ));
     }
+    let policy = config.policy.unwrap_or(config.raster);
     for (key, expected) in [
         ("vgo.channels", CHANNEL_COUNT),
         ("vgo.height", config.raster.height),
         ("vgo.width", config.raster.width),
-        ("vgo.policy_size", config.raster.pixels() + 1),
+        ("vgo.policy_size", policy.pixels() + 1),
     ] {
         let actual = metadata
             .custom(key)

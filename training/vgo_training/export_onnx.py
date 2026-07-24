@@ -39,7 +39,8 @@ def export(arguments: argparse.Namespace) -> dict[str, object]:
     model_width = int(checkpoint["model_width"])
     blocks = int(checkpoint["blocks"])
     checkpoint_digest = file_sha256(checkpoint_path)
-    policy_size = height * width + 1
+    policy_resolution = int(checkpoint.get("policy_resolution", height))
+    policy_size = policy_resolution * policy_resolution + 1
     example = torch.zeros((2, channels, height, width), dtype=torch.float32)
     batch = torch.export.Dim("batch", min=1, max=arguments.maximum_batch)
 

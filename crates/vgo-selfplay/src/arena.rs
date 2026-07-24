@@ -37,7 +37,11 @@ struct Arguments {
     maximum_plies: u32,
     #[arg(long, default_value_t = 8)]
     threads: usize,
-    #[arg(long, default_value_t = 128)]
+    /// Placement grid the policy head emits; independent of the render
+    /// resolution. Must match the value the model was exported with.
+    #[arg(long, default_value_t = 32)]
+    policy_resolution: usize,
+    #[arg(long, default_value_t = 96)]
     resolution: usize,
     #[arg(long, default_value_t = 1.0 / 6.0)]
     radius: f64,
@@ -67,6 +71,7 @@ fn load_model(model: PathBuf, arguments: &Arguments) -> Result<BatchedEvaluator,
     let service = OnnxBatchService::load(&OnnxServiceConfig {
         model,
         raster: RasterConfig::square(arguments.resolution),
+        policy: Some(RasterConfig::square(arguments.policy_resolution)),
         maximum_batch: arguments.maximum_batch,
         provider: arguments.provider,
         device_id: 0,
@@ -95,11 +100,12 @@ fn validate_arguments(arguments: &Arguments) -> Result<(), &'static str> {
         || arguments.threads == 0
         || arguments.maximum_batch == 0
         || arguments.resolution == 0
+        || arguments.policy_resolution == 0
     {
         return Err("arena counts, simulations, and dimensions must be positive");
     }
-    if arguments.coarse_pool > arguments.resolution {
-        return Err("--coarse-pool must not exceed --resolution");
+    if arguments.coarse_pool > arguments.policy_resolution {
+        return Err("--coarse-pool must not exceed --policy-resolution");
     }
     if !arguments.radius.is_finite() || arguments.radius <= 0.0 || arguments.radius >= 0.5 {
         return Err("--radius must be finite and between zero and one half");
@@ -265,6 +271,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  \"wall_seconds\": {:.6},\n",
             "  \"model_evaluations\": {},\n",
             "  \"model_batches\": {},\n",
+            "  \"encoding_seconds\": {:.3},\n",
+            "  \"queue_seconds\": {:.3},\n",
+            "  \"inference_seconds\": {:.3},\n",
             "  \"failures\": {}\n",
             "}}"
         ),
@@ -285,6 +294,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         elapsed,
         candidate_metrics.requests,
         candidate_metrics.batches,
+        candidate_metrics.encoding_nanoseconds as f64 / 1e9,
+        candidate_metrics.queue_nanoseconds as f64 / 1e9,
+        candidate_metrics.inference_nanoseconds as f64 / 1e9,
         candidate_metrics.failures,
     );
     Ok(())
@@ -327,11 +339,13 @@ mod tests {
 
     #[test]
     fn invalid_coarse_sampling_config_is_rejected_before_arena() {
+        // The pool counts fine cells per coarse region on the placement grid,
+        // which is now independent of the render resolution.
         let oversized_pool = Arguments::try_parse_from([
             "vgo-arena",
             "--candidate",
             "candidate.onnx",
-            "--resolution",
+            "--policy-resolution",
             "16",
             "--coarse-pool",
             "17",
@@ -339,8 +353,24 @@ mod tests {
         .expect("CLI syntax parses");
         assert_eq!(
             validate_arguments(&oversized_pool),
-            Err("--coarse-pool must not exceed --resolution")
+            Err("--coarse-pool must not exceed --policy-resolution")
         );
+
+        // A pool larger than the raster but within the placement grid is fine:
+        // the two resolutions are unrelated.
+        let coarse_raster = Arguments::try_parse_from([
+            "vgo-arena",
+            "--candidate",
+            "candidate.onnx",
+            "--resolution",
+            "16",
+            "--policy-resolution",
+            "32",
+            "--coarse-pool",
+            "17",
+        ])
+        .expect("CLI syntax parses");
+        assert_eq!(validate_arguments(&coarse_raster), Ok(()));
     }
 
     #[test]

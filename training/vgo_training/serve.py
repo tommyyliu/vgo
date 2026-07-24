@@ -32,11 +32,20 @@ def read_exact(stream, size: int, *, allow_eof: bool = False) -> bytes | None:
 
 def load_model(checkpoint_path: Path) -> tuple[nn.Module, dict[str, object]]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    # Checkpoints written before the placement grid was decoupled have no
+    # policy_resolution and are raster-coupled.
+    stored_policy = checkpoint.get("policy_resolution")
+    policy_resolution = (
+        int(stored_policy)
+        if stored_policy is not None and int(stored_policy) != int(checkpoint["height"])
+        else None
+    )
     model = build_model(
         architecture=str(checkpoint.get("architecture", "flat")),
         channels=int(checkpoint["channels"]),
         width=int(checkpoint["model_width"]),
         blocks=int(checkpoint["blocks"]),
+        policy_resolution=policy_resolution,
     )
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()

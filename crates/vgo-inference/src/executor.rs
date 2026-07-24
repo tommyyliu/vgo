@@ -170,6 +170,7 @@ mod tests {
         fn contract(&self) -> BatchContract {
             BatchContract {
                 raster: RasterConfig::square(2),
+                policy: RasterConfig::square(2),
                 maximum_batch: 1,
             }
         }

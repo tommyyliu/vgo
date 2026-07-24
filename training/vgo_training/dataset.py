@@ -98,8 +98,21 @@ def _read_header(path: Path) -> tuple[bytes, int, int, int, int, int, int]:
         raise ValueError(f"unsupported replay version: {version}")
     if samples == 0 or channels == 0 or height == 0 or width == 0:
         raise ValueError("dataset dimensions must be positive")
-    if policy_size != height * width + 1:
-        raise ValueError("policy size must equal raster pixels plus pass")
+    # The placement grid may be coarser than the render raster, so policy_size
+    # need not equal raster pixels. When it does not, the placement grid must be
+    # square (the decoupled grid is always `policy_resolution^2 + 1`) and no
+    # finer than the raster it is pooled from.
+    placement_cells = policy_size - 1
+    if placement_cells <= 0:
+        raise ValueError("policy size must include at least one placement cell plus pass")
+    if placement_cells != height * width:
+        side = round(placement_cells**0.5)
+        if side * side != placement_cells:
+            raise ValueError(
+                "decoupled policy size must be a square placement grid plus pass"
+            )
+        if side > min(height, width):
+            raise ValueError("placement grid must not exceed the raster resolution")
     return magic, version, samples, channels, height, width, policy_size
 
 
@@ -359,3 +372,57 @@ def load_datasets(paths: Iterable[str | Path]) -> RasterDataset:
         width=first.width,
         sources=tuple(source for dataset in datasets for source in dataset.sources),
     )
+
+
+def replay_diagnostics(dataset: RasterDataset, *, maximum_pairs: int = 400) -> dict[str, object]:
+    """Health metrics for a replay shard, keyed on whether the policy target is
+    learnable at all.
+
+    `ply0_candidate_jaccard` is the mean pairwise overlap of candidate sets across
+    games at ply zero, where every game sees the identical empty board. If the
+    coarse-to-fine sampler is drawing from a board-dependent map, those sets
+    should substantially agree. Near zero means the target's support relocates
+    every game, which is the unlearnable-target failure the redesign exists to
+    fix -- see docs/POLICY_REDESIGN.md.
+
+    `top1_visit_share` is the mean fraction of root visits landing on the
+    most-visited child. Very high with a small candidate count suggests search is
+    committing before progressive widening has introduced later candidates.
+
+    `distinct_opening_moves` counts how many different first moves the shard
+    contains. Under deterministic (argmax) selection with a stable candidate
+    sampler this collapses toward one.
+    """
+    import itertools
+
+    plies = dataset.plies
+    opening = (plies == 0).nonzero().flatten()
+    visits = dataset.visits.float()
+    totals = visits.sum(dim=1).clamp(min=1.0)
+    top1 = float((visits.max(dim=1).values / totals).mean()) if dataset.samples else 0.0
+
+    jaccard = float("nan")
+    distinct_openings = 0
+    if len(opening) >= 1:
+        distinct_openings = int(torch.unique(dataset.selected_actions[opening]).numel())
+    if len(opening) >= 2:
+        # uint32 proposal counts do not support comparison on all torch builds.
+        support = dataset.proposal_counts[opening].long() > 0
+        overlaps = []
+        for left, right in itertools.islice(
+            itertools.combinations(range(len(opening)), 2), maximum_pairs
+        ):
+            first, second = support[left], support[right]
+            union = (first | second).sum().clamp(min=1)
+            overlaps.append(float((first & second).sum() / union))
+        if overlaps:
+            jaccard = sum(overlaps) / len(overlaps)
+
+    explored = (visits > 0).sum(dim=1).float()
+    return {
+        "ply0_games": int(len(opening)),
+        "ply0_candidate_jaccard": jaccard,
+        "distinct_opening_moves": distinct_openings,
+        "top1_visit_share": top1,
+        "explored_candidates_per_position": float(explored.mean()) if dataset.samples else 0.0,
+    }

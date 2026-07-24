@@ -18,8 +18,17 @@ class ResidualBlock(nn.Module):
 
 
 class RasterPolicyValueNet(nn.Module):
-    def __init__(self, channels: int, width: int = 32, blocks: int = 3) -> None:
+    def __init__(
+        self,
+        channels: int,
+        width: int = 32,
+        blocks: int = 3,
+        policy_resolution: int | None = None,
+    ) -> None:
         super().__init__()
+        # See UNetPolicyValueNet: the placement grid may be coarser than the
+        # raster the tower reads. None keeps them equal.
+        self.policy_resolution = policy_resolution
         self.stem = nn.Sequential(
             nn.Conv2d(channels, width, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -37,6 +46,10 @@ class RasterPolicyValueNet(nn.Module):
     def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.blocks(self.stem(states))
         pooled = features.mean(dim=(-2, -1))
+        if self.policy_resolution is not None:
+            features = nn.functional.adaptive_avg_pool2d(
+                features, (self.policy_resolution, self.policy_resolution)
+            )
         placement_logits = self.policy_map(features).flatten(start_dim=1)
         pass_logit = self.pass_head(pooled)
         policy_logits = torch.cat((placement_logits, pass_logit), dim=1)
@@ -87,8 +100,20 @@ class UNetPolicyValueNet(nn.Module):
     heads read the bottleneck for global context.
     """
 
-    def __init__(self, channels: int, width: int = 64, blocks: int = 8) -> None:
+    def __init__(
+        self,
+        channels: int,
+        width: int = 64,
+        blocks: int = 8,
+        policy_resolution: int | None = None,
+    ) -> None:
         super().__init__()
+        # The policy head may emit a coarser placement grid than the raster it
+        # reads. The encoder/decoder still runs at full resolution, so the
+        # Voronoi boundary channels keep their detail; only the placement output
+        # is coarsened, which concentrates the coarse->fine proposal budget over
+        # far fewer cells. None keeps the policy grid equal to the input raster.
+        self.policy_resolution = policy_resolution
         shallow = max(16, width // 2)
         middle = width
         bottleneck = width * 2
@@ -115,6 +140,13 @@ class UNetPolicyValueNet(nn.Module):
         skip_mid = self.down1(skip_full)
         bottleneck = self.down2(skip_mid)
         decoded = self.up2(self.up1(bottleneck, skip_mid), skip_full)
+        if self.policy_resolution is not None:
+            # Pool the features, not the logits: averaging feature channels
+            # before the 1x1 projection keeps more signal than averaging the
+            # scalar logits it would otherwise produce.
+            decoded = nn.functional.adaptive_avg_pool2d(
+                decoded, (self.policy_resolution, self.policy_resolution)
+            )
         placement_logits = self.policy_map(decoded).flatten(start_dim=1)
         pooled = bottleneck.mean(dim=(-2, -1))
         pass_logit = self.pass_head(pooled)
@@ -123,12 +155,25 @@ class UNetPolicyValueNet(nn.Module):
         return policy_logits, values
 
 
-def build_model(architecture: str, channels: int, width: int, blocks: int) -> nn.Module:
+def build_model(
+    architecture: str,
+    channels: int,
+    width: int,
+    blocks: int,
+    policy_resolution: int | None = None,
+) -> nn.Module:
     """Construct a policy-value net by architecture name. Older checkpoints without
-    an architecture field are the flat residual tower."""
+    an architecture field are the flat residual tower.
+
+    `policy_resolution` coarsens the placement grid the policy head emits while
+    leaving the input raster untouched; None keeps them equal."""
     if architecture in ("", "flat", "raster"):
-        return RasterPolicyValueNet(channels=channels, width=width, blocks=blocks)
+        return RasterPolicyValueNet(
+            channels=channels, width=width, blocks=blocks, policy_resolution=policy_resolution
+        )
     if architecture == "unet":
-        return UNetPolicyValueNet(channels=channels, width=width, blocks=blocks)
+        return UNetPolicyValueNet(
+            channels=channels, width=width, blocks=blocks, policy_resolution=policy_resolution
+        )
     raise ValueError(f"unknown model architecture: {architecture!r}")
 

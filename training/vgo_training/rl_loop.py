@@ -204,8 +204,14 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("value weight must be nonnegative")
     if arguments.coarse_pool < 0:
         raise ValueError("coarse pool must be nonnegative")
-    if arguments.coarse_pool > arguments.resolution:
-        raise ValueError("coarse pool must not exceed resolution")
+    if arguments.policy_resolution <= 0:
+        raise ValueError("policy resolution must be positive")
+    if arguments.coarse_pool > arguments.policy_resolution:
+        raise ValueError("coarse pool must not exceed policy resolution")
+    if arguments.temperature < 0.0:
+        raise ValueError("temperature must be nonnegative")
+    if arguments.temperature_plies < 0:
+        raise ValueError("temperature plies must be nonnegative")
 
 
 def promotion_decision(
@@ -248,10 +254,16 @@ def generation_command(
         str(arguments.samples),
         "--resolution",
         str(arguments.resolution),
+        "--policy-resolution",
+        str(arguments.policy_resolution),
         "--simulations",
         str(arguments.generation_simulations),
         "--coarse-pool",
         str(arguments.coarse_pool),
+        "--temperature",
+        str(arguments.temperature),
+        "--temperature-plies",
+        str(arguments.temperature_plies),
         "--max-plies",
         str(arguments.maximum_plies),
         "--radius",
@@ -306,6 +318,8 @@ def arena_command(
         str(arguments.arena_actors),
         "--resolution",
         str(arguments.resolution),
+        "--policy-resolution",
+        str(arguments.policy_resolution),
         "--radius",
         str(arguments.radius),
         "--seed",
@@ -507,6 +521,19 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
         generation = progress["generation"]
         if isinstance(generation, dict):
             generation["dataset"] = str(replay_path / "dataset.vgo")
+            if "diagnostics" not in generation:
+                # Cheap health check on the shard we just wrote. A ply-0 Jaccard
+                # near zero means the policy target is still sampler noise, which
+                # no amount of training will fix; see docs/RL_LOOP.md.
+                from .dataset import load_dataset, replay_diagnostics
+
+                try:
+                    generation["diagnostics"] = replay_diagnostics(
+                        load_dataset(replay_path / "dataset.vgo")
+                    )
+                except Exception as error:  # diagnostics must never fail a run
+                    generation["diagnostics"] = {"error": str(error)}
+                atomic_json(progress_path, progress)
         replay_paths.append(replay_path / "dataset.vgo")
         active_replay = replay_paths[-arguments.replay_window :]
 
@@ -697,7 +724,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--samples", type=int, default=192)
     parser.add_argument("--replay-window", type=int, default=4)
-    parser.add_argument("--resolution", type=int, default=128)
+    parser.add_argument("--resolution", type=int, default=96)
     parser.add_argument("--radius", type=float, default=1.0 / 6.0)
     parser.add_argument("--generation-simulations", type=int, default=64)
     parser.add_argument(
@@ -705,6 +732,32 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="fine cells per coarse sampling region; 0 uses legacy candidates",
+    )
+    parser.add_argument(
+        "--policy-resolution",
+        type=int,
+        default=32,
+        help=(
+            "placement grid the policy head emits, independent of --resolution. "
+            "Coarser placement concentrates the fixed coarse->fine proposal budget "
+            "over far fewer cells; rendering keeps --resolution detail."
+        ),
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "softmax temperature on root visit counts for the opening plies of "
+            "self-play generation; 0 is deterministic argmax. Arenas are always "
+            "deterministic regardless of this value."
+        ),
+    )
+    parser.add_argument(
+        "--temperature-plies",
+        type=int,
+        default=30,
+        help="plies over which --temperature applies before reverting to argmax",
     )
     parser.add_argument("--maximum-plies", type=int, default=48)
     parser.add_argument("--examples", type=int, default=2)

@@ -17,6 +17,60 @@ from .serve import load_model
 
 LEGAL_CLEARANCE_CHANNEL = 7
 
+# The eight symmetries of the square: (number of 90-degree rotations, flip?).
+DIHEDRAL_TRANSFORMS = tuple((rotations, flip) for flip in (False, True) for rotations in range(4))
+
+
+def apply_dihedral(
+    states: torch.Tensor,
+    policies: torch.Tensor,
+    policy_masks: torch.Tensor,
+    transform: int,
+    height: int,
+    width: int,
+    policy_height: int | None = None,
+    policy_width: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply one of the eight square symmetries to a batch of states and targets.
+
+    The board is square and every raster channel is a geometric field of the
+    position (player-relative, so no colour swapping is involved), which makes
+    the dihedral group an exact symmetry of the game: the transformed position is
+    a real position whose transformed policy is the correct target for it.
+
+    Policy vectors are `height * width` placement cells followed by one pass
+    logit. Only the placement block is reindexed; pass is invariant under every
+    symmetry, so it is carried through untouched.
+    """
+    if transform == 0:
+        return states, policies, policy_masks
+    if height != width:
+        raise ValueError("dihedral augmentation requires a square raster")
+    # The placement grid may be coarser than the raster; both are square, so the
+    # same symmetry applies to each at its own scale.
+    policy_height = height if policy_height is None else policy_height
+    policy_width = width if policy_width is None else policy_width
+    if policy_height != policy_width:
+        raise ValueError("dihedral augmentation requires a square placement grid")
+    rotations, flip = DIHEDRAL_TRANSFORMS[transform]
+
+    def spatial(tensor: torch.Tensor) -> torch.Tensor:
+        # [..., H, W] with the symmetry applied to the trailing two axes.
+        if rotations:
+            tensor = torch.rot90(tensor, rotations, dims=(-2, -1))
+        if flip:
+            tensor = torch.flip(tensor, dims=(-1,))
+        return tensor.contiguous()
+
+    cells = policy_height * policy_width
+
+    def policy(tensor: torch.Tensor) -> torch.Tensor:
+        placements, pass_logit = tensor[:, :cells], tensor[:, cells:]
+        grid = placements.reshape(-1, policy_height, policy_width)
+        return torch.cat((spatial(grid).reshape(placements.shape[0], -1), pass_logit), dim=1)
+
+    return spatial(states), policy(policies), policy(policy_masks)
+
 
 def importance_corrected_policy_targets(
     visits: torch.Tensor,
@@ -138,23 +192,40 @@ def importance_corrected_policy_targets(
 def full_legal_policy_masks(
     states: torch.Tensor, explored_masks: torch.Tensor
 ) -> torch.Tensor:
-    """Return the full raster legality mask, preserving explored boundary aliases."""
+    """Return the full legality mask on the *policy* grid, preserving explored aliases.
+
+    Legality is read from the raster's signed legal-clearance channel, which is at
+    the render resolution. When the placement grid is coarser, each policy cell
+    covers a block of raster pixels and is legal if *any* of them is legal --
+    max-pooling, not averaging: a cell containing one playable point is a playable
+    move, and averaging clearance would erase exactly the near-boundary moves.
+    """
     if states.ndim != 4 or explored_masks.ndim != 2:
         raise ValueError("states must be rank four and policy masks rank two")
-    pixels = states.shape[2] * states.shape[3]
-    if explored_masks.shape != (states.shape[0], pixels + 1):
-        raise ValueError("policy mask shape does not match raster dimensions")
+    if explored_masks.shape[0] != states.shape[0]:
+        raise ValueError("policy mask batch does not match states")
+    placement_cells = explored_masks.shape[1] - 1
     if states.shape[1] <= LEGAL_CLEARANCE_CHANNEL:
         # Only synthetic/legacy fixtures lack the semantic legal-clearance
         # channel. Their stored candidate mask is the best available contract.
         return explored_masks.bool()
-    placements = states[:, LEGAL_CLEARANCE_CHANNEL].reshape(states.shape[0], pixels) >= 0.0
+    clearance = states[:, LEGAL_CLEARANCE_CHANNEL].unsqueeze(1)
+    raster_cells = states.shape[2] * states.shape[3]
+    if placement_cells != raster_cells:
+        side = int(round(placement_cells**0.5))
+        if side * side != placement_cells:
+            raise ValueError("policy mask is not a square placement grid plus pass")
+        # max_pool over clearance == "any legal pixel in this cell".
+        clearance = nn.functional.adaptive_max_pool2d(clearance, (side, side))
+    placements = clearance.reshape(states.shape[0], -1) >= 0.0
+    if placements.shape[1] != placement_cells:
+        raise ValueError("policy mask shape does not match the placement grid")
     passes = torch.ones(
         (states.shape[0], 1), dtype=torch.bool, device=states.device
     )
-    # Exact continuous actions on the legal boundary can map to a raster cell
-    # whose centre is just outside the legal set. Keep such explored aliases in
-    # the denominator so every positive target remains representable.
+    # Exact continuous actions on the legal boundary can map to a cell whose
+    # centre is just outside the legal set. Keep such explored aliases in the
+    # denominator so every positive target remains representable.
     return torch.cat((placements, passes), dim=1) | explored_masks.bool()
 
 
@@ -354,6 +425,18 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
     dataset_channels = dataset.channels
     dataset_height = dataset.height
     dataset_width = dataset.width
+    # The replay policy vector is `policy_resolution^2 + 1`, which is how the
+    # placement grid reaches training: it may be coarser than the raster the
+    # states were rendered at. Equal sizes mean the grids are coupled.
+    placement_cells = dataset.policies.shape[1] - 1
+    policy_resolution = int(round(placement_cells**0.5))
+    if policy_resolution * policy_resolution != placement_cells:
+        raise ValueError(
+            f"replay policy vector {dataset.policies.shape[1]} is not a square grid plus pass"
+        )
+    decoupled_policy = (
+        policy_resolution if (policy_resolution, policy_resolution) != (dataset_height, dataset_width) else None
+    )
     dataset_sources = dataset.sources
     dataset_shape = tuple(dataset.states.shape)
     generator = torch.Generator().manual_seed(arguments.seed)
@@ -390,6 +473,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
             channels=dataset_channels,
             width=model_width,
             blocks=blocks,
+            policy_resolution=decoupled_policy,
         )
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=arguments.learning_rate)
@@ -432,6 +516,23 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
             policy_targets = training.policies[indices].to(device)
             policy_masks = training.policy_masks[indices].to(device)
             value_targets = training.values[indices].to(device)
+            if arguments.augment:
+                # One symmetry per batch rather than per sample: the transform is
+                # a cheap view-and-copy, and over many epochs each position is
+                # still seen under all eight. Values are scalars and invariant.
+                transform = int(
+                    torch.randint(len(DIHEDRAL_TRANSFORMS), (1,), generator=generator).item()
+                )
+                states, policy_targets, policy_masks = apply_dihedral(
+                    states,
+                    policy_targets,
+                    policy_masks,
+                    transform,
+                    training.height,
+                    training.width,
+                    policy_resolution,
+                    policy_resolution,
+                )
             logits, values = model(states)
             policy_loss = policy_cross_entropy(logits, policy_targets, policy_masks)
             value_loss = nn.functional.mse_loss(values, value_targets)
@@ -487,6 +588,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         "channels": dataset_channels,
         "height": dataset_height,
         "width": dataset_width,
+        "policy_resolution": policy_resolution,
         "model_width": model_width,
         "blocks": blocks,
         "architecture": architecture,
@@ -553,6 +655,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--report-every", type=int, default=20)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="apply the eight dihedral symmetries of the square board to training batches",
+    )
     return parser.parse_args()
 
 
