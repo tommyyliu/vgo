@@ -61,9 +61,32 @@ measurement with `vgo_training.benchmark_precision`.
 
 ## Policy coordinates
 
-The network emits `height * width` placement logits and one final pass logit.
-A continuous candidate maps to the containing pixel. MCTS visits from candidates
-that share a pixel are added together.
+The network emits `policy_resolution^2` placement logits and one final pass
+logit. A continuous candidate maps to the containing policy cell. MCTS visits
+from candidates that share a cell are added together.
+
+**The placement grid is independent of the render resolution.** They were once
+the same number; they answer different questions. The raster resolution controls
+how much geometric detail the convolution tower sees -- channels 2, 3, 6, and 7
+are continuous fields whose *edges* carry the information, and coarsening them
+aliases the Voronoi ridge away. The placement resolution controls how finely a
+move can be aimed, and a board roughly nine stones across does not need 16384
+distinct placements.
+
+Keeping them equal was actively harmful. Progressive widening draws
+`K = min(96, ceil(2*sqrt(N+1)))` proposals -- 33 at 256 simulations. Spread over
+a 128x128 grid, 33 draws essentially never land on the same cell twice, so the
+sampled candidate set relocates every game and the policy target has no stable
+support. Over 32x32 the same 33 draws revisit cells 21% of the time. Measured
+ply-0 candidate overlap rose from `0.002` to `0.034` on that change alone.
+
+Set `--policy-resolution` at generation, arena, and duel time; it is stored in
+the checkpoint and frozen into the exported ONNX metadata as `vgo.policy_size`.
+The replay header records it, and training derives the model's policy head from
+the replay rather than from a flag. The full-legal training mask is max-pooled
+from the raster's clearance channel down to the placement grid: a policy cell is
+legal if *any* raster pixel inside it is legal, because a cell containing one
+playable point is a playable move.
 
 Sampled search does not imply that unvisited pixels are bad moves. Every current
 replay record therefore contains the sampled-candidate mask, raw visit counts,

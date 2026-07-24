@@ -26,26 +26,36 @@ From `training`:
 uv run python -m vgo_training.rl_loop `
   --output ../artifacts/rl-run `
   --iterations 4 --samples 768 --replay-window 4 `
-  --resolution 128 --coarse-pool 8 --generation-simulations 128 `
-  --epochs 50 --training-batch 16 --device cuda `
-  --actors 16 --arena-actors 1 --arena-pairs 40 `
+  --resolution 96 --policy-resolution 32 --coarse-pool 4 `
+  --generation-simulations 256 --epochs 50 --training-batch 16 --device cuda `
+  --actors 16 --arena-actors 32 --arena-pairs 40 `
   --maximum-batch 16 --provider tensorrt `
   --promotion-score 0.52 --maximum-truncation-rate 0.02
 ```
 
-Generation uses many actors to fill inference batches. Promotion deliberately
-defaults to one actor. Concurrent FP16 requests can produce different batch
-shapes, and small numerical changes can change an action when logits are nearly
-tied. Single-actor arenas issue batch-one requests in a stable order. Use more
-arena actors for throughput measurements, not promotion decisions.
+Generation and arenas both use many actors to fill inference batches. Arenas
+were formerly single-actor on the theory that concurrent FP16 requests change
+batch shapes, and that small numerical differences could flip an action when
+logits are nearly tied. Measured on one model pair, that fear was unfounded: the
+same 24-game arena scored 0.625 identically at 1, 8, 16, 24, 32, and 48 actors,
+with byte-identical evaluation counts. Single-actor arenas do not buy
+determinism -- search is already seeded per (match, position, ply) -- they only
+pin one floating-point reduction order, at 6x the wall time. Prefer more actors
+and more pairs: sampling error over 24 games is +/-0.19, which dwarfs anything
+batching perturbs.
+
+Throughput scales with *concurrent games*, not threads, because MCTS is
+sequential within a game: one evaluation is in flight per game, so `--threads`
+above `--pairs` does nothing. Set arena actors near the pair count.
 
 The first iteration bootstraps from the deterministic naive evaluator. Later
 iterations generate with the incumbent, warm-start training, and retain recent
 replay. Pass both `--initial-checkpoint` and `--initial-onnx` to continue from a
 published model; `--initial-replay` adds existing shards to the replay window.
-`--coarse-pool 8` enables coarse-to-fine policy sampling for ONNX self-play and
+`--coarse-pool` enables coarse-to-fine policy sampling for ONNX self-play and
 arenas; its default of `0` preserves the legacy candidate sequence. The pool is
-the number of fine cells per coarse region and cannot exceed `--resolution`.
+the number of fine cells per coarse region and cannot exceed
+`--policy-resolution`.
 The loop forwards the same pool to replay generation, baseline and promotion
 arenas, and optional Elo matches.
 
@@ -55,6 +65,37 @@ model necessarily produces legacy replay in iteration zero even when
 accepted, or immediately when both `--initial-checkpoint` and `--initial-onnx`
 are supplied. ONNX candidates in the iteration-zero arena can still use the
 coarse path.
+
+## Move selection and self-play diversity
+
+Generation samples the played move from the root visit counts:
+`P(a) ∝ visits(a)^(1 / temperature)` while `ply < --temperature-plies`, and
+deterministic argmax from that ply onward. `--temperature 0` restores pure
+argmax everywhere.
+
+This matters more than it looks. Under argmax, search is a deterministic
+function of the position, so a given board always yields the same move and every
+game from the empty board is the same game. Before this was added, the only
+thing making self-play games differ was randomness in the *candidate sampler* —
+which is exactly the target noise the coarse-to-fine redesign exists to remove.
+Removing that noise without adding move sampling collapses self-play to one
+game repeated. Arenas and `vgo-playout-duel` deliberately do not sample: a
+promotion verdict wants the search's best move, not a draw from it.
+
+Two diagnostics track whether this is working, both reported per iteration:
+
+- **ply-0 candidate Jaccard** — mean pairwise overlap of candidate sets across
+  games on the identical empty board. Near zero means the candidate support is
+  relocating every game and the policy target is still noise. This was `0.002`
+  on the 128x128 `coarse-pw-night1` replay, i.e. worse than the ~10% the
+  redesign set out to fix. Decoupling the placement grid (see
+  `--policy-resolution`) raised it to `0.034`: 33 proposal draws over 1024 cells
+  can revisit a cell, where 23 draws over 16384 essentially never do. Raising
+  move-selection temperature did *not* move this number, which is how we learned
+  the noise is upstream of move selection.
+- **top-1 visit share** — mean fraction of root visits on the most-visited
+  child. Very high with few candidates and few simulations suggests PUCT is
+  committing before progressive widening has introduced later candidates.
 
 Spatial search retains the standard cumulative visit-count widening budget
 `min(96, max(4, ceil(2 * sqrt(N + 1))))`. Each widening call draws only the IID

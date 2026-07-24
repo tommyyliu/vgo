@@ -46,11 +46,11 @@ cd training
 uv run python -m vgo_training.rl_loop `
   --output ../artifacts/rl-run-NAME `
   --iterations 4 --samples 3072 --replay-window 4 `
-  --resolution 128 --coarse-pool 8 `
-  --generation-simulations 128 --arena-simulations 128 `
+  --resolution 96 --policy-resolution 32 --coarse-pool 4 `
+  --generation-simulations 256 --arena-simulations 256 `
   --maximum-plies 96 `
   --epochs 120 --training-batch 32 --warm-learning-rate 1e-4 --value-weight 0.1 `
-  --device cuda --actors 64 --arena-actors 1 --arena-pairs 40 `
+  --device cuda --actors 64 --arena-actors 32 --arena-pairs 40 `
   --maximum-batch 64 --provider tensorrt `
   --promotion-score 0.52 --maximum-truncation-rate 0.02
 ```
@@ -64,9 +64,9 @@ so the window does not restart empty:
   --initial-replay ../artifacts/PREV/iteration-000/replay/dataset.vgo
 ```
 
-`--coarse-pool` is the only coarse-sampling knob. Its default `0` uses legacy
+`--coarse-pool` is the coarse-sampling knob. Its default `0` uses legacy
 candidates; a positive value is forwarded unchanged to generation, every arena,
-and Elo telemetry, and must not exceed `--resolution`. With no initial model,
+and Elo telemetry, and must not exceed `--policy-resolution`. With no initial model,
 iteration-zero generation uses the naive evaluator and therefore falls back to
 legacy candidates because it has no spatial policy grid. Supply an initial
 checkpoint/ONNX pair to exercise coarse generation immediately, or let it begin
@@ -97,18 +97,43 @@ compare models directly, run the arena yourself:
 cargo run --release -p vgo-selfplay --bin vgo-arena -- `
   --candidate artifacts/A/model/candidate.onnx `
   --opponent  artifacts/B/model/candidate.onnx `
-  --pairs 75 --simulations 128 --max-plies 96 --threads 4 `
-  --resolution 128 --coarse-pool 8 --radius 0.16666666666666666 `
+  --pairs 75 --simulations 256 --max-plies 256 --threads 32 `
+  --resolution 96 --policy-resolution 32 --coarse-pool 4 `
+  --radius 0.05555555555555555 `
   --maximum-batch 16 --provider tensorrt --cache-directory artifacts/onnx-cache
 ```
 
 Omit `--opponent` to play the naive policy. Games are colour-swapped in pairs,
-so `--pairs 75` is 150 games. Use `--threads 1` for a promotion-grade verdict
-and more actors only for aggregate measurements; see the determinism note in
-`docs/RL_LOOP.md`.
+so `--pairs 75` is 150 games. Set `--threads` near `--pairs`: throughput scales
+with concurrent games, not threads, because MCTS keeps only one evaluation in
+flight per game. Arena verdicts were measured identical from 1 to 48 threads, so
+parallel arenas are promotion-grade; see the note in `docs/RL_LOOP.md`.
 
 Run it through `runtime_environment()` if you invoke it from Python, or from a
 shell where the TensorRT libraries are already on `PATH`. See the traps below.
+
+### Is search working at all?
+
+`vgo-arena` drives both seats at one `--simulations`, so it cannot tell you
+whether search depth is buying anything. `vgo-playout-duel` holds the model
+fixed and varies only the playout budget, which isolates the search path from
+policy quality:
+
+```powershell
+cargo run --release -p vgo-selfplay --bin vgo-playout-duel -- `
+  --model artifacts/A/model/candidate.onnx `
+  --high 128 --low 16 --pairs 40 --coarse-pool 8 `
+  --max-plies 160 --threads 32 --resolution 96 --policy-resolution 32 `
+  --radius 0.05555555555555555 --maximum-batch 64 `
+  --provider tensorrt --cache-directory artifacts/onnx-cache
+```
+
+The deep seat should win comfortably. If it does not, the fault is in search
+rather than in the policy, because both seats share one evaluator. Pass
+`--coarse-pool 0` to run the same comparison on the legacy candidate path;
+running both is how you tell a coarse-sampling regression from a general search
+regression. Use the same `--radius` and `--resolution` the model trained at, or
+the net sees out-of-distribution rasters and inference returns NaN.
 
 ## Benchmarks
 
@@ -180,8 +205,8 @@ mirror-symmetric finish. Self-play at 128 simulations produces none at all;
 arenas at 16 produce 12-22%. A nonzero draw rate is a useful signal rather than
 a curiosity.
 
-**Replay shards are large.** 3072 samples at 128x128x10 float32 is 2.3 GB, so a
-four-deep window is roughly 10 GB of host memory. `artifacts/` is gitignored for
+**Replay shards are large.** 3072 samples at 96x96x10 float32 is 1.1 GB, so a
+four-deep window is roughly 5 GB of host memory. `artifacts/` is gitignored for
 this reason.
 
 **A silently killed training stage is usually the device running out of memory.**

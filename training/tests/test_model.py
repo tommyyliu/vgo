@@ -4,6 +4,8 @@ import torch
 
 from vgo_training.model import RasterPolicyValueNet
 from vgo_training.train_demo import (
+    DIHEDRAL_TRANSFORMS,
+    apply_dihedral,
     full_legal_policy_masks,
     importance_corrected_policy_targets,
     policy_cross_entropy,
@@ -114,6 +116,82 @@ class ModelTests(unittest.TestCase):
                 torch.zeros(1, 2, dtype=torch.uint32),
                 torch.ones(1, 2, dtype=torch.bool),
             )
+
+
+class DihedralAugmentationTests(unittest.TestCase):
+    """A wrong reindex here silently corrupts every policy target, so these check
+    the state and the target move together rather than just that shapes survive."""
+
+    height = 4
+    width = 4
+
+    def _fixture(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cells = self.height * self.width
+        # Each state pixel holds its own flat index, so we can follow where it went.
+        states = (
+            torch.arange(cells, dtype=torch.float32)
+            .reshape(1, 1, self.height, self.width)
+            .repeat(2, 1, 1, 1)
+        )
+        policies = torch.zeros(2, cells + 1)
+        policies[:, 5] = 1.0
+        policies[:, -1] = 0.25
+        masks = torch.ones(2, cells + 1)
+        return states, policies, masks
+
+    def test_state_and_policy_stay_aligned(self) -> None:
+        states, policies, masks = self._fixture()
+        cells = self.height * self.width
+        for transform in range(len(DIHEDRAL_TRANSFORMS)):
+            moved_states, moved_policies, _ = apply_dihedral(
+                states, policies, masks, transform, self.height, self.width
+            )
+            cell = int(moved_policies[0, :cells].argmax())
+            row, column = divmod(cell, self.width)
+            self.assertEqual(
+                float(moved_states[0, 0, row, column]),
+                5.0,
+                f"transform {transform} moved the policy and the state differently",
+            )
+
+    def test_pass_is_invariant_and_mass_conserved(self) -> None:
+        states, policies, masks = self._fixture()
+        for transform in range(len(DIHEDRAL_TRANSFORMS)):
+            _, moved, _ = apply_dihedral(
+                states, policies, masks, transform, self.height, self.width
+            )
+            self.assertAlmostEqual(float(moved[0, -1]), 0.25, places=6)
+            self.assertAlmostEqual(float(moved[0].sum()), 1.25, places=6)
+
+    def test_transforms_are_distinct(self) -> None:
+        # Cell (0, 1) is off both diagonals and off centre, so its orbit under the
+        # dihedral group has all eight elements. A cell on a diagonal (such as the
+        # (1, 1) used by the other tests) is fixed by a reflection and would only
+        # produce four images -- correct behaviour, but useless for this check.
+        states, _, masks = self._fixture()
+        cells = self.height * self.width
+        policies = torch.zeros(2, cells + 1)
+        policies[:, 1] = 1.0
+        seen = set()
+        for transform in range(len(DIHEDRAL_TRANSFORMS)):
+            _, moved, _ = apply_dihedral(
+                states, policies, masks, transform, self.height, self.width
+            )
+            seen.add(int(moved[0, :cells].argmax()))
+        self.assertEqual(len(seen), 8, "the eight symmetries must map a cell eight ways")
+
+    def test_identity_transform_is_a_passthrough(self) -> None:
+        states, policies, masks = self._fixture()
+        moved_states, moved_policies, _ = apply_dihedral(
+            states, policies, masks, 0, self.height, self.width
+        )
+        self.assertTrue(torch.equal(moved_states, states))
+        self.assertTrue(torch.equal(moved_policies, policies))
+
+    def test_non_square_raster_is_rejected(self) -> None:
+        states, policies, masks = self._fixture()
+        with self.assertRaises(ValueError):
+            apply_dihedral(states, policies, masks, 1, 2, 8)
 
 
 if __name__ == "__main__":

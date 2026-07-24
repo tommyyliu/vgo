@@ -380,3 +380,78 @@ class DatasetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReplayDiagnosticsTests(unittest.TestCase):
+    """These metrics decide whether a full RL run is worth starting, so the
+    degenerate cases have to report honestly rather than crash or flatter."""
+
+    def _dataset(self, supports, opening_actions, visits_rows):
+        import torch
+
+        from vgo_training.dataset import RasterDataset
+
+        samples = len(supports)
+        cells = 4
+        counts = torch.zeros(samples, cells + 1, dtype=torch.int64)
+        for row, support in enumerate(supports):
+            for cell in support:
+                counts[row, cell] = 1
+        visits = torch.tensor(visits_rows, dtype=torch.float32)
+        return RasterDataset(
+            states=torch.zeros(samples, 10, 2, 2),
+            policies=torch.zeros(samples, cells + 1),
+            policy_masks=torch.zeros(samples, cells + 1),
+            visits=visits,
+            betas=torch.zeros(samples, cells + 1),
+            proposal_counts=counts,
+            values=torch.zeros(samples),
+            selected_actions=torch.tensor(opening_actions, dtype=torch.int64),
+            game_ids=torch.arange(samples),
+            plies=torch.zeros(samples, dtype=torch.int64),
+            seeds=torch.zeros(samples, dtype=torch.int64),
+            height=2,
+            width=2,
+            sources=("test",),
+        )
+
+    def test_identical_candidate_sets_score_one(self) -> None:
+        from vgo_training.dataset import replay_diagnostics
+
+        dataset = self._dataset(
+            supports=[[0, 1], [0, 1], [0, 1]],
+            opening_actions=[0, 0, 0],
+            visits_rows=[[4, 0, 0, 0, 0]] * 3,
+        )
+        report = replay_diagnostics(dataset)
+        self.assertAlmostEqual(report["ply0_candidate_jaccard"], 1.0, places=6)
+        self.assertEqual(report["distinct_opening_moves"], 1)
+
+    def test_disjoint_candidate_sets_score_zero(self) -> None:
+        from vgo_training.dataset import replay_diagnostics
+
+        dataset = self._dataset(
+            supports=[[0], [1], [2]],
+            opening_actions=[0, 1, 2],
+            visits_rows=[[2, 2, 0, 0, 0]] * 3,
+        )
+        report = replay_diagnostics(dataset)
+        self.assertAlmostEqual(report["ply0_candidate_jaccard"], 0.0, places=6)
+        self.assertEqual(report["distinct_opening_moves"], 3)
+
+    def test_top1_visit_share_tracks_concentration(self) -> None:
+        from vgo_training.dataset import replay_diagnostics
+
+        peaked = self._dataset([[0]], [0], [[9, 1, 0, 0, 0]])
+        flat = self._dataset([[0]], [0], [[5, 5, 0, 0, 0]])
+        self.assertAlmostEqual(replay_diagnostics(peaked)["top1_visit_share"], 0.9, places=6)
+        self.assertAlmostEqual(replay_diagnostics(flat)["top1_visit_share"], 0.5, places=6)
+
+    def test_single_opening_game_reports_no_jaccard(self) -> None:
+        import math
+
+        from vgo_training.dataset import replay_diagnostics
+
+        report = replay_diagnostics(self._dataset([[0]], [0], [[4, 0, 0, 0, 0]]))
+        self.assertTrue(math.isnan(report["ply0_candidate_jaccard"]))
+        self.assertEqual(report["ply0_games"], 1)

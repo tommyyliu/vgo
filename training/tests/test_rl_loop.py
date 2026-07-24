@@ -75,11 +75,27 @@ class RlLoopTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "coarse pool must be nonnegative"):
             validate_arguments(invalid)
 
+        # The pool counts fine cells per coarse region on the placement grid,
+        # which is independent of the render resolution.
         oversized_pool = parse_arguments(
-            ["--output", "run", "--resolution", "16", "--coarse-pool", "17"]
+            ["--output", "run", "--policy-resolution", "16", "--coarse-pool", "17"]
         )
-        with self.assertRaisesRegex(ValueError, "coarse pool must not exceed resolution"):
+        with self.assertRaisesRegex(ValueError, "coarse pool must not exceed policy resolution"):
             validate_arguments(oversized_pool)
+
+        decoupled = parse_arguments(
+            [
+                "--output",
+                "run",
+                "--resolution",
+                "16",
+                "--policy-resolution",
+                "32",
+                "--coarse-pool",
+                "17",
+            ]
+        )
+        validate_arguments(decoupled)
 
     @patch("vgo_training.rl_loop.cargo_executable", return_value="cargo")
     def test_coarse_sampling_is_forwarded_to_generation_and_all_arenas(
