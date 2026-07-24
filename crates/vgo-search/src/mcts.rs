@@ -54,6 +54,10 @@ pub struct ChildSummary {
     pub prior: f64,
     pub visits: u32,
     pub black_value: f64,
+    /// Coarse->fine sampling probability beta = P_coarse * P_fine for this
+    /// candidate, or None for legacy (quasi-random) candidates and pass. Used by
+    /// training for the Sampled-AlphaZero importance correction on the target.
+    pub beta: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -437,6 +441,7 @@ pub fn search_with_evaluator(
             prior: child.prior,
             visits: child.visits,
             black_value: child.black_value(),
+            beta: child.beta,
         })
         .collect::<Vec<_>>();
     let best = preferred_child_indices(&children, position.to_move())
