@@ -14,12 +14,14 @@ import torch
 MAGIC = b"VGODATA1"
 VERSION = 2
 REPLAY_MAGIC = b"VGORPLY1"
-# v1: state, policy, mask, value, ... ; v2 inserts per-cell visits + beta after
-# the mask (for off-policy reweighting). Both are accepted; v1 records synthesize
-# visits from the policy and leave beta at zero. REPLAY_VERSION is the version the
-# current generator writes.
-REPLAY_VERSION = 2
-REPLAY_VERSIONS = (1, 2)
+# v1: state, policy, mask, value, ...
+# v2: inserts per-cell visits + beta after the mask
+# v3: inserts per-cell u32 proposal multiplicities immediately after beta
+#
+# Older records synthesize unavailable fields so replay windows can span schema
+# versions. REPLAY_VERSION is the version the current generator writes.
+REPLAY_VERSION = 3
+REPLAY_VERSIONS = (1, 2, 3)
 HEADER = struct.Struct("<8s6I")
 
 
@@ -28,15 +30,38 @@ class RasterDataset:
     states: torch.Tensor
     policies: torch.Tensor
     policy_masks: torch.Tensor
-    # Raw MCTS visit counts and coarse->fine sampling probabilities (beta) per
-    # cell. For legacy/v1 shards visits proxy the policy and betas are zero.
+    # Raw MCTS visit counts, coarse->fine sampling probabilities (beta), and raw
+    # cumulative proposal multiplicities per cell. Legacy/v1 shards proxy visits
+    # with the policy; pre-v3 shards synthesize zero proposal counts.
     visits: torch.Tensor
     betas: torch.Tensor
+    proposal_counts: torch.Tensor
     values: torch.Tensor
     selected_actions: torch.Tensor
     game_ids: torch.Tensor
     plies: torch.Tensor
     seeds: torch.Tensor
+    height: int
+    width: int
+    sources: tuple[str, ...]
+
+    @property
+    def samples(self) -> int:
+        return self.states.shape[0]
+
+    @property
+    def channels(self) -> int:
+        return self.states.shape[1]
+
+
+@dataclass(frozen=True)
+class PreparedRasterDataset:
+    """Training tensors after raw replay policy supervision has been consumed."""
+
+    states: torch.Tensor
+    policies: torch.Tensor
+    policy_masks: torch.Tensor
+    values: torch.Tensor
     height: int
     width: int
     sources: tuple[str, ...]
@@ -124,12 +149,14 @@ def _load_legacy(
     # legacy datasets carry no raw visits/beta: proxy visits with the policy.
     visits = policies.copy()
     beta = np.zeros_like(policies)
+    proposal_counts = np.zeros_like(policies, dtype=np.uint32)
     return (
         states,
         policies,
         masks,
         visits,
         beta,
+        proposal_counts,
         values,
         selected,
         zeros,
@@ -158,6 +185,8 @@ def _load_replay(
             ("visits", "<f4", (policy_size,)),
             ("beta", "<f4", (policy_size,)),
         ]
+    if version >= 3:
+        fields.append(("proposal_counts", "<u4", (policy_size,)))
     fields += [
         ("value", "<f4"),
         ("selected_action", "<u4"),
@@ -188,12 +217,17 @@ def _load_replay(
         # visit share, and beta is zero (no factored sampling was recorded).
         visits = policies.copy()
         beta = np.zeros_like(policies)
+    if version >= 3:
+        proposal_counts = np.array(records["proposal_counts"], copy=True)
+    else:
+        proposal_counts = np.zeros_like(policies, dtype=np.uint32)
     return (
         np.array(records["state"], copy=True),
         policies,
         masks,
         visits,
         beta,
+        proposal_counts,
         np.array(records["value"], copy=True),
         np.array(records["selected_action"], copy=True).astype(np.int64),
         np.array(records["game"], copy=True).astype(np.int64),
@@ -216,6 +250,7 @@ def load_dataset(path: str | Path) -> RasterDataset:
         policy_masks,
         visits,
         beta,
+        proposal_counts,
         values,
         selected,
         games,
@@ -226,6 +261,10 @@ def load_dataset(path: str | Path) -> RasterDataset:
 
     if not np.isfinite(states).all() or not np.isfinite(policies).all():
         raise ValueError("dataset contains non-finite tensors")
+    if not np.isfinite(visits).all() or np.any(visits < 0.0):
+        raise ValueError("visit counts must be finite and nonnegative")
+    if not np.isfinite(beta).all() or np.any((beta < 0.0) | (beta > 1.0)):
+        raise ValueError("sampling probabilities must be finite and in [0, 1]")
     if not np.isfinite(values).all() or np.any(np.abs(values) > 1.0):
         raise ValueError("value targets must be finite and in [-1, 1]")
     if np.any(policies < 0.0) or not np.allclose(policies.sum(axis=1), 1.0, atol=1e-5):
@@ -236,6 +275,38 @@ def load_dataset(path: str | Path) -> RasterDataset:
         raise ValueError("every sample must expose at least one policy action")
     if np.any((policies > 0.0) & (policy_masks == 0.0)):
         raise ValueError("positive policy targets must be included in the mask")
+    if np.any((visits > 0.0) & (policy_masks == 0.0)):
+        raise ValueError("positive visit counts must be included in the mask")
+    if np.any((beta > 0.0) & (policy_masks == 0.0)):
+        raise ValueError("positive sampling probabilities must be included in the mask")
+    if np.any((proposal_counts > 0) & (policy_masks == 0.0)):
+        raise ValueError("positive proposal counts must be included in the mask")
+    visit_totals = visits.sum(axis=1, keepdims=True)
+    if np.any(visit_totals <= 0.0):
+        raise ValueError("every sample must contain at least one visit")
+    if not np.allclose(visits / visit_totals, policies, atol=1e-5):
+        raise ValueError("policy targets must equal normalized visit counts")
+    if np.any(beta[:, -1] != 0.0):
+        raise ValueError("the deterministically enumerated pass action must have beta zero")
+    if np.any(proposal_counts[:, -1] != 0):
+        raise ValueError(
+            "the deterministically enumerated pass action must have proposal count zero"
+        )
+    counted_rows = np.any(proposal_counts[:, :-1] > 0, axis=1)
+    proposal_support = proposal_counts[:, :-1] > 0
+    beta_support = beta[:, :-1] > 0.0
+    if np.any(counted_rows[:, None] & (proposal_support != beta_support)):
+        raise ValueError(
+            "counted placement support must equal positive-beta placement support"
+        )
+    coarse_rows = np.any(beta[:, :-1] > 0.0, axis=1)
+    missing_beta = (
+        coarse_rows[:, None]
+        & (policy_masks[:, :-1] != 0.0)
+        & (beta[:, :-1] == 0.0)
+    )
+    if np.any(missing_beta):
+        raise ValueError("coarse-sampled placement candidates must have positive beta")
     replay_actions = selected >= 0
     if np.any(selected[replay_actions] >= policy_size):
         raise ValueError("selected replay action is outside the policy tensor")
@@ -248,6 +319,7 @@ def load_dataset(path: str | Path) -> RasterDataset:
         policy_masks=torch.from_numpy(policy_masks).bool(),
         visits=torch.from_numpy(visits),
         betas=torch.from_numpy(beta),
+        proposal_counts=torch.from_numpy(proposal_counts),
         values=torch.from_numpy(values),
         selected_actions=torch.from_numpy(selected),
         game_ids=torch.from_numpy(games),
@@ -277,6 +349,7 @@ def load_datasets(paths: Iterable[str | Path]) -> RasterDataset:
         policy_masks=torch.cat([dataset.policy_masks for dataset in datasets]),
         visits=torch.cat([dataset.visits for dataset in datasets]),
         betas=torch.cat([dataset.betas for dataset in datasets]),
+        proposal_counts=torch.cat([dataset.proposal_counts for dataset in datasets]),
         values=torch.cat([dataset.values for dataset in datasets]),
         selected_actions=torch.cat([dataset.selected_actions for dataset in datasets]),
         game_ids=torch.cat([dataset.game_ids for dataset in datasets]),

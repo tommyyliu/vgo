@@ -1,0 +1,75 @@
+{
+  "schema": "vgo.coarse-policy-smoke.v2",
+  "date": "2026-07-24",
+  "result": "pass",
+  "purpose": "Exercise ONNX coarse-to-fine progressive-widening replay generation, replay-v3 loading, corrected full-legal training, ONNX export, and a coarse-to-fine promotion arena in one RL-loop iteration.",
+  "configuration": {
+    "provider": "cpu",
+    "resolution": 128,
+    "coarse_pool": 8,
+    "samples": 4,
+    "generation_simulations": 16,
+    "progressive_widening": {
+      "initial_candidates": 4,
+      "maximum_candidates": 96,
+      "coefficient": 2.0,
+      "exponent": 0.5,
+      "root_proposal_draws_at_16_simulations": 8
+    },
+    "epochs": 1,
+    "training_batch": 2,
+    "arena_pairs": 1,
+    "arena_simulations": 8,
+    "actors": 1,
+    "maximum_batch": 2,
+    "seed": 700001
+  },
+  "initial_model": {
+    "checkpoint_sha256": "509f87bcd245e096fdb0b67e72c4e447629031bc68ac2fbdf09d38f04a4870ad",
+    "onnx_sha256": "e26546c092c11e552bb1680430d78f667c4d79490fb51fbe70a3cd91931d1996"
+  },
+  "replay_audit": {
+    "replay_version": 3,
+    "dataset_sha256": "d8b8986f80843126778febfe8494bdc08668e9644fd2c6aec8ae1b67f3bbf69d",
+    "samples": 4,
+    "proposal_draws_per_row": [8, 8, 8, 8],
+    "unique_proposals_per_row": [8, 8, 8, 8],
+    "maximum_multiplicity_per_row": [1, 1, 1, 1],
+    "proposal_and_beta_support_match": true,
+    "pass_beta_per_row": [0.0, 0.0, 0.0, 0.0],
+    "pass_proposal_count_per_row": [0, 0, 0, 0],
+    "visit_sum_per_row": [16.0, 16.0, 16.0, 16.0],
+    "maximum_policy_visit_normalization_error": 0.0,
+    "corrected_target_sum_per_row": [0.9999999403953552, 1.0, 1.0, 1.0],
+    "explored_action_counts": [9, 9, 9, 9],
+    "full_legal_denominator_counts": [7397, 2339, 1149, 272]
+  },
+  "training": {
+    "policy_target": "progressive_empirical_importance_v1",
+    "policy_denominator": "full_legal_raster_v1",
+    "importance_corrected_samples": 4,
+    "uncorrected_samples": 0,
+    "checkpoint_sha256": "61fbdc1146f023ee398aca7670fa41733e6e049f91e3e87ab30d6c92954a4791"
+  },
+  "export": {
+    "onnx_sha256": "13d89b106cc306e8cde7d7d3684c1941f25cf4d19127a50dc83ac931e0f5fb22"
+  },
+  "arena": {
+    "coarse_pool": 8,
+    "games": 2,
+    "completed": 2,
+    "truncated": 0,
+    "candidate_wins": 1,
+    "candidate_losses": 1,
+    "draws": 0,
+    "candidate_score": 0.5,
+    "failures": 0
+  },
+  "wall_seconds": 19.624951523001073,
+  "notes": [
+    "The smoke starts from an existing ONNX incumbent because the naive evaluator has no spatial fine grid and intentionally falls back to legacy candidates.",
+    "All four smoke rows happened to contain unique draws; duplicate aggregation and cumulative multiplicity are covered by deterministic Rust and replay-target unit tests.",
+    "The target-side beta-hat/beta correction is a practical self-normalized estimator under progressive widening, not a claim of the fixed-sampled-set proof.",
+    "The tiny training and arena budgets validate integration only; they are not a strength measurement."
+  ]
+}

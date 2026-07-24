@@ -30,6 +30,9 @@ struct Arguments {
     pairs: usize,
     #[arg(long, default_value_t = 16)]
     simulations: u32,
+    /// Fine cells per coarse sampling region; zero uses legacy candidates.
+    #[arg(long, default_value_t = 0)]
+    coarse_pool: usize,
     #[arg(long = "max-plies", default_value_t = 48)]
     maximum_plies: u32,
     #[arg(long, default_value_t = 8)]
@@ -79,6 +82,31 @@ fn load_model(model: PathBuf, arguments: &Arguments) -> Result<BatchedEvaluator,
     )
 }
 
+fn search_config(simulations: u32, coarse_pool: usize) -> SearchConfig {
+    let mut config = SearchConfig::canary(simulations);
+    config.coarse_pool = coarse_pool;
+    config
+}
+
+fn validate_arguments(arguments: &Arguments) -> Result<(), &'static str> {
+    if arguments.pairs == 0
+        || arguments.simulations == 0
+        || arguments.maximum_plies == 0
+        || arguments.threads == 0
+        || arguments.maximum_batch == 0
+        || arguments.resolution == 0
+    {
+        return Err("arena counts, simulations, and dimensions must be positive");
+    }
+    if arguments.coarse_pool > arguments.resolution {
+        return Err("--coarse-pool must not exceed --resolution");
+    }
+    if !arguments.radius.is_finite() || arguments.radius <= 0.0 || arguments.radius >= 0.5 {
+        return Err("--radius must be finite and between zero and one half");
+    }
+    Ok(())
+}
+
 fn play_game(
     candidate: &BatchedEvaluator,
     opponent: Option<&BatchedEvaluator>,
@@ -100,7 +128,7 @@ fn play_game(
             };
             search_with_evaluator(
                 position,
-                SearchConfig::canary(arguments.simulations),
+                search_config(arguments.simulations, arguments.coarse_pool),
                 seed,
                 evaluator,
             )
@@ -132,14 +160,8 @@ fn wilson_interval(points: f64, games: usize) -> (f64, f64) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = Arc::new(Arguments::parse());
-    if arguments.pairs == 0
-        || arguments.simulations == 0
-        || arguments.maximum_plies == 0
-        || arguments.threads == 0
-        || arguments.maximum_batch == 0
-        || arguments.resolution == 0
-    {
-        return Err("arena counts, simulations, and dimensions must be positive".into());
+    if let Err(message) = validate_arguments(&arguments) {
+        return Err(message.into());
     }
     let candidate = load_model(arguments.candidate.clone(), &arguments)?;
     let opponent = arguments
@@ -238,6 +260,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  \"candidate_score\": {:.6},\n",
             "  \"score_ci95\": [{:.6}, {:.6}],\n",
             "  \"simulations_per_move\": {},\n",
+            "  \"coarse_pool\": {},\n",
             "  \"average_plies\": {:.3},\n",
             "  \"wall_seconds\": {:.6},\n",
             "  \"model_evaluations\": {},\n",
@@ -257,6 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         interval.0,
         interval.1,
         arguments.simulations,
+        arguments.coarse_pool,
         plies as f64 / games as f64,
         elapsed,
         candidate_metrics.requests,
@@ -268,10 +292,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::wilson_interval;
+    use clap::Parser;
+
+    use super::{Arguments, search_config, validate_arguments, wilson_interval};
 
     #[test]
     fn empty_arena_interval_is_uninformative() {
         assert_eq!(wilson_interval(0.0, 0), (0.0, 1.0));
+    }
+
+    #[test]
+    fn coarse_pool_cli_defaults_to_legacy_and_accepts_an_override() {
+        let default = Arguments::try_parse_from(["vgo-arena", "--candidate", "candidate.onnx"])
+            .expect("default CLI parses");
+        assert_eq!(default.coarse_pool, 0);
+
+        let configured = Arguments::try_parse_from([
+            "vgo-arena",
+            "--candidate",
+            "candidate.onnx",
+            "--coarse-pool",
+            "8",
+        ])
+        .expect("coarse sampling options parse");
+        assert_eq!(configured.coarse_pool, 8);
+    }
+
+    #[test]
+    fn coarse_sampling_is_applied_to_search_config() {
+        let configured = search_config(19, 8);
+        assert_eq!(configured.simulations, 19);
+        assert_eq!(configured.coarse_pool, 8);
+    }
+
+    #[test]
+    fn invalid_coarse_sampling_config_is_rejected_before_arena() {
+        let oversized_pool = Arguments::try_parse_from([
+            "vgo-arena",
+            "--candidate",
+            "candidate.onnx",
+            "--resolution",
+            "16",
+            "--coarse-pool",
+            "17",
+        ])
+        .expect("CLI syntax parses");
+        assert_eq!(
+            validate_arguments(&oversized_pool),
+            Err("--coarse-pool must not exceed --resolution")
+        );
+    }
+
+    #[test]
+    fn invalid_radius_is_rejected_before_arena() {
+        for radius in ["0", "0.5", "NaN"] {
+            let arguments = Arguments::try_parse_from([
+                "vgo-arena",
+                "--candidate",
+                "candidate.onnx",
+                "--radius",
+                radius,
+            ])
+            .expect("CLI syntax parses");
+            assert_eq!(
+                validate_arguments(&arguments),
+                Err("--radius must be finite and between zero and one half")
+            );
+        }
     }
 }

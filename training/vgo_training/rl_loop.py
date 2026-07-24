@@ -202,6 +202,10 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("learning rates must be positive")
     if arguments.value_weight < 0.0:
         raise ValueError("value weight must be nonnegative")
+    if arguments.coarse_pool < 0:
+        raise ValueError("coarse pool must be nonnegative")
+    if arguments.coarse_pool > arguments.resolution:
+        raise ValueError("coarse pool must not exceed resolution")
 
 
 def promotion_decision(
@@ -232,20 +236,70 @@ def rust_command(root: Path, binary: str) -> list[str]:
     ]
 
 
+def generation_command(
+    arguments: argparse.Namespace,
+    root: Path,
+    output: Path,
+    seed: int,
+    incumbent: Path | None,
+) -> list[str]:
+    command = rust_command(root, "vgo-generate-demo") + [
+        "--samples",
+        str(arguments.samples),
+        "--resolution",
+        str(arguments.resolution),
+        "--simulations",
+        str(arguments.generation_simulations),
+        "--coarse-pool",
+        str(arguments.coarse_pool),
+        "--max-plies",
+        str(arguments.maximum_plies),
+        "--radius",
+        str(arguments.radius),
+        "--seed",
+        str(seed),
+        "--examples",
+        str(arguments.examples),
+        "--output",
+        str(output),
+        "--maximum-batch",
+        str(arguments.maximum_batch),
+        "--delay-ms",
+        str(arguments.delay_ms),
+        "--actors",
+        str(arguments.actors),
+        "--provider",
+        arguments.provider,
+        "--fp16",
+        str(arguments.fp16).lower(),
+        "--cache-directory",
+        str((root / "artifacts" / "onnx-cache").resolve()),
+    ]
+    if incumbent is None:
+        command.extend(["--runtime", "naive"])
+    else:
+        command.extend(["--runtime", "onnx", "--model", str(incumbent)])
+    return command
+
+
 def arena_command(
     arguments: argparse.Namespace,
     root: Path,
     candidate: Path,
     opponent: Path | None,
     seed: int,
+    *,
+    pairs: int | None = None,
 ) -> list[str]:
     command = rust_command(root, "vgo-arena") + [
         "--candidate",
         str(candidate),
         "--pairs",
-        str(arguments.arena_pairs),
+        str(arguments.arena_pairs if pairs is None else pairs),
         "--simulations",
         str(arguments.arena_simulations),
+        "--coarse-pool",
+        str(arguments.coarse_pool),
         "--max-plies",
         str(arguments.maximum_plies),
         "--threads",
@@ -303,22 +357,14 @@ def update_elo_pool(
     for slot, (opponent_iteration, opponent_onnx) in enumerate(opponents):
         if not Path(opponent_onnx).exists():
             continue
-        command = rust_command(root, "vgo-arena") + [
-            "--candidate", str(candidate_onnx),
-            "--opponent", str(opponent_onnx),
-            "--pairs", str(arguments.elo_pool_pairs),
-            "--simulations", str(arguments.arena_simulations),
-            "--max-plies", str(arguments.maximum_plies),
-            "--threads", str(arguments.arena_actors),
-            "--resolution", str(arguments.resolution),
-            "--radius", str(arguments.radius),
-            "--seed", str(arguments.arena_seed + iteration * 10_000 + 7_000 + slot),
-            "--maximum-batch", str(arguments.maximum_batch),
-            "--delay-ms", str(arguments.delay_ms),
-            "--provider", arguments.provider,
-            "--fp16", str(arguments.fp16).lower(),
-            "--cache-directory", str((root / "artifacts" / "onnx-cache").resolve()),
-        ]
+        command = arena_command(
+            arguments,
+            root,
+            candidate_onnx,
+            opponent_onnx,
+            arguments.arena_seed + iteration * 10_000 + 7_000 + slot,
+            pairs=arguments.elo_pool_pairs,
+        )
         try:
             result = run_json_command(
                 command,
@@ -430,42 +476,13 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
         progress = recover_progress(iteration_path)
         progress_path = iteration_path / "progress.json"
         generation_seed = arguments.seed + iteration * 100_000
-        generation_command = rust_command(root, "vgo-generate-demo") + [
-            "--samples",
-            str(arguments.samples),
-            "--resolution",
-            str(arguments.resolution),
-            "--simulations",
-            str(arguments.generation_simulations),
-            "--max-plies",
-            str(arguments.maximum_plies),
-            "--radius",
-            str(arguments.radius),
-            "--seed",
-            str(generation_seed),
-            "--examples",
-            str(arguments.examples),
-            "--output",
-            str(replay_staging),
-            "--maximum-batch",
-            str(arguments.maximum_batch),
-            "--delay-ms",
-            str(arguments.delay_ms),
-            "--actors",
-            str(arguments.actors),
-            "--provider",
-            arguments.provider,
-            "--fp16",
-            str(arguments.fp16).lower(),
-            "--cache-directory",
-            str((root / "artifacts" / "onnx-cache").resolve()),
-        ]
-        if incumbent_onnx is None:
-            generation_command.extend(["--runtime", "naive"])
-        else:
-            generation_command.extend(
-                ["--runtime", "onnx", "--model", str(incumbent_onnx)]
-            )
+        generate_command = generation_command(
+            arguments,
+            root,
+            replay_staging,
+            generation_seed,
+            incumbent_onnx,
+        )
         generation_complete = require_artifacts(
             progress,
             "generation",
@@ -478,7 +495,7 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
             if replay_staging.exists():
                 shutil.rmtree(replay_staging)
             progress["generation"] = run_json_command(
-                generation_command,
+                generate_command,
                 cwd=root,
                 log_path=iteration_path / "generate.log",
                 environment=environment,
@@ -671,7 +688,7 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
     return report
 
 
-def parse_arguments() -> argparse.Namespace:
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the complete VGO reinforcement-learning loop")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--initial-checkpoint", type=Path)
@@ -683,6 +700,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--resolution", type=int, default=128)
     parser.add_argument("--radius", type=float, default=1.0 / 6.0)
     parser.add_argument("--generation-simulations", type=int, default=64)
+    parser.add_argument(
+        "--coarse-pool",
+        type=int,
+        default=0,
+        help="fine cells per coarse sampling region; 0 uses legacy candidates",
+    )
     parser.add_argument("--maximum-plies", type=int, default=48)
     parser.add_argument("--examples", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=80)
@@ -723,7 +746,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--maximum-truncation-rate", type=float, default=0.02)
     parser.add_argument("--seed", type=int, default=700_001)
     parser.add_argument("--arena-seed", type=int, default=900_001)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":

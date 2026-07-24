@@ -59,7 +59,13 @@ impl FineGrid {
                 }
             }
         }
-        Self { width, height, coarse, logits, legal }
+        Self {
+            width,
+            height,
+            coarse,
+            logits,
+            legal,
+        }
     }
 
     /// Grid dimensions, for callers that need to map points back to cells.
@@ -171,12 +177,8 @@ fn cell_center(row: usize, col: usize, width: usize, height: usize) -> Point {
 
 /// Numerically stable softmax of an iterator of logits (already legal-only).
 fn softmax(logits: impl Iterator<Item = f32> + Clone) -> Vec<f64> {
-    let max = logits
-        .clone()
-        .fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f64> = logits
-        .map(|l| f64::from(l - max).exp())
-        .collect();
+    let max = logits.clone().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f64> = logits.map(|l| f64::from(l - max).exp()).collect();
     let sum: f64 = exps.iter().sum();
     if sum <= 0.0 {
         let n = exps.len().max(1);
@@ -240,7 +242,11 @@ mod tests {
         let samples = sample_candidates(&grid, 50, stream(vec![0.05, 0.27, 0.51, 0.73, 0.95]));
         assert_eq!(samples.len(), 50);
         for s in &samples {
-            assert!(s.beta > 0.0 && s.beta <= 1.0, "beta {} out of range", s.beta);
+            assert!(
+                s.beta > 0.0 && s.beta <= 1.0,
+                "beta {} out of range",
+                s.beta
+            );
             // Recover which coarse cell the point fell in and its legal-fine count.
             let col = (s.point.x * width as f64).floor() as usize;
             let row = (s.point.y * height as f64).floor() as usize;

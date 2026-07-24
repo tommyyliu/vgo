@@ -15,14 +15,28 @@ No simulator or game-rule implementation belongs here.
 The end-to-end replay, training, export, arena, promotion, and restart workflow
 is documented in [`../docs/RL_LOOP.md`](../docs/RL_LOOP.md).
 
-## Raster training canary
+## Raster training workflow
 
-Generate MCTS-labeled examples from the repository root:
+Generate a legacy bootstrap shard from the repository root:
 
 ```powershell
 cargo run --release -p vgo-selfplay --bin vgo-generate-demo -- `
   --samples 96 --resolution 128 --simulations 100 --output artifacts/raster-demo
 ```
+
+The naive evaluator in that command has no spatial policy grid, so it cannot
+exercise coarse-to-fine sampling. Given an exported model, generate spatial
+replay with:
+
+```powershell
+cargo run --release -p vgo-selfplay --bin vgo-generate-demo -- `
+  --samples 96 --resolution 128 --simulations 100 --coarse-pool 8 `
+  --runtime onnx --model artifacts/PREV/iteration-000/model/candidate.onnx `
+  --provider cpu --output artifacts/raster-coarse-demo
+```
+
+`--coarse-pool` defaults to `0`, must not exceed the raster resolution, and is
+the only coarse-sampling control exposed by the generator.
 
 Then run the small policy/value overfit experiment from this directory:
 
@@ -33,12 +47,20 @@ uv run python -m vgo_training.train_demo `
   --model-width 32 --blocks 3
 ```
 
-The binary loader validates the schema, exact file size, policy normalization,
-candidate mask, finite values, and tensor dimensions before training. The first
-96-sample CPU canary reduced sampled-policy KL from `0.489` to `0.054`, reached
-`81.2%` sampled-action top-1 agreement, and reduced value MAE from `0.997` to
-`0.131`. Its retained metrics are in
-[`../benchmarks/results/2026-07-21-raster-training-canary.json`](../benchmarks/results/2026-07-21-raster-training-canary.json).
+Replay v3 stores raw visits and beta followed by a `u32` proposal-count array.
+The loader validates exact file size, policy/visit agreement, candidate and
+proposal support, beta bounds, deterministic-pass metadata, finite values, and
+tensor dimensions. Replay v1 and v2 remain compatible; missing proposal counts
+are synthesized as zero.
+
+For v3 spatial rows, placement target mass is
+`visits * proposal_count / (K * beta)`, while deterministic pass keeps its raw
+visit mass. Zero-count legacy rows use normalized raw visits. The full-legal
+denominator comes from `legal_clearance` channel 7 plus pass and any sampled
+boundary aliases. Training computes these targets and masks once in bounded CPU
+batches, caches them for all epochs and metrics, and releases the consumed raw
+visits, beta, and proposal-count tensors. The retained end-to-end audit is
+[`../benchmarks/results/2026-07-24-coarse-policy-smoke.json`](../benchmarks/results/2026-07-24-coarse-policy-smoke.json).
 
 ## Inference service
 

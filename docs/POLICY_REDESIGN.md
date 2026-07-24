@@ -1,20 +1,30 @@
 # Policy representation redesign (design note)
 
-Status (2026-07-23): **search + data plumbing BUILT and tested; training-side
-consumption and the importance-correction math NOT yet built.**
+Status (2026-07-24): **the implementation is built, covered by component tests,
+and verified end to end.**
 
 Done:
 - `crates/vgo-search/src/coarse_fine.rs` — FineGrid + sample_candidates (beta =
   P_coarse * P_fine), unit-tested.
-- MCTS widening uses coarse->fine when `SearchConfig.coarse_pool > 0` and the
-  policy is spatial (`Policy::fine_grid`, implemented by the ONNX DensePolicy);
-  legacy path preserved at coarse_pool = 0. beta flows out on ChildSummary.
-- Replay format v2: raw visit counts + beta per cell (generate_demo.rs writer,
-  dataset.py reader accepts v1 and v2, RasterDataset.visits / .betas).
-
-Not done yet: the training loss (full-legal sparse cross-entropy consuming
-visits/beta), the importance-correction math (to brainstorm), wiring coarse_pool
-through generate_demo/rl_loop CLI, and actually running it.
+- MCTS uses coarse-to-fine draws when `SearchConfig.coarse_pool > 0` and the
+  policy is spatial (`Policy::fine_grid`, implemented by the ONNX DensePolicy).
+  It retains the standard visit-count progressive-widening schedule, draws only
+  the cumulative delta at each widening call, and records duplicate proposal
+  multiplicities instead of retrying them.
+- Replay format v3 stores raw visits, beta, and `u32` proposal counts per cell.
+  The Python loader remains compatible with replay v1 and v2.
+- Training derives the complete raster legal mask from `legal_clearance` channel
+  7, always includes pass, and preserves any explored continuous-action boundary
+  aliases. Corrected sparse targets and legal masks are materialized once on CPU
+  and reused by training and metrics.
+- `vgo-generate-demo`, `vgo-arena`, and `vgo_training.rl_loop` accept
+  `--coarse-pool`; the loop passes the same value to generation, baseline,
+  promotion, and Elo arenas. Zero retains legacy candidate generation, and a
+  positive pool cannot exceed the raster resolution.
+- A retained CPU smoke generated replay v3 from an ONNX incumbent, trained with
+  corrected full-legal supervision, exported ONNX, and completed a two-game
+  coarse-to-fine promotion arena. See
+  [`../benchmarks/results/2026-07-24-coarse-policy-smoke.json`](../benchmarks/results/2026-07-24-coarse-policy-smoke.json).
 
 ## The problem being fixed
 
@@ -50,18 +60,28 @@ Close the loop:
    32-48 is plenty for a ~9-across board), with the **true legal mask** applied.
 2. Build a **coarse map by MAX-pooling** the fine map (each coarse cell = max of
    its fine region, so a cell with one great move scores high, not washed out).
-3. **Factored sampling, WITH replacement**, K times (K = candidate budget, ~6-8):
+3. Retain the existing visit-count progressive-widening budget:
+
+   ```text
+   K(N) = min(96, max(4, ceil(2 * sqrt(N + 1))))
+   ```
+
+   Here `N` is the node visit count and `K(N)` is the cumulative number of
+   placement proposals. On each widening call, draw only
+   `K(N) - proposals_already_drawn` additional samples **with replacement**:
+
    - sample a coarse cell `C` ~ softmax(coarse map)  -> `P_coarse(C)`
    - sample a fine cell `a` within `C` ~ softmax(fine logits restricted to C)
      -> `P_fine(a|C)`
    - candidate action `a`; its sampling probability is the exact product
      **beta(a) = P_coarse(C(a)) * P_fine(a|C(a))**.
-   With replacement: draws are i.i.d. from beta, the product formula holds
-   unconditionally, and re-drawing a coarse cell just yields a *different* fine
-   point within it (natural sub-cell diversity). No conditional bookkeeping.
-4. The coarse grid partition gives **spatial diversity for free** — distinct
-   coarse cells are distinct board regions, so this replaces Halton-spread + NMS
-   in one step. Coarse resolution is the "how distinct must candidates be" knob.
+   The delta draws are IID from the same beta. If a cell is drawn again, its
+   proposal count `m(a)` increases; MCTS does not create another child and does
+   not retry the draw. Pass is enumerated once, deterministically, outside this
+   placement sampler.
+4. Coarse pooling retains regional structure without averaging away a sharp
+   fine-cell peak. `coarse_pool` is the number of fine cells per coarse region;
+   it must not exceed the raster resolution.
 5. Move played = the sampled fine cell (its center, or jitter within it). The net
    never predicts continuously; the grid resolution is the placement precision.
 
@@ -77,25 +97,51 @@ learns, regions/points sharpen and candidates improve automatically.
   are implicitly pushed down by the denominator, which keeps the map honest as a
   proposal distribution (the reason we chose full-legal over explored-only:
   the map doubles as the candidate proposal and needs the negative signal).
-- Target is **sparse**: nonzero only on the K explored candidates, mass from their
-  visit counts. Loss = `-sum_{k in explored} pi_target(k) * log softmax(logits)_k`.
-  Only propagates signal through explored nodes — exactly the goal.
+- Target is **sparse**: nonzero only on explored candidates with target mass.
+  Loss = `-sum_{k in explored} pi_target(k) * log softmax(logits)_k`.
+  “Sparse” describes target support: the full-legal denominator deliberately
+  gives every unexplored legal logit gradient `p(a) > 0`, pushing it down. Only
+  illegal cells have zero policy gradient.
 
-## Importance / sampling correction — TO BRAINSTORM (not building yet)
+## Importance / sampling correction
 
-Because candidates are sampled from the net's own beta, the unbiased Sampled-AZ
-target needs an importance correction ~ `visits(a) / (N * beta(a))`. The key
-enabler we found: **beta(a) = P_coarse * P_fine is exact and cheap** (two-stage
-factorization), so the correction is computable, not murky as first feared. With
-with-replacement i.i.d. sampling the math is clean. BUT the exact form of the
-correction (and how it interacts with the full-legal softmax target) needs a
-proper brainstorm before implementing. For a first cut we may skip the correction
-(slightly biased) and add it once worked out.
+For a replay row, let `n(a)` be raw visits, `m(a)` the number of IID proposal
+draws that selected placement cell `a`, and `K = sum_a m(a)` the cumulative
+placement draw count. Thus `beta_hat(a) = m(a) / K` is the empirical proposal
+distribution. The implemented unnormalized target is:
+
+```text
+u(a)    = n(a) * m(a) / (K * beta(a))   for sampled placements
+u(pass) = n(pass)                        because pass is deterministic
+u(a)    = 0                              otherwise
+q(a)    = u(a) / sum_b u(b)
+```
+
+`K` counts draws, including repeats and zero-visit candidates; it is not the
+number of distinct cells. Replay v1/v2, the naive-policy fallback, and pass-only
+rows have zero proposal counts and use normalized raw visits without correction.
+Python performs the calculation in float64 log space, then caches the normalized
+targets and full-legal masks once before splitting or training. The raw visits,
+beta, and proposal-count tensors are released after that preparation.
+
+This is the target-side, or “naive modification,” branch described by
+[Hubert et al., *Learning and Planning in Complex Action
+Spaces*](https://proceedings.mlr.press/v139/hubert21a.html), sections 5.1–5.2:
+PUCT uses the network prior on the sampled children, and training applies
+`(beta_hat / beta)` to the visit distribution afterward. It is not the paper's
+preferred alternative of correcting PUCT priors and then training directly on
+normalized visits. This implementation corrects the training projection only;
+move selection and inner value backup still use the uncorrected search visits.
+
+The paper's derivation assumes a fixed sampled action set. Here proposals are
+introduced progressively as node visits grow, so early children can accumulate
+search visits before later children exist. The final `q` is therefore a
+practical self-normalized estimator for this schedule, not a claim of an
+unbiased fixed-set estimate. Replay v3 preserves visits, beta, and multiplicity
+so this correction can be audited or changed without regenerating data.
 
 ## Also on the list (separate, smaller)
 
-- **Store raw visit counts** in the replay (not just normalized pi) so loss
-  weighting/analysis needs no regeneration.
 - **8-fold dihedral symmetry augmentation** — free 8x data + strong prior for a
   small model.
 - **Lower render resolution** (48-64, board is ~9-across; ~5-7x cheaper).

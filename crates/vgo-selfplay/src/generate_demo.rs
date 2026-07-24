@@ -28,10 +28,11 @@ use vgo_search::{
 use vgo_selfplay::play_game as run_playout;
 
 const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
-// v2 adds raw per-cell visit counts and the coarse->fine sampling probability
-// (beta) after the policy mask, so training can apply an off-policy importance
-// correction independent of how candidates were drawn. See docs/POLICY_REDESIGN.md.
-const REPLAY_VERSION: u32 = 2;
+// v2 added raw per-cell visit counts and coarse->fine sampling probability
+// (beta). v3 additionally records the empirical proposal multiplicity per cell,
+// so training can correct using both beta and beta-hat without regenerating
+// replay.
+const REPLAY_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GenerationRuntime {
@@ -66,6 +67,7 @@ struct PendingSample {
     policy_mask: Vec<f32>,
     visits: Vec<f32>,
     beta: Vec<f32>,
+    proposal_counts: Vec<u32>,
     to_move: Color,
     selected_action: u32,
     game: u64,
@@ -79,6 +81,7 @@ struct LabeledSample {
     policy_mask: Vec<f32>,
     visits: Vec<f32>,
     beta: Vec<f32>,
+    proposal_counts: Vec<u32>,
     value: f32,
     selected_action: u32,
     game: u64,
@@ -101,6 +104,9 @@ struct Config {
     resolution: usize,
     #[arg(long, default_value_t = 100)]
     simulations: u32,
+    /// Fine cells per coarse sampling region; zero uses legacy candidates.
+    #[arg(long, default_value_t = 0)]
+    coarse_pool: usize,
     #[arg(long = "max-plies", default_value_t = 48)]
     maximum_plies: u32,
     #[arg(long, default_value_t = 1.0 / 6.0)]
@@ -141,6 +147,9 @@ struct PolicyTarget {
     /// Coarse->fine sampling probability beta per cell; 0.0 for legacy/pass
     /// candidates (which have no factored sampling probability).
     beta: Vec<f32>,
+    /// Number of raw coarse->fine proposal draws landing in each cell. Legacy
+    /// candidates and pass have zero multiplicity.
+    proposal_counts: Vec<u32>,
 }
 
 fn policy_target(result: &SearchResult, config: RasterConfig) -> PolicyTarget {
@@ -149,6 +158,7 @@ fn policy_target(result: &SearchResult, config: RasterConfig) -> PolicyTarget {
     let mut mask = vec![0.0_f32; size];
     let mut visits = vec![0.0_f32; size];
     let mut beta = vec![0.0_f32; size];
+    let mut proposal_counts = vec![0_u32; size];
     let total = result
         .children
         .iter()
@@ -165,12 +175,16 @@ fn policy_target(result: &SearchResult, config: RasterConfig) -> PolicyTarget {
         if let Some(b) = child.beta {
             beta[index] = b as f32;
         }
+        proposal_counts[index] = proposal_counts[index]
+            .checked_add(child.proposal_count)
+            .expect("proposal multiplicity must fit in u32");
     }
     PolicyTarget {
         policy,
         mask,
         visits,
         beta,
+        proposal_counts,
     }
 }
 
@@ -181,25 +195,45 @@ fn action_index(action: Action, config: RasterConfig) -> u32 {
     }
 }
 
+fn search_config(simulations: u32, coarse_pool: usize) -> SearchConfig {
+    let mut config = SearchConfig::canary(simulations);
+    config.coarse_pool = coarse_pool;
+    config
+}
+
+fn validate_config(config: &Config) -> Result<(), &'static str> {
+    if config.samples == 0
+        || config.resolution == 0
+        || config.simulations == 0
+        || config.maximum_plies == 0
+        || config.maximum_batch == 0
+        || config.actors == 0
+        || config.maximum_games.is_some_and(|games| games == 0)
+    {
+        return Err("generation counts, simulations, and dimensions must be positive");
+    }
+    if config.coarse_pool > config.resolution {
+        return Err("--coarse-pool must not exceed --resolution");
+    }
+    if !config.radius.is_finite() || config.radius <= 0.0 || config.radius >= 0.5 {
+        return Err("--radius must be finite and between zero and one half");
+    }
+    Ok(())
+}
+
 fn generate_game(
     config: &Config,
     evaluator: &dyn Evaluator,
     game_index: u64,
 ) -> Result<GameSamples, EvaluationError> {
     let raster_config = RasterConfig::square(config.resolution);
+    let search_config = search_config(config.simulations, config.coarse_pool);
     let game_seed = config.seed.wrapping_add(game_index);
     let mut pending = Vec::new();
     let playout = run_playout(
         Position::new(config.radius, Vec::new(), Color::Black),
         config.maximum_plies,
-        |position, _ply| {
-            search_with_evaluator(
-                position,
-                SearchConfig::canary(config.simulations),
-                game_seed,
-                evaluator,
-            )
-        },
+        |position, _ply| search_with_evaluator(position, search_config, game_seed, evaluator),
         |step| {
             let target = policy_target(step.search, raster_config);
             pending.push(PendingSample {
@@ -208,6 +242,7 @@ fn generate_game(
                 policy_mask: target.mask,
                 visits: target.visits,
                 beta: target.beta,
+                proposal_counts: target.proposal_counts,
                 to_move: step.position.to_move(),
                 selected_action: action_index(step.action, raster_config),
                 game: game_index,
@@ -232,6 +267,7 @@ fn generate_game(
             policy_mask: sample.policy_mask,
             visits: sample.visits,
             beta: sample.beta,
+            proposal_counts: sample.proposal_counts,
             value: if sample.to_move == Color::Black {
                 black_value
             } else {
@@ -359,6 +395,9 @@ fn write_dataset(path: &Path, samples: &[LabeledSample]) -> std::io::Result<()> 
         for &value in &sample.beta {
             write_f32(&mut writer, value)?;
         }
+        for &value in &sample.proposal_counts {
+            writer.write_all(&value.to_le_bytes())?;
+        }
         write_f32(&mut writer, sample.value)?;
         writer.write_all(&sample.selected_action.to_le_bytes())?;
         writer.write_all(&sample.game.to_le_bytes())?;
@@ -389,6 +428,7 @@ fn write_manifest(
     let mut writer = BufWriter::new(File::create(&temporary)?);
     writeln!(writer, "{{")?;
     writeln!(writer, "  \"schema\": \"vgo.replay-shard.v1\",")?;
+    writeln!(writer, "  \"replay_version\": {REPLAY_VERSION},")?;
     writeln!(writer, "  \"dataset\": \"dataset.vgo\",")?;
     writeln!(writer, "  \"dataset_sha256\": \"{dataset_sha256}\",")?;
     writeln!(writer, "  \"samples\": {},", samples.len())?;
@@ -403,6 +443,7 @@ fn write_manifest(
         config.resolution * config.resolution + 1
     )?;
     writeln!(writer, "  \"simulations\": {},", config.simulations)?;
+    writeln!(writer, "  \"coarse_pool\": {},", config.coarse_pool)?;
     writeln!(writer, "  \"radius\": {},", config.radius)?;
     writeln!(writer, "  \"seed\": {},", config.seed)?;
     writeln!(writer, "  \"maximum_plies\": {},", config.maximum_plies)?;
@@ -423,7 +464,19 @@ fn write_manifest(
     )?;
     writeln!(
         writer,
-        "  \"policy_mask\": \"sampled candidate pixels and pass; unsampled pixels are excluded from policy loss\","
+        "  \"policy_mask\": \"sampled candidate pixels and pass; training derives the full legal denominator from legal_clearance\","
+    )?;
+    writeln!(
+        writer,
+        "  \"raw_visits\": \"f32 MCTS root visits aggregated by policy cell\","
+    )?;
+    writeln!(
+        writer,
+        "  \"sampling_beta\": \"f32 exact per-draw coarse-to-fine proposal probability for sampled placements; zero for pass and legacy candidates\","
+    )?;
+    writeln!(
+        writer,
+        "  \"proposal_counts\": \"u32 raw coarse-to-fine proposal multiplicity aggregated by policy cell; zero for pass and legacy candidates\","
     )?;
     writeln!(
         writer,
@@ -550,12 +603,8 @@ fn write_json_string(writer: &mut impl Write, value: &str) -> std::io::Result<()
 
 fn main() -> std::io::Result<()> {
     let config = Config::parse();
-    assert!(config.samples > 0);
-    assert!(config.resolution > 0);
-    assert!(config.simulations > 0);
-    assert!(config.maximum_batch > 0);
-    assert!(config.actors > 0);
-    assert!(config.maximum_games.is_none_or(|games| games > 0));
+    validate_config(&config)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
     fs::create_dir_all(&config.output)?;
 
     let raster = RasterConfig::square(config.resolution);
@@ -625,6 +674,7 @@ fn main() -> std::io::Result<()> {
             "  \"dataset_sha256\": \"{}\",\n",
             "  \"evaluator\": \"{}\",\n",
             "  \"actors\": {},\n",
+            "  \"coarse_pool\": {},\n",
             "  \"channels\": {},\n",
             "  \"resolution\": {},\n",
             "  \"policy_size\": {},\n",
@@ -637,6 +687,7 @@ fn main() -> std::io::Result<()> {
         dataset_sha256,
         config.runtime.as_str(),
         config.actors,
+        config.coarse_pool,
         CHANNEL_COUNT,
         config.resolution,
         config.resolution * config.resolution + 1,
@@ -648,11 +699,104 @@ fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use vgo_core::Point;
+    use vgo_raster::RasterConfig;
+    use vgo_search::{Action, CandidateSource, ChildSummary, SearchResult, SearchStats};
 
-    use super::Config;
+    use super::{Config, policy_target, search_config, validate_config};
 
     #[test]
     fn malformed_cli_values_are_rejected() {
         assert!(Config::try_parse_from(["vgo-generate-demo", "--resolution", "large"]).is_err());
+    }
+
+    #[test]
+    fn coarse_pool_cli_defaults_to_legacy_and_accepts_an_override() {
+        let default = Config::try_parse_from(["vgo-generate-demo"]).expect("default CLI parses");
+        assert_eq!(default.coarse_pool, 0);
+
+        let configured = Config::try_parse_from(["vgo-generate-demo", "--coarse-pool", "8"])
+            .expect("coarse sampling options parse");
+        assert_eq!(configured.coarse_pool, 8);
+    }
+
+    #[test]
+    fn coarse_sampling_is_applied_to_search_config() {
+        let configured = search_config(37, 8);
+        assert_eq!(configured.simulations, 37);
+        assert_eq!(configured.coarse_pool, 8);
+    }
+
+    #[test]
+    fn invalid_coarse_sampling_config_is_rejected_before_generation() {
+        let oversized_pool = Config::try_parse_from([
+            "vgo-generate-demo",
+            "--resolution",
+            "16",
+            "--coarse-pool",
+            "17",
+        ])
+        .expect("CLI syntax parses");
+        assert_eq!(
+            validate_config(&oversized_pool),
+            Err("--coarse-pool must not exceed --resolution")
+        );
+    }
+
+    #[test]
+    fn zero_maximum_plies_is_rejected_before_generation() {
+        let config = Config::try_parse_from(["vgo-generate-demo", "--max-plies", "0"])
+            .expect("CLI syntax parses");
+        assert_eq!(
+            validate_config(&config),
+            Err("generation counts, simulations, and dimensions must be positive")
+        );
+    }
+
+    #[test]
+    fn invalid_radius_is_rejected_before_generation() {
+        for radius in ["0", "0.5", "NaN"] {
+            let config = Config::try_parse_from(["vgo-generate-demo", "--radius", radius])
+                .expect("CLI syntax parses");
+            assert_eq!(
+                validate_config(&config),
+                Err("--radius must be finite and between zero and one half")
+            );
+        }
+    }
+
+    #[test]
+    fn policy_target_aggregates_proposal_multiplicity_by_pixel() {
+        let sampled = |point, visits, proposal_count| ChildSummary {
+            action: Action::Place(point),
+            source: CandidateSource::AreaSequence,
+            prior: 0.25,
+            visits,
+            black_value: 0.0,
+            beta: Some(0.125),
+            proposal_count,
+        };
+        let result = SearchResult {
+            action: Action::Pass,
+            children: vec![
+                sampled(Point::new(0.1, 0.1), 2, 2),
+                sampled(Point::new(0.2, 0.2), 1, 3),
+                ChildSummary {
+                    action: Action::Pass,
+                    source: CandidateSource::Pass,
+                    prior: 0.5,
+                    visits: 1,
+                    black_value: 0.0,
+                    beta: None,
+                    proposal_count: 0,
+                },
+            ],
+            stats: SearchStats::default(),
+        };
+
+        let target = policy_target(&result, RasterConfig::square(2));
+
+        assert_eq!(target.proposal_counts, vec![5, 0, 0, 0, 0]);
+        assert_eq!(target.proposal_counts[4], 0, "pass is not proposed");
     }
 }

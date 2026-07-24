@@ -46,7 +46,8 @@ cd training
 uv run python -m vgo_training.rl_loop `
   --output ../artifacts/rl-run-NAME `
   --iterations 4 --samples 3072 --replay-window 4 `
-  --resolution 128 --generation-simulations 128 --arena-simulations 128 `
+  --resolution 128 --coarse-pool 8 `
+  --generation-simulations 128 --arena-simulations 128 `
   --maximum-plies 96 `
   --epochs 120 --training-batch 32 --warm-learning-rate 1e-4 --value-weight 0.1 `
   --device cuda --actors 64 --arena-actors 1 --arena-pairs 40 `
@@ -62,6 +63,19 @@ so the window does not restart empty:
   --initial-onnx ../artifacts/PREV/iteration-000/model/candidate.onnx `
   --initial-replay ../artifacts/PREV/iteration-000/replay/dataset.vgo
 ```
+
+`--coarse-pool` is the only coarse-sampling knob. Its default `0` uses legacy
+candidates; a positive value is forwarded unchanged to generation, every arena,
+and Elo telemetry, and must not exceed `--resolution`. With no initial model,
+iteration-zero generation uses the naive evaluator and therefore falls back to
+legacy candidates because it has no spatial policy grid. Supply an initial
+checkpoint/ONNX pair to exercise coarse generation immediately, or let it begin
+after the first accepted model.
+
+Current coarse replay is version 3: it stores raw visits, beta, and `u32`
+proposal multiplicities. Versions 1 and 2 remain loadable in the same replay
+window. The sparse corrected targets and full-legal masks are prepared once
+before training rather than recomputed each epoch.
 
 ### Resuming
 
@@ -84,7 +98,7 @@ cargo run --release -p vgo-selfplay --bin vgo-arena -- `
   --candidate artifacts/A/model/candidate.onnx `
   --opponent  artifacts/B/model/candidate.onnx `
   --pairs 75 --simulations 128 --max-plies 96 --threads 4 `
-  --resolution 128 --radius 0.16666666666666666 `
+  --resolution 128 --coarse-pool 8 --radius 0.16666666666666666 `
   --maximum-batch 16 --provider tensorrt --cache-directory artifacts/onnx-cache
 ```
 
@@ -141,6 +155,10 @@ and cross-generation comparison. Re-export with
 
 **The ply-limit flag is spelled differently in each layer.** The driver takes
 `--maximum-plies`; the Rust binaries take `--max-plies`.
+
+**A coarse pool larger than the raster is rejected.** `--coarse-pool` counts
+fine cells per coarse region, so use a value from `1` through `--resolution`
+when enabling spatial sampling. Zero explicitly selects the legacy path.
 
 **Truncated games block promotion.** A game that hits the ply limit is excluded
 from the arena score, and `--maximum-truncation-rate` rejects the candidate if

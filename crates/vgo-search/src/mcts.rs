@@ -54,6 +54,9 @@ pub struct ChildSummary {
     pub prior: f64,
     pub visits: u32,
     pub black_value: f64,
+    /// Number of IID coarse-to-fine proposal draws that selected this placement.
+    /// Legacy candidates and the deterministically enumerated pass action use 0.
+    pub proposal_count: u32,
     /// Coarse->fine sampling probability beta = P_coarse * P_fine for this
     /// candidate, or None for legacy (quasi-random) candidates and pass. Used by
     /// training for the Sampled-AlphaZero importance correction on the target.
@@ -85,6 +88,9 @@ struct Child {
     /// or None for legacy (quasi-random) candidates. Recorded for the
     /// Sampled-AlphaZero importance correction on the policy target.
     beta: Option<f64>,
+    /// IID proposal multiplicity for coarse-to-fine placement candidates.
+    /// Legacy candidates and pass use 0.
+    proposal_count: u32,
     visits: u32,
     black_value_sum: f64,
     node: Option<Box<Node>>,
@@ -108,10 +114,15 @@ struct Node {
     candidates_exhausted: bool,
     terminal_black_value: Option<f64>,
     evaluation: Option<Evaluation>,
-    /// Counter-based RNG state for coarse->fine candidate sampling, seeded from
+    /// Counter-based RNG state for coarse-to-fine candidate sampling, seeded from
     /// the match seed and this node's position so sampling is deterministic per
-    /// (match, position) yet advances across widen calls.
+    /// (match, position) yet advances across widening calls.
     sample_rng: u64,
+    /// Cumulative number of coarse-to-fine placement proposals drawn at this node.
+    proposal_draws: usize,
+    /// Highest visit-count coarse proposal budget already serviced. `None` means
+    /// the policy has not yet confirmed that it exposes a spatial fine grid.
+    coarse_budget: Option<usize>,
 }
 
 impl Node {
@@ -149,6 +160,8 @@ impl Node {
             terminal_black_value,
             evaluation,
             sample_rng,
+            proposal_draws: 0,
+            coarse_budget: None,
         })
     }
 
@@ -175,6 +188,9 @@ impl Node {
             .min(config.maximum_candidates);
 
         if config.coarse_pool > 0 {
+            if self.coarse_budget.is_some_and(|budget| budget >= desired) {
+                return;
+            }
             if let Some(grid) = self
                 .evaluation
                 .as_ref()
@@ -182,6 +198,7 @@ impl Node {
                 .fine_grid(&self.position, config.coarse_pool)
             {
                 self.widen_coarse_fine(&grid, desired, stats);
+                self.coarse_budget = Some(desired);
                 normalize_priors(&mut self.children);
                 return;
             }
@@ -200,6 +217,7 @@ impl Node {
                     policy_logit,
                     prior: 0.0,
                     beta: None,
+                    proposal_count: 0,
                     visits: 0,
                     black_value_sum: 0.0,
                     node: None,
@@ -212,10 +230,11 @@ impl Node {
         normalize_priors(&mut self.children);
     }
 
-    /// Widen using coarse->fine sampling from the net's own policy map. Draws
-    /// candidates with replacement until `desired` distinct placements exist (or
-    /// the draw budget is spent), deduping by cell and recording each candidate's
-    /// exact sampling probability beta. The pass action is always available.
+    /// Extend the visit-count progressive-widening budget with IID coarse-to-fine
+    /// draws from the net's policy map. Repeated cells increment proposal
+    /// multiplicity on the existing child rather than triggering a retry. Each
+    /// child's exact sampling probability beta is recorded, and pass is always
+    /// available.
     fn widen_coarse_fine(&mut self, grid: &FineGrid, desired: usize, stats: &mut SearchStats) {
         // Ensure Pass is a candidate exactly once (it is not part of the grid).
         if !self
@@ -236,45 +255,36 @@ impl Node {
                 policy_logit,
                 prior: 0.0,
                 beta: None,
+                proposal_count: 0,
                 visits: 0,
                 black_value_sum: 0.0,
                 node: None,
             });
         }
 
-        // Draw with replacement until we have `desired` placement children or the
-        // draw budget (a small multiple of desired, to bound repeats) is spent.
-        let placements = self
-            .children
-            .iter()
-            .filter(|c| matches!(c.candidate.action, Action::Place(_)))
-            .count();
-        let want = desired.saturating_sub(placements);
-        if want == 0 {
+        let draw_count = desired.saturating_sub(self.proposal_draws);
+        if draw_count == 0 {
             return;
         }
-        let budget = want.saturating_mul(8).max(want);
         let mut rng = self.sample_rng;
         let mut next = || {
             rng = crate::candidates::splitmix64(rng);
             crate::candidates::unit_f64(rng)
         };
-        let mut added = 0;
-        for _ in 0..budget {
-            if added >= want {
-                break;
-            }
-            let sample = crate::coarse_fine::sample_candidates(grid, 1, &mut next);
-            let Some(sample) = sample.into_iter().next() else {
-                break;
-            };
+        let samples = crate::coarse_fine::sample_candidates(grid, draw_count, &mut next);
+        self.sample_rng = rng;
+        for sample in samples {
+            self.proposal_draws += 1;
             let action = Action::Place(sample.point);
-            // Dedup by cell: skip a placement whose cell already has a child.
-            let already = self.children.iter().any(|child| match child.candidate.action {
-                Action::Place(existing) => grid.same_cell(existing, sample.point),
-                Action::Pass => false,
-            });
-            if already {
+            if let Some(existing) =
+                self.children
+                    .iter_mut()
+                    .find(|child| match child.candidate.action {
+                        Action::Place(existing) => grid.same_cell(existing, sample.point),
+                        Action::Pass => false,
+                    })
+            {
+                existing.proposal_count += 1;
                 continue;
             }
             let policy_logit = self
@@ -290,14 +300,13 @@ impl Node {
                 policy_logit,
                 prior: 0.0,
                 beta: Some(sample.beta),
+                proposal_count: 1,
                 visits: 0,
                 black_value_sum: 0.0,
                 node: None,
             });
             stats.generated_candidates += 1;
-            added += 1;
         }
-        self.sample_rng = rng;
     }
 
     fn select_child(&self, config: SearchConfig) -> usize {
@@ -441,6 +450,7 @@ pub fn search_with_evaluator(
             prior: child.prior,
             visits: child.visits,
             black_value: child.black_value(),
+            proposal_count: child.proposal_count,
             beta: child.beta,
         })
         .collect::<Vec<_>>();
@@ -457,11 +467,16 @@ pub fn search_with_evaluator(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use vgo_core::{Color, Position};
 
     use crate::{Action, Evaluation, EvaluationError, Evaluator, Policy};
 
-    use super::{SearchConfig, search, search_with_evaluator};
+    use super::{Node, SearchConfig, SearchStats, search, search_with_evaluator};
 
     struct FlatPolicy;
 
@@ -483,11 +498,7 @@ mod tests {
             0.0
         }
 
-        fn fine_grid(
-            &self,
-            position: &Position,
-            coarse: usize,
-        ) -> Option<crate::FineGrid> {
+        fn fine_grid(&self, position: &Position, coarse: usize) -> Option<crate::FineGrid> {
             Some(crate::FineGrid::build(
                 position,
                 self.width,
@@ -515,6 +526,36 @@ mod tests {
         }
     }
 
+    struct CountingGridPolicy {
+        fine_grid_calls: Arc<AtomicUsize>,
+    }
+
+    impl Policy for CountingGridPolicy {
+        fn logit(&self, _action: Action) -> f64 {
+            0.0
+        }
+
+        fn fine_grid(&self, position: &Position, coarse: usize) -> Option<crate::FineGrid> {
+            self.fine_grid_calls.fetch_add(1, Ordering::Relaxed);
+            Some(crate::FineGrid::build(position, 8, 8, coarse, |_, _| 0.0))
+        }
+    }
+
+    struct CountingGridEvaluator {
+        fine_grid_calls: Arc<AtomicUsize>,
+    }
+
+    impl Evaluator for CountingGridEvaluator {
+        fn evaluate(&self, _position: &Position) -> Result<Evaluation, EvaluationError> {
+            Ok(Evaluation::new(
+                0.0,
+                Box::new(CountingGridPolicy {
+                    fine_grid_calls: Arc::clone(&self.fine_grid_calls),
+                }),
+            ))
+        }
+    }
+
     struct ConstantEvaluator(f64);
 
     impl Evaluator for ConstantEvaluator {
@@ -529,6 +570,138 @@ mod tests {
         fn evaluate(&self, _position: &Position) -> Result<Evaluation, EvaluationError> {
             Err(EvaluationError::new("expected failure"))
         }
+    }
+
+    #[test]
+    fn coarse_fine_duplicate_draws_increment_proposal_count() {
+        let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+        let mut config = SearchConfig::canary(1);
+        config.coarse_pool = 1;
+        config.initial_candidates = 7;
+        let evaluator = GridEvaluator {
+            width: 1,
+            height: 1,
+        };
+
+        let result = search_with_evaluator(&position, config, 7, &evaluator)
+            .expect("coarse-fine search completes");
+        let placements = result
+            .children
+            .iter()
+            .filter(|child| matches!(child.action, Action::Place(_)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(placements.len(), 1);
+        assert_eq!(
+            placements[0].proposal_count,
+            config.initial_candidates as u32
+        );
+        assert_eq!(
+            result
+                .children
+                .iter()
+                .map(|child| child.proposal_count)
+                .sum::<u32>(),
+            config.initial_candidates as u32
+        );
+        assert!(
+            result
+                .children
+                .iter()
+                .filter(|child| matches!(child.action, Action::Pass))
+                .all(|child| child.proposal_count == 0)
+        );
+    }
+
+    #[test]
+    fn coarse_fine_progressive_widening_can_add_later_candidates() {
+        let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+        let evaluator = GridEvaluator {
+            width: 32,
+            height: 32,
+        };
+        let mut config = SearchConfig::canary(1);
+        config.coarse_pool = 4;
+        let mut stats = SearchStats::default();
+        let mut node =
+            Node::new(position, None, 11, &evaluator, &mut stats).expect("node evaluates");
+
+        node.widen(config, &mut stats);
+        let initial_actions = node
+            .children
+            .iter()
+            .filter_map(|child| match child.candidate.action {
+                Action::Place(point) => Some(point),
+                Action::Pass => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(node.proposal_draws, 4);
+        assert_eq!(
+            node.children
+                .iter()
+                .map(|child| child.proposal_count)
+                .sum::<u32>(),
+            4
+        );
+
+        node.visits = 1_023;
+        node.widen(config, &mut stats);
+        let later_actions = node
+            .children
+            .iter()
+            .filter_map(|child| match child.candidate.action {
+                Action::Place(point) => Some(point),
+                Action::Pass => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(node.proposal_draws, 64);
+        assert_eq!(
+            node.children
+                .iter()
+                .map(|child| child.proposal_count)
+                .sum::<u32>(),
+            64
+        );
+        assert!(later_actions.len() > initial_actions.len());
+        assert!(
+            initial_actions
+                .iter()
+                .all(|action| later_actions.contains(action))
+        );
+    }
+
+    #[test]
+    fn coarse_fine_grid_is_rebuilt_only_when_the_draw_budget_grows() {
+        let fine_grid_calls = Arc::new(AtomicUsize::new(0));
+        let evaluator = CountingGridEvaluator {
+            fine_grid_calls: Arc::clone(&fine_grid_calls),
+        };
+        let mut config = SearchConfig::canary(1);
+        config.coarse_pool = 2;
+        let mut stats = SearchStats::default();
+        let mut node = Node::new(
+            Position::new(1.0 / 6.0, Vec::new(), Color::Black),
+            None,
+            13,
+            &evaluator,
+            &mut stats,
+        )
+        .expect("node evaluates");
+
+        node.widen(config, &mut stats);
+        assert_eq!(fine_grid_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(node.proposal_draws, 4);
+
+        node.visits = 1;
+        node.widen(config, &mut stats);
+        assert_eq!(fine_grid_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(node.proposal_draws, 4);
+
+        node.visits = 4;
+        node.widen(config, &mut stats);
+        assert_eq!(fine_grid_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(node.proposal_draws, 5);
     }
 
     #[test]
@@ -549,13 +722,24 @@ mod tests {
             .iter()
             .filter(|c| matches!(c.action, Action::Place(_)))
             .count();
-        assert!(placements >= 2, "expected several placements, got {placements}");
+        assert!(
+            placements >= 2,
+            "expected several placements, got {placements}"
+        );
         assert!(
             result
                 .children
                 .iter()
                 .any(|c| matches!(c.action, Action::Pass)),
             "pass must remain a candidate"
+        );
+        assert_eq!(
+            result
+                .children
+                .iter()
+                .map(|child| child.proposal_count)
+                .sum::<u32>(),
+            16
         );
         // The visit budget is honoured.
         let total: u32 = result.children.iter().map(|c| c.visits).sum();

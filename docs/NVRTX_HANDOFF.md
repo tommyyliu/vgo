@@ -1,8 +1,10 @@
 # Blackwell (sm_120) GPU inference — hand-off notes
 
-Status as of 2026-07-22. Goal was "run the RL loop for a few steps" on this
+Status updated 2026-07-24. Goal was "run the RL loop for a few steps" on this
 machine (Linux / Fedora 44, RTX 5070 Ti / Blackwell / sm_120). **RESOLVED — the
-RL loop runs end-to-end on `--provider cuda`.** This records the whole path.
+RL loop runs end-to-end on `--provider cuda`.** This records the GPU path. The
+verification runs below predate the final coarse-to-fine replay-v3 design and
+are not evidence for that policy-sampling change.
 
 ## TL;DR
 
@@ -119,7 +121,8 @@ The loop sets `LD_LIBRARY_PATH` and `ORT_DYLIB_PATH` itself now. From `training/
 uv run python -m vgo_training.rl_loop \
   --output ../artifacts/rl-cuda-demo \
   --iterations 2 --samples 256 --replay-window 2 \
-  --resolution 128 --generation-simulations 48 --arena-simulations 48 \
+  --resolution 128 --coarse-pool 8 \
+  --generation-simulations 48 --arena-simulations 48 \
   --maximum-plies 64 \
   --epochs 40 --training-batch 32 --warm-learning-rate 1e-4 --value-weight 0.1 \
   --device cuda --actors 16 --arena-actors 1 --arena-pairs 12 \
@@ -128,6 +131,15 @@ uv run python -m vgo_training.rl_loop \
 ```
 
 Swap `--provider cpu --device cpu` to run the whole thing today without the bug.
+
+`--coarse-pool` defaults to `0` for the legacy candidate path, is forwarded to
+generation and every arena, and must not exceed the raster resolution. In the
+command above, iteration-zero generation still falls back to legacy candidates:
+the naive bootstrap evaluator has no spatial policy grid. Supply both an initial
+checkpoint and ONNX model to use coarse generation immediately; otherwise it
+starts after the first accepted model. Coarse search uses the ordinary
+visit-count progressive-widening schedule, with cumulative IID delta draws,
+duplicate multiplicity accounting, and deterministic pass.
 
 To drive `vgo-arena` directly, export the two env vars first (the loop does this
 for you):

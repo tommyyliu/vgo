@@ -26,7 +26,7 @@ From `training`:
 uv run python -m vgo_training.rl_loop `
   --output ../artifacts/rl-run `
   --iterations 4 --samples 768 --replay-window 4 `
-  --resolution 128 --generation-simulations 128 `
+  --resolution 128 --coarse-pool 8 --generation-simulations 128 `
   --epochs 50 --training-batch 16 --device cuda `
   --actors 16 --arena-actors 1 --arena-pairs 40 `
   --maximum-batch 16 --provider tensorrt `
@@ -43,6 +43,28 @@ The first iteration bootstraps from the deterministic naive evaluator. Later
 iterations generate with the incumbent, warm-start training, and retain recent
 replay. Pass both `--initial-checkpoint` and `--initial-onnx` to continue from a
 published model; `--initial-replay` adds existing shards to the replay window.
+`--coarse-pool 8` enables coarse-to-fine policy sampling for ONNX self-play and
+arenas; its default of `0` preserves the legacy candidate sequence. The pool is
+the number of fine cells per coarse region and cannot exceed `--resolution`.
+The loop forwards the same pool to replay generation, baseline and promotion
+arenas, and optional Elo matches.
+
+The bootstrap generator has no spatial policy grid, so a run without an initial
+model necessarily produces legacy replay in iteration zero even when
+`--coarse-pool` is positive. Coarse-to-fine generation begins after a model is
+accepted, or immediately when both `--initial-checkpoint` and `--initial-onnx`
+are supplied. ONNX candidates in the iteration-zero arena can still use the
+coarse path.
+
+Spatial search retains the standard cumulative visit-count widening budget
+`min(96, max(4, ceil(2 * sqrt(N + 1))))`. Each widening call draws only the IID
+delta needed to reach that budget. Duplicate cells increase their proposal
+count rather than being retried, while pass is enumerated deterministically.
+Replay v3 stores those `u32` counts after visits and beta; the loader remains
+compatible with replay v1 and v2. Training prepares the self-normalized sparse
+target and full-legal mask once on CPU, then reuses them across epochs and
+metrics. See [`POLICY_REDESIGN.md`](POLICY_REDESIGN.md) for the correction's
+mathematical scope.
 
 ## Artifacts
 
@@ -58,11 +80,24 @@ Each `iteration-NNN` directory contains:
 `run.json` names the final incumbent. Training loss is diagnostic because the
 current split is sample-level. Fresh arena games are the promotion signal.
 
-## First result
+## Current coarse-to-fine integration result
 
-The retained 2026-07-22 run trained at 128x128 over 1,920 positions. Held-out
-policy KL fell from `0.5881` to `0.4944`, and value MAE fell from `0.3599` to
-`0.3247`. On 120 fixed-seed, single-actor games against the same naive policy:
+The retained 2026-07-24 CPU smoke exercised the complete final path from an
+existing ONNX incumbent: 4 replay-v3 samples at 128x128, 16 generation
+simulations, one training epoch, ONNX export, and a two-game promotion arena.
+Every replay row contained the expected eight cumulative proposal draws and 16
+visits; all corrected targets normalized, and the full-legal denominators were
+substantially larger than the nine explored actions. This is an integration
+check, not a playing-strength result. The full audit is
+[`../benchmarks/results/2026-07-24-coarse-policy-smoke.json`](../benchmarks/results/2026-07-24-coarse-policy-smoke.json).
+
+## Historical legacy-path result
+
+This 2026-07-22 measurement predates the final coarse-to-fine replay-v3 design;
+it remains useful only as a baseline for the surrounding RL-loop machinery. It
+trained at 128x128 over 1,920 positions. Held-out policy KL fell from `0.5881`
+to `0.4944`, and value MAE fell from `0.3599` to `0.3247`. On 120 fixed-seed,
+single-actor games against the same naive policy:
 
 | Model | Wins | Losses | Draws | Score | 95% CI |
 | --- | ---: | ---: | ---: | ---: | ---: |

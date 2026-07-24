@@ -327,9 +327,13 @@ impl Policy for DensePolicy {
     fn fine_grid(&self, position: &vgo_core::Position, coarse: usize) -> Option<FineGrid> {
         let width = self.config.width;
         let height = self.config.height;
-        Some(FineGrid::build(position, width, height, coarse, |row, col| {
-            self.logits[row * width + col]
-        }))
+        Some(FineGrid::build(
+            position,
+            width,
+            height,
+            coarse,
+            |row, col| self.logits[row * width + col],
+        ))
     }
 }
 

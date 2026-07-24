@@ -65,18 +65,31 @@ The network emits `height * width` placement logits and one final pass logit.
 A continuous candidate maps to the containing pixel. MCTS visits from candidates
 that share a pixel are added together.
 
-Sampled search does not imply that unvisited pixels are bad moves. Every dataset
-record therefore contains both a policy target and a policy mask. The loss takes
-a softmax only over sampled candidate pixels and pass. This preserves the
-meaning of progressive widening while keeping the policy head raster-native.
+Sampled search does not imply that unvisited pixels are bad moves. Every current
+replay record therefore contains the sampled-candidate mask, raw visit counts,
+the coarse-to-fine proposal probability beta, and the raw proposal multiplicity
+for each policy cell. Training derives the full legal raster mask from
+`legal_clearance >= 0`, adds pass, and unions sampled boundary aliases. The loss
+takes its softmax over that full legal mask while its corrected target has
+nonzero mass only on visited candidates. Unexplored legal cells consequently
+receive the denominator's negative signal; illegal cells receive no gradient.
+
+For a sampled placement, the sparse target's unnormalized mass is
+`visits * proposal_count / (K * beta)`, where `K` is the sum of placement
+proposal counts in that row. Deterministic pass retains its raw visit mass.
+Rows from older schemas or the non-spatial fallback have zero proposal counts
+and use normalized raw visits. Corrected targets and legal masks are prepared
+once on CPU and cached for both training and metrics.
 
 ## Dataset format
 
-Version 2 files begin with this little-endian header:
+All binary datasets begin with this little-endian header. Legacy tensors use
+magic `VGODATA1` and version 2; replay shards use `VGORPLY1` and replay version
+1, 2, or 3.
 
 ```text
-8 bytes  magic: VGODATA1
-u32      version: 2
+8 bytes  magic
+u32      version
 u32      samples
 u32      channels
 u32      height
@@ -84,17 +97,30 @@ u32      width
 u32      policy size
 ```
 
-Each record then contains contiguous little-endian `f32` arrays:
+Current replay shards use magic `VGORPLY1`, replay version 3, and then contain:
 
 ```text
 state[channels * height * width]
 policy_target[height * width + 1]
-policy_mask[height * width + 1]
+sampled_candidate_mask[height * width + 1]
+raw_visits[height * width + 1]
+sampling_beta[height * width + 1]
+proposal_counts[height * width + 1]   # little-endian u32
 current_player_terminal_value[1]
+selected_action[u32]
+game[u64]
+ply[u32]
+seed[u64]
 ```
 
-The Python loader verifies the exact file size, finite values, binary masks,
-policy normalization, and target/mask agreement before exposing tensors.
+Replay version 1 omits `raw_visits`, `sampling_beta`, and `proposal_counts`.
+Version 2 adds visits and beta but has no proposal counts. The loader synthesizes
+visits from normalized policy when necessary and uses zeros for unavailable beta
+or counts, so replay windows may span all three versions. The Python loader
+verifies the exact file size, finite/nonnegative visits, beta bounds, count/beta
+support agreement, deterministic-pass zeros, binary masks,
+normalized-visits/policy agreement, and selected-action consistency before
+exposing tensors.
 
 ## Diagnostics
 
