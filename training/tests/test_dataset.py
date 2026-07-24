@@ -86,7 +86,7 @@ class DatasetTests(unittest.TestCase):
                 stream.write(
                     HEADER.pack(
                         REPLAY_MAGIC,
-                        REPLAY_VERSION,
+                        1,  # this record uses the v1 layout (no visits/beta)
                         samples,
                         channels,
                         height,

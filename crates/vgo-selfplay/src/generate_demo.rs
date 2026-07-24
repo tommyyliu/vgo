@@ -28,7 +28,10 @@ use vgo_search::{
 use vgo_selfplay::play_game as run_playout;
 
 const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
-const REPLAY_VERSION: u32 = 1;
+// v2 adds raw per-cell visit counts and the coarse->fine sampling probability
+// (beta) after the policy mask, so training can apply an off-policy importance
+// correction independent of how candidates were drawn. See docs/POLICY_REDESIGN.md.
+const REPLAY_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GenerationRuntime {
@@ -61,6 +64,8 @@ struct PendingSample {
     raster: SemanticRaster,
     policy: Vec<f32>,
     policy_mask: Vec<f32>,
+    visits: Vec<f32>,
+    beta: Vec<f32>,
     to_move: Color,
     selected_action: u32,
     game: u64,
@@ -72,6 +77,8 @@ struct LabeledSample {
     raster: SemanticRaster,
     policy: Vec<f32>,
     policy_mask: Vec<f32>,
+    visits: Vec<f32>,
+    beta: Vec<f32>,
     value: f32,
     selected_action: u32,
     game: u64,
@@ -124,9 +131,24 @@ struct Config {
     cache_directory: PathBuf,
 }
 
-fn policy_target(result: &SearchResult, config: RasterConfig) -> (Vec<f32>, Vec<f32>) {
-    let mut policy = vec![0.0_f32; config.pixels() + 1];
-    let mut policy_mask = vec![0.0_f32; config.pixels() + 1];
+struct PolicyTarget {
+    /// Normalized visit distribution over cells (the legacy target).
+    policy: Vec<f32>,
+    /// 1.0 for any cell that received a candidate, else 0.0.
+    mask: Vec<f32>,
+    /// Raw visit counts per cell (unnormalized), for off-policy reweighting.
+    visits: Vec<f32>,
+    /// Coarse->fine sampling probability beta per cell; 0.0 for legacy/pass
+    /// candidates (which have no factored sampling probability).
+    beta: Vec<f32>,
+}
+
+fn policy_target(result: &SearchResult, config: RasterConfig) -> PolicyTarget {
+    let size = config.pixels() + 1;
+    let mut policy = vec![0.0_f32; size];
+    let mut mask = vec![0.0_f32; size];
+    let mut visits = vec![0.0_f32; size];
+    let mut beta = vec![0.0_f32; size];
     let total = result
         .children
         .iter()
@@ -138,9 +160,18 @@ fn policy_target(result: &SearchResult, config: RasterConfig) -> (Vec<f32>, Vec<
             Action::Place(point) => action_pixel(point.x, point.y, config),
         };
         policy[index] += child.visits as f32 / total as f32;
-        policy_mask[index] = 1.0;
+        mask[index] = 1.0;
+        visits[index] += child.visits as f32;
+        if let Some(b) = child.beta {
+            beta[index] = b as f32;
+        }
     }
-    (policy, policy_mask)
+    PolicyTarget {
+        policy,
+        mask,
+        visits,
+        beta,
+    }
 }
 
 fn action_index(action: Action, config: RasterConfig) -> u32 {
@@ -170,11 +201,13 @@ fn generate_game(
             )
         },
         |step| {
-            let (policy, policy_mask) = policy_target(step.search, raster_config);
+            let target = policy_target(step.search, raster_config);
             pending.push(PendingSample {
                 raster: rasterize(step.position, raster_config),
-                policy,
-                policy_mask,
+                policy: target.policy,
+                policy_mask: target.mask,
+                visits: target.visits,
+                beta: target.beta,
                 to_move: step.position.to_move(),
                 selected_action: action_index(step.action, raster_config),
                 game: game_index,
@@ -197,6 +230,8 @@ fn generate_game(
             raster: sample.raster,
             policy: sample.policy,
             policy_mask: sample.policy_mask,
+            visits: sample.visits,
+            beta: sample.beta,
             value: if sample.to_move == Color::Black {
                 black_value
             } else {
@@ -316,6 +351,12 @@ fn write_dataset(path: &Path, samples: &[LabeledSample]) -> std::io::Result<()> 
             write_f32(&mut writer, value)?;
         }
         for &value in &sample.policy_mask {
+            write_f32(&mut writer, value)?;
+        }
+        for &value in &sample.visits {
+            write_f32(&mut writer, value)?;
+        }
+        for &value in &sample.beta {
             write_f32(&mut writer, value)?;
         }
         write_f32(&mut writer, sample.value)?;

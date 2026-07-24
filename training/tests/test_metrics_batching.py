@@ -19,6 +19,8 @@ def fixture(samples: int, channels: int = 4, height: int = 8, width: int = 8) ->
         states=torch.rand(samples, channels, height, width, generator=generator),
         policies=policies,
         policy_masks=masks,
+        visits=policies.clone(),
+        betas=torch.zeros(samples, policy_size),
         values=torch.rand(samples, generator=generator) * 2 - 1,
         selected_actions=torch.zeros(samples, dtype=torch.int64),
         game_ids=torch.zeros(samples, dtype=torch.int64),

@@ -89,6 +89,8 @@ def subset(dataset: RasterDataset, indices: torch.Tensor) -> RasterDataset:
         states=dataset.states[indices],
         policies=dataset.policies[indices],
         policy_masks=dataset.policy_masks[indices],
+        visits=dataset.visits[indices],
+        betas=dataset.betas[indices],
         values=dataset.values[indices],
         selected_actions=dataset.selected_actions[indices],
         game_ids=dataset.game_ids[indices],
