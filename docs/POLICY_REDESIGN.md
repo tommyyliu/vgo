@@ -1,7 +1,20 @@
 # Policy representation redesign (design note)
 
-Status: **design agreed, not yet implemented** (2026-07-23). Captures the diagnosis
-and the target design so it survives the session. Nothing here is built yet.
+Status (2026-07-23): **search + data plumbing BUILT and tested; training-side
+consumption and the importance-correction math NOT yet built.**
+
+Done:
+- `crates/vgo-search/src/coarse_fine.rs` — FineGrid + sample_candidates (beta =
+  P_coarse * P_fine), unit-tested.
+- MCTS widening uses coarse->fine when `SearchConfig.coarse_pool > 0` and the
+  policy is spatial (`Policy::fine_grid`, implemented by the ONNX DensePolicy);
+  legacy path preserved at coarse_pool = 0. beta flows out on ChildSummary.
+- Replay format v2: raw visit counts + beta per cell (generate_demo.rs writer,
+  dataset.py reader accepts v1 and v2, RasterDataset.visits / .betas).
+
+Not done yet: the training loss (full-legal sparse cross-entropy consuming
+visits/beta), the importance-correction math (to brainstorm), wiring coarse_pool
+through generate_demo/rl_loop CLI, and actually running it.
 
 ## The problem being fixed
 
