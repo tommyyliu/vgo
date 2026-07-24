@@ -111,6 +111,11 @@ struct Config {
     policy_resolution: usize,
     #[arg(long, default_value_t = 256)]
     simulations: u32,
+    /// Leaves evaluated together per simulation round. Above one, a single game
+    /// keeps that many evaluations in flight instead of one, which fills
+    /// inference batches without needing more concurrent games.
+    #[arg(long, default_value_t = 1)]
+    leaf_batch: usize,
     /// Fine cells per coarse sampling region; zero uses legacy candidates.
     #[arg(long, default_value_t = 0)]
     coarse_pool: usize,
@@ -215,11 +220,13 @@ fn search_config(
     coarse_pool: usize,
     temperature: f64,
     temperature_plies: u32,
+    leaf_batch: usize,
 ) -> SearchConfig {
     let mut config = SearchConfig::canary(simulations);
     config.coarse_pool = coarse_pool;
     config.temperature = temperature;
     config.temperature_plies = temperature_plies;
+    config.leaf_batch = leaf_batch.max(1);
     config
 }
 
@@ -265,6 +272,7 @@ fn generate_game(
         config.coarse_pool,
         config.temperature,
         config.temperature_plies,
+        config.leaf_batch,
     );
     let game_seed = config.seed.wrapping_add(game_index);
     let mut pending = Vec::new();
@@ -775,7 +783,7 @@ mod tests {
 
     #[test]
     fn coarse_sampling_is_applied_to_search_config() {
-        let configured = search_config(37, 8, 1.0, 30);
+        let configured = search_config(37, 8, 1.0, 30, 1);
         assert_eq!(configured.simulations, 37);
         assert_eq!(configured.coarse_pool, 8);
         assert_eq!(configured.temperature, 1.0);

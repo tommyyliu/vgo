@@ -46,6 +46,16 @@ struct Arguments {
     /// Fine cells per coarse sampling region; zero uses legacy candidates.
     #[arg(long, default_value_t = 0)]
     coarse_pool: usize,
+    /// Leaves evaluated together per simulation round for the high seat; above
+    /// one a single game keeps that many evaluations in flight.
+    #[arg(long, default_value_t = 1)]
+    leaf_batch: usize,
+    /// Leaf batch for the low seat. Defaults to `--leaf-batch`, so both seats
+    /// match unless set. Differing values turn the duel into a test of whether
+    /// batched search is as strong as sequential search at equal simulations,
+    /// rather than a test of playout depth.
+    #[arg(long)]
+    low_leaf_batch: Option<usize>,
     #[arg(long = "max-plies", default_value_t = 128)]
     maximum_plies: u32,
     #[arg(long, default_value_t = 1)]
@@ -154,9 +164,10 @@ fn load_model(arguments: &Arguments) -> Result<BatchedEvaluator, EvaluationError
     )
 }
 
-fn search_config(simulations: u32, coarse_pool: usize) -> SearchConfig {
+fn search_config(simulations: u32, coarse_pool: usize, leaf_batch: usize) -> SearchConfig {
     let mut config = SearchConfig::canary(simulations);
     config.coarse_pool = coarse_pool;
+    config.leaf_batch = leaf_batch.max(1);
     config
 }
 
@@ -170,14 +181,20 @@ fn play_game(
         Position::new(arguments.radius, Vec::new(), Color::Black),
         arguments.maximum_plies,
         |position, _| {
-            let simulations = if position.to_move() == high_color {
+            let high_to_move = position.to_move() == high_color;
+            let simulations = if high_to_move {
                 arguments.high
             } else {
                 arguments.low
             };
+            let leaf_batch = if high_to_move {
+                arguments.leaf_batch
+            } else {
+                arguments.low_leaf_batch.unwrap_or(arguments.leaf_batch)
+            };
             search_with_evaluator(
                 position,
-                search_config(simulations, arguments.coarse_pool),
+                search_config(simulations, arguments.coarse_pool, leaf_batch),
                 seed,
                 evaluator,
             )
@@ -272,6 +289,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  \"coarse_pool\": {},\n",
             "  \"high_simulations\": {},\n",
             "  \"low_simulations\": {},\n",
+            "  \"leaf_batch\": {},\n",
+            "  \"low_leaf_batch\": {},\n",
             "  \"pairs\": {},\n",
             "  \"games\": {},\n",
             "  \"completed\": {},\n",
@@ -290,6 +309,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         arguments.coarse_pool,
         arguments.high,
         arguments.low,
+        arguments.leaf_batch,
+        arguments.low_leaf_batch.unwrap_or(arguments.leaf_batch),
         arguments.pairs,
         report.games,
         report.completed,

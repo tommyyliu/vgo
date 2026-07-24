@@ -30,6 +30,13 @@ pub struct SearchConfig {
     /// Sampling late endgame moves throws away won positions for no diversity
     /// benefit, because by then the visit distribution is what we want to trust.
     pub temperature_plies: u32,
+    /// Number of leaves to collect and evaluate together per simulation round.
+    /// One keeps the sequential path: descend, evaluate, back up. Larger values
+    /// let a single game keep that many evaluations in flight, which is what
+    /// fills inference batches when few games run concurrently. Virtual loss
+    /// steers the concurrent descents apart. Values above one change which nodes
+    /// get explored, so arenas comparing two models should use the same setting.
+    pub leaf_batch: usize,
 }
 
 impl SearchConfig {
@@ -46,6 +53,7 @@ impl SearchConfig {
             coarse_pool: 0,
             temperature: 0.0,
             temperature_plies: 0,
+            leaf_batch: 1,
         }
     }
 }
@@ -133,6 +141,13 @@ struct Child {
     /// Legacy candidates and pass use 0.
     proposal_count: u32,
     visits: u32,
+    /// Pending descents that have selected this child but whose evaluation has
+    /// not returned yet. Deliberately separate from `visits` rather than folded
+    /// into it: the progressive-widening budget and the replay visit target both
+    /// read `visits` and must see only completed simulations, while PUCT must see
+    /// the in-flight ones so concurrent descents spread out instead of stacking
+    /// on the same branch.
+    virtual_visits: u32,
     black_value_sum: f64,
     node: Option<Box<Node>>,
 }
@@ -150,6 +165,8 @@ impl Child {
 struct Node {
     position: Position,
     visits: u32,
+    /// In-flight descents through this node; see `Child::virtual_visits`.
+    virtual_visits: u32,
     children: Vec<Child>,
     candidates: CandidateSequence,
     candidates_exhausted: bool,
@@ -167,6 +184,39 @@ struct Node {
 }
 
 impl Node {
+    /// Build a node whose evaluation was already computed elsewhere.
+    ///
+    /// The batched path evaluates a round of leaves together, so by the time a
+    /// node is constructed its evaluation exists. A finished position needs no
+    /// evaluation and takes its value from analysis instead.
+    fn from_evaluation(position: Position, evaluation: Evaluation, match_seed: u64) -> Self {
+        let terminal_black_value = if position.phase() == Phase::Finished {
+            Some(Analysis::new(&position).outcome.black_utility())
+        } else {
+            None
+        };
+        let candidates = CandidateSequence::new(&position, match_seed);
+        let sample_rng =
+            crate::candidates::splitmix64(match_seed ^ crate::candidates::position_hash(&position));
+        Self {
+            position,
+            visits: 0,
+            virtual_visits: 0,
+            children: Vec::new(),
+            candidates,
+            candidates_exhausted: false,
+            evaluation: if terminal_black_value.is_some() {
+                None
+            } else {
+                Some(evaluation)
+            },
+            terminal_black_value,
+            sample_rng,
+            proposal_draws: 0,
+            coarse_budget: None,
+        }
+    }
+
     fn new(
         position: Position,
         analysis: Option<&Analysis>,
@@ -195,6 +245,7 @@ impl Node {
         Ok(Self {
             position,
             visits: 0,
+            virtual_visits: 0,
             children: Vec::new(),
             candidates,
             candidates_exhausted: false,
@@ -260,6 +311,7 @@ impl Node {
                     beta: None,
                     proposal_count: 0,
                     visits: 0,
+                    virtual_visits: 0,
                     black_value_sum: 0.0,
                     node: None,
                 });
@@ -298,6 +350,7 @@ impl Node {
                 beta: None,
                 proposal_count: 0,
                 visits: 0,
+                virtual_visits: 0,
                 black_value_sum: 0.0,
                 node: None,
             });
@@ -343,6 +396,7 @@ impl Node {
                 beta: Some(sample.beta),
                 proposal_count: 1,
                 visits: 0,
+                virtual_visits: 0,
                 black_value_sum: 0.0,
                 node: None,
             });
@@ -351,7 +405,7 @@ impl Node {
     }
 
     fn select_child(&self, config: SearchConfig) -> usize {
-        let parent_visits = f64::from(self.visits.max(1)).sqrt();
+        let parent_visits = f64::from((self.visits + self.virtual_visits).max(1)).sqrt();
         let perspective = if self.position.to_move() == Color::Black {
             1.0
         } else {
@@ -361,9 +415,22 @@ impl Node {
             .iter()
             .enumerate()
             .map(|(index, child)| {
-                let exploitation = perspective * child.black_value();
-                let exploration = config.exploration * child.prior * parent_visits
-                    / (1.0 + f64::from(child.visits));
+                // Virtual loss counts an in-flight descent as a visit that scored
+                // the worst possible value for the player to move. That both
+                // shrinks the exploration bonus and drags the mean down, so a
+                // second concurrent descent prefers a different branch instead of
+                // piling onto the same one. It is removed when the real value
+                // arrives, so it biases only the order of exploration, never the
+                // statistics that survive the search.
+                let pending = f64::from(child.virtual_visits);
+                let total = f64::from(child.visits) + pending;
+                let exploitation = if total == 0.0 {
+                    0.0
+                } else {
+                    // Pending descents contribute -1 from the mover's perspective.
+                    (perspective * child.black_value_sum - pending) / total
+                };
+                let exploration = config.exploration * child.prior * parent_visits / (1.0 + total);
                 (index, exploitation + exploration)
             })
             .max_by(|left, right| {
@@ -476,6 +543,205 @@ fn sampled_child_indices(
     order
 }
 
+/// Run the simulation budget in rounds of up to `config.leaf_batch` descents,
+/// evaluating each round's leaves concurrently.
+///
+/// MCTS is sequential within a game -- a simulation cannot start until the
+/// previous one backs up -- so a single game keeps exactly one evaluation in
+/// flight and the inference broker sees batches of one. Collecting several
+/// leaves before evaluating raises that to `leaf_batch`, which is what lets one
+/// game fill a batch. Virtual loss keeps the concurrent descents from all
+/// choosing the same branch.
+///
+/// The evaluations run on scoped threads so the broker coalesces them, exactly
+/// as it already does for requests arriving from separate games.
+fn run_batched_simulations(
+    root: &mut Node,
+    config: SearchConfig,
+    match_seed: u64,
+    evaluator: &dyn Evaluator,
+    stats: &mut SearchStats,
+) -> Result<(), EvaluationError> {
+    let mut remaining = config.simulations;
+    while remaining > 0 {
+        let round = config.leaf_batch.min(remaining as usize).max(1);
+        let mut descents = Vec::with_capacity(round);
+        for _ in 0..round {
+            descents.push(descend(root, config, stats));
+        }
+
+        // Evaluate the pending leaves together. Terminal and depth-limited
+        // descents already carry their value and skip this entirely.
+        let pending = descents
+            .iter()
+            .filter_map(|descent| match descent {
+                Descent::Pending { position, .. } => Some(position.clone()),
+                Descent::Resolved { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let evaluations = if pending.is_empty() {
+            Vec::new()
+        } else {
+            stats.evaluations += pending.len() as u64;
+            evaluate_concurrently(&pending, evaluator)?
+        };
+
+        let mut evaluated = evaluations.into_iter();
+        for descent in descents {
+            match descent {
+                Descent::Resolved { path, value } => {
+                    back_up(root, &path, value, None, stats);
+                }
+                Descent::Pending {
+                    path,
+                    position,
+                    depth,
+                } => {
+                    let evaluation = evaluated.next().expect("one evaluation per pending leaf");
+                    let node = Node::from_evaluation(position, evaluation, match_seed);
+                    let value = node
+                        .terminal_black_value
+                        .unwrap_or_else(|| node.black_evaluation());
+                    stats.maximum_depth = stats.maximum_depth.max(depth);
+                    back_up(root, &path, value, Some(node), stats);
+                }
+            }
+            stats.simulations += 1;
+        }
+        remaining -= round as u32;
+    }
+    Ok(())
+}
+
+/// Evaluate positions concurrently so the inference broker can batch them.
+fn evaluate_concurrently(
+    positions: &[Position],
+    evaluator: &dyn Evaluator,
+) -> Result<Vec<Evaluation>, EvaluationError> {
+    if positions.len() == 1 {
+        return Ok(vec![evaluator.evaluate(&positions[0])?]);
+    }
+    std::thread::scope(|scope| {
+        let handles = positions
+            .iter()
+            .map(|position| scope.spawn(|| evaluator.evaluate(position)))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("evaluation worker did not panic"))
+            .collect()
+    })
+}
+
+/// The outcome of descending to a leaf without evaluating it.
+enum Descent {
+    /// A position needing evaluation, reached by the recorded child path. The
+    /// caller evaluates it (concurrently with other descents) and returns the
+    /// result through `back_up`.
+    Pending {
+        path: Vec<usize>,
+        position: Position,
+        depth: u32,
+    },
+    /// The descent ended at a terminal or depth-limited node, whose value is
+    /// already known. No evaluation is needed; `back_up` can be called directly.
+    Resolved { path: Vec<usize>, value: f64 },
+}
+
+/// Descend from the root to a leaf, applying virtual loss along the way.
+///
+/// Unlike `simulate` this performs no evaluation, so several descents can be run
+/// back to back and their leaves evaluated as one batch. Each visited edge takes
+/// a virtual visit, which `back_up` releases. Every `descend` must be paired with
+/// exactly one `back_up` or the tree keeps a phantom in-flight visit forever.
+fn descend(node: &mut Node, config: SearchConfig, stats: &mut SearchStats) -> Descent {
+    let mut path = Vec::new();
+    let mut current = &mut *node;
+    let mut depth = 0_u32;
+
+    loop {
+        stats.maximum_depth = stats.maximum_depth.max(depth);
+        if let Some(value) = current.terminal_black_value {
+            stats.terminal_leaves += 1;
+            current.virtual_visits += 1;
+            return Descent::Resolved { path, value };
+        }
+        if depth >= config.maximum_depth {
+            stats.depth_limited_leaves += 1;
+            let value = current.black_evaluation();
+            current.virtual_visits += 1;
+            return Descent::Resolved { path, value };
+        }
+
+        current.widen(config, stats);
+        let index = current.select_child(config);
+        current.virtual_visits += 1;
+        current.children[index].virtual_visits += 1;
+        path.push(index);
+
+        if current.children[index].node.is_none() {
+            // Unexpanded: this is the leaf the caller must evaluate. The child
+            // node is created during back-up, once its evaluation exists.
+            let position = current.children[index]
+                .candidate
+                .action
+                .apply(&current.position)
+                .position;
+            return Descent::Pending {
+                path,
+                position,
+                depth: depth + 1,
+            };
+        }
+        current = current.children[index]
+            .node
+            .as_mut()
+            .expect("child node checked present");
+        depth += 1;
+    }
+}
+
+/// Release the virtual loss along `path` and record `black_value`.
+///
+/// `expansion` supplies the evaluated node for a `Descent::Pending` leaf; a
+/// `Descent::Resolved` descent passes `None`.
+fn back_up(
+    node: &mut Node,
+    path: &[usize],
+    black_value: f64,
+    mut expansion: Option<Node>,
+    stats: &mut SearchStats,
+) {
+    fn recurse(
+        node: &mut Node,
+        path: &[usize],
+        black_value: f64,
+        expansion: &mut Option<Node>,
+        stats: &mut SearchStats,
+    ) {
+        node.virtual_visits = node.virtual_visits.saturating_sub(1);
+        node.visits += 1;
+        let Some((&index, rest)) = path.split_first() else {
+            return;
+        };
+        let child = &mut node.children[index];
+        child.virtual_visits = child.virtual_visits.saturating_sub(1);
+        child.visits += 1;
+        child.black_value_sum += black_value;
+        if let Some(next) = child.node.as_mut() {
+            recurse(next, rest, black_value, expansion, stats);
+        } else if let Some(created) = expansion.take() {
+            debug_assert!(rest.is_empty(), "expansion must terminate the path");
+            let mut created = created;
+            // The freshly evaluated leaf counts one visit of its own.
+            created.visits += 1;
+            child.node = Some(Box::new(created));
+            stats.expanded_nodes += 1;
+        }
+    }
+    recurse(node, path, black_value, &mut expansion, stats);
+}
+
 fn simulate(
     node: &mut Node,
     config: SearchConfig,
@@ -563,9 +829,13 @@ pub fn search_at_ply(
     );
     let mut stats = SearchStats::default();
     let mut root = Node::new(position.clone(), None, match_seed, evaluator, &mut stats)?;
-    for _ in 0..config.simulations {
-        simulate(&mut root, config, match_seed, evaluator, 0, &mut stats)?;
-        stats.simulations += 1;
+    if config.leaf_batch > 1 {
+        run_batched_simulations(&mut root, config, match_seed, evaluator, &mut stats)?;
+    } else {
+        for _ in 0..config.simulations {
+            simulate(&mut root, config, match_seed, evaluator, 0, &mut stats)?;
+            stats.simulations += 1;
+        }
     }
     let children = root
         .children
@@ -615,11 +885,12 @@ mod tests {
 
     use vgo_core::{Color, Position};
 
-    use crate::{Action, Evaluation, EvaluationError, Evaluator, Policy};
+    use crate::{Action, Evaluation, EvaluationError, Evaluator, NaiveEvaluator, Policy};
 
     use super::{
-        ChildSummary, Node, SearchConfig, SearchStats, sampled_child_indices, search,
-        search_at_ply, search_with_evaluator,
+        ChildSummary, Descent, Node, SearchConfig, SearchResult, SearchStats, descend,
+        run_batched_simulations, sampled_child_indices, search, search_at_ply,
+        search_with_evaluator, simulate,
     };
 
     fn child(action: Action, visits: u32) -> ChildSummary {
@@ -695,6 +966,103 @@ mod tests {
         let first = sampled_child_indices(&children, Color::Black, 1.0, 12_345);
         let again = sampled_child_indices(&children, Color::Black, 1.0, 12_345);
         assert_eq!(first, again);
+    }
+
+    /// `leaf_batch = 1` must reproduce the sequential path exactly. It routes
+    /// through descend/back_up rather than `simulate`, so this pins that the
+    /// restructuring did not change the search.
+    #[test]
+    fn unit_leaf_batch_matches_the_sequential_path() {
+        let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+        let sequential = SearchConfig::canary(64);
+        let mut batched = sequential;
+        batched.leaf_batch = 1;
+
+        let left = search_with_evaluator(&position, sequential, 11, &NaiveEvaluator)
+            .expect("naive search is infallible");
+        let right = search_with_evaluator(&position, batched, 11, &NaiveEvaluator)
+            .expect("naive search is infallible");
+        assert_eq!(left.action, right.action);
+        assert_eq!(left.stats.simulations, right.stats.simulations);
+        let visits = |result: &SearchResult| {
+            result.children.iter().map(|c| c.visits).collect::<Vec<_>>()
+        };
+        assert_eq!(visits(&left), visits(&right));
+    }
+
+    /// Virtual loss must leave no residue: after the search every in-flight
+    /// counter is back to zero and the visit total equals the simulation budget.
+    /// A leak here would silently distort PUCT for the rest of the game.
+    #[test]
+    fn batched_search_conserves_visits_and_clears_virtual_loss() {
+        let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+        for leaf_batch in [1usize, 2, 4, 8] {
+            let mut config = SearchConfig::canary(64);
+            config.leaf_batch = leaf_batch;
+            let mut stats = SearchStats::default();
+            let mut root = Node::new(position.clone(), None, 7, &NaiveEvaluator, &mut stats)
+                .expect("root evaluates");
+            if leaf_batch > 1 {
+                run_batched_simulations(&mut root, config, 7, &NaiveEvaluator, &mut stats)
+                    .expect("batched search runs");
+            } else {
+                for _ in 0..config.simulations {
+                    simulate(&mut root, config, 7, &NaiveEvaluator, 0, &mut stats)
+                        .expect("sequential search runs");
+                    stats.simulations += 1;
+                }
+            }
+            assert_eq!(
+                root.virtual_visits, 0,
+                "root virtual loss leaked at leaf_batch {leaf_batch}"
+            );
+            assert!(
+                root.children.iter().all(|child| child.virtual_visits == 0),
+                "child virtual loss leaked at leaf_batch {leaf_batch}"
+            );
+            assert_eq!(
+                root.visits, config.simulations,
+                "root visits must equal the simulation budget at leaf_batch {leaf_batch}"
+            );
+            let child_visits: u32 = root.children.iter().map(|child| child.visits).sum();
+            assert_eq!(
+                child_visits, config.simulations,
+                "child visits must sum to the budget at leaf_batch {leaf_batch}"
+            );
+            assert_eq!(stats.simulations, config.simulations);
+        }
+    }
+
+    /// Virtual loss exists to spread concurrent descents. Without it a round of
+    /// descents would all pick the same child, so a batched search would explore
+    /// far fewer distinct branches than a sequential one.
+    #[test]
+    fn virtual_loss_spreads_a_batch_across_children() {
+        let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+        let mut config = SearchConfig::canary(16);
+        config.leaf_batch = 8;
+        let mut stats = SearchStats::default();
+        let mut root =
+            Node::new(position.clone(), None, 3, &NaiveEvaluator, &mut stats).expect("root");
+        root.widen(config, &mut stats);
+
+        // One round of descents without backing any of them up: every descent
+        // sees the previous descents' virtual loss.
+        let mut chosen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            if let Descent::Pending { path, .. } | Descent::Resolved { path, .. } =
+                descend(&mut root, config, &mut stats)
+            {
+                if let Some(&first) = path.first() {
+                    chosen.insert(first);
+                }
+            }
+        }
+        assert!(
+            chosen.len() > 1,
+            "virtual loss should spread 8 descents over more than one child, got {}",
+            chosen.len()
+        );
     }
 
     /// Temperature must not leak into arenas: past `temperature_plies`, and for

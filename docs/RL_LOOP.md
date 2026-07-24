@@ -97,6 +97,34 @@ Two diagnostics track whether this is working, both reported per iteration:
   child. Very high with few candidates and few simulations suggests PUCT is
   committing before progressive widening has introduced later candidates.
 
+## Leaf parallelization
+
+MCTS is sequential within a game: a simulation cannot begin until the previous
+one backs up, so one game keeps exactly one evaluation in flight and the
+inference broker sees batches of one. `--leaf-batch` collects that many leaves
+per round and evaluates them together, raising in-flight evaluations per game
+from one to `leaf_batch`.
+
+Concurrent descents would otherwise all choose the same branch, so each descent
+takes a *virtual loss* on the edges it traverses: an in-flight visit scored as
+the worst possible value for the player to move, released when the real value
+backs up. Virtual loss is held in a separate counter from `visits`, because
+three consumers need different views. Progressive widening reads `visits` for
+the proposal budget and must see only completed simulations, or the
+coarse-to-fine draw count drifts and corrupts the importance correction. The
+replay visit target likewise must record real visits. Only PUCT sees
+`visits + virtual_visits`.
+
+`--leaf-batch 1` is the sequential path and is pinned by test to produce
+identical actions and visit counts. Above one, which nodes get explored
+changes, so both seats of an arena must use the same value.
+
+Measured on a 4-game arena, where game-level concurrency cannot fill batches:
+138s at `leaf-batch 1` versus 12s at 16, an 11.5x speedup, with mean batch size
+tracking the setting (15.24 of 16). Self-play generation runs many games at
+once and so already fills batches; leaf parallelization matters most for few
+concurrent games -- interactive play against a person being the limiting case.
+
 Spatial search retains the standard cumulative visit-count widening budget
 `min(96, max(4, ceil(2 * sqrt(N + 1))))`. Each widening call draws only the IID
 delta needed to reach that budget. Duplicate cells increase their proposal

@@ -33,6 +33,11 @@ struct Arguments {
     /// Fine cells per coarse sampling region; zero uses legacy candidates.
     #[arg(long, default_value_t = 0)]
     coarse_pool: usize,
+    /// Leaves evaluated together per simulation round; above one a single game
+    /// keeps that many evaluations in flight. Both seats must use the same value
+    /// for a fair comparison, since it changes which nodes get explored.
+    #[arg(long, default_value_t = 1)]
+    leaf_batch: usize,
     #[arg(long = "max-plies", default_value_t = 48)]
     maximum_plies: u32,
     #[arg(long, default_value_t = 8)]
@@ -87,9 +92,10 @@ fn load_model(model: PathBuf, arguments: &Arguments) -> Result<BatchedEvaluator,
     )
 }
 
-fn search_config(simulations: u32, coarse_pool: usize) -> SearchConfig {
+fn search_config(simulations: u32, coarse_pool: usize, leaf_batch: usize) -> SearchConfig {
     let mut config = SearchConfig::canary(simulations);
     config.coarse_pool = coarse_pool;
+    config.leaf_batch = leaf_batch.max(1);
     config
 }
 
@@ -134,7 +140,7 @@ fn play_game(
             };
             search_with_evaluator(
                 position,
-                search_config(arguments.simulations, arguments.coarse_pool),
+                search_config(arguments.simulations, arguments.coarse_pool, arguments.leaf_batch),
                 seed,
                 evaluator,
             )
@@ -332,7 +338,7 @@ mod tests {
 
     #[test]
     fn coarse_sampling_is_applied_to_search_config() {
-        let configured = search_config(19, 8);
+        let configured = search_config(19, 8, 1);
         assert_eq!(configured.simulations, 19);
         assert_eq!(configured.coarse_pool, 8);
     }
