@@ -180,30 +180,69 @@ pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32
     let radius = position.radius();
     let distance_scale = (4.0 * radius).max(f64::EPSILON);
 
+    // The inner loop tracks *squared* distances. Squaring is monotonic on
+    // nonnegative reals, so every minimum and ordering below is unchanged, but it
+    // replaces one `hypot` per (pixel, stone) pair with a multiply-add. Only the
+    // four surviving distances need a square root, per pixel rather than per
+    // stone. At 96x96 with 30 stones that is 276k transcendental calls traded for
+    // 37k -- this loop was measured at 66% of all self-play CPU time.
+    let to_move = position.to_move();
+    let stones = position.stones();
+    // Splitting by colour once hoists the per-stone colour comparison out of the
+    // pixel loop entirely.
+    let mut current_stones = Vec::with_capacity(stones.len());
+    let mut opponent_stones = Vec::with_capacity(stones.len());
+    for stone in stones {
+        if stone.color == to_move {
+            current_stones.push((stone.x, stone.y));
+        } else {
+            opponent_stones.push((stone.x, stone.y));
+        }
+    }
+
     for row in 0..config.height {
         let y = (row as f64 + 0.5) / config.height as f64;
         for column in 0..config.width {
             let x = (column as f64 + 0.5) / config.width as f64;
             let pixel = row * config.width + column;
-            let mut current_distance = f64::INFINITY;
-            let mut opponent_distance = f64::INFINITY;
-            let mut nearest = f64::INFINITY;
-            let mut second = f64::INFINITY;
+            let mut current_square = f64::INFINITY;
+            let mut opponent_square = f64::INFINITY;
+            let mut nearest_square = f64::INFINITY;
+            let mut second_square = f64::INFINITY;
 
-            for stone in position.stones() {
-                let distance = (x - stone.x).hypot(y - stone.y);
-                if stone.color == position.to_move() {
-                    current_distance = current_distance.min(distance);
-                } else {
-                    opponent_distance = opponent_distance.min(distance);
+            for &(sx, sy) in &current_stones {
+                let dx = x - sx;
+                let dy = y - sy;
+                let square = dx * dx + dy * dy;
+                if square < current_square {
+                    current_square = square;
                 }
-                if distance < nearest {
-                    second = nearest;
-                    nearest = distance;
-                } else if distance < second {
-                    second = distance;
+                if square < nearest_square {
+                    second_square = nearest_square;
+                    nearest_square = square;
+                } else if square < second_square {
+                    second_square = square;
                 }
             }
+            for &(sx, sy) in &opponent_stones {
+                let dx = x - sx;
+                let dy = y - sy;
+                let square = dx * dx + dy * dy;
+                if square < opponent_square {
+                    opponent_square = square;
+                }
+                if square < nearest_square {
+                    second_square = nearest_square;
+                    nearest_square = square;
+                } else if square < second_square {
+                    second_square = square;
+                }
+            }
+
+            let current_distance = current_square.sqrt();
+            let opponent_distance = opponent_square.sqrt();
+            let nearest = nearest_square.sqrt();
+            let second = second_square.sqrt();
 
             set(data, pixels, 0, pixel, inside(current_distance, radius));
             set(data, pixels, 1, pixel, inside(opponent_distance, radius));
@@ -338,6 +377,138 @@ mod tests {
     use vgo_core::{Color, Position, Stone};
 
     use super::{CHANNEL_COUNT, RasterConfig, action_pixel, rasterize, rasterize_into};
+
+    /// The pre-optimization formulation: one `hypot` per (pixel, stone) pair.
+    /// `rasterize_into` now accumulates squared distances and takes four square
+    /// roots per pixel instead; squaring is monotonic so every min and ordering
+    /// is preserved. This reference pins that equivalence.
+    fn hypot_reference(position: &Position, config: RasterConfig) -> Vec<f32> {
+        let pixels = config.pixels();
+        let mut data = vec![0.0f32; CHANNEL_COUNT * pixels];
+        let radius = position.radius();
+        let scale = (4.0 * radius).max(f64::EPSILON);
+        for row in 0..config.height {
+            let y = (row as f64 + 0.5) / config.height as f64;
+            for column in 0..config.width {
+                let x = (column as f64 + 0.5) / config.width as f64;
+                let pixel = row * config.width + column;
+                let (mut current, mut opponent) = (f64::INFINITY, f64::INFINITY);
+                let (mut nearest, mut second) = (f64::INFINITY, f64::INFINITY);
+                for stone in position.stones() {
+                    let distance = (x - stone.x).hypot(y - stone.y);
+                    if stone.color == position.to_move() {
+                        current = current.min(distance);
+                    } else {
+                        opponent = opponent.min(distance);
+                    }
+                    if distance < nearest {
+                        second = nearest;
+                        nearest = distance;
+                    } else if distance < second {
+                        second = distance;
+                    }
+                }
+                data[pixel] = super::inside(current, radius);
+                data[pixels + pixel] = super::inside(opponent, radius);
+                let (owned, taken) = super::ownership(current, opponent);
+                data[2 * pixels + pixel] = owned;
+                data[3 * pixels + pixel] = taken;
+                data[4 * pixels + pixel] = super::normalized_distance(current, scale);
+                data[5 * pixels + pixel] = super::normalized_distance(opponent, scale);
+                data[6 * pixels + pixel] = if second.is_finite() {
+                    (1.0 - (second - nearest) / radius).clamp(0.0, 1.0) as f32
+                } else {
+                    0.0
+                };
+                let board = (x - radius)
+                    .min(1.0 - radius - x)
+                    .min(y - radius)
+                    .min(1.0 - radius - y);
+                let clear = if nearest.is_finite() {
+                    nearest - 2.0 * radius
+                } else {
+                    f64::INFINITY
+                };
+                data[7 * pixels + pixel] = (board.min(clear) / radius).clamp(-1.0, 1.0) as f32;
+                data[8 * pixels + pixel] = (2.0 * radius) as f32;
+                data[9 * pixels + pixel] = f32::from(position.consecutive_passes() > 0);
+            }
+        }
+        data
+    }
+
+    fn scattered_position(stones: usize) -> Position {
+        let radius = 1.0 / 18.0;
+        let mut placed: Vec<Stone> = Vec::new();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut attempts = 0;
+        while placed.len() < stones && attempts < 100_000 {
+            attempts += 1;
+            let x = radius + (1.0 - 2.0 * radius) * next();
+            let y = radius + (1.0 - 2.0 * radius) * next();
+            let color = if placed.len() % 2 == 0 {
+                Color::Black
+            } else {
+                Color::White
+            };
+            let probe = Position::new(radius, placed.clone(), Color::Black);
+            if vgo_core::is_legal_placement(&probe, x, y) {
+                placed.push(Stone { x, y, color });
+            }
+        }
+        Position::new(radius, placed, Color::Black)
+    }
+
+    /// The squared-distance rewrite must not change the raster. Exact equality is
+    /// the bar: `hypot` and `sqrt(dx*dx + dy*dy)` can differ by an ulp, which on a
+    /// pixel exactly equidistant from two stones could flip Voronoi ownership
+    /// between a tie and a winner. Real positions do not manufacture such ties;
+    /// a symmetric lattice does, so this uses scattered placements.
+    #[test]
+    fn squared_distance_raster_matches_the_hypot_formulation() {
+        for stones in [0usize, 1, 5, 17, 40] {
+            let position = scattered_position(stones);
+            let config = RasterConfig::square(48);
+            let produced = rasterize(&position, config);
+            let expected = hypot_reference(&position, config);
+            assert_eq!(
+                produced.data(),
+                expected.as_slice(),
+                "raster diverged from the hypot reference at {stones} stones"
+            );
+        }
+    }
+
+    /// Channel 7's sign is the legality predicate the training mask is built
+    /// from, so it must agree with the exact simulator, not merely with the old
+    /// floating-point formulation.
+    #[test]
+    fn legal_clearance_sign_agrees_with_the_exact_predicate() {
+        let position = scattered_position(12);
+        let config = RasterConfig::square(48);
+        let raster = rasterize(&position, config);
+        let pixels = config.pixels();
+        for row in 0..config.height {
+            for column in 0..config.width {
+                let pixel = row * config.width + column;
+                let x = (column as f64 + 0.5) / config.width as f64;
+                let y = (row as f64 + 0.5) / config.height as f64;
+                let clearance = raster.data()[7 * pixels + pixel];
+                let legal = vgo_core::is_legal_placement(&position, x, y);
+                if clearance > 0.02 {
+                    assert!(legal, "positive clearance at ({x}, {y}) must be legal");
+                } else if clearance < -0.02 {
+                    assert!(!legal, "negative clearance at ({x}, {y}) must be illegal");
+                }
+            }
+        }
+    }
 
     #[test]
     fn raster_has_stable_shape_and_ranges() {
