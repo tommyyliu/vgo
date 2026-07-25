@@ -1,0 +1,96 @@
+epoch=   1 policy_kl=2.19163 top1=0.220 value_mae=0.99998 lr=0.002000
+epoch=  25 policy_kl=1.83447 top1=0.231 value_mae=1.00000 lr=0.001992
+epoch=  50 policy_kl=1.80788 top1=0.231 value_mae=1.00002 lr=0.001966
+epoch=  75 policy_kl=1.86446 top1=0.233 value_mae=1.00001 lr=0.001925
+epoch= 100 policy_kl=1.79789 top1=0.238 value_mae=1.00003 lr=0.001867
+epoch= 125 policy_kl=1.80541 top1=0.238 value_mae=1.00001 lr=0.001795
+epoch= 150 policy_kl=1.80451 top1=0.249 value_mae=1.00003 lr=0.001710
+epoch= 175 policy_kl=1.80430 top1=0.251 value_mae=1.00002 lr=0.001613
+epoch= 200 policy_kl=1.79797 top1=0.244 value_mae=1.00003 lr=0.001505
+epoch= 225 policy_kl=1.80437 top1=0.238 value_mae=1.00000 lr=0.001389
+epoch= 250 policy_kl=1.87776 top1=0.218 value_mae=1.00001 lr=0.001266
+epoch= 275 policy_kl=1.85451 top1=0.246 value_mae=1.00002 lr=0.001139
+epoch= 300 policy_kl=1.83831 top1=0.226 value_mae=1.00001 lr=0.001010
+epoch= 325 policy_kl=1.82930 top1=0.239 value_mae=1.00001 lr=0.000881
+epoch= 350 policy_kl=1.84045 top1=0.248 value_mae=1.00001 lr=0.000754
+epoch= 375 policy_kl=1.82136 top1=0.254 value_mae=1.00002 lr=0.000631
+epoch= 400 policy_kl=1.82763 top1=0.244 value_mae=1.00002 lr=0.000515
+epoch= 425 policy_kl=1.82158 top1=0.259 value_mae=1.00002 lr=0.000407
+epoch= 450 policy_kl=1.82877 top1=0.249 value_mae=1.00002 lr=0.000310
+epoch= 475 policy_kl=1.83544 top1=0.249 value_mae=1.00002 lr=0.000225
+epoch= 500 policy_kl=1.83760 top1=0.246 value_mae=1.00001 lr=0.000153
+epoch= 525 policy_kl=1.83494 top1=0.251 value_mae=1.00001 lr=0.000095
+epoch= 550 policy_kl=1.84025 top1=0.246 value_mae=1.00002 lr=0.000054
+epoch= 575 policy_kl=1.84072 top1=0.244 value_mae=1.00002 lr=0.000028
+epoch= 600 policy_kl=1.84211 top1=0.248 value_mae=1.00002 lr=0.000020
+{
+  "schema": "vgo.training-run.v2",
+  "datasets": [
+    "/home/tommy/PycharmProjects/vgo/artifacts/decoupled-run2/iteration-000/replay/dataset.vgo",
+    "/home/tommy/PycharmProjects/vgo/artifacts/decoupled-run2/iteration-001/replay/dataset.vgo"
+  ],
+  "checkpoint": "/tmp/claude-1000/-home-tommy-PycharmProjects-vgo/57b46eeb-7b26-4811-a630-70ee959d90ee/scratchpad/longtrain.pt",
+  "parent_checkpoint": null,
+  "device": "cuda",
+  "samples": 6144,
+  "training_samples": 5530,
+  "validation_samples": 614,
+  "shape": [
+    6144,
+    10,
+    96,
+    96
+  ],
+  "parameters": 2796451,
+  "epochs": 600,
+  "batch_size": 64,
+  "learning_rate": 0.002,
+  "value_weight": 0.1,
+  "policy_target": "progressive_empirical_importance_v1",
+  "policy_denominator": "full_legal_raster_v1",
+  "importance_corrected_samples": 6080,
+  "uncorrected_samples": 64,
+  "selection_metric": "policy_kl + value_weight * value_mae",
+  "wall_seconds": 4937.484974592982,
+  "best_epoch": 100,
+  "initial_training": {
+    "loss": 5.521827888943618,
+    "policy_cross_entropy": 5.42176330559508,
+    "policy_target_entropy": 1.8065989678850225,
+    "policy_kl": 3.6151643377100577,
+    "policy_top1": 0.041410488245931285,
+    "value_mae": 1.0000865144927937
+  },
+  "initial_validation": {
+    "loss": 5.502121705806993,
+    "policy_cross_entropy": 5.402118926716161,
+    "policy_target_entropy": 1.7970493585356673,
+    "policy_kl": 3.605069568180494,
+    "policy_top1": 0.0504885993606687,
+    "value_mae": 0.9997769077748352
+  },
+  "best_validation": {
+    "loss": 3.694953658642909,
+    "policy_cross_entropy": 3.594941028942891,
+    "policy_target_entropy": 1.7970493585356673,
+    "policy_kl": 1.7978916704072239,
+    "policy_top1": 0.23778501662641083,
+    "value_mae": 1.0000275117178306
+  },
+  "final_training": {
+    "loss": 3.770516356339722,
+    "policy_cross_entropy": 3.670517167389716,
+    "policy_target_entropy": 1.8065989678850225,
+    "policy_kl": 1.8639181995046936,
+    "policy_top1": 0.23182640146282224,
+    "value_mae": 0.9999602935197771
+  },
+  "final_validation": {
+    "loss": 3.694953658642909,
+    "policy_cross_entropy": 3.594941028942891,
+    "policy_target_entropy": 1.7970493585356673,
+    "policy_kl": 1.7978916704072239,
+    "policy_top1": 0.23778501662641083,
+    "value_mae": 1.0000275117178306
+  }
+}
