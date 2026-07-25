@@ -496,12 +496,22 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         arguments.batch_size,
         value_weight=arguments.value_weight,
     )
+    # Checkpoint selection scores each term by its *relative* improvement over
+    # the starting model rather than by its raw magnitude. Summing raw terms lets
+    # a flat one dominate: measured on one iteration, policy_kl sat at ~1.79 and
+    # jittered +/-0.008 while the entire value signal spanned 0.019, so noise in
+    # the term carrying no information outranked 80 epochs of real value
+    # learning and the epoch-zero weights were saved and then lost their arena.
+    # Normalising by the initial value makes each term contribute its fractional
+    # gain, so a term that does not move cannot outvote one that does.
+    def selection_score(current: dict[str, float]) -> float:
+        policy = current["policy_kl"] / max(initial_validation["policy_kl"], 1e-9)
+        value = current["value_mae"] / max(initial_validation["value_mae"], 1e-9)
+        return policy + arguments.value_weight * value
+
     best_epoch = 0
     best = initial_validation
-    best_score = (
-        initial_validation["policy_kl"]
-        + arguments.value_weight * initial_validation["value_mae"]
-    )
+    best_score = selection_score(initial_validation)
     best_state = {
         name: value.detach().cpu().clone() for name, value in model.state_dict().items()
     }
@@ -549,7 +559,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
                 arguments.batch_size,
                 value_weight=arguments.value_weight,
             )
-            score = current["policy_kl"] + arguments.value_weight * current["value_mae"]
+            score = selection_score(current)
             if score < best_score:
                 best_epoch = epoch
                 best = current
@@ -623,7 +633,9 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         "policy_denominator": "full_legal_raster_v1",
         "importance_corrected_samples": corrected_samples,
         "uncorrected_samples": dataset_samples - corrected_samples,
-        "selection_metric": "policy_kl + value_weight * value_mae",
+        "selection_metric": (
+            "relative: policy_kl/initial + value_weight * value_mae/initial"
+        ),
         "wall_seconds": elapsed,
         "best_epoch": best_epoch,
         "initial_training": initial_training,

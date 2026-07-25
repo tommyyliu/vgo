@@ -196,3 +196,54 @@ class DihedralAugmentationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SelectionMetricTests(unittest.TestCase):
+    """Checkpoint selection must not let a term that carries no signal outvote
+    one that does.
+
+    Measured on a real iteration: policy_kl sat at ~1.79 and jittered +/-0.008
+    across 80 epochs while the whole value signal spanned 0.019. Summing raw
+    terms meant KL noise outranked genuine value learning, epoch-zero weights
+    were saved, and that checkpoint then lost its promotion arena.
+    """
+
+    @staticmethod
+    def _score(current, initial, value_weight):
+        # Mirrors train_demo.selection_score, which is a closure over the run's
+        # initial validation and so cannot be imported directly.
+        policy = current["policy_kl"] / max(initial["policy_kl"], 1e-9)
+        value = current["value_mae"] / max(initial["value_mae"], 1e-9)
+        return policy + value_weight * value
+
+    def test_flat_policy_does_not_outvote_improving_value(self) -> None:
+        initial = {"policy_kl": 1.7842, "value_mae": 0.5452}
+        # Real epoch-80 numbers from the iteration that regressed.
+        final = {"policy_kl": 1.7904, "value_mae": 0.3570}
+        raw_initial = initial["policy_kl"] + 0.1 * initial["value_mae"]
+        raw_final = final["policy_kl"] + 0.1 * final["value_mae"]
+        self.assertLess(
+            raw_final,
+            raw_initial,
+            "sanity: on these numbers the raw metric does prefer the final epoch",
+        )
+        # The failure mode is a *lucky early* KL sample beating everything later.
+        lucky = {"policy_kl": 1.7700, "value_mae": 0.5400}
+        self.assertLess(
+            lucky["policy_kl"] + 0.1 * lucky["value_mae"],
+            raw_final,
+            "raw metric prefers the lucky early epoch over trained weights",
+        )
+        self.assertLess(
+            self._score(final, initial, 0.1),
+            self._score(lucky, initial, 0.1),
+            "relative metric must prefer the trained weights",
+        )
+
+    def test_improving_policy_still_wins(self) -> None:
+        initial = {"policy_kl": 2.0, "value_mae": 1.0}
+        better = {"policy_kl": 1.5, "value_mae": 1.0}
+        worse = {"policy_kl": 2.2, "value_mae": 0.9}
+        self.assertLess(
+            self._score(better, initial, 0.1), self._score(worse, initial, 0.1)
+        )
