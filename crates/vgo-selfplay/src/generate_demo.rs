@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeMap,
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
@@ -90,7 +89,6 @@ struct LabeledSample {
 }
 
 struct GameSamples {
-    index: u64,
     samples: Vec<LabeledSample>,
     completed: bool,
 }
@@ -299,7 +297,6 @@ fn generate_game(
     )?;
     let Some(outcome) = playout.outcome else {
         return Ok(GameSamples {
-            index: game_index,
             samples: Vec::new(),
             completed: false,
         });
@@ -326,7 +323,6 @@ fn generate_game(
         })
         .collect();
     Ok(GameSamples {
-        index: game_index,
         samples,
         completed: true,
     })
@@ -366,32 +362,39 @@ fn generate(
     }
     drop(sender);
 
+    // Games count toward the sample target as they arrive.
+    //
+    // This used to drain in game-index order, which stalled the collector on the
+    // slowest game in each contiguous prefix: with 64 actors and games varying
+    // from a few plies to the 256-ply limit, a finished game contributed nothing
+    // until every lower-indexed game completed. Actors stayed busy but the loop
+    // exits on sample count, so the wait was wall-clock time -- 7.9s per game
+    // against 2.4s for the arena, which has no such constraint.
+    //
+    // That ordering did not buy determinism and was not worth its cost. Which
+    // games reach the shard depends on which have finished when the target is
+    // met, and that is a function of scheduling either way; ordering the winners
+    // afterwards does not change the set. Replay is training data that gets
+    // shuffled and dihedrally augmented before use, and generation is already
+    // nondeterministic through temperature sampling and FP16 batch composition,
+    // so byte-identical shards were never a property this pipeline had.
     let mut samples = Vec::with_capacity(config.samples);
     let mut completed_games = 0;
     let mut discarded_games = 0;
-    let mut expected_game = 0_u64;
-    let mut pending = BTreeMap::new();
     while samples.len() < config.samples {
         let game = receiver.recv().map_err(|_| {
             EvaluationError::new(format!(
                 "replay exhausted {maximum_games} game attempts after {completed_games} completed and {discarded_games} discarded games"
             ))
         })??;
-        pending.insert(game.index, game);
-        while let Some(game) = pending.remove(&expected_game) {
-            expected_game += 1;
-            if game.completed {
-                completed_games += 1;
-                samples.extend(game.samples);
-                if samples.len() >= config.samples {
-                    samples.truncate(config.samples);
-                    break;
-                }
-            } else {
-                discarded_games += 1;
-            }
+        if game.completed {
+            completed_games += 1;
+            samples.extend(game.samples);
+        } else {
+            discarded_games += 1;
         }
     }
+    samples.truncate(config.samples);
     stopped.store(true, Ordering::Relaxed);
     drop(receiver);
     for handle in handles {
