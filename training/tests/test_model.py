@@ -199,51 +199,46 @@ if __name__ == "__main__":
 
 
 class SelectionMetricTests(unittest.TestCase):
-    """Checkpoint selection must not let a term that carries no signal outvote
-    one that does.
+    """Checkpoint selection must let a genuinely better model win.
 
-    Measured on a real iteration: policy_kl sat at ~1.79 and jittered +/-0.008
-    across 80 epochs while the whole value signal spanned 0.019. Summing raw
-    terms meant KL noise outranked genuine value learning, epoch-zero weights
-    were saved, and that checkpoint then lost its promotion arena.
+    This is scored as `policy_kl + value_weight * value_mae`, which only works
+    when the two terms can outvote each other. At value_weight 0.1 it discarded
+    whole training runs twice: policy_kl sits near 1.8 and drifts while
+    value_mae improves 30-50%, but a 0.1 weight caps the value term's total
+    contribution at 0.1, so any KL drift above ~10% of the value gain makes the
+    untrained epoch-zero weights win. Both resulting checkpoints lost their
+    promotion arenas. These tests use the real numbers from those runs.
     """
 
     @staticmethod
-    def _score(current, initial, value_weight):
-        # Mirrors train_demo.selection_score, which is a closure over the run's
-        # initial validation and so cannot be imported directly.
-        policy = current["policy_kl"] / max(initial["policy_kl"], 1e-9)
-        value = current["value_mae"] / max(initial["value_mae"], 1e-9)
-        return policy + value_weight * value
+    def _score(current, value_weight):
+        return current["policy_kl"] + value_weight * current["value_mae"]
 
-    def test_flat_policy_does_not_outvote_improving_value(self) -> None:
+    def test_rising_kl_does_not_veto_a_large_value_gain(self) -> None:
+        # decoupled-run3 iteration 1: KL degraded 6% while value improved 42%.
+        initial = {"policy_kl": 1.7654, "value_mae": 0.4374}
+        trained = {"policy_kl": 1.8945, "value_mae": 0.2872}
+        self.assertLess(
+            self._score(initial, 0.1),
+            self._score(trained, 0.1),
+            "sanity: at 0.1 the untrained weights win, which is the bug",
+        )
+        self.assertLess(
+            self._score(trained, 1.0),
+            self._score(initial, 1.0),
+            "at 1.0 the trained weights must win",
+        )
+
+    def test_flat_kl_does_not_veto_value_learning(self) -> None:
+        # decoupled-run2 iteration 2: KL flat within noise, value improved 35%.
         initial = {"policy_kl": 1.7842, "value_mae": 0.5452}
-        # Real epoch-80 numbers from the iteration that regressed.
-        final = {"policy_kl": 1.7904, "value_mae": 0.3570}
-        raw_initial = initial["policy_kl"] + 0.1 * initial["value_mae"]
-        raw_final = final["policy_kl"] + 0.1 * final["value_mae"]
-        self.assertLess(
-            raw_final,
-            raw_initial,
-            "sanity: on these numbers the raw metric does prefer the final epoch",
-        )
-        # The failure mode is a *lucky early* KL sample beating everything later.
-        lucky = {"policy_kl": 1.7700, "value_mae": 0.5400}
-        self.assertLess(
-            lucky["policy_kl"] + 0.1 * lucky["value_mae"],
-            raw_final,
-            "raw metric prefers the lucky early epoch over trained weights",
-        )
-        self.assertLess(
-            self._score(final, initial, 0.1),
-            self._score(lucky, initial, 0.1),
-            "relative metric must prefer the trained weights",
-        )
+        trained = {"policy_kl": 1.7904, "value_mae": 0.3570}
+        self.assertLess(self._score(trained, 1.0), self._score(initial, 1.0))
 
-    def test_improving_policy_still_wins(self) -> None:
+    def test_policy_improvement_still_counts(self) -> None:
         initial = {"policy_kl": 2.0, "value_mae": 1.0}
-        better = {"policy_kl": 1.5, "value_mae": 1.0}
-        worse = {"policy_kl": 2.2, "value_mae": 0.9}
+        better_policy = {"policy_kl": 1.5, "value_mae": 1.0}
+        worse_policy = {"policy_kl": 2.5, "value_mae": 0.9}
         self.assertLess(
-            self._score(better, initial, 0.1), self._score(worse, initial, 0.1)
+            self._score(better_policy, 1.0), self._score(worse_policy, 1.0)
         )

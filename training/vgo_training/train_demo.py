@@ -496,18 +496,20 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         arguments.batch_size,
         value_weight=arguments.value_weight,
     )
-    # Checkpoint selection scores each term by its *relative* improvement over
-    # the starting model rather than by its raw magnitude. Summing raw terms lets
-    # a flat one dominate: measured on one iteration, policy_kl sat at ~1.79 and
-    # jittered +/-0.008 while the entire value signal spanned 0.019, so noise in
-    # the term carrying no information outranked 80 epochs of real value
-    # learning and the epoch-zero weights were saved and then lost their arena.
-    # Normalising by the initial value makes each term contribute its fractional
-    # gain, so a term that does not move cannot outvote one that does.
+    # Checkpoint selection is the plain weighted sum. It is only meaningful when
+    # the two terms can actually outvote each other, which is why
+    # --value-weight defaults to 1.0.
+    #
+    # The history is worth keeping: at value_weight 0.1 this selection discarded
+    # whole training runs twice. policy_kl sits near 1.8 and either jitters or
+    # drifts upward while value_mae improves 30-50%, but a 0.1 weight caps the
+    # value term's total possible contribution at 0.1 -- so any KL drift above
+    # ~10% of the value gain makes the untrained epoch-zero weights win. Both
+    # times the resulting checkpoint went to its promotion arena untrained and
+    # lost. Down-weighting a term in the *loss* is a statement about gradients;
+    # reusing that weight for *selection* silently gave the noisier term a veto.
     def selection_score(current: dict[str, float]) -> float:
-        policy = current["policy_kl"] / max(initial_validation["policy_kl"], 1e-9)
-        value = current["value_mae"] / max(initial_validation["value_mae"], 1e-9)
-        return policy + arguments.value_weight * value
+        return current["policy_kl"] + arguments.value_weight * current["value_mae"]
 
     best_epoch = 0
     best = initial_validation
@@ -633,9 +635,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         "policy_denominator": "full_legal_raster_v1",
         "importance_corrected_samples": corrected_samples,
         "uncorrected_samples": dataset_samples - corrected_samples,
-        "selection_metric": (
-            "relative: policy_kl/initial + value_weight * value_mae/initial"
-        ),
+        "selection_metric": "policy_kl + value_weight * value_mae",
         "wall_seconds": elapsed,
         "best_epoch": best_epoch,
         "initial_training": initial_training,
@@ -658,7 +658,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=3e-3)
-    parser.add_argument("--value-weight", type=float, default=0.25)
+    parser.add_argument("--value-weight", type=float, default=1.0)
     parser.add_argument("--model-width", type=int, default=32)
     parser.add_argument("--blocks", type=int, default=3)
     parser.add_argument("--architecture", choices=("flat", "unet"), default="flat")

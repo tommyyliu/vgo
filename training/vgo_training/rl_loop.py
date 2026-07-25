@@ -765,7 +765,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--training-batch", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=2e-3)
     parser.add_argument("--warm-learning-rate", type=float, default=5e-4)
-    parser.add_argument("--value-weight", type=float, default=0.25)
+    parser.add_argument("--value-weight", type=float, default=1.0)
     parser.add_argument("--architecture", choices=("flat", "unet"), default="flat")
     parser.add_argument("--model-width", type=int, default=32)
     parser.add_argument("--blocks", type=int, default=3)
