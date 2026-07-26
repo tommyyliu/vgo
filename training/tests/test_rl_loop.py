@@ -212,11 +212,24 @@ class EloPoolTests(unittest.TestCase):
         heavy = fit_ratings(matches, anchor=0, prior_games=2.0)
         self.assertGreater(light[1], heavy[1])
 
-    def test_skipping_the_promotion_arena_requires_a_zero_gate(self) -> None:
-        arguments = parse_arguments(
-            ["--output", "out", "--skip-promotion-arena", "--promotion-score", "0.52"]
+    def test_promotion_gate_and_arena_must_agree(self) -> None:
+        # Default: no arena, no gate, every candidate accepted.
+        default = parse_arguments(["--output", "out"])
+        self.assertFalse(default.promotion_arena)
+        self.assertEqual(default.promotion_score, 0.0)
+        validate_arguments(default)
+
+        # A score without the arena that measures it is a silent no-op.
+        orphan = parse_arguments(["--output", "out", "--promotion-score", "0.52"])
+        with self.assertRaisesRegex(ValueError, "no effect without"):
+            validate_arguments(orphan)
+
+        # An arena with a zero gate would run 120 games and accept regardless.
+        toothless = parse_arguments(["--output", "out", "--promotion-arena"])
+        with self.assertRaisesRegex(ValueError, "nonzero"):
+            validate_arguments(toothless)
+
+        gated = parse_arguments(
+            ["--output", "out", "--promotion-arena", "--promotion-score", "0.52"]
         )
-        with self.assertRaisesRegex(ValueError, "nonzero --promotion-score"):
-            validate_arguments(arguments)
-        arguments.promotion_score = 0.0
-        validate_arguments(arguments)
+        validate_arguments(gated)

@@ -197,10 +197,14 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("validation fraction must be in [0, 1)")
     if not 0.0 <= arguments.promotion_score <= 1.0:
         raise ValueError("promotion score must be in [0, 1]")
-    if getattr(arguments, "skip_promotion_arena", False) and arguments.promotion_score > 0.0:
+    if arguments.promotion_arena and arguments.promotion_score <= 0.0:
         raise ValueError(
-            "--skip-promotion-arena accepts every candidate, so it cannot be "
-            "combined with a nonzero --promotion-score"
+            "--promotion-arena gates on a minimum score, so it needs a nonzero "
+            "--promotion-score"
+        )
+    if not arguments.promotion_arena and arguments.promotion_score > 0.0:
+        raise ValueError(
+            "a nonzero --promotion-score has no effect without --promotion-arena"
         )
     if getattr(arguments, "elo_prior_games", 1.0) <= 0.0:
         raise ValueError("elo prior games must be positive")
@@ -654,7 +658,7 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
         baseline_arena = progress.get("baseline_arena")
         if incumbent_onnx is None:
             promotion_arena = baseline_arena
-        elif arguments.skip_promotion_arena:
+        elif not arguments.promotion_arena:
             # AlphaZero-style: no gate, so the 60-pair vs-incumbent arena is pure
             # telemetry -- and the least informative kind, since consecutive
             # generations are nearly identical. The Elo pool measures the same
@@ -815,20 +819,32 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "not a promotion gate, from iteration 1 on)",
     )
     parser.add_argument(
-        "--skip-promotion-arena",
-        action="store_true",
-        help="skip the vs-incumbent arena entirely and accept every candidate. "
-        "Only valid with --promotion-score 0; pair it with an Elo pool, which "
-        "measures the same progress against many opponents for fewer games",
+        "--promotion-arena",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="gate promotion on a vs-incumbent arena. Off by default: it only "
+        "answers 'did N beat N-1', where the two nets are nearly identical and "
+        "the result is mostly sampling noise. Prefer an Elo pool, which "
+        "measures the same progress against many opponents for fewer games. "
+        "Enabling it requires a nonzero --promotion-score",
     )
     parser.add_argument(
         "--elo-pool-samples",
         type=int,
-        default=0,
+        default=2,
         help="past generations to play the new net against each iteration for Elo "
-        "tracking (0 disables); pure telemetry, does not gate promotion",
+        "tracking (0 disables); pure telemetry, does not gate promotion. With no "
+        "promotion arena this is the only progress signal, so it defaults on. "
+        "Each sample is a separate arena process paying ~21s of TensorRT engine "
+        "warmup, so opponent count -- not total games -- drives the cost",
     )
-    parser.add_argument("--elo-pool-pairs", type=int, default=1)
+    parser.add_argument(
+        "--elo-pool-pairs",
+        type=int,
+        default=8,
+        help="color-swapped pairs per sampled opponent; marginal cost is only "
+        "~0.93s/pair, so prefer more pairs over more opponents",
+    )
     parser.add_argument(
         "--elo-prior-games",
         type=float,
@@ -846,7 +862,13 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--delay-ms", type=int, default=1)
     parser.add_argument("--provider", choices=("cpu", "cuda", "tensorrt"), default="tensorrt")
     parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--promotion-score", type=float, default=0.52)
+    parser.add_argument(
+        "--promotion-score",
+        type=float,
+        default=0.0,
+        help="minimum vs-incumbent arena score to promote; requires "
+        "--promotion-arena. Zero (the default) accepts every candidate",
+    )
     parser.add_argument("--maximum-truncation-rate", type=float, default=0.02)
     parser.add_argument("--seed", type=int, default=700_001)
     parser.add_argument("--arena-seed", type=int, default=900_001)
