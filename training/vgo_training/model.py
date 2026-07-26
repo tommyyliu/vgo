@@ -4,6 +4,9 @@ import torch
 from torch import nn
 
 
+MODEL_ARCHITECTURES = ("flat", "unet", "ddrnet")
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, width: int) -> None:
         super().__init__()
@@ -155,6 +158,256 @@ class UNetPolicyValueNet(nn.Module):
         return policy_logits, values
 
 
+class _DDRContext(nn.Module):
+    """A compact DAPPM-style context module for the small low-resolution branch.
+
+    DDRNet's original five fixed pooling scales target 1024x2048 road scenes.
+    VGO rasters leave only a 6x6 or 8x8 semantic map, so native, half, and global
+    scales carry the distinct context that is available without redundant 1x1
+    branches. As in DAPPM, each coarser scale is added to and processed from the
+    preceding scale before all scales are compressed together.
+    """
+
+    def __init__(
+        self, channels_in: int, branch_channels: int, channels_out: int
+    ) -> None:
+        super().__init__()
+        self.scale0 = nn.Sequential(
+            nn.Conv2d(channels_in, branch_channels, kernel_size=1),
+            nn.ReLU(),
+        )
+        self.scale1 = nn.Sequential(
+            nn.AvgPool2d(kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(channels_in, branch_channels, kernel_size=1),
+            nn.ReLU(),
+        )
+        self.scale2 = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels_in, branch_channels, kernel_size=1),
+            nn.ReLU(),
+        )
+        self.process1 = nn.Sequential(
+            nn.Conv2d(branch_channels, branch_channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.process2 = nn.Sequential(
+            nn.Conv2d(branch_channels, branch_channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.compression = nn.Conv2d(branch_channels * 3, channels_out, kernel_size=1)
+        self.shortcut = nn.Conv2d(channels_in, channels_out, kernel_size=1)
+
+    @staticmethod
+    def _resize(inputs: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+        return nn.functional.interpolate(
+            inputs, size=size, mode="bilinear", align_corners=False
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        size = inputs.shape[-2:]
+        native = self.scale0(inputs)
+        half = self.process1(self._resize(self.scale1(inputs), size) + native)
+        global_context = self.process2(
+            self._resize(self.scale2(inputs), size) + half
+        )
+        combined = torch.cat((native, half, global_context), dim=1)
+        return torch.relu(self.compression(combined) + self.shortcut(inputs))
+
+
+class DDRNetPolicyValueNet(nn.Module):
+    """DDRNet-inspired dual-resolution policy/value network.
+
+    The official DDRNet-23-slim keeps its detail branch at output stride 8 and
+    drives the context branch down to stride 64. That schedule is efficient for
+    megapixel road scenes but too coarse for a 96-128px game raster. This
+    adaptation shifts the two branches one octave higher: policy detail remains
+    at stride 4 while semantic context runs at strides 8 and 16. Two bilateral
+    fusions repeatedly exchange precise placement geometry and global context.
+
+    ``blocks`` remains checkpoint metadata shared by every architecture. Here it
+    controls the number of residual blocks in each DDRNet stage in groups of
+    four: 1-4 -> one block, 5-8 -> two blocks, and so on. Thus the common
+    ``width=64, blocks=8`` setting corresponds to the two-block stages of
+    DDRNet-23-slim without copying its scene-specific stride schedule.
+
+    Reference: Hong et al., "Deep Dual-resolution Networks for Real-time and
+    Accurate Semantic Segmentation of Road Scenes", arXiv:2101.06085.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        width: int = 64,
+        blocks: int = 8,
+        policy_resolution: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.policy_resolution = policy_resolution
+        stem_channels = max(8, width // 2)
+        detail_channels = width
+        context_channels = width * 2
+        deep_channels = width * 4
+        stage_blocks = max(1, (blocks + 3) // 4)
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(
+                channels, stem_channels, kernel_size=3, stride=2, padding=1
+            ),
+            nn.ReLU(),
+            nn.Conv2d(
+                stem_channels,
+                detail_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+            ),
+            nn.ReLU(),
+        )
+        self.detail_entry = nn.Sequential(
+            *(ResidualBlock(detail_channels) for _ in range(stage_blocks))
+        )
+
+        self.detail_stage1 = nn.Sequential(
+            *(ResidualBlock(detail_channels) for _ in range(stage_blocks))
+        )
+        self.context_stage1 = _Down(
+            detail_channels, context_channels, stage_blocks
+        )
+        self.context_to_detail1 = nn.Conv2d(
+            context_channels, detail_channels, kernel_size=1
+        )
+        self.detail_to_context1 = nn.Conv2d(
+            detail_channels,
+            context_channels,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+        )
+
+        self.detail_stage2 = nn.Sequential(
+            *(ResidualBlock(detail_channels) for _ in range(stage_blocks))
+        )
+        self.context_stage2 = _Down(
+            context_channels, deep_channels, stage_blocks
+        )
+        self.context_to_detail2 = nn.Conv2d(
+            deep_channels, detail_channels, kernel_size=1
+        )
+        self.detail_to_context2 = nn.Sequential(
+            nn.Conv2d(
+                detail_channels,
+                context_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+            ),
+            nn.ReLU(),
+            nn.Conv2d(
+                context_channels,
+                deep_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+            ),
+        )
+
+        context_branch = max(8, width // 2)
+        self.context = _DDRContext(
+            deep_channels, context_branch, context_channels
+        )
+        self.detail_tail = nn.Sequential(
+            nn.Conv2d(detail_channels, context_channels, kernel_size=1),
+            nn.ReLU(),
+            ResidualBlock(context_channels),
+        )
+        self.policy_features = nn.Sequential(
+            nn.Conv2d(
+                context_channels, detail_channels, kernel_size=3, padding=1
+            ),
+            nn.ReLU(),
+        )
+        self.policy_map = nn.Conv2d(detail_channels, 1, kernel_size=1)
+        self.pass_head = nn.Linear(context_channels, 1)
+        self.value_head = nn.Sequential(
+            nn.Linear(context_channels, context_channels),
+            nn.ReLU(),
+            nn.Linear(context_channels, 1),
+            nn.Tanh(),
+        )
+
+    @staticmethod
+    def _resize(inputs: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+        return nn.functional.interpolate(
+            inputs, size=size, mode="bilinear", align_corners=False
+        )
+
+    @classmethod
+    def _resize_policy(
+        cls, inputs: torch.Tensor, size: tuple[int, int]
+    ) -> torch.Tensor:
+        pooled_size = (
+            min(size[0], inputs.shape[-2]),
+            min(size[1], inputs.shape[-1]),
+        )
+        if pooled_size != inputs.shape[-2:]:
+            inputs = nn.functional.adaptive_avg_pool2d(inputs, pooled_size)
+        if pooled_size != size:
+            inputs = cls._resize(inputs, size)
+        return inputs
+
+    def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        detail = self.detail_entry(self.stem(states))
+
+        # Both directions consume the pre-fusion branch values. This is the
+        # bilateral exchange that distinguishes DDRNet from a one-way decoder.
+        detail_before = self.detail_stage1(detail)
+        context_before = self.context_stage1(detail)
+        detail = torch.relu(
+            detail_before
+            + self._resize(
+                self.context_to_detail1(context_before),
+                detail_before.shape[-2:],
+            )
+        )
+        context = torch.relu(
+            context_before + self.detail_to_context1(detail_before)
+        )
+
+        detail_before = self.detail_stage2(detail)
+        context_before = self.context_stage2(context)
+        detail = torch.relu(
+            detail_before
+            + self._resize(
+                self.context_to_detail2(context_before),
+                detail_before.shape[-2:],
+            )
+        )
+        context = torch.relu(
+            context_before + self.detail_to_context2(detail_before)
+        )
+
+        semantic = self.context(context)
+        fused = torch.relu(
+            self.detail_tail(detail)
+            + self._resize(semantic, detail.shape[-2:])
+        )
+        placement_logits = self.policy_map(self.policy_features(fused))
+        target_size = (
+            (self.policy_resolution, self.policy_resolution)
+            if self.policy_resolution is not None
+            else states.shape[-2:]
+        )
+        placement_logits = self._resize_policy(
+            placement_logits, target_size
+        ).flatten(start_dim=1)
+
+        pooled = semantic.mean(dim=(-2, -1))
+        pass_logit = self.pass_head(pooled)
+        policy_logits = torch.cat((placement_logits, pass_logit), dim=1)
+        values = self.value_head(pooled).squeeze(1)
+        return policy_logits, values
+
+
 def build_model(
     architecture: str,
     channels: int,
@@ -175,5 +428,11 @@ def build_model(
         return UNetPolicyValueNet(
             channels=channels, width=width, blocks=blocks, policy_resolution=policy_resolution
         )
+    if architecture == "ddrnet":
+        return DDRNetPolicyValueNet(
+            channels=channels,
+            width=width,
+            blocks=blocks,
+            policy_resolution=policy_resolution,
+        )
     raise ValueError(f"unknown model architecture: {architecture!r}")
-

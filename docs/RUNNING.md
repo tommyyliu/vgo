@@ -141,7 +141,8 @@ the net sees out-of-distribution rasters and inference returns NaN.
 cargo run --release -p vgo-selfplay --bin vgo-canary -- `
   --pairs 100 --first 1000 --second 10 --max-plies 48 --threads 4 --seed 10001
 
-cargo run --release -p vgo-selfplay --bin vgo-model-smoke
+cargo run --release -p vgo-selfplay --bin vgo-model-smoke -- `
+  --resolution 128 --policy-resolution 32
 ```
 
 ```powershell

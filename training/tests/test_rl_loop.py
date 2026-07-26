@@ -69,6 +69,7 @@ class RlLoopTests(unittest.TestCase):
     def test_coarse_sampling_defaults_and_validation(self) -> None:
         default = parse_arguments(["--output", "run"])
         self.assertEqual(default.coarse_pool, 0)
+        self.assertEqual(default.architecture, "flat")
         validate_arguments(default)
 
         invalid = parse_arguments(["--output", "run", "--coarse-pool", "-1"])
@@ -96,6 +97,12 @@ class RlLoopTests(unittest.TestCase):
             ]
         )
         validate_arguments(decoupled)
+
+        ddrnet = parse_arguments(
+            ["--output", "run", "--architecture", "ddrnet"]
+        )
+        self.assertEqual(ddrnet.architecture, "ddrnet")
+        validate_arguments(ddrnet)
 
     @patch("vgo_training.rl_loop.cargo_executable", return_value="cargo")
     def test_coarse_sampling_is_forwarded_to_generation_and_all_arenas(

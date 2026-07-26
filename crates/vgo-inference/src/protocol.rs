@@ -4,7 +4,7 @@ use std::{
     mem::size_of,
 };
 
-use vgo_raster::{CHANNEL_COUNT, SemanticRaster};
+use vgo_raster::{CHANNEL_COUNT, RasterConfig, SemanticRaster};
 use vgo_search::EvaluationError;
 
 const REQUEST_MAGIC: [u8; 8] = *b"VGOIFR01";
@@ -113,11 +113,22 @@ pub fn read_response_frame(
     reader: &mut impl Read,
     batch: &[InferenceInput],
 ) -> Result<Vec<InferenceOutput>, EvaluationError> {
-    let config = batch
+    let policy = batch
         .first()
         .ok_or_else(|| EvaluationError::new("inference batch must not be empty"))?
         .raster
         .config();
+    read_response_frame_with_policy(reader, batch, policy)
+}
+
+pub fn read_response_frame_with_policy(
+    reader: &mut impl Read,
+    batch: &[InferenceInput],
+    policy: RasterConfig,
+) -> Result<Vec<InferenceOutput>, EvaluationError> {
+    if batch.is_empty() {
+        return Err(EvaluationError::new("inference batch must not be empty"));
+    }
     let mut magic = [0_u8; 8];
     reader.read_exact(&mut magic).map_err(io_error)?;
     if magic != RESPONSE_MAGIC {
@@ -129,7 +140,7 @@ pub fn read_response_frame(
     if version != PROTOCOL_VERSION || count != batch.len() {
         return Err(EvaluationError::new("inference response header mismatch"));
     }
-    if policy_size != config.pixels() + 1 {
+    if policy_size != policy.pixels() + 1 {
         return Err(EvaluationError::new("inference policy size mismatch"));
     }
 
@@ -213,7 +224,8 @@ mod tests {
     use vgo_raster::{RasterConfig, rasterize};
 
     use super::{
-        InferenceInput, PROTOCOL_VERSION, RESPONSE_MAGIC, encode_request_frame, read_response_frame,
+        InferenceInput, PROTOCOL_VERSION, RESPONSE_MAGIC, encode_request_frame,
+        read_response_frame, read_response_frame_with_policy,
     };
 
     fn inputs() -> Vec<InferenceInput> {
@@ -223,6 +235,22 @@ mod tests {
             InferenceInput::new(10, raster.clone()),
             InferenceInput::new(20, raster),
         ]
+    }
+
+    fn response(policy_size: u32) -> Vec<u8> {
+        let mut response = Vec::new();
+        response.extend_from_slice(&RESPONSE_MAGIC);
+        response.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        response.extend_from_slice(&2_u32.to_le_bytes());
+        response.extend_from_slice(&policy_size.to_le_bytes());
+        for (id, value, logit) in [(20_u64, -0.25_f32, 2.0_f32), (10, 0.5, 1.0)] {
+            response.extend_from_slice(&id.to_le_bytes());
+            response.extend_from_slice(&value.to_le_bytes());
+            for _ in 0..policy_size {
+                response.extend_from_slice(&logit.to_le_bytes());
+            }
+        }
+        response
     }
 
     #[test]
@@ -237,25 +265,26 @@ mod tests {
     #[test]
     fn responses_are_routed_by_identifier() {
         let inputs = inputs();
-        let policy_size = 5_u32;
-        let mut response = Vec::new();
-        response.extend_from_slice(&RESPONSE_MAGIC);
-        response.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-        response.extend_from_slice(&2_u32.to_le_bytes());
-        response.extend_from_slice(&policy_size.to_le_bytes());
-        for (id, value, logit) in [(20_u64, -0.25_f32, 2.0_f32), (10, 0.5, 1.0)] {
-            response.extend_from_slice(&id.to_le_bytes());
-            response.extend_from_slice(&value.to_le_bytes());
-            for _ in 0..policy_size {
-                response.extend_from_slice(&logit.to_le_bytes());
-            }
-        }
-        let outputs = read_response_frame(&mut Cursor::new(response), &inputs)
-            .expect("valid framed response");
+        // The response grid is deliberately decoupled from the 2x2 raster.
+        let policy_size = 2_u32;
+        let outputs = read_response_frame_with_policy(
+            &mut Cursor::new(response(policy_size)),
+            &inputs,
+            RasterConfig::square(1),
+        )
+        .expect("valid framed response");
         assert_eq!(outputs[0].id(), 10);
         assert_eq!(outputs[0].current_value(), 0.5);
         assert_eq!(outputs[0].policy(), vec![1.0; policy_size as usize]);
         assert_eq!(outputs[1].id(), 20);
         assert_eq!(outputs[1].current_value(), -0.25);
+    }
+
+    #[test]
+    fn response_wrapper_defaults_to_the_raster_grid() {
+        let inputs = inputs();
+        let outputs = read_response_frame(&mut Cursor::new(response(5)), &inputs)
+            .expect("valid raster-coupled response");
+        assert!(outputs.iter().all(|output| output.policy().len() == 5));
     }
 }

@@ -11,6 +11,7 @@ import random
 import time
 
 from .bradley_terry import fit_ratings
+from .model import MODEL_ARCHITECTURES
 
 
 def atomic_json(path: Path, value: object) -> None:
@@ -766,7 +767,9 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=2e-3)
     parser.add_argument("--warm-learning-rate", type=float, default=5e-4)
     parser.add_argument("--value-weight", type=float, default=1.0)
-    parser.add_argument("--architecture", choices=("flat", "unet"), default="flat")
+    parser.add_argument(
+        "--architecture", choices=MODEL_ARCHITECTURES, default="flat"
+    )
     parser.add_argument("--model-width", type=int, default=32)
     parser.add_argument("--blocks", type=int, default=3)
     parser.add_argument("--training-threads", type=int, default=4)

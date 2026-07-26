@@ -6,7 +6,10 @@ mod protocol;
 
 pub use executor::{BatchExecutor, CompletedBatch, InferenceBatch, ThreadedBatchExecutor};
 pub use onnx::{OnnxBatchService, OnnxProvider, OnnxServiceConfig};
-pub use protocol::{InferenceInput, InferenceOutput, encode_request_frame, read_response_frame};
+pub use protocol::{
+    InferenceInput, InferenceOutput, encode_request_frame, read_response_frame,
+    read_response_frame_with_policy,
+};
 
 use std::{
     io::{BufReader, BufWriter, Write},
@@ -59,6 +62,7 @@ pub struct PythonProcessConfig {
     pub working_directory: PathBuf,
     pub checkpoint: PathBuf,
     pub raster: RasterConfig,
+    pub policy: Option<RasterConfig>,
     pub maximum_batch: usize,
     pub torch_threads: usize,
     pub device: TorchDevice,
@@ -141,9 +145,7 @@ impl PythonBatchService {
             reader: BufReader::new(stdout),
             contract: BatchContract {
                 raster: config.raster,
-                // The Python service protocol has no separate policy grid; its
-                // policy output is always raster-sized.
-                policy: config.raster,
+                policy: config.policy.unwrap_or(config.raster),
                 maximum_batch: config.maximum_batch,
             },
         })
@@ -163,7 +165,7 @@ impl BatchService for PythonBatchService {
             .expect("writer exists while service is alive");
         writer.write_all(&frame).map_err(io_error)?;
         writer.flush().map_err(io_error)?;
-        read_response_frame(&mut self.reader, batch)
+        read_response_frame_with_policy(&mut self.reader, batch, self.contract.policy)
     }
 }
 

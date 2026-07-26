@@ -1,0 +1,261 @@
+{
+  "schema": "vgo.ddrnet-trial.v1",
+  "date": "2026-07-26",
+  "base_commit": "f2cd856",
+  "result": "promising_opt_in",
+  "purpose": "Evaluate a DDRNet-style policy/value architecture at the production 10x96x96 raster and 32x32-plus-pass policy shape without changing the default model.",
+  "sources": {
+    "implementation": "https://github.com/ydhongHIT/DDRNet",
+    "paper": "https://arxiv.org/abs/2101.06085",
+    "license": "https://github.com/ydhongHIT/DDRNet/blob/main/LICENSE"
+  },
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "pytorch_float32_matmul_precision": "high (TF32 permitted on CUDA)",
+    "input_shape": [10, 96, 96],
+    "policy_size": 1025
+  },
+  "commands": {
+    "eager": "python -m vgo_training.benchmark_model --checkpoint CHECKPOINT --device cuda --no-compile --batches 1,8,16,32,64 --warmup 25 --iterations 500 --threads 1",
+    "compiled": "python -m vgo_training.benchmark_model --checkpoint CHECKPOINT --device cuda --compile --batches 1,16,32 --slot-batch 16 --slots 1 --warmup 10 --iterations 300 --threads 1",
+    "training": "python -m vgo_training.train_demo DATASET --output OUTPUT --epochs 20 --batch-size 64 --learning-rate 0.003 --value-weight 1.0 --model-width MODEL_WIDTH --blocks 8 --architecture ARCHITECTURE --threads 4 --device cuda --seed 7 --report-every 5 --validation-fraction 0.1 --augment",
+    "export": "python -m vgo_training.export_onnx --checkpoint CHECKPOINT --output MODEL.onnx --maximum-batch 64",
+    "tensorrt": "vgo-onnx-bench --model MODEL.onnx --provider tensorrt --resolution 96 --policy-resolution 32 --batch 16 --warmup 10 --iterations 200 --fp16 true --compare-python false"
+  },
+  "adaptation": {
+    "detail_output_stride": 4,
+    "context_output_strides": [8, 16],
+    "bilateral_fusions": 2,
+    "context_module": "three-scale hierarchical DAPPM adaptation",
+    "notes": [
+      "The official road-scene network's output-stride-8 detail branch and output-stride-64 context tail are too coarse for a 96px board.",
+      "Every cross-branch resize names the peer tensor's exact spatial size, including odd raster dimensions.",
+      "The existing checkpoint, policy/value output, training, serving, compilation, and ONNX contracts are unchanged."
+    ]
+  },
+  "models": [
+    {
+      "architecture": "unet",
+      "width": 64,
+      "blocks": 8,
+      "parameters": 2796451,
+      "profiled_flops_per_position": 5320606208
+    },
+    {
+      "architecture": "ddrnet",
+      "width": 48,
+      "blocks": 8,
+      "parameters": 2664531,
+      "profiled_flops_per_position": 809020608
+    },
+    {
+      "architecture": "ddrnet",
+      "width": 64,
+      "blocks": 8,
+      "parameters": 4734403,
+      "profiled_flops_per_position": 1433633024
+    }
+  ],
+  "inference": {
+    "tool": "vgo_training.benchmark_model",
+    "warmup_iterations": 25,
+    "timed_iterations": 500,
+    "threads": 1,
+    "precision": "FP32 tensors with PyTorch float32 matmul precision set to high",
+    "eager_positions_per_second": [
+      {
+        "batch": 1,
+        "unet_width_64": 687.8959766552607,
+        "ddrnet_width_48": 737.1393019761724,
+        "ddrnet_width_64": 631.4762100612877
+      },
+      {
+        "batch": 8,
+        "unet_width_64": 1653.0022926478325,
+        "ddrnet_width_48": 3712.5966687522327,
+        "ddrnet_width_64": 2814.6813126735638
+      },
+      {
+        "batch": 16,
+        "unet_width_64": 1952.360018529236,
+        "ddrnet_width_48": 4790.065568927741,
+        "ddrnet_width_64": 3731.20732946105
+      },
+      {
+        "batch": 32,
+        "unet_width_64": 1735.0697164736832,
+        "ddrnet_width_48": 5419.8784566221875,
+        "ddrnet_width_64": 3721.5645784687053
+      },
+      {
+        "batch": 64,
+        "unet_width_64": 1383.664327151575,
+        "ddrnet_width_48": 5088.741230442003,
+        "ddrnet_width_64": 3724.651099670505
+      }
+    ],
+    "compiled_protocol": {
+      "mode": "reduce-overhead",
+      "fullgraph": true,
+      "warmup_iterations": 10,
+      "timed_iterations": 300
+    },
+    "compiled_positions_per_second": [
+      {
+        "batch": 1,
+        "unet_width_64": 689.0954226368482,
+        "ddrnet_width_48": 710.0453723632576
+      },
+      {
+        "batch": 16,
+        "unet_width_64": 2543.708564175659,
+        "ddrnet_width_48": 8979.728302197698
+      },
+      {
+        "batch": 32,
+        "unet_width_64": 2385.6830110904675,
+        "ddrnet_width_48": 11150.320037664727
+      }
+    ],
+    "summary": {
+      "parameter_reduction_fraction": 0.047174078859239854,
+      "profiled_flop_reduction_fraction": 0.847945783549332,
+      "eager_speedup_at_batch_16": 2.4534745249168863,
+      "compiled_speedup_at_batch_16": 3.530171824187636,
+      "compiled_speedup_at_batch_32": 4.673848112188236
+    }
+  },
+  "tensorrt": {
+    "configuration": {
+      "provider": "TensorRT execution provider",
+      "onnx_sha256": "45f97c5b53620f3c6cda1afc832c3e069cd0c8956c92b8417f50df2e4516e939",
+      "precision": "fp16",
+      "batch": 16,
+      "warmup_iterations": 10,
+      "timed_iterations": 200
+    },
+    "results": [
+      {
+        "architecture": "unet",
+        "width": 64,
+        "milliseconds_per_batch": 3.342109,
+        "positions_per_second": 4787.397
+      },
+      {
+        "architecture": "ddrnet",
+        "width": 48,
+        "milliseconds_per_batch": 2.502216,
+        "positions_per_second": 6394.332
+      }
+    ],
+    "ddrnet_speedup": 1.3356594408193012,
+    "parity_on_16_fixture_positions": {
+      "onnx_cpu_fp32_vs_pytorch_cpu": {
+        "policy_max_absolute_difference": 0.000068665,
+        "value_max_absolute_difference": 0.000000715,
+        "top_one_equal": 16,
+        "top_one_total": 16
+      },
+      "ddrnet_tensorrt_fp32_vs_pytorch_cuda": {
+        "policy_max_absolute_difference": 0.073379517,
+        "value_max_absolute_difference": 0.000236034,
+        "top_one_equal": 16,
+        "top_one_total": 16
+      },
+      "ddrnet_tensorrt_fp16_vs_pytorch_cuda": {
+        "policy_max_absolute_difference": 0.409790039,
+        "value_max_absolute_difference": 0.002054691,
+        "top_one_equal": 16,
+        "top_one_total": 16
+      },
+      "unet_tensorrt_fp16_vs_pytorch_cuda": {
+        "policy_max_absolute_difference": 0.817367554,
+        "value_max_absolute_difference": 0.016876101,
+        "top_one_equal": 16,
+        "top_one_total": 16
+      }
+    }
+  },
+  "training_smoke": {
+    "dataset": {
+      "path": "artifacts/decoupled-run3/iteration-000/replay/dataset.vgo",
+      "sha256": "0c88697b2bcd8ac276175097cc62aff2824f76544d1f4f6d9df1c139ac22c06e",
+      "samples": 3072,
+      "training_samples": 2765,
+      "validation_samples": 307
+    },
+    "configuration": {
+      "from_scratch": true,
+      "epochs": 20,
+      "batch_size": 64,
+      "learning_rate": 0.003,
+      "value_weight": 1.0,
+      "seed": 7,
+      "augmentation": "random dihedral symmetry per batch",
+      "device": "cuda"
+    },
+    "results": [
+      {
+        "architecture": "unet",
+        "width": 64,
+        "parameters": 2796451,
+        "wall_seconds": 122.8542512949789,
+        "best_epoch": 20,
+        "validation_policy_kl": 2.0453937267247553,
+        "validation_policy_top1": 0.16938110860823033,
+        "validation_value_mae": 0.9999667004187643,
+        "validation_selection_score": 3.0453604271435197
+      },
+      {
+        "architecture": "ddrnet",
+        "width": 48,
+        "parameters": 2664531,
+        "wall_seconds": 28.49711772397859,
+        "best_epoch": 20,
+        "validation_policy_kl": 1.983237795022101,
+        "validation_policy_top1": 0.20846905571435873,
+        "validation_value_mae": 0.5811548165079049,
+        "validation_selection_score": 2.564392611530006
+      }
+    ],
+    "summary": {
+      "ddrnet_training_speedup": 4.3111114774812656,
+      "ddrnet_selection_score_reduction_fraction": 0.15793461139332232
+    }
+  },
+  "verification": {
+    "unit_tests": {
+      "passed": 44,
+      "failed": 0
+    },
+    "rust_tests": {
+      "vgo_inference_passed": 7,
+      "vgo_inference_failed": 0,
+      "vgo_selfplay_test_targets_compile": true
+    },
+    "checkpoint_round_trip": "pass",
+    "odd_raster_forward_and_backward": "pass",
+    "torch_compile_fullgraph": "pass",
+    "onnx": {
+      "status": "pass",
+      "opset": 20,
+      "dynamic_batch": [1, 64],
+      "checker_full_check": true,
+      "checkpoint_sha256": "8126a36bc8c83fb6409dcebc082820c1eb7b40e8ebe2806cfba7ca28fe311df2",
+      "onnx_sha256": "a4862f3b6d8133ab7e5fc4c14a581c3a4b33bc963649e7e60941d06afd648bfa"
+    },
+    "decoupled_python_transport": "pass",
+    "decoupled_stage_benchmark": "pass",
+    "decoupled_model_smoke": "pass",
+    "native_onnx_cpu_execution": "pass",
+    "native_tensorrt_fp32_execution": "pass",
+    "native_tensorrt_fp16_execution": "pass"
+  },
+  "conclusion": [
+    "The width-48 DDRNet adaptation is mechanically compatible and materially faster than the parameter-matched U-Net on this GPU.",
+    "The short replay trial is encouraging but is not a strength result; the sample budget is small and neither model is converged.",
+    "Keep DDRNet opt-in until it passes a normal replay window and the existing promotion arena."
+  ]
+}

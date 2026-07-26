@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 from .dataset import PreparedRasterDataset, RasterDataset, load_datasets
-from .model import build_model
+from .model import MODEL_ARCHITECTURES, build_model
 from .serve import load_model
 
 
@@ -661,7 +661,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--value-weight", type=float, default=1.0)
     parser.add_argument("--model-width", type=int, default=32)
     parser.add_argument("--blocks", type=int, default=3)
-    parser.add_argument("--architecture", choices=("flat", "unet"), default="flat")
+    parser.add_argument(
+        "--architecture", choices=MODEL_ARCHITECTURES, default="flat"
+    )
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=7)

@@ -86,6 +86,8 @@ struct Arguments {
     probe_requests: usize,
     #[arg(long, default_value_t = 128)]
     resolution: usize,
+    #[arg(long)]
+    policy_resolution: Option<usize>,
     #[arg(long, default_value_t = 1.0 / 6.0)]
     radius: f64,
 }
@@ -137,6 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compile = arguments.compile;
     let probe_requests = arguments.probe_requests;
     let resolution = arguments.resolution;
+    let policy_resolution = arguments.policy_resolution.unwrap_or(resolution);
     let radius = arguments.radius;
     if actors == 0
         || games == 0
@@ -145,13 +148,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || maximum_batch == 0
         || torch_threads == 0
         || resolution == 0
+        || policy_resolution == 0
         || !(0.0_f64..=0.5).contains(&radius)
         || radius == 0.0
     {
-        return Err("counts and resolution must be positive; radius must be in (0, 0.5]".into());
+        return Err(
+            "counts and raster/policy resolutions must be positive; radius must be in (0, 0.5]"
+                .into(),
+        );
     }
 
     let raster = RasterConfig::square(resolution);
+    let policy = RasterConfig::square(policy_resolution);
     let broker = BrokerConfig {
         maximum_delay: Duration::from_millis(maximum_delay_ms),
         queue_capacity: (actors * 4).max(maximum_batch * 2),
@@ -163,6 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 working_directory,
                 checkpoint,
                 raster,
+                policy: Some(policy),
                 maximum_batch,
                 torch_threads,
                 device,
@@ -174,7 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let service = OnnxBatchService::load(&OnnxServiceConfig {
                 model,
                 raster,
-                policy: None,
+                policy: Some(policy),
                 maximum_batch,
                 provider,
                 device_id: 0,
@@ -297,6 +306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  \"python_device\": {},\n",
             "  \"python_compiled\": {},\n",
             "  \"raster_resolution\": {},\n",
+            "  \"policy_resolution\": {},\n",
             "  \"stone_radius\": {:.9},\n",
             "  \"input_bytes_per_position\": {},\n",
             "  \"completed_games\": {},\n",
@@ -335,6 +345,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         python_device,
         python_compiled,
         resolution,
+        policy_resolution,
         radius,
         10 * resolution * resolution * size_of::<f32>(),
         completed_games,

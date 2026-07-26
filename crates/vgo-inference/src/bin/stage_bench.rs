@@ -133,6 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         root.join("artifacts/raster-demo/model.pt"),
     );
     let resolution = value_argument(&arguments, "--resolution", 128_usize)?;
+    let policy_resolution = value_argument(&arguments, "--policy-resolution", resolution)?;
     let batch = value_argument(&arguments, "--batch", 16_usize)?;
     let raster_samples = value_argument(&arguments, "--raster-samples", 10_000_usize)?;
     let raster_threads = value_argument(&arguments, "--raster-threads", 16_usize)?;
@@ -141,6 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = value_argument(&arguments, "--device", TorchDevice::Cuda)?;
     let compile = value_argument(&arguments, "--compile", true)?;
     if resolution == 0
+        || policy_resolution == 0
         || batch == 0
         || raster_samples == 0
         || raster_threads == 0
@@ -151,6 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let raster_config = RasterConfig::square(resolution);
+    let policy_config = RasterConfig::square(policy_resolution);
     let positions = fixture_positions();
     let rasters = positions
         .iter()
@@ -181,6 +184,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         working_directory,
         checkpoint,
         raster: raster_config,
+        policy: Some(policy_config),
         maximum_batch: batch,
         torch_threads: 1,
         device,
@@ -204,6 +208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         concat!(
             "{{\n",
             "  \"resolution\": {},\n",
+            "  \"policy_resolution\": {},\n",
             "  \"channels\": 10,\n",
             "  \"batch\": {},\n",
             "  \"device\": \"{}\",\n",
@@ -226,6 +231,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "}}"
         ),
         resolution,
+        policy_resolution,
         batch,
         device.as_str(),
         compile,

@@ -47,6 +47,38 @@ uv run python -m vgo_training.train_demo `
   --model-width 32 --blocks 3
 ```
 
+Three model families share the same checkpoint and inference contract:
+`--architecture flat` is the original full-resolution residual tower,
+`--architecture unet` moves most work into an encoder bottleneck, and
+`--architecture ddrnet` uses persistent detail and context branches with two
+bilateral fusions. The DDRNet option is a clean adaptation of
+[DDRNet-23-slim](https://github.com/ydhongHIT/DDRNet) rather than a literal port:
+VGO keeps the detail branch at 1/4 raster resolution and context at 1/8-1/16,
+because the road-scene model's 1/8-1/64 schedule discards too much of a
+96-128px board. The parameter-matched trial uses 2.66M parameters at width 48,
+versus 2.80M for the established width-64 U-Net:
+
+```powershell
+uv run python -m vgo_training.train_demo `
+  ../artifacts/raster-demo/dataset.vgo `
+  --output ../artifacts/raster-demo/ddrnet.pt --device cuda `
+  --architecture ddrnet --model-width 48 --blocks 8
+```
+
+The dual-resolution design and compact hierarchical pyramid context module are
+based on Hong et al.,
+["Deep Dual-resolution Networks for Real-time and Accurate Semantic Segmentation
+of Road Scenes"](https://arxiv.org/abs/2101.06085). The initial speed, export,
+and replay-training measurements are recorded in
+[`../benchmarks/results/2026-07-26-ddrnet-trial.json`](../benchmarks/results/2026-07-26-ddrnet-trial.json).
+Existing defaults remain `flat`; selecting DDRNet never changes how older
+checkpoints are loaded.
+
+An initial checkpoint always retains the architecture stored in that
+checkpoint; model families do not share compatible parameter layouts. To switch
+from an existing flat or U-Net checkpoint to DDRNet, start the DDRNet run
+without `--initial-checkpoint`.
+
 Replay v3 stores raw visits and beta followed by a `u32` proposal-count array.
 The loader validates exact file size, policy/visit agreement, candidate and
 proposal support, beta bounds, deterministic-pass metadata, finite values, and
@@ -75,10 +107,10 @@ uv run python -m vgo_training.serve `
 ```
 
 Run the complete Rust-side boundary and actor smoke test from the repository
-root with `cargo run --release -p vgo-selfplay --bin vgo-model-smoke`. The
-active canary uses radius `1/6` and a 128x128 raster by default. `--radius` and
-`--resolution` are independent so a small game can exercise a larger inference
-tensor.
+root with `vgo-model-smoke --resolution 128 --policy-resolution 32` through
+Cargo. The active canary uses radius `1/6` and a 128x128 raster by default.
+`--radius` and `--resolution` are independent so a small game can exercise a
+larger inference tensor.
 
 Measure the GPU-resident model without rasterization, framing, IPC, or transfer:
 
@@ -127,14 +159,19 @@ $env:PATH = "$PWD\training\.venv\Lib\site-packages\tensorrt_libs;" +
   "$PWD\training\.venv\Lib\site-packages\torch\lib;$env:CUDA_PATH\bin;$env:PATH"
 
 cargo run --release -p vgo-inference --bin vgo-onnx-bench -- `
-  --provider tensorrt --batch 32 --compare-python false
+  --provider tensorrt --resolution 128 --policy-resolution 32 `
+  --batch 32 --compare-python false
 
 cargo run --release -p vgo-selfplay --bin vgo-model-smoke -- `
-  --runtime onnx --provider tensorrt --fp16 true
+  --runtime onnx --provider tensorrt --fp16 true `
+  --resolution 128 --policy-resolution 32
 ```
 
 `vgo-onnx-bench` times input packing, ONNX Runtime, and output collection. Use
-`--fp16 false` for an FP32 TensorRT parity check. TensorRT engine and timing
+`--policy-resolution` to match a checkpoint with a decoupled policy head; it
+defaults to `--resolution` for older same-size models. The production 96-to-32
+models use `--resolution 96 --policy-resolution 32`. Use `--fp16 false` for an
+FP32 TensorRT parity check. TensorRT engine and timing
 caches are separated by model digest, precision, raster shape, and maximum
 batch under `artifacts/onnx-cache`.
 
@@ -142,7 +179,8 @@ From the repository root, `vgo-stage-bench` separately measures Rust
 rasterization, request framing, and the warm subprocess service:
 
 ```powershell
-cargo run --release -p vgo-inference --bin vgo-stage-bench
+cargo run --release -p vgo-inference --bin vgo-stage-bench -- `
+  --resolution 128 --policy-resolution 32
 ```
 
 Windows uses the CUDA 13.0 PyTorch index and the matching `triton-windows`

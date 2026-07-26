@@ -1,8 +1,15 @@
+from pathlib import Path
+import tempfile
 import unittest
 
 import torch
 
-from vgo_training.model import RasterPolicyValueNet
+from vgo_training.model import (
+    DDRNetPolicyValueNet,
+    RasterPolicyValueNet,
+    build_model,
+)
+from vgo_training.serve import load_model
 from vgo_training.train_demo import (
     DIHEDRAL_TRANSFORMS,
     apply_dihedral,
@@ -21,6 +28,87 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(tuple(value.shape), (2,))
         self.assertTrue(torch.all(value >= -1.0))
         self.assertTrue(torch.all(value <= 1.0))
+
+    def test_ddrnet_handles_odd_rasters_and_backpropagates_both_fusions(self) -> None:
+        model = DDRNetPolicyValueNet(channels=10, width=16, blocks=2)
+        policy, value = model(torch.randn(2, 10, 19, 23))
+        self.assertEqual(tuple(policy.shape), (2, 19 * 23 + 1))
+        self.assertEqual(tuple(value.shape), (2,))
+        self.assertTrue(torch.all(value >= -1.0))
+        self.assertTrue(torch.all(value <= 1.0))
+
+        (policy.square().mean() + value.square().mean()).backward()
+        for parameter in (
+            model.context_to_detail1.weight,
+            model.detail_to_context1.weight,
+            model.context_to_detail2.weight,
+            model.detail_to_context2[0].weight,
+        ):
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(bool(torch.isfinite(parameter.grad).all()))
+
+    def test_ddrnet_emits_decoupled_policy_grid(self) -> None:
+        model = build_model(
+            "ddrnet",
+            channels=10,
+            width=16,
+            blocks=2,
+            policy_resolution=7,
+        )
+        policy, value = model(torch.zeros(1, 10, 31, 31))
+        self.assertIsInstance(model, DDRNetPolicyValueNet)
+        self.assertEqual(tuple(policy.shape), (1, 7 * 7 + 1))
+        self.assertEqual(tuple(value.shape), (1,))
+
+    def test_ddrnet_averages_when_policy_grid_is_smaller(self) -> None:
+        logits = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)
+        resized = DDRNetPolicyValueNet._resize_policy(logits, (2, 2))
+        expected = torch.tensor([[[[2.5, 4.5], [10.5, 12.5]]]])
+        torch.testing.assert_close(resized, expected)
+
+    def test_ddrnet_pools_before_mixed_axis_policy_resize(self) -> None:
+        logits = torch.zeros(1, 1, 4, 8)
+        logits[0, 0, 1, 2] = 1.0
+        logits[0, 0, 2, 5] = 1.0
+        resized = DDRNetPolicyValueNet._resize_policy(logits, (8, 3))
+        pooled = torch.nn.functional.adaptive_avg_pool2d(logits, (4, 3))
+        expected = torch.nn.functional.interpolate(
+            pooled, size=(8, 3), mode="bilinear", align_corners=False
+        )
+        torch.testing.assert_close(resized, expected)
+        self.assertGreater(float(resized.abs().sum()), 0.0)
+
+    def test_ddrnet_checkpoint_round_trips_through_loader(self) -> None:
+        torch.manual_seed(42)
+        model = DDRNetPolicyValueNet(
+            channels=10, width=16, blocks=2, policy_resolution=7
+        ).eval()
+        states = torch.randn(2, 10, 16, 16)
+        expected = model(states)
+        checkpoint = {
+            "schema": "vgo.raster-policy-value.v1",
+            "architecture": "ddrnet",
+            "channels": 10,
+            "height": 16,
+            "width": 16,
+            "policy_resolution": 7,
+            "model_width": 16,
+            "blocks": 2,
+            "state_dict": model.state_dict(),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ddrnet.pt"
+            torch.save(checkpoint, path)
+            loaded, metadata = load_model(path)
+        actual = loaded(states)
+        self.assertIsInstance(loaded, DDRNetPolicyValueNet)
+        self.assertEqual(metadata["architecture"], "ddrnet")
+        torch.testing.assert_close(actual[0], expected[0])
+        torch.testing.assert_close(actual[1], expected[1])
+
+    def test_unknown_architecture_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown model architecture"):
+            build_model("unknown", channels=10, width=8, blocks=1)
 
     def test_full_legal_loss_pushes_down_unexplored_legal_cells(self) -> None:
         states = torch.zeros(1, 10, 1, 3)

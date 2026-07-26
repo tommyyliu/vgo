@@ -56,7 +56,17 @@ fn fixture_positions() -> Vec<Position> {
 fn compare(
     expected: &[vgo_inference::InferenceOutput],
     actual: &[vgo_inference::InferenceOutput],
-) -> (f32, f64, usize) {
+) -> Result<(f32, f64, usize), std::io::Error> {
+    if expected.len() != actual.len()
+        || expected
+            .iter()
+            .zip(actual)
+            .any(|(left, right)| left.policy().len() != right.policy().len())
+    {
+        return Err(std::io::Error::other(
+            "inference parity output shapes differ",
+        ));
+    }
     let mut policy_maximum = 0.0_f32;
     let mut value_maximum = 0.0_f64;
     let mut top_one_equal = 0;
@@ -80,7 +90,7 @@ fn compare(
             .map(|(index, _)| index);
         top_one_equal += usize::from(expected_top == actual_top);
     }
-    (policy_maximum, value_maximum, top_one_equal)
+    Ok((policy_maximum, value_maximum, top_one_equal))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -104,6 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let training = path_argument(&arguments, "--training", root.join("training"));
     let provider = value_argument(&arguments, "--provider", OnnxProvider::Cuda)?;
     let resolution = value_argument(&arguments, "--resolution", 128_usize)?;
+    let policy_resolution = value_argument(&arguments, "--policy-resolution", resolution)?;
     let batch = value_argument(&arguments, "--batch", 8_usize)?;
     let warmup = value_argument(&arguments, "--warmup", 10_usize)?;
     let iterations = value_argument(&arguments, "--iterations", 200_usize)?;
@@ -111,10 +122,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compare_python = value_argument(&arguments, "--compare-python", true)?;
     let python_device = value_argument(&arguments, "--python-device", TorchDevice::Cpu)?;
     let python_compile = value_argument(&arguments, "--python-compile", false)?;
-    if resolution == 0 || batch == 0 || warmup == 0 || iterations == 0 {
-        return Err("resolution and benchmark counts must be positive".into());
+    if resolution == 0 || policy_resolution == 0 || batch == 0 || warmup == 0 || iterations == 0 {
+        return Err("raster and policy resolutions and benchmark counts must be positive".into());
     }
     let raster_config = RasterConfig::square(resolution);
+    let policy_config = RasterConfig::square(policy_resolution);
     let positions = fixture_positions();
     let inputs = (0..batch)
         .map(|index| {
@@ -129,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut service = OnnxBatchService::load(&OnnxServiceConfig {
         model,
         raster: raster_config,
-        policy: None,
+        policy: Some(policy_config),
         maximum_batch: batch,
         provider,
         device_id: 0,
@@ -156,6 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             working_directory: training,
             checkpoint,
             raster: raster_config,
+            policy: Some(policy_config),
             maximum_batch: batch,
             torch_threads: 1,
             device: python_device,
@@ -163,7 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         let expected = python_service.infer(&inputs)?;
         let actual = service.infer(&inputs)?;
-        Some(compare(&expected, &actual))
+        Some(compare(&expected, &actual)?)
     } else {
         None
     };
@@ -186,6 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "{{\n",
             "  \"provider\": \"{}\",\n",
             "  \"resolution\": {},\n",
+            "  \"policy_resolution\": {},\n",
             "  \"batch\": {},\n",
             "  \"fp16\": {},\n",
             "  \"warmup\": {},\n",
@@ -199,6 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         service.provider().as_str(),
         resolution,
+        policy_resolution,
         batch,
         fp16,
         warmup,
