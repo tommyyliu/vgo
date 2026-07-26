@@ -197,6 +197,13 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("validation fraction must be in [0, 1)")
     if not 0.0 <= arguments.promotion_score <= 1.0:
         raise ValueError("promotion score must be in [0, 1]")
+    if getattr(arguments, "skip_promotion_arena", False) and arguments.promotion_score > 0.0:
+        raise ValueError(
+            "--skip-promotion-arena accepts every candidate, so it cannot be "
+            "combined with a nonzero --promotion-score"
+        )
+    if getattr(arguments, "elo_prior_games", 1.0) <= 0.0:
+        raise ValueError("elo prior games must be positive")
     if not 0.0 <= arguments.maximum_truncation_rate <= 1.0:
         raise ValueError("maximum truncation rate must be in [0, 1]")
     if arguments.learning_rate <= 0.0 or arguments.warm_learning_rate <= 0.0:
@@ -413,7 +420,7 @@ def update_elo_pool(
                 matches.append(json.loads(line))
     if not matches:
         return {}
-    ratings = fit_ratings(matches, anchor=0)
+    ratings = fit_ratings(matches, anchor=0, prior_games=arguments.elo_prior_games)
     ranked = dict(sorted(ratings.items()))
     atomic_json(elo_dir / "ratings.json", {str(k): round(v, 1) for k, v in ranked.items()})
     current = ratings.get(iteration)
@@ -647,6 +654,12 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
         baseline_arena = progress.get("baseline_arena")
         if incumbent_onnx is None:
             promotion_arena = baseline_arena
+        elif arguments.skip_promotion_arena:
+            # AlphaZero-style: no gate, so the 60-pair vs-incumbent arena is pure
+            # telemetry -- and the least informative kind, since consecutive
+            # generations are nearly identical. The Elo pool measures the same
+            # progress against many opponents for a fraction of the games.
+            promotion_arena = None
         else:
             if "promotion_arena" not in progress:
                 progress["promotion_arena"] = run_json_command(
@@ -663,10 +676,14 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
                 )
                 atomic_json(progress_path, progress)
             promotion_arena = progress["promotion_arena"]
-        accepted = promotion_decision(
-            promotion_arena,
-            arguments.promotion_score,
-            arguments.maximum_truncation_rate,
+        accepted = (
+            True
+            if promotion_arena is None
+            else promotion_decision(
+                promotion_arena,
+                arguments.promotion_score,
+                arguments.maximum_truncation_rate,
+            )
         )
         if accepted:
             incumbent_checkpoint = checkpoint
@@ -798,6 +815,13 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "not a promotion gate, from iteration 1 on)",
     )
     parser.add_argument(
+        "--skip-promotion-arena",
+        action="store_true",
+        help="skip the vs-incumbent arena entirely and accept every candidate. "
+        "Only valid with --promotion-score 0; pair it with an Elo pool, which "
+        "measures the same progress against many opponents for fewer games",
+    )
+    parser.add_argument(
         "--elo-pool-samples",
         type=int,
         default=0,
@@ -805,6 +829,15 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "tracking (0 disables); pure telemetry, does not gate promotion",
     )
     parser.add_argument("--elo-pool-pairs", type=int, default=1)
+    parser.add_argument(
+        "--elo-prior-games",
+        type=float,
+        default=0.25,
+        help="virtual even games regularizing each generation's rating. Keeps an "
+        "undefeated net from diverging, but shrinks every rating toward the "
+        "anchor: at the old default of 2.0 a simulated 40-generation ladder "
+        "read 468 Elo against a true 585, and 0.25 recovers it to 623",
+    )
     parser.add_argument("--arena-pairs", type=int, default=16)
     parser.add_argument("--arena-simulations", type=int, default=16)
     parser.add_argument("--actors", type=int, default=8)

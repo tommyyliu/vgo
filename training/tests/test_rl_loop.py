@@ -163,3 +163,60 @@ class RlLoopTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EloPoolTests(unittest.TestCase):
+    """The Elo pool replaces the vs-incumbent arena once gating is off.
+
+    A promotion arena only ever answers "did N beat N-1", which is the least
+    informative comparison available: consecutive generations are nearly
+    identical, so a 60-pair result is mostly sampling noise. Bradley-Terry over
+    an accumulating match history pools every game ever played into every
+    rating, for a fraction of the games per iteration.
+    """
+
+    def test_ratings_recover_a_known_ladder(self) -> None:
+        import random
+
+        from vgo_training.bradley_terry import fit_ratings
+
+        rng = random.Random(7)
+        truth = {generation: generation * 15.0 for generation in range(30)}
+        matches = []
+        for generation in range(1, 30):
+            for opponent in rng.sample(range(generation), min(4, generation)):
+                wins = losses = 0
+                for _ in range(8):
+                    probability = 1.0 / (
+                        1.0 + 10.0 ** ((truth[opponent] - truth[generation]) / 400.0)
+                    )
+                    if rng.random() < probability:
+                        wins += 1
+                    else:
+                        losses += 1
+                matches.append(
+                    {"a": generation, "b": opponent, "a_wins": wins, "b_wins": losses}
+                )
+        ratings = fit_ratings(matches, anchor=0, prior_games=0.25)
+        self.assertAlmostEqual(ratings[0], 0.0)
+        # Monotone ladder: the last generation must rate well above the first.
+        self.assertGreater(ratings[29], 300.0)
+        errors = [abs(ratings[g] - truth[g]) for g in range(30)]
+        self.assertLess(sum(errors) / len(errors), 120.0)
+
+    def test_heavy_prior_shrinks_ratings_toward_the_anchor(self) -> None:
+        from vgo_training.bradley_terry import fit_ratings
+
+        matches = [{"a": 1, "b": 0, "a_wins": 16, "b_wins": 4}]
+        light = fit_ratings(matches, anchor=0, prior_games=0.25)
+        heavy = fit_ratings(matches, anchor=0, prior_games=2.0)
+        self.assertGreater(light[1], heavy[1])
+
+    def test_skipping_the_promotion_arena_requires_a_zero_gate(self) -> None:
+        arguments = parse_arguments(
+            ["--output", "out", "--skip-promotion-arena", "--promotion-score", "0.52"]
+        )
+        with self.assertRaisesRegex(ValueError, "nonzero --promotion-score"):
+            validate_arguments(arguments)
+        arguments.promotion_score = 0.0
+        validate_arguments(arguments)
