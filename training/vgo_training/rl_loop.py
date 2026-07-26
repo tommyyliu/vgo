@@ -570,6 +570,7 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
             arguments.device,
             "--schedule",
             arguments.schedule,
+            "--compile" if arguments.compile else "--no-compile",
             "--seed",
             str(arguments.seed + iteration),
             "--report-every",
@@ -781,6 +782,12 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("wsd", "cosine"),
         default="wsd",
         help="learning-rate schedule forwarded to training",
+    )
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="compile the training model and enable TF32 (forwarded to training)",
     )
     parser.add_argument("--report-every", type=int, default=10)
     parser.add_argument("--validation-fraction", type=float, default=0.1)

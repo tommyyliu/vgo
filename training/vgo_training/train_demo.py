@@ -516,6 +516,15 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
             policy_resolution=decoupled_policy,
         )
     model = model.to(device)
+    # TF32 matmuls and compilation only pay off on CUDA, and training is ~80% of
+    # RL-loop wall time. `compiled` is what the training step runs; `model` stays
+    # the uncompiled module so state_dict keys keep their original names and the
+    # checkpoint remains loadable by serve/export.
+    if arguments.compile and device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+        compiled = torch.compile(model)
+    else:
+        compiled = model
     optimizer = torch.optim.Adam(model.parameters(), lr=arguments.learning_rate)
     scheduler = build_scheduler(optimizer, arguments)
     initial_training = metrics(
@@ -581,7 +590,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
                     policy_resolution,
                     policy_resolution,
                 )
-            logits, values = model(states)
+            logits, values = compiled(states)
             policy_loss = policy_cross_entropy(logits, policy_targets, policy_masks)
             value_loss = nn.functional.mse_loss(values, value_targets)
             loss = policy_loss + arguments.value_weight * value_loss
@@ -667,6 +676,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         "batch_size": arguments.batch_size,
         "learning_rate": arguments.learning_rate,
         "schedule": arguments.schedule,
+        "compiled": bool(arguments.compile and device.type == "cuda"),
         "value_weight": arguments.value_weight,
         "policy_target": policy_target_name,
         "policy_denominator": "full_legal_raster_v1",
@@ -704,6 +714,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="compile the training model and enable TF32 matmuls (CUDA only)",
+    )
     parser.add_argument(
         "--schedule",
         choices=("wsd", "cosine"),
