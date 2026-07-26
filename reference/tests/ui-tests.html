@@ -22,6 +22,10 @@ document.getElementById('app').addEventListener('load', function () {
     assert(doc.querySelectorAll('#board circle').length === 6, 'boot stones did not render');
     assert(doc.getElementById('turn').textContent === 'Black', 'initial turn is wrong');
     assert(doc.getElementById('positionWarning').hidden, 'valid boot position has a warning');
+    const settled = doc.querySelector('#board .settled-region');
+    assert(settled, 'settled shading did not render');
+    assert(settled.getAttribute('fill-rule') === 'nonzero', 'settled union lost its fill rule');
+    assert(settled.getAttribute('stroke') === 'none', 'per-stone settled contours are visible');
   });
 
   test('pass pass concludes and undo reopens the game', function () {
@@ -52,10 +56,14 @@ document.getElementById('app').addEventListener('load', function () {
     assert(doc.querySelectorAll('#board circle').length === 2, 'invalid diagram was discarded');
   });
 
-  test('hovering a move previews its outcome without committing it', function () {
+  test('hovering previews local visual changes without committing the move', function () {
     const win = document.getElementById('app').contentWindow;
+    // Each old per-stone settled loop grows by only a microscopic amount here.
+    // The former area-based preview nevertheless ringed all six complete loops.
     doc.getElementById('sgf').value =
-      '(;FF[4]GM[VGO]SZ[1]RA[0.05000]PL[B]AB[0.30000,0.35000]AW[0.70000,0.65000])';
+      '(;FF[4]GM[VGO]SZ[1]RA[0.05000]PL[B]' +
+      'AB[0.69900,0.50000][0.40050,0.67234][0.40050,0.32766]' +
+      'AW[0.59950,0.67234][0.30100,0.50000][0.59950,0.32766])';
     doc.getElementById('load').click();
     const stones = doc.querySelectorAll('#board circle').length;
     const score = doc.getElementById('scoreB').textContent;
@@ -67,6 +75,16 @@ document.getElementById('app').addEventListener('load', function () {
     }));
     win.renderPreview();                       // the page defers this to an animation frame
     assert(doc.querySelectorAll('#preview path').length > 0, 'hover drew no preview geometry');
+    const growth = doc.querySelector('#preview .settled-growth');
+    assert(growth, 'hover drew no newly settled area');
+    assert(growth.getAttribute('stroke') === 'none', 'hover exposed per-stone contour strokes');
+    assert(growth.getAttribute('mask') === 'url(#previewSettledDelta)',
+      'hover did not subtract the current settled union');
+    assert(doc.querySelector('#preview .settled-current-cutout'),
+      'hover delta mask has no current-union cutout');
+    const boundarySegments = (win.previewData().moved.match(/M/g) || []).length;
+    assert(boundarySegments === 6,
+      'hover redrew shortened boundary remainders: ' + boundarySegments + ' segments');
     assert(doc.getElementById('pvB').textContent.includes('%'), 'hover showed no preview score');
     assert(doc.querySelectorAll('#board circle').length === stones, 'preview committed a stone');
     assert(doc.getElementById('scoreB').textContent === score, 'preview altered the live score');

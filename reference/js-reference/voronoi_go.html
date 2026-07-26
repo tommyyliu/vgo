@@ -106,8 +106,8 @@
       Rendered as SVG: cells, edges and stones are exact vectors — crisp at any
       zoom. Capture is analytic and unsampled. Shaded areas are <em>settled</em>
       (no legal move can change them); their boundary is solved in closed form,
-      not sampled. Hovering shows what the move would settle. A stone's whole
-      disk must fit on the board.
+      not sampled. Hovering shades only the resolved move's newly settled area.
+      A stone's whole disk must fit on the board.
     </div>
     <hr>
     <div class="row mut"><span>position (VGO-SGF)</span></div>
@@ -159,13 +159,12 @@
      CAPTURE (analytic) -- reduces to a finite vertex test (section 2): no
         sampling and no dependence on contour detail.
 
-     INTERACTABILITY CONTOUR (exact predicate, adaptive vector approximation) --
-        A point x is interactable iff freeDist(x) < ndist(x) (nearest legal spot
-        closer than its own stone). The settled region { freeDist>=ndist } is
-        located with a Lipschitz-pruned quadtree and contoured at its leaves. In
-        open space it is exactly a disk of radius r around each stone; in a sealed
-        pocket it fills the whole cell (= capture). Detail only affects the
-        contour tolerance, not classification or the game.
+     SETTLED CONTOUR (analytic, adaptively flattened) -- A15 removes the
+        Voronoi partition, A16 makes each per-stone settled region star-shaped,
+        and A17 solves its radius in every direction in closed form. Curved
+        boundaries are flattened only to SVG's display tolerance. In open space
+        a per-stone region is exactly its radius-r disk; in a sealed pocket it
+        grows to cover the stone's cell.
 
    RENDERING is SVG. The board uses viewBox "0 0 1 1", so every coordinate is a
    board unit [0,1] with no scaling math; strokes use vector-effect
@@ -363,17 +362,13 @@ function freeMaskSVG() {
 
 // The per-stone regions of A15 overlap, so their union is a nonzero-winding
 // fill. A hole in the settled set is covered by no loop and stays unfilled.
+// The loops are an internal construction, not independently meaningful
+// contours, so stroking them would expose overlap seams inside the union.
 const loopsD = loops => loops.reduce((d, loop) => d + polyD(loop), '');
-const loopArea = loop => {                               // shoelace, sign-independent
-  let sum = 0;
-  for (let i = 0, j = loop.length - 1; i < loop.length; j = i++)
-    sum += (loop[j][0] - loop[i][0]) * (loop[j][1] + loop[i][1]);
-  return Math.abs(sum) / 2;
-};
 function settledSVG() {
   if (!Q.loops.length) return '';
-  return `<path d="${loopsD(Q.loops)}" fill="rgba(4,6,10,0.40)" fill-rule="${Q.fillRule}" ` +
-         `stroke="rgba(120,200,255,0.55)" stroke-width="1" ${NSS}/>`;
+  return `<path class="settled-region" d="${loopsD(Q.loops)}" fill="rgba(4,6,10,0.40)" ` +
+         `fill-rule="${Q.fillRule}" stroke="none"/>`;
 }
 
 /* =========================================================================
@@ -408,17 +403,15 @@ function draw() {
    exactly and then thrown away. The preview therefore inherits the real rules:
    real capture, real self-capture, real scores — never a UI approximation.
 
-   Two costs are deliberately avoided. The transaction is memoized on the
-   snapped point (snapping collapses most mouse movement onto a point already
-   resolved) and re-rendered at most once per animation frame. The settled
-   contour is NOT recomputed: its quadtree is the most expensive object on the
-   page and shading is a property of the committed board, not of a hover.
+   The transaction is memoized on the snapped point (snapping collapses most
+   mouse movement onto a point already resolved) and re-rendered at most once
+   per animation frame. The analytic settled contour is cheap enough to compute
+   for the resolved position at hover rate.
 
-   Only boundaries that actually MOVE are drawn. Adding a stone re-clips every
-   cell, but a half-plane that binds nothing leaves its polygon's vertices
-   untouched, so unchanged edges match their current segment exactly and drop
-   out of the diff. What is left is precisely the part of the board that the
-   move would redraw.
+   Only boundaries that actually MOVE are drawn. An edge is matched by its two
+   sites and its old collinear interval is removed from the post-move segment,
+   so shortening an edge does not highlight its long unchanged remainder. What
+   remains is precisely the part of the board that the move would redraw.
    ========================================================================= */
 const previewG   = document.getElementById('preview');
 const $pvB       = document.getElementById('pvB');
@@ -428,10 +421,38 @@ let previewCache = { position:null, key:'', data:null };   // position identity 
 let previewFrame = 0;
 
 const stoneKey = (x, y, c) => x + '|' + y + '|' + c;
-const segKey = (a, b) => {                                 // undirected, endpoint-order independent
-  const p = f(a[0]) + ',' + f(a[1]), q = f(b[0]) + ',' + f(b[1]);
-  return p < q ? p + ';' + q : q + ';' + p;
+const siteKey = stone => stoneKey(stone.x, stone.y, stone.c);
+const sitePairKey = (a, b) => {
+  const first = siteKey(a), second = siteKey(b);
+  return first < second ? first + ';' + second : second + ';' + first;
 };
+const PREVIEW_EDGE_EPSILON = 1e-5;                        // at SVG's five-decimal display precision
+
+// Return only the portions of segment a-b not already covered by `previous`.
+// A surviving pair of sites keeps the same bisector, but insertion can shorten
+// its edge and capture can lengthen it. Comparing endpoints alone would paint a
+// long unchanged remainder whenever either endpoint moved.
+function uncoveredEdgeParts(a, b, previous) {
+  if (!previous) return [[a, b]];
+  const dx = b[0] - a[0], dy = b[1] - a[1], length = Math.hypot(dx, dy);
+  if (length <= PREVIEW_EDGE_EPSILON) return [];
+  const ux = dx / length, uy = dy / length;
+  const lineDistance = point => Math.abs((point[0] - a[0]) * uy - (point[1] - a[1]) * ux);
+  if (Math.max(lineDistance(previous[0]), lineDistance(previous[1])) >
+      4 * VGO.numeric.coordinateEpsilon) return [[a, b]];
+
+  const project = point => (point[0] - a[0]) * ux + (point[1] - a[1]) * uy;
+  const first = project(previous[0]), second = project(previous[1]);
+  const overlapStart = Math.max(0, Math.min(first, second));
+  const overlapEnd = Math.min(length, Math.max(first, second));
+  if (overlapEnd <= overlapStart + PREVIEW_EDGE_EPSILON) return [[a, b]];
+
+  const at = distance => [a[0] + distance * ux, a[1] + distance * uy];
+  const parts = [];
+  if (overlapStart > PREVIEW_EDGE_EPSILON) parts.push([a, at(overlapStart)]);
+  if (length - overlapEnd > PREVIEW_EDGE_EPSILON) parts.push([at(overlapEnd), b]);
+  return parts;
+}
 
 function previewData() {
   if (!hover || !hover.legal || !opt('ovPreview') || state.phase !== 'playing') return null;
@@ -453,40 +474,30 @@ function buildPreview(result) {
   const doomed = state.stones.filter(s => !survivors.has(stoneKey(s.x, s.y, s.c)));
   const selfCaptured = !survivors.has(stoneKey(hover.x, hover.y, state.toMove));
 
-  const current = new Set();
-  for (const cell of G.cells) for (const e of cell.edges) current.add(segKey(e.A, e.B));
+  const currentEdges = new Map();
+  for (let i = 0; i < G.cells.length; i++) for (const e of G.cells[i].edges) {
+    if (e.j < 0 || e.j < i) continue;                      // board edge, or the twin already recorded
+    currentEdges.set(sitePairKey(state.stones[i], state.stones[e.j]), [e.A, e.B]);
+  }
   let moved = '';
   const cells = afterA.geometry.cells;
   for (let i = 0; i < cells.length; i++) for (const e of cells[i].edges) {
     if (e.j < 0 || e.j < i) continue;                      // board edge, or the twin already emitted
-    if (current.has(segKey(e.A, e.B))) continue;           // this boundary does not move
-    moved += `M${f(e.A[0])} ${f(e.A[1])}L${f(e.B[0])} ${f(e.B[1])}`;
+    const previous = currentEdges.get(sitePairKey(after.stones[i], after.stones[e.j]));
+    for (const part of uncoveredEdgeParts(e.A, e.B, previous))
+      moved += `M${f(part[0][0])} ${f(part[0][1])}L${f(part[1][0])} ${f(part[1][1])}`;
   }
 
   /* The settled region the move would produce. A15-A17 make this a closed-form
      sweep, so shading that used to cost a quadtree is now affordable on a hover.
 
-     Only regions that actually change are drawn. In open space a stone settles
-     exactly its own radius-r disk (A16), which the stone already covers, so
-     drawing every region would ring the whole board for no information. What is
-     worth seeing is the move's own region and the neighbours it grows — by A8
-     a non-capturing move can only enlarge them. */
+     Keep the complete post-move union here. The renderer subtracts the current
+     union with an SVG mask, revealing the exact newly settled area rather than
+     ringing an entire per-stone loop because its total area changed slightly. */
   const settled = contourFor(after, afterA);
-  const indexed = settled.loops.length === after.stones.length &&
-                  Q.loops.length === state.stones.length;
-  let settledLoops = settled.loops;
-  if (indexed) {
-    const before = new Map();
-    state.stones.forEach((s, i) => before.set(stoneKey(s.x, s.y, s.c), loopArea(Q.loops[i])));
-    settledLoops = settled.loops.filter((loop, i) => {
-      const s = after.stones[i];
-      const previous = before.get(stoneKey(s.x, s.y, s.c));
-      return previous === undefined || Math.abs(loopArea(loop) - previous) > 1e-7;
-    });
-  }
 
   return { moved:moved, doomed:doomed, selfCaptured:selfCaptured,
-           settledLoops:settledLoops, settledRule:settled.fillRule,
+           settledLoops:settled.loops, settledRule:settled.fillRule,
            scores:afterA.scores, captured:result.captured };
 }
 
@@ -502,10 +513,21 @@ function renderPreview() {
   let svg = '';
 
   // Settled first, so the moved boundaries and capture marks read on top of it.
-  if (opt('ovLock') && data.settledLoops.length)
-    svg += `<path d="${loopsD(data.settledLoops)}" fill="rgba(120,200,255,.16)" ` +
-           `fill-rule="${data.settledRule}" stroke="rgba(150,215,255,.8)" ` +
-           `stroke-width="1.5" stroke-dasharray="3 3" ${NSS}/>`;
+  // Masking out the current union leaves only the final position's newly
+  // settled area. Both layers stay fill-only: per-stone loop strokes would
+  // reveal the overlapping construction rather than a meaningful boundary.
+  if (opt('ovLock') && data.settledLoops.length) {
+    const before = Q.loops.length ? loopsD(Q.loops) : '';
+    if (before)
+      svg += `<defs><mask id="previewSettledDelta" maskUnits="userSpaceOnUse" ` +
+             `maskContentUnits="userSpaceOnUse" x="0" y="0" width="1" height="1" ` +
+             `style="mask-type:luminance"><rect x="0" y="0" width="1" height="1" fill="white"/>` +
+             `<path class="settled-current-cutout" d="${before}" fill="black" ` +
+             `fill-rule="${Q.fillRule}"/></mask></defs>`;
+    svg += `<path class="settled-growth" d="${loopsD(data.settledLoops)}" ` +
+           `fill="rgba(120,200,255,.24)" fill-rule="${data.settledRule}" stroke="none"` +
+           (before ? ` mask="url(#previewSettledDelta)"` : '') + '/>';
+  }
 
   if (data.moved)
     svg += `<path d="${data.moved}" fill="none" stroke="rgba(120,200,255,.85)" stroke-width="1.5" ` +

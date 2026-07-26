@@ -53,7 +53,7 @@ zero-length contact is discarded before adjacency is formed, so cells meeting
 at only a vertex never connect groups.
 
 Capture uses the finite cell-vertex criterion proved in `AXIOMS.md`. It does
-not use the quadtree contour.
+not use the settled contour.
 
 ## Transactions
 
@@ -84,7 +84,9 @@ line to the surviving part of `boundary L`, so `boundary L` is never built.
 Loops are closed and simple by construction and carry no sampling depth, so
 there is no contour topology to diagnose or repair. They overlap, so the union
 is a nonzero-winding fill rather than an even-odd one. The output remains
-presentation data only; capture does not use it.
+presentation data only; capture does not use it. The page fills that compound
+union without stroking its constituent loops, since overlap seams inside the
+union are not boundaries of the settled set.
 
 The HTML page owns only UI concerns: history, hover state, controls, SVG
 construction, and downloads.
@@ -93,16 +95,19 @@ The hovered move is previewed by running the real transaction and discarding
 it. Because `VGO.game.place()` is pure, the preview shows exact capture,
 self-capture, and post-move scores rather than a second, approximate rule
 implementation in the page. The preview draws only boundaries the move would
-move: a half-plane that binds nothing leaves its polygon's vertices untouched,
-so unchanged edges compare equal and fall out of the diff. The transaction is
-memoized on the snapped point and rendered at most once per animation frame.
+move. Shared edges are keyed by their pair of sites, and the prior collinear
+interval is subtracted from the post-move edge. An unchanged or merely shortened
+edge therefore contributes nothing; a new or extended edge contributes only its
+new span. The transaction is memoized on the snapped point and rendered at most
+once per animation frame.
 
-The preview also shades what the move would settle, which the analytic contour
-makes affordable at hover rate. Only regions whose area changes are drawn: in
-open space a stone settles exactly its own radius-`r` disk by A16, so drawing
-every region would ring the whole board without saying anything. What remains is
-the move's own region and the neighbours it grows, which by A8 is the entire
-effect of a non-capturing move.
+The preview also shades what the fully resolved move would newly settle, which
+the analytic contour makes affordable at hover rate. The post-move settled
+union is masked by the current union, so the page draws the exact visible
+increment rather than ringing a whole per-stone region because its area changed
+slightly. This remains meaningful when the increment is distant or
+disconnected, and capture markers continue to describe stones removed by the
+transaction.
 
 ## Records
 
