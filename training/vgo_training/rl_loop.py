@@ -568,6 +568,8 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
             str(arguments.training_threads),
             "--device",
             arguments.device,
+            "--schedule",
+            arguments.schedule,
             "--seed",
             str(arguments.seed + iteration),
             "--report-every",
@@ -774,6 +776,12 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--blocks", type=int, default=3)
     parser.add_argument("--training-threads", type=int, default=4)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--schedule",
+        choices=("wsd", "cosine"),
+        default="wsd",
+        help="learning-rate schedule forwarded to training",
+    )
     parser.add_argument("--report-every", type=int, default=10)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument(

@@ -1,4 +1,5 @@
 from pathlib import Path
+import argparse
 import tempfile
 import unittest
 
@@ -13,6 +14,7 @@ from vgo_training.serve import load_model
 from vgo_training.train_demo import (
     DIHEDRAL_TRANSFORMS,
     apply_dihedral,
+    build_scheduler,
     full_legal_policy_masks,
     importance_corrected_policy_targets,
     policy_cross_entropy,
@@ -330,3 +332,68 @@ class SelectionMetricTests(unittest.TestCase):
         self.assertLess(
             self._score(better_policy, 1.0), self._score(worse_policy, 1.0)
         )
+
+
+class ScheduleTests(unittest.TestCase):
+    """WSD exists so that training longer does not reshape the curve.
+
+    Cosine ties its shape to `--epochs`, so a run that is still improving at
+    the end has already annealed its rate away, and extending it re-tunes
+    every epoch's rate. WSD only moves the boundary between a constant
+    stable phase and a fixed trailing decay.
+    """
+
+    @staticmethod
+    def _rates(epochs: int, **overrides: object) -> list[float]:
+        arguments = argparse.Namespace(
+            learning_rate=2e-3,
+            epochs=epochs,
+            schedule="wsd",
+            warmup_epochs=5,
+            decay_fraction=0.2,
+            final_learning_rate_fraction=0.01,
+        )
+        for name, value in overrides.items():
+            setattr(arguments, name, value)
+        parameter = torch.nn.Parameter(torch.zeros(1))
+        optimizer = torch.optim.Adam([parameter], lr=arguments.learning_rate)
+        scheduler = build_scheduler(optimizer, arguments)
+        rates = []
+        for _ in range(epochs):
+            rates.append(optimizer.param_groups[0]["lr"])
+            optimizer.step()
+            scheduler.step()
+        return rates
+
+    def test_wsd_warms_up_holds_then_decays(self) -> None:
+        rates = self._rates(150)
+        self.assertTrue(all(a < b for a, b in zip(rates[:5], rates[1:6])))
+        self.assertEqual(len({round(rate, 12) for rate in rates[5:120]}), 1)
+        self.assertAlmostEqual(rates[60], 2e-3)
+        self.assertTrue(all(a > b for a, b in zip(rates[120:-1], rates[121:])))
+
+    def test_wsd_never_exceeds_base_rate_or_drops_below_floor(self) -> None:
+        rates = self._rates(150)
+        self.assertLessEqual(max(rates), 2e-3)
+        self.assertGreaterEqual(min(rates), 2e-5 - 1e-15)
+
+    def test_longer_runs_only_extend_the_stable_phase(self) -> None:
+        # The point of WSD: the decay window keeps its shape and the extra
+        # epochs all land at the full rate, so --epochs is a free knob.
+        for epochs, expected_stable in ((50, 35), (300, 235), (600, 475)):
+            rates = self._rates(epochs)
+            stable = sum(1 for rate in rates if abs(rate - 2e-3) < 1e-12)
+            self.assertEqual(stable, expected_stable)
+            self.assertAlmostEqual(rates[-1], 2e-5)
+
+    def test_degenerate_settings_still_produce_a_usable_rate(self) -> None:
+        for epochs, warmup, decay in ((1, 5, 0.2), (3, 5, 0.2), (10, 0, 1.0)):
+            rates = self._rates(epochs, warmup_epochs=warmup, decay_fraction=decay)
+            self.assertEqual(len(rates), epochs)
+            self.assertGreater(min(rates), 0.0)
+            self.assertLessEqual(max(rates), 2e-3)
+
+    def test_cosine_remains_available_unchanged(self) -> None:
+        rates = self._rates(150, schedule="cosine")
+        self.assertAlmostEqual(rates[0], 2e-3)
+        self.assertTrue(all(a >= b for a, b in zip(rates[:-1], rates[1:])))

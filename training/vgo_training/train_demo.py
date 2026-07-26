@@ -401,6 +401,46 @@ def atomic_write_text(path: Path, text: str) -> None:
     temporary.replace(path)
 
 
+def build_scheduler(
+    optimizer: torch.optim.Optimizer, arguments: argparse.Namespace
+) -> torch.optim.lr_scheduler.LRScheduler:
+    """Learning-rate schedule over epochs.
+
+    Cosine bakes the run length into the curve: `T_max` is the horizon, so
+    training longer means re-tuning the shape, and a run that is still
+    improving at the end has already annealed its learning rate away.
+
+    WSD (warmup-stable-decay) holds a constant rate through the middle and
+    only spends `--decay-fraction` of the run annealing to `eta_min`. The
+    stable phase can be any length, so extending a run is just a larger
+    `--epochs`. The short warmup covers the from-scratch case, where a full
+    rate at step one is the likeliest source of a loss spike.
+    """
+    minimum = arguments.learning_rate * arguments.final_learning_rate_fraction
+    if arguments.schedule == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=arguments.epochs, eta_min=minimum
+        )
+    epochs = arguments.epochs
+    warmup = min(arguments.warmup_epochs, max(epochs - 1, 0))
+    decay = min(round(epochs * arguments.decay_fraction), max(epochs - warmup, 0))
+    stable = max(epochs - warmup - decay, 0)
+    floor = arguments.final_learning_rate_fraction
+
+    def scale(epoch: int) -> float:
+        # LambdaLR multiplies the base rate; `epoch` is zero-based here.
+        if epoch < warmup:
+            return (epoch + 1) / (warmup + 1)
+        if epoch < warmup + stable:
+            return 1.0
+        if decay <= 0:
+            return 1.0
+        progress = (epoch - warmup - stable + 1) / decay
+        return max(1.0 + (floor - 1.0) * min(progress, 1.0), floor)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, scale)
+
+
 def train(arguments: argparse.Namespace) -> dict[str, object]:
     random.seed(arguments.seed)
     np.random.seed(arguments.seed)
@@ -477,11 +517,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         )
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=arguments.learning_rate)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=arguments.epochs,
-        eta_min=arguments.learning_rate * 0.01,
-    )
+    scheduler = build_scheduler(optimizer, arguments)
     initial_training = metrics(
         model,
         training,
@@ -630,6 +666,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         "epochs": arguments.epochs,
         "batch_size": arguments.batch_size,
         "learning_rate": arguments.learning_rate,
+        "schedule": arguments.schedule,
         "value_weight": arguments.value_weight,
         "policy_target": policy_target_name,
         "policy_denominator": "full_legal_raster_v1",
@@ -667,6 +704,31 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--schedule",
+        choices=("wsd", "cosine"),
+        default="wsd",
+        help="learning-rate schedule; wsd holds a constant rate and anneals "
+        "only at the end, so a longer run needs no reshaping",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=5,
+        help="wsd only: epochs ramping linearly to the full rate",
+    )
+    parser.add_argument(
+        "--decay-fraction",
+        type=float,
+        default=0.2,
+        help="wsd only: trailing fraction of the run spent annealing",
+    )
+    parser.add_argument(
+        "--final-learning-rate-fraction",
+        type=float,
+        default=0.01,
+        help="floor as a fraction of --learning-rate, for both schedules",
+    )
     parser.add_argument("--report-every", type=int, default=20)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument(
