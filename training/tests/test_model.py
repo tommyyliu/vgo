@@ -397,3 +397,21 @@ class ScheduleTests(unittest.TestCase):
         rates = self._rates(150, schedule="cosine")
         self.assertAlmostEqual(rates[0], 2e-3)
         self.assertTrue(all(a >= b for a, b in zip(rates[:-1], rates[1:])))
+
+
+class CompileTests(unittest.TestCase):
+    def test_in_place_compile_leaves_state_dict_keys_unchanged(self) -> None:
+        """`Module.compile()` must not rename parameters.
+
+        `torch.compile(model)` returns a wrapper whose state_dict prefixes every
+        key with `_orig_mod.`. Saving that would produce checkpoints neither
+        `serve.load_model` nor the ONNX exporter can read, so training compiles
+        in place instead.
+        """
+        model = build_model("ddrnet", channels=10, width=8, blocks=1, policy_resolution=5)
+        before = set(model.state_dict())
+        self.assertIsNone(model.compile())
+        self.assertEqual(set(model.state_dict()), before)
+
+        wrapped = torch.compile(build_model("flat", channels=10, width=8, blocks=1))
+        self.assertTrue(any(key.startswith("_orig_mod") for key in wrapped.state_dict()))
