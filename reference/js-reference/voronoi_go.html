@@ -90,6 +90,14 @@
       </label>
     </div>
     <div class="row mut"><span>server</span><span><input id="aiUrl" value="http://127.0.0.1:8181/move" style="width:180px"></span></div>
+    <!-- TEMPORARY: remove once the policy-resolution question is settled. Plays
+         you on the same fixed lattice the model is limited to, so a game is not
+         confounded by the model being unable to answer off-lattice moves. -->
+    <div class="row mut" title="temporary: restrict your moves to the model's policy lattice">
+      <span>[temp] lock to model grid</span>
+      <span><input type="checkbox" id="gridLock">
+        <select id="gridN"><option>32</option><option>48</option><option>64</option><option>96</option></select></span>
+    </div>
     <div id="aiReadout" class="mut" style="font-size:11px; white-space:pre; margin-top:4px;"></div>
     <hr>
     <div class="row mut"><span>game tree</span><span id="treeInfo"></span></div>
@@ -649,9 +657,27 @@ function savePNG() {
    9. INPUT + CONTROLS
    ========================================================================= */
 function evtToBoard(e) { const r = cv.getBoundingClientRect(); return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }; }
+/* TEMPORARY -- remove once the policy resolution question is settled.
+
+   The model's policy head emits a fixed NxN lattice, so it can only ever play
+   those N^2 points, while a human clicks anywhere in the continuum. That makes
+   every human game an off-lattice game the model has never seen in self-play,
+   and confounds "the model is weak" with "the model is handicapped here".
+   Restricting the human to the same lattice separates the two. */
+function snapToPolicyGrid(x, y) {
+  const n = +document.getElementById('gridN').value;
+  const cell = (v) => (Math.min(n - 1, Math.max(0, Math.floor(v * n))) + 0.5) / n;
+  return { x: cell(x), y: cell(y) };
+}
+
 function updateHover(e) {
   const p = evtToBoard(e);
-  const t = opt('ovSnap') ? nearestLegal(p.x, p.y) : { x: p.x, y: p.y, legal: isLegalPlacement(p.x, p.y), snapped: false };
+  // Lattice restriction happens first: snapping to the nearest legal spot
+  // afterwards would pull the move straight back off the lattice.
+  const q = document.getElementById('gridLock').checked ? snapToPolicyGrid(p.x, p.y) : p;
+  const t = (opt('ovSnap') && !document.getElementById('gridLock').checked)
+    ? nearestLegal(q.x, q.y)
+    : { x: q.x, y: q.y, legal: isLegalPlacement(q.x, q.y), snapped: false };
   hover = { rawX: p.x, rawY: p.y, x: t.x, y: t.y, legal: t.legal, snapped: t.snapped };
 }
 cv.addEventListener('mousemove', e => { updateHover(e); draw(); });
