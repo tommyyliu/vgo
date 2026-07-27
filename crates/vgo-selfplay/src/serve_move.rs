@@ -151,20 +151,43 @@ fn parse_request(body: &str) -> Result<Request, String> {
     })
 }
 
+/// Does this request line address the move route? Accepts an optional trailing
+/// slash and any query string, because a mistyped URL would otherwise 404 and
+/// the browser would report that as a CORS error rather than a wrong path.
+fn is_move_request(request_line: &str) -> bool {
+    let Some(target) = request_line
+        .strip_prefix("POST ")
+        .and_then(|rest| rest.split_whitespace().next())
+    else {
+        return false;
+    };
+    let path = target.split(['?', '#']).next().unwrap_or(target);
+    path == "/move" || path == "/move/"
+}
+
 fn escape(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn respond(stream: &mut TcpStream, status: &str, body: &str) -> std::io::Result<()> {
     // Permissive CORS so the client works when opened straight off the
-    // filesystem, which is how the reference client is normally used.
+    // filesystem, which is how the reference client is normally used. A
+    // `file://` page sends `Origin: null`, which only `*` satisfies.
+    //
+    // `Allow-Headers` lists what a preflight may approve, so it has to name
+    // every header the client might set -- a request the browser rejects here
+    // surfaces only as an opaque "CORS error" with no server-side trace.
+    // `Max-Age` lets the browser cache the approval instead of preflighting
+    // every move.
     write!(
         stream,
         "HTTP/1.1 {status}\r\n\
          Content-Type: application/json\r\n\
          Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Headers: Content-Type\r\n\
+         Access-Control-Allow-Headers: Content-Type, Accept, Origin, X-Requested-With\r\n\
          Access-Control-Allow-Methods: POST, OPTIONS\r\n\
+         Access-Control-Max-Age: 86400\r\n\
+         Vary: Origin\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n{body}",
         body.len()
@@ -300,7 +323,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = respond(&mut stream, "204 No Content", "");
             continue;
         }
-        if !request_line.starts_with("POST /move") {
+        if !is_move_request(&request_line) {
+            // A 404 reaches the browser as an opaque CORS failure rather than a
+            // status code, so be liberal about the path: `/move`, `/move/`, and
+            // `/move?x=1` all mean the same thing here.
             let _ = respond(
                 &mut stream,
                 "404 Not Found",
@@ -408,6 +434,17 @@ mod tests {
         let stones = parse_stones(r#"{"stones":[{"x":0.5,"c":"B"},{"x":0.1,"y":0.2,"c":"W"}]}"#);
         assert_eq!(stones.len(), 1);
         assert_eq!(stones[0].color, Color::White);
+    }
+
+    #[test]
+    fn the_move_route_tolerates_slashes_and_queries() {
+        use super::is_move_request;
+        assert!(is_move_request("POST /move HTTP/1.1"));
+        assert!(is_move_request("POST /move/ HTTP/1.1"));
+        assert!(is_move_request("POST /move?seed=7 HTTP/1.1"));
+        assert!(!is_move_request("POST /moves HTTP/1.1"));
+        assert!(!is_move_request("GET /move HTTP/1.1"));
+        assert!(!is_move_request("POST / HTTP/1.1"));
     }
 
     #[test]

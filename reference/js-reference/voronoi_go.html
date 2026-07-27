@@ -696,9 +696,15 @@ async function requestModelMove() {
   aiPending = true;
   aiSay('thinking...');
   try {
+    // text/plain keeps this a CORS "simple" request, so the browser sends it
+    // straight through with no preflight. Asking for application/json would
+    // force an OPTIONS round trip -- which the server does answer, but a
+    // preflight from a file:// page sends `Origin: null` and is the usual
+    // source of opaque CORS failures. The server parses the body by shape and
+    // never reads Content-Type.
     const response = await fetch(document.getElementById('aiUrl').value, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'text/plain' },
       body: JSON.stringify({
         radius: state.radius,
         toMove: state.toMove,
@@ -723,8 +729,13 @@ async function requestModelMove() {
     draw();
     return true;
   } catch (error) {
-    // The usual cause is the server not running; say so rather than failing mute.
-    aiSay('unreachable', String(error && error.message || error));
+    // fetch throws the same opaque TypeError for a refused connection and for a
+    // blocked cross-origin response, so name both rather than guess.
+    aiSay('unreachable',
+      `${error && error.message || error}\n` +
+      `could not reach ${document.getElementById('aiUrl').value}\n` +
+      'start: cargo run --release -p vgo-selfplay --bin vgo-serve-move -- --model <path>\n' +
+      'if the server is running, check the host matches (127.0.0.1 vs localhost).');
     return false;
   } finally {
     aiPending = false;
