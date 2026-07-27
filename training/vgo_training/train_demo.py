@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from pathlib import Path
 import random
@@ -524,6 +525,24 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         torch.set_float32_matmul_precision("high")
         model.compile()
     optimizer = torch.optim.Adam(model.parameters(), lr=arguments.learning_rate)
+    # Adam's moment estimates start at zero, and beta2=0.999 needs on the order
+    # of 2000 steps to build usable history. At ~432 steps/epoch a 10-epoch RL
+    # iteration is 4320 steps, so a cold start spends a large fraction of the
+    # run on noisy per-parameter step sizes -- a cost the old 150-epoch
+    # iterations amortized away. Carrying the parent's state over skips it.
+    # The replay window is mostly shared between consecutive iterations, so the
+    # gradient statistics the moments encode are still broadly valid.
+    optimizer_restored = False
+    if arguments.restore_optimizer and parent_checkpoint is not None:
+        state = parent.get("optimizer_state_dict")
+        if state is not None:
+            try:
+                optimizer.load_state_dict(state)
+                optimizer_restored = True
+            except (ValueError, KeyError) as error:
+                # A shape or param-group mismatch must not be fatal: falling back
+                # to a cold optimizer is exactly the previous behaviour.
+                print(f"optimizer state not restored: {error}", flush=True)
     scheduler = build_scheduler(optimizer, arguments)
     initial_training = metrics(
         model,
@@ -560,6 +579,9 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
     best_state = {
         name: value.detach().cpu().clone() for name, value in model.state_dict().items()
     }
+    # Captured alongside the weights so the saved moments describe the published
+    # epoch, not wherever training happened to end.
+    best_optimizer_state = copy.deepcopy(optimizer.state_dict())
     started = time.perf_counter()
 
     model.train()
@@ -613,6 +635,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
                     name: value.detach().cpu().clone()
                     for name, value in model.state_dict().items()
                 }
+                best_optimizer_state = copy.deepcopy(optimizer.state_dict())
             print(
                 f"epoch={epoch:4d} policy_kl={current['policy_kl']:.5f} "
                 f"top1={current['policy_top1']:.3f} value_mae={current['value_mae']:.5f} "
@@ -648,6 +671,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         "blocks": blocks,
         "architecture": architecture,
         "state_dict": model.state_dict(),
+        "optimizer_state_dict": best_optimizer_state,
         "parent_checkpoint": parent_checkpoint,
         "replay_sources": list(dataset_sources),
         "policy_target": policy_target_name,
@@ -675,6 +699,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         "learning_rate": arguments.learning_rate,
         "schedule": arguments.schedule,
         "compiled": bool(arguments.compile and device.type == "cuda"),
+        "optimizer_restored": optimizer_restored,
         "value_weight": arguments.value_weight,
         "policy_target": policy_target_name,
         "policy_denominator": "full_legal_raster_v1",
@@ -717,6 +742,14 @@ def parse_arguments() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="compile the training model and enable TF32 matmuls (CUDA only)",
+    )
+    parser.add_argument(
+        "--restore-optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="restore Adam moments from --initial-checkpoint instead of starting "
+        "them at zero. Matters most for short runs: beta2=0.999 needs ~2000 "
+        "steps of history, and a 10-epoch iteration is only ~4300",
     )
     parser.add_argument(
         "--schedule",

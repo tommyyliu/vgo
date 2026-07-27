@@ -618,6 +618,9 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
             "--schedule",
             arguments.schedule,
             "--compile" if arguments.compile else "--no-compile",
+            "--restore-optimizer"
+            if arguments.restore_optimizer
+            else "--no-restore-optimizer",
             "--seed",
             str(arguments.seed + iteration),
             "--report-every",
@@ -848,6 +851,13 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="compile the training model and enable TF32 (forwarded to training)",
+    )
+    parser.add_argument(
+        "--restore-optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="carry Adam moments across iterations instead of restarting them "
+        "cold each time (forwarded to training)",
     )
     parser.add_argument("--report-every", type=int, default=10)
     parser.add_argument("--validation-fraction", type=float, default=0.1)

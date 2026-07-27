@@ -1,5 +1,6 @@
 from pathlib import Path
 import argparse
+import copy
 import tempfile
 import unittest
 
@@ -415,3 +416,49 @@ class CompileTests(unittest.TestCase):
 
         wrapped = torch.compile(build_model("flat", channels=10, width=8, blocks=1))
         self.assertTrue(any(key.startswith("_orig_mod") for key in wrapped.state_dict()))
+
+
+class OptimizerStateTests(unittest.TestCase):
+    """Adam moments must survive an iteration boundary.
+
+    They start at zero and beta2=0.999 needs ~2000 steps of history; a 10-epoch
+    RL iteration is only ~4300 steps, so a cold start wastes a large share of
+    every short run. The 150-epoch iterations amortized this away, which is why
+    it went unnoticed.
+    """
+
+    @staticmethod
+    def _stepped_optimizer() -> tuple[torch.nn.Module, torch.optim.Optimizer]:
+        model = build_model("flat", channels=10, width=8, blocks=1)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        for _ in range(3):
+            policy, value = model(torch.randn(2, 10, 8, 8))
+            (policy.square().mean() + value.square().mean()).backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        return model, optimizer
+
+    def test_round_trip_preserves_moments(self) -> None:
+        model, optimizer = self._stepped_optimizer()
+        saved = copy.deepcopy(optimizer.state_dict())
+        restored = torch.optim.Adam(model.parameters(), lr=1e-3)
+        self.assertEqual(len(restored.state_dict()["state"]), 0)
+        restored.load_state_dict(saved)
+        self.assertEqual(
+            len(restored.state_dict()["state"]), len(saved["state"])
+        )
+        first = next(iter(saved["state"].values()))
+        other = next(iter(restored.state_dict()["state"].values()))
+        torch.testing.assert_close(first["exp_avg"], other["exp_avg"])
+        torch.testing.assert_close(first["exp_avg_sq"], other["exp_avg_sq"])
+        self.assertGreater(int(first["step"]), 0)
+
+    def test_mismatched_state_is_rejected_not_silently_applied(self) -> None:
+        # A different architecture has a different parameter count, so restoring
+        # must raise rather than quietly produce nonsense; train_demo catches
+        # this and falls back to a cold optimizer.
+        _, optimizer = self._stepped_optimizer()
+        wider = build_model("flat", channels=10, width=16, blocks=2)
+        target = torch.optim.Adam(wider.parameters(), lr=1e-3)
+        with self.assertRaises(ValueError):
+            target.load_state_dict(optimizer.state_dict())
