@@ -136,6 +136,26 @@ def json_from_log(path: Path) -> dict[str, object]:
     return json.loads(stdout)
 
 
+def json_documents_from_log(path: Path) -> list[dict[str, object]]:
+    """Every top-level JSON document in a log's stdout, in order.
+
+    A batched arena emits one record per opponent, so the single-document
+    reader above would silently keep only the last one.
+    """
+    text = path.read_text(encoding="utf-8")
+    stdout = text.split("\nSTDOUT\n", 1)[1].split("\nSTDERR\n", 1)[0]
+    documents: list[dict[str, object]] = []
+    decoder = json.JSONDecoder()
+    index = 0
+    while True:
+        start = stdout.find("{", index)
+        if start < 0:
+            return documents
+        document, end = decoder.raw_decode(stdout, start)
+        documents.append(document)
+        index = end
+
+
 def recover_progress(iteration_path: Path) -> dict[str, object]:
     progress_path = iteration_path / "progress.json"
     if progress_path.exists():
@@ -347,8 +367,11 @@ def arena_command(
         "--cache-directory",
         str((root / "artifacts" / "onnx-cache").resolve()),
     ]
+    # `opponent` may be one path or several; vgo-arena repeats --opponent and
+    # emits one JSON record per opponent, reusing the loaded candidate.
     if opponent is not None:
-        command.extend(["--opponent", str(opponent)])
+        for path in [opponent] if isinstance(opponent, (str, Path)) else opponent:
+            command.extend(["--opponent", str(path)])
     return command
 
 
@@ -379,37 +402,46 @@ def update_elo_pool(
     opponents = sample.sample(
         past_generations, min(arguments.elo_pool_samples, len(past_generations))
     )
+    playable = [
+        (index, path) for index, path in opponents if Path(path).exists()
+    ]
     new_records: list[dict[str, object]] = []
-    for slot, (opponent_iteration, opponent_onnx) in enumerate(opponents):
-        if not Path(opponent_onnx).exists():
-            continue
+    if playable:
+        # One process for every opponent: vgo-arena loads the candidate once and
+        # emits a record per opponent, in the order given.
+        log_path = elo_dir / f"iter{iteration:03d}-pool.log"
         command = arena_command(
             arguments,
             root,
             candidate_onnx,
-            opponent_onnx,
-            arguments.arena_seed + iteration * 10_000 + 7_000 + slot,
+            [path for _, path in playable],
+            arguments.arena_seed + iteration * 10_000 + 7_000,
             pairs=arguments.elo_pool_pairs,
         )
         try:
-            result = run_json_command(
-                command,
-                cwd=root,
-                log_path=elo_dir / f"iter{iteration:03d}-vs{opponent_iteration:03d}.log",
-                environment=environment,
-            )
+            run_logged(command, cwd=root, log_path=log_path, environment=environment)
+            results = json_documents_from_log(log_path)
         except Exception as error:  # noqa: BLE001 — telemetry must not kill the loop
-            print(f"[elo] skipped match vs gen {opponent_iteration}: {error}", flush=True)
-            continue
-        # Only count decisive completed games; a truncated game is not a result.
-        record = {
-            "a": iteration,
-            "b": opponent_iteration,
-            "a_wins": int(result.get("candidate_wins", 0)),
-            "b_wins": int(result.get("candidate_losses", 0)),
-            "draws": int(result.get("draws", 0)),
-        }
-        new_records.append(record)
+            print(f"[elo] skipped pool matches: {error}", flush=True)
+            results = []
+        if results and len(results) != len(playable):
+            print(
+                f"[elo] expected {len(playable)} records, got {len(results)}; "
+                "discarding to avoid mis-attributing matches",
+                flush=True,
+            )
+            results = []
+        for (opponent_iteration, _), result in zip(playable, results):
+            # Only count decisive completed games; a truncated game is not a result.
+            new_records.append(
+                {
+                    "a": iteration,
+                    "b": opponent_iteration,
+                    "a_wins": int(result.get("candidate_wins", 0)),
+                    "b_wins": int(result.get("candidate_losses", 0)),
+                    "draws": int(result.get("draws", 0)),
+                }
+            )
 
     if new_records:
         with matches_path.open("a", encoding="ascii") as handle:
@@ -834,16 +866,17 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         default=2,
         help="past generations to play the new net against each iteration for Elo "
         "tracking (0 disables); pure telemetry, does not gate promotion. With no "
-        "promotion arena this is the only progress signal, so it defaults on. "
-        "Each sample is a separate arena process paying ~21s of TensorRT engine "
-        "warmup, so opponent count -- not total games -- drives the cost",
+        "promotion arena this is the only progress signal, so it defaults on",
     )
     parser.add_argument(
         "--elo-pool-pairs",
         type=int,
-        default=8,
-        help="color-swapped pairs per sampled opponent; marginal cost is only "
-        "~0.93s/pair, so prefer more pairs over more opponents",
+        default=16,
+        help="color-swapped pairs per sampled opponent. Concurrency is capped by "
+        "game count, so a small match leaves most arena threads idle and the "
+        "inference broker never fills a batch: measured cost per game is 3.08s "
+        "at 4 pairs, 1.13s at 16, and 0.92s at 60. Prefer few large matches -- "
+        "2x16 is 64 games in ~72s, where 4x4 is 32 games in ~99s",
     )
     parser.add_argument(
         "--elo-prior-games",

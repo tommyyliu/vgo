@@ -233,3 +233,37 @@ class EloPoolTests(unittest.TestCase):
             ["--output", "out", "--promotion-arena", "--promotion-score", "0.52"]
         )
         validate_arguments(gated)
+
+
+class BatchedArenaTests(unittest.TestCase):
+    def test_arena_command_repeats_the_opponent_flag(self) -> None:
+        arguments = parse_arguments(["--output", "out"])
+        single = arena_command(
+            arguments, Path("/root"), Path("cand.onnx"), Path("a.onnx"), 1
+        )
+        self.assertEqual(single.count("--opponent"), 1)
+        several = arena_command(
+            arguments,
+            Path("/root"),
+            Path("cand.onnx"),
+            [Path("a.onnx"), Path("b.onnx"), Path("c.onnx")],
+            1,
+        )
+        self.assertEqual(several.count("--opponent"), 3)
+        self.assertIn("b.onnx", several)
+
+    def test_every_record_is_read_from_a_batched_log(self) -> None:
+        from vgo_training.rl_loop import json_documents_from_log
+
+        body = "\n".join(
+            json.dumps({"candidate_score": score, "opponent_model": name})
+            for score, name in ((0.5, "a"), (0.75, "b"), (0.25, "c"))
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.log"
+            path.write_text(f"COMMAND x\nSTDOUT\n{body}\nSTDERR\n", encoding="utf-8")
+            documents = json_documents_from_log(path)
+        self.assertEqual([d["opponent_model"] for d in documents], ["a", "b", "c"])
+        # The single-document reader keeps only the last, which is why the
+        # batched path needs its own reader.
+        self.assertEqual(len(documents), 3)

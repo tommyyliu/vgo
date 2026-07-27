@@ -13,7 +13,8 @@ use std::{
 use clap::{ArgAction, Parser};
 use vgo_core::{Color, Outcome, Position};
 use vgo_inference::{
-    BatchedEvaluator, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
+    BatchedEvaluator, BrokerConfig, BrokerMetrics, OnnxBatchService, OnnxProvider,
+    OnnxServiceConfig,
 };
 use vgo_raster::RasterConfig;
 use vgo_search::{EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, search_with_evaluator};
@@ -24,8 +25,13 @@ use vgo_selfplay::play_game as run_playout;
 struct Arguments {
     #[arg(long)]
     candidate: PathBuf,
+    /// Repeatable. Each opponent plays `--pairs` color-swapped pairs against the
+    /// same loaded candidate and emits its own JSON record. Batching them here
+    /// amortizes the provider's per-process model load and warmup, which is
+    /// ~21s against ~0.93s per additional pair: six opponents in one process
+    /// costs about what one does. Omit entirely to play the naive evaluator.
     #[arg(long)]
-    opponent: Option<PathBuf>,
+    opponent: Vec<PathBuf>,
     #[arg(long, default_value_t = 16)]
     pairs: usize,
     #[arg(long, default_value_t = 16)]
@@ -176,19 +182,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(message.into());
     }
     let candidate = load_model(arguments.candidate.clone(), &arguments)?;
-    let opponent = arguments
-        .opponent
-        .clone()
-        .map(|model| load_model(model, &arguments))
-        .transpose()?;
+    // One record per opponent, or a single naive-evaluator record when none are
+    // given. The candidate is loaded once and reused across every match.
+    let opponents: Vec<Option<PathBuf>> = if arguments.opponent.is_empty() {
+        vec![None]
+    } else {
+        arguments.opponent.iter().cloned().map(Some).collect()
+    };
+    for (index, opponent_path) in opponents.into_iter().enumerate() {
+        let opponent = opponent_path
+            .clone()
+            .map(|model| load_model(model, &arguments))
+            .transpose()?;
+        // Distinct seeds per opponent, or every match would replay one game set.
+        let seed_base = arguments.seed + (index as u64) * 1_000_003;
+        run_match(
+            &arguments,
+            &candidate,
+            opponent.as_ref(),
+            opponent_path.as_deref(),
+            seed_base,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_match(
+    arguments: &Arc<Arguments>,
+    candidate: &BatchedEvaluator,
+    opponent: Option<&BatchedEvaluator>,
+    opponent_path: Option<&std::path::Path>,
+    seed_base: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let games = arguments.pairs * 2;
     let next_game = Arc::new(AtomicUsize::new(0));
+    // Broker counters are cumulative over the process, and the candidate is
+    // shared across every opponent, so report this match's delta.
+    let baseline = candidate.metrics();
     let started = Instant::now();
     let mut handles = Vec::with_capacity(arguments.threads);
     for _ in 0..arguments.threads {
-        let arguments = Arc::clone(&arguments);
+        let arguments = Arc::clone(arguments);
         let candidate = candidate.clone();
-        let opponent = opponent.clone();
+        let opponent = opponent.cloned();
         let next_game = Arc::clone(&next_game);
         handles.push(thread::spawn(move || {
             let mut results = Vec::new();
@@ -206,7 +242,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &candidate,
                     opponent.as_ref(),
                     candidate_color,
-                    arguments.seed + (game / 2) as u64,
+                    seed_base + (game / 2) as u64,
                     &arguments,
                 )?);
             }
@@ -251,17 +287,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         points / completed as f64
     };
     let interval = wilson_interval(points, completed);
-    let candidate_metrics = candidate.metrics();
-    let opponent_name = if arguments.opponent.is_some() {
+    let current = candidate.metrics();
+    let candidate_metrics = BrokerMetrics {
+        requests: current.requests - baseline.requests,
+        batches: current.batches - baseline.batches,
+        positions: current.positions - baseline.positions,
+        maximum_batch: current.maximum_batch,
+        failures: current.failures - baseline.failures,
+        encoding_nanoseconds: current.encoding_nanoseconds - baseline.encoding_nanoseconds,
+        queue_nanoseconds: current.queue_nanoseconds - baseline.queue_nanoseconds,
+        inference_nanoseconds: current.inference_nanoseconds - baseline.inference_nanoseconds,
+    };
+    let opponent_name = if opponent_path.is_some() {
         "onnx"
     } else {
         "naive"
     };
+    let opponent_model = opponent_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
     println!(
         concat!(
             "{{\n",
             "  \"schema\": \"vgo.arena.v1\",\n",
             "  \"opponent\": \"{}\",\n",
+            "  \"opponent_model\": \"{}\",\n",
             "  \"pairs\": {},\n",
             "  \"games\": {},\n",
             "  \"completed\": {},\n",
@@ -284,6 +334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "}}"
         ),
         opponent_name,
+        opponent_model,
         arguments.pairs,
         games,
         completed,
