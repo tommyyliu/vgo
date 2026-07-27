@@ -344,33 +344,72 @@ def load_dataset(path: str | Path) -> RasterDataset:
     )
 
 
+_CONCATENATED_FIELDS = (
+    "states",
+    "policies",
+    "policy_masks",
+    "visits",
+    "betas",
+    "proposal_counts",
+    "values",
+    "selected_actions",
+    "game_ids",
+    "plies",
+    "seeds",
+)
+
+
 def load_datasets(paths: Iterable[str | Path]) -> RasterDataset:
-    datasets = [load_dataset(path) for path in paths]
-    if not datasets:
+    """Concatenate replay shards without ever holding two full copies.
+
+    `torch.cat` over a list of loaded shards allocates the whole output while
+    every input is still referenced, so peak memory is twice the window. At a
+    coupled 128x128 policy a shard is ~6 GB, and a five-shard window peaked at
+    60 GB against 60 GB of RAM -- see the ddrnet-wide OOM. Here each shard is
+    copied into a preallocated output and then dropped, so the peak is the
+    window plus one shard rather than the window twice.
+    """
+    paths = [Path(path) for path in paths]
+    if not paths:
         raise ValueError("at least one replay dataset is required")
-    first = datasets[0]
-    for dataset in datasets[1:]:
-        if (dataset.channels, dataset.height, dataset.width) != (
-            first.channels,
-            first.height,
-            first.width,
-        ):
+
+    # Headers are cheap to read and give the total sample count up front, which
+    # is what lets the output be allocated once.
+    headers = [_read_header(Path(path).resolve(strict=True)) for path in paths]
+    first_shape = headers[0][3:6]
+    for header in headers[1:]:
+        if header[3:6] != first_shape:
             raise ValueError("all replay datasets must have the same raster shape")
+    total = sum(header[2] for header in headers)
+
+    output: dict[str, torch.Tensor] = {}
+    sources: list[str] = []
+    offset = 0
+    for path in paths:
+        shard = load_dataset(path)
+        if not output:
+            for field in _CONCATENATED_FIELDS:
+                template = getattr(shard, field)
+                output[field] = torch.empty(
+                    (total, *template.shape[1:]), dtype=template.dtype
+                )
+        stop = offset + shard.samples
+        for field in _CONCATENATED_FIELDS:
+            output[field][offset:stop].copy_(getattr(shard, field))
+        sources.extend(shard.sources)
+        offset = stop
+        # Drop the shard before loading the next one; without this the peak is
+        # the window plus every shard already consumed.
+        del shard
+
+    if offset != total:
+        raise ValueError(f"expected {total} concatenated samples, wrote {offset}")
+
     return RasterDataset(
-        states=torch.cat([dataset.states for dataset in datasets]),
-        policies=torch.cat([dataset.policies for dataset in datasets]),
-        policy_masks=torch.cat([dataset.policy_masks for dataset in datasets]),
-        visits=torch.cat([dataset.visits for dataset in datasets]),
-        betas=torch.cat([dataset.betas for dataset in datasets]),
-        proposal_counts=torch.cat([dataset.proposal_counts for dataset in datasets]),
-        values=torch.cat([dataset.values for dataset in datasets]),
-        selected_actions=torch.cat([dataset.selected_actions for dataset in datasets]),
-        game_ids=torch.cat([dataset.game_ids for dataset in datasets]),
-        plies=torch.cat([dataset.plies for dataset in datasets]),
-        seeds=torch.cat([dataset.seeds for dataset in datasets]),
-        height=first.height,
-        width=first.width,
-        sources=tuple(source for dataset in datasets for source in dataset.sources),
+        **output,
+        height=first_shape[1],
+        width=first_shape[2],
+        sources=tuple(sources),
     )
 
 

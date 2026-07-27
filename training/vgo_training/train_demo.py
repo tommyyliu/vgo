@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import random
@@ -315,7 +316,7 @@ def prepare_policy_supervision(
 @torch.no_grad()
 def metrics(
     model: nn.Module,
-    dataset: PreparedRasterDataset,
+    dataset: DatasetView | PreparedRasterDataset,
     device: torch.device,
     batch_size: int,
     *,
@@ -348,10 +349,9 @@ def metrics(
     for start in range(0, total, batch_size):
         stop = min(start + batch_size, total)
         count = stop - start
-        states = dataset.states[start:stop].to(device)
-        targets = dataset.policies[start:stop].to(device)
-        masks = dataset.policy_masks[start:stop].to(device)
-        values = dataset.values[start:stop].to(device)
+        states, targets, masks, values = gather_batch(
+            dataset, torch.arange(start, stop), device
+        )
         logits, predictions = model(states)
         # Reuses the training objective so the two can never drift apart.
         cross_entropy_total += float(policy_cross_entropy(logits, targets, masks)) * count
@@ -382,18 +382,79 @@ def metrics(
     }
 
 
-def subset(
-    dataset: PreparedRasterDataset, indices: torch.Tensor
-) -> PreparedRasterDataset:
-    return PreparedRasterDataset(
-        states=dataset.states[indices],
-        policies=dataset.policies[indices],
-        policy_masks=dataset.policy_masks[indices],
-        values=dataset.values[indices],
-        height=dataset.height,
-        width=dataset.width,
-        sources=dataset.sources,
+def gather_batch(
+    dataset: "DatasetView | PreparedRasterDataset",
+    selection: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gather one batch onto `device` from either a split view or a whole dataset.
+
+    `selection` indexes into whatever it is given: positions within the view for
+    a `DatasetView`, rows of the dataset otherwise.
+    """
+    if isinstance(dataset, DatasetView):
+        return dataset.batch(selection, device)
+    return (
+        dataset.states[selection].to(device),
+        dataset.policies[selection].to(device),
+        dataset.policy_masks[selection].to(device),
+        dataset.values[selection].to(device),
     )
+
+
+@dataclass(frozen=True)
+class DatasetView:
+    """A train/validation split held as an index rather than as gathered rows.
+
+    Materializing the split with `dataset.states[indices]` allocates a full copy
+    of every tensor, and because both halves are built while the original is
+    still live the peak is roughly twice the replay window. At a coupled 128x128
+    policy that was ~36 GB for a five-shard window. Carrying the indices instead
+    makes a split free; rows are gathered per batch, which is the granularity the
+    GPU consumes anyway.
+    """
+
+    base: PreparedRasterDataset
+    indices: torch.Tensor
+
+    @property
+    def samples(self) -> int:
+        return int(self.indices.shape[0])
+
+    @property
+    def height(self) -> int:
+        return self.base.height
+
+    @property
+    def width(self) -> int:
+        return self.base.width
+
+    @property
+    def channels(self) -> int:
+        return self.base.channels
+
+    @property
+    def sources(self) -> tuple[str, ...]:
+        return self.base.sources
+
+    def batch(
+        self, selection: torch.Tensor, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather one batch of rows onto `device`.
+
+        `selection` indexes into this view, not into the underlying dataset.
+        """
+        rows = self.indices[selection]
+        return (
+            self.base.states[rows].to(device),
+            self.base.policies[rows].to(device),
+            self.base.policy_masks[rows].to(device),
+            self.base.values[rows].to(device),
+        )
+
+
+def subset(dataset: PreparedRasterDataset, indices: torch.Tensor) -> DatasetView:
+    return DatasetView(base=dataset, indices=indices)
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -490,6 +551,8 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
     training_indices = split[validation_samples:]
     training = subset(dataset, training_indices)
     validation = subset(dataset, validation_indices) if validation_samples else training
+    # Both views reference `dataset`, so this drops only the local name -- the
+    # tensors stay alive for the batch gathers. Nothing here frees the window.
     del dataset, split, validation_indices, training_indices
 
     parent_checkpoint = None
@@ -589,10 +652,9 @@ def train(arguments: argparse.Namespace) -> dict[str, object]:
         permutation = torch.randperm(training.samples, generator=generator)
         for start in range(0, training.samples, arguments.batch_size):
             indices = permutation[start : start + arguments.batch_size]
-            states = training.states[indices].to(device)
-            policy_targets = training.policies[indices].to(device)
-            policy_masks = training.policy_masks[indices].to(device)
-            value_targets = training.values[indices].to(device)
+            states, policy_targets, policy_masks, value_targets = training.batch(
+                indices, device
+            )
             if arguments.augment:
                 # One symmetry per batch rather than per sample: the transform is
                 # a cheap view-and-copy, and over many epochs each position is

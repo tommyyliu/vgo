@@ -159,9 +159,17 @@ class MetricsBatchingTests(unittest.TestCase):
             expected,
         )
 
+        # `prepared_subset` is a view and deliberately keeps the base tensors
+        # alive -- that is how a split avoids copying the replay window. So the
+        # prepared storage is released once no view refers to it, not merely
+        # when the dataset name goes out of scope.
         del raw, dataset, policy_storage, mask_storage
         gc.collect()
         self.assertTrue(all(reference() is None for reference in raw_refs))
+        self.assertTrue(all(reference() is not None for reference in prepared_refs))
+
+        del prepared_subset
+        gc.collect()
         self.assertTrue(all(reference() is None for reference in prepared_refs))
 
     def test_metric_loss_uses_training_value_weight(self) -> None:
