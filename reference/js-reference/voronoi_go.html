@@ -81,6 +81,17 @@
       <button id="clear">Clear</button>
     </div>
     <hr>
+    <div class="row"><span>model opponent</span><span id="aiStatus" class="mut">off</span></div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+      <button id="aiMove" title="ask the model for a move and play it">Model move</button>
+      <label class="mut" title="the model answers every time it is this colour's turn">
+        <input type="checkbox" id="aiAuto"> auto-reply as
+        <select id="aiColor"><option value="W">white</option><option value="B">black</option></select>
+      </label>
+    </div>
+    <div class="row mut"><span>server</span><span><input id="aiUrl" value="http://127.0.0.1:8181/move" style="width:180px"></span></div>
+    <div id="aiReadout" class="mut" style="font-size:11px; white-space:pre; margin-top:4px;"></div>
+    <hr>
     <div class="row mut"><span>game tree</span><span id="treeInfo"></span></div>
     <div class="nav">
       <button id="navStart" title="first move">&#9198;</button>
@@ -645,7 +656,7 @@ function updateHover(e) {
 }
 cv.addEventListener('mousemove', e => { updateHover(e); draw(); });
 cv.addEventListener('mouseleave', () => { hover = null; draw(); });
-cv.addEventListener('click', e => { updateHover(e); if (hover && hover.legal && placeStone(hover.x, hover.y)) { updateHover(e); draw(); } });
+cv.addEventListener('click', e => { updateHover(e); if (hover && hover.legal && placeStone(hover.x, hover.y)) { updateHover(e); draw(); maybeAutoReply(); } });
 
 document.getElementById('pass').onclick = () => {
   const before = snapshot();
@@ -655,6 +666,84 @@ document.getElementById('pass').onclick = () => {
   goTo(outcome.node);
   if (state.phase === 'finished') flash('Final score — ' + document.getElementById('turn').textContent);
 };
+/* =========================================================================
+   MODEL OPPONENT
+
+   `vgo-serve-move` runs the same MCTS and ONNX evaluator the arena scores with,
+   so the opponent here is exactly the model being rated rather than a separate
+   implementation that could drift. This side only serialises the position and
+   applies whatever move comes back; all search lives in Rust.
+
+     cargo run --release -p vgo-selfplay --bin vgo-serve-move -- \
+       --model artifacts/<run>/iteration-NNN/model/candidate.onnx
+   ========================================================================= */
+
+const $aiStatus = document.getElementById('aiStatus');
+const $aiReadout = document.getElementById('aiReadout');
+let aiPending = false;
+
+function aiSay(text, readout) {
+  $aiStatus.textContent = text;
+  if (readout !== undefined) $aiReadout.textContent = readout;
+}
+
+async function requestModelMove() {
+  // One request at a time: the search is seconds long and a second click would
+  // otherwise apply a move computed for a position that has already changed.
+  if (aiPending) return false;
+  if (state.phase === 'finished') { aiSay('game over'); return false; }
+  if (!A.validation.playable) { aiSay('position not playable'); return false; }
+  aiPending = true;
+  aiSay('thinking...');
+  try {
+    const response = await fetch(document.getElementById('aiUrl').value, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        radius: state.radius,
+        toMove: state.toMove,
+        stones: state.stones.map(s => ({ x: s.x, y: s.y, c: s.c })),
+      }),
+    });
+    const reply = await response.json();
+    if (!response.ok) { aiSay('server error', reply.error || response.statusText); return false; }
+    const lines = (reply.candidates || []).slice(0, 5).map(c =>
+      `${c.pass ? 'pass' : c.x.toFixed(3) + ',' + c.y.toFixed(3)}  v=${c.visits}  ${c.value >= 0 ? '+' : ''}${c.value.toFixed(3)}`);
+    aiSay('played', lines.join('\n'));
+    if (reply.pass) {
+      const before = snapshot();
+      const outcome = VGO.gameTree.pass(current, RULES);
+      if (!outcome.ok) return false;
+      pushUndo(before);
+      goTo(outcome.node);
+      flash('Model passed');
+      return true;
+    }
+    if (!placeStone(reply.x, reply.y)) { aiSay('move rejected', `${reply.x}, ${reply.y}`); return false; }
+    draw();
+    return true;
+  } catch (error) {
+    // The usual cause is the server not running; say so rather than failing mute.
+    aiSay('unreachable', String(error && error.message || error));
+    return false;
+  } finally {
+    aiPending = false;
+  }
+}
+
+document.getElementById('aiMove').onclick = () => { requestModelMove().then(maybeAutoReply); };
+
+/* Auto-reply fires whenever it becomes the model's turn, including after undo
+   or tree navigation, so a stray click cannot leave it waiting on its own move. */
+function maybeAutoReply() {
+  if (!document.getElementById('aiAuto').checked) return;
+  if (aiPending || state.phase === 'finished') return;
+  if (state.toMove !== document.getElementById('aiColor').value) return;
+  setTimeout(() => { requestModelMove().then(maybeAutoReply); }, 50);
+}
+document.getElementById('aiAuto').onchange = maybeAutoReply;
+document.getElementById('aiColor').onchange = maybeAutoReply;
+
 document.getElementById('undo').onclick  = () => undo(false);
 document.getElementById('clear').onclick = () => {
   pushUndo(snapshot());

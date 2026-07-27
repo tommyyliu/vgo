@@ -1,0 +1,418 @@
+#![forbid(unsafe_code)]
+
+//! Serve model moves over HTTP so the JS client can play against a checkpoint.
+//!
+//! The arena and the Elo pool answer "is this model stronger than that one",
+//! which is what training needs but says nothing about whether the play looks
+//! sensible to a person. This binary closes that gap: it wraps the same MCTS and
+//! ONNX evaluator the arena uses, so the opponent in the browser is exactly the
+//! model being rated -- not a reimplementation that could drift.
+//!
+//! The protocol is one route. POST /move with the position:
+//!
+//! ```json
+//! {"radius": 0.0556, "toMove": "B",
+//!  "stones": [{"x": 0.5, "y": 0.5, "c": "B"}]}
+//! ```
+//!
+//! and the reply is the chosen move plus what the search thought of it:
+//!
+//! ```json
+//! {"pass": false, "x": 0.42, "y": 0.31, "visits": 121, "value": 0.18,
+//!  "candidates": [...]}
+//! ```
+//!
+//! Hand-rolled over `std::net::TcpListener` rather than pulling an async web
+//! stack into a workspace whose only shared dependency is clap. The surface is
+//! one route with a small body, and this is a local development tool.
+
+use std::{
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
+    path::PathBuf,
+    time::Duration,
+};
+
+use clap::{ArgAction, Parser};
+use vgo_core::{Color, Phase, Position, Stone};
+use vgo_inference::{
+    BatchedEvaluator, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
+};
+use vgo_raster::RasterConfig;
+use vgo_search::{Action, SearchConfig, search_with_evaluator};
+
+#[derive(Debug, Parser)]
+#[command(about = "Serve model moves over HTTP for the JS client")]
+struct Arguments {
+    #[arg(long)]
+    model: PathBuf,
+    #[arg(long, default_value = "127.0.0.1:8181")]
+    address: String,
+    /// Simulations per move. Higher is stronger and slower.
+    #[arg(long, default_value_t = 256)]
+    simulations: u32,
+    #[arg(long, default_value_t = 96)]
+    resolution: usize,
+    #[arg(long, default_value_t = 32)]
+    policy_resolution: usize,
+    /// Fine cells per coarse sampling region. Must match how the model was
+    /// trained, or its policy head is read through the wrong sampler.
+    #[arg(long, default_value_t = 4)]
+    coarse_pool: usize,
+    #[arg(long, default_value_t = 4)]
+    leaf_batch: usize,
+    #[arg(long, default_value = "tensorrt")]
+    provider: OnnxProvider,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    fp16: bool,
+    #[arg(long, default_value = "artifacts/onnx-cache")]
+    cache_directory: PathBuf,
+    #[arg(long, default_value_t = 900_001)]
+    seed: u64,
+}
+
+/// The subset of JSON this protocol needs: objects of numbers, strings, and
+/// arrays of objects. Written by hand because the workspace carries no serde and
+/// the request shape is fixed and small.
+#[derive(Debug)]
+struct Request {
+    radius: f64,
+    to_move: Color,
+    stones: Vec<Stone>,
+}
+
+fn parse_number(text: &str) -> Option<f64> {
+    text.trim().trim_matches('"').parse::<f64>().ok()
+}
+
+fn parse_color(text: &str) -> Option<Color> {
+    match text.trim().trim_matches('"') {
+        "B" | "b" | "black" | "Black" => Some(Color::Black),
+        "W" | "w" | "white" | "White" => Some(Color::White),
+        _ => None,
+    }
+}
+
+/// Pull `"key": value` out of a flat JSON fragment. Values are scalars only;
+/// nested structures are handled separately by `parse_stones`.
+fn field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    let start = body.find(&needle)? + needle.len();
+    let rest = body[start..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let end = rest
+        .find(|c: char| c == ',' || c == '}' || c == ']')
+        .unwrap_or(rest.len());
+    Some(rest[..end].trim())
+}
+
+fn parse_stones(body: &str) -> Vec<Stone> {
+    let Some(start) = body.find("\"stones\"") else {
+        return Vec::new();
+    };
+    let Some(open) = body[start..].find('[') else {
+        return Vec::new();
+    };
+    let Some(close) = body[start + open..].find(']') else {
+        return Vec::new();
+    };
+    let array = &body[start + open + 1..start + open + close];
+    let mut stones = Vec::new();
+    for chunk in array.split('{').skip(1) {
+        let object = chunk.split('}').next().unwrap_or("");
+        let x = field(object, "x").and_then(parse_number);
+        let y = field(object, "y").and_then(parse_number);
+        // The client calls the colour `c`; accept `color` too.
+        let color = field(object, "c")
+            .or_else(|| field(object, "color"))
+            .and_then(parse_color);
+        if let (Some(x), Some(y), Some(color)) = (x, y, color) {
+            stones.push(Stone::new(x, y, color));
+        }
+    }
+    stones
+}
+
+fn parse_request(body: &str) -> Result<Request, String> {
+    let radius = field(body, "radius")
+        .and_then(parse_number)
+        .ok_or("missing or malformed \"radius\"")?;
+    if !radius.is_finite() || radius <= 0.0 || radius >= 0.5 {
+        return Err("radius must be finite and between zero and one half".into());
+    }
+    let to_move = field(body, "toMove")
+        .or_else(|| field(body, "to_move"))
+        .and_then(parse_color)
+        .ok_or("missing or malformed \"toMove\"")?;
+    Ok(Request {
+        radius,
+        to_move,
+        stones: parse_stones(body),
+    })
+}
+
+fn escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn respond(stream: &mut TcpStream, status: &str, body: &str) -> std::io::Result<()> {
+    // Permissive CORS so the client works when opened straight off the
+    // filesystem, which is how the reference client is normally used.
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\n\
+         Content-Type: application/json\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Headers: Content-Type\r\n\
+         Access-Control-Allow-Methods: POST, OPTIONS\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn move_json(result: &vgo_search::SearchResult, to_move: Color) -> String {
+    let mut children: Vec<_> = result.children.iter().collect();
+    children.sort_by_key(|child| std::cmp::Reverse(child.visits));
+    // black_value is from black's perspective throughout the search; report it
+    // from the mover's, which is what a UI wants to show.
+    let orient = |value: f64| match to_move {
+        Color::Black => value,
+        Color::White => -value,
+    };
+    let chosen = children
+        .iter()
+        .find(|child| child.action == result.action)
+        .map(|child| (child.visits, orient(child.black_value)))
+        .unwrap_or((0, 0.0));
+    let candidates = children
+        .iter()
+        .take(8)
+        .map(|child| match child.action {
+            Action::Pass => format!(
+                "{{\"pass\":true,\"visits\":{},\"value\":{:.4}}}",
+                child.visits,
+                orient(child.black_value)
+            ),
+            Action::Place(point) => format!(
+                "{{\"pass\":false,\"x\":{:.6},\"y\":{:.6},\"visits\":{},\"value\":{:.4}}}",
+                point.x,
+                point.y,
+                child.visits,
+                orient(child.black_value)
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    match result.action {
+        Action::Pass => format!(
+            "{{\"pass\":true,\"visits\":{},\"value\":{:.4},\"candidates\":[{candidates}]}}",
+            chosen.0, chosen.1
+        ),
+        Action::Place(point) => format!(
+            "{{\"pass\":false,\"x\":{:.6},\"y\":{:.6},\"visits\":{},\"value\":{:.4},\"candidates\":[{candidates}]}}",
+            point.x, point.y, chosen.0, chosen.1
+        ),
+    }
+}
+
+fn read_request(stream: &mut TcpStream) -> std::io::Result<(String, String)> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut length = 0_usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 || line.trim().is_empty() {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut body = vec![0_u8; length];
+    if length > 0 {
+        reader.read_exact(&mut body)?;
+    }
+    Ok((request_line, String::from_utf8_lossy(&body).into_owned()))
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let arguments = Arguments::parse();
+    if arguments.simulations == 0 || arguments.resolution == 0 {
+        return Err("simulations and resolution must be positive".into());
+    }
+    if arguments.coarse_pool > arguments.policy_resolution {
+        return Err("--coarse-pool must not exceed --policy-resolution".into());
+    }
+
+    let service = OnnxBatchService::load(&OnnxServiceConfig {
+        policy: Some(RasterConfig::square(arguments.policy_resolution)),
+        model: arguments.model.clone(),
+        raster: RasterConfig::square(arguments.resolution),
+        maximum_batch: arguments.leaf_batch.max(1),
+        provider: arguments.provider,
+        device_id: 0,
+        fp16: arguments.fp16,
+        cache_directory: arguments.cache_directory.clone(),
+    })?;
+    let evaluator = BatchedEvaluator::spawn(
+        BrokerConfig {
+            maximum_delay: Duration::from_millis(1),
+            queue_capacity: arguments.leaf_batch.max(2) * 2,
+        },
+        service,
+    )?;
+
+    let mut config = SearchConfig::canary(arguments.simulations);
+    config.coarse_pool = arguments.coarse_pool;
+    config.leaf_batch = arguments.leaf_batch.max(1);
+    // A human opponent wants the search's best move, not a draw from it.
+    config.temperature = 0.0;
+    config.temperature_plies = 0;
+
+    let listener = TcpListener::bind(&arguments.address)?;
+    println!(
+        "vgo-serve-move listening on http://{} ({} simulations, model {})",
+        arguments.address,
+        arguments.simulations,
+        arguments.model.display()
+    );
+    println!("POST /move with {{radius, toMove, stones:[{{x,y,c}}]}}");
+
+    let mut request_index: u64 = 0;
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("connection failed: {error}");
+                continue;
+            }
+        };
+        let (request_line, body) = match read_request(&mut stream) {
+            Ok(parts) => parts,
+            Err(error) => {
+                eprintln!("could not read request: {error}");
+                continue;
+            }
+        };
+        if request_line.starts_with("OPTIONS") {
+            let _ = respond(&mut stream, "204 No Content", "");
+            continue;
+        }
+        if !request_line.starts_with("POST /move") {
+            let _ = respond(
+                &mut stream,
+                "404 Not Found",
+                "{\"error\":\"POST /move is the only route\"}",
+            );
+            continue;
+        }
+        let request = match parse_request(&body) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    &format!("{{\"error\":\"{}\"}}", escape(&error)),
+                );
+                continue;
+            }
+        };
+        let position = Position::new(request.radius, request.stones, request.to_move);
+        // A client can post a finished or self-inconsistent board; refuse both
+        // here rather than let the search fail deep inside on it.
+        if position.phase() != Phase::Playing {
+            let _ = respond(
+                &mut stream,
+                "409 Conflict",
+                "{\"error\":\"position is already finished\"}",
+            );
+            continue;
+        }
+        if !position.validate().is_playable() {
+            let _ = respond(
+                &mut stream,
+                "400 Bad Request",
+                "{\"error\":\"position is not playable (overlapping or out-of-bounds stones)\"}",
+            );
+            continue;
+        }
+        // Vary the seed per request so repeated identical positions do not
+        // replay one search, while a single game stays reproducible per seed.
+        request_index += 1;
+        let result = match search_with_evaluator(
+            &position,
+            config,
+            arguments.seed.wrapping_add(request_index),
+            &evaluator,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = respond(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    &format!("{{\"error\":\"{}\"}}", escape(&error.to_string())),
+                );
+                continue;
+            }
+        };
+        let payload = move_json(&result, position.to_move());
+        println!(
+            "move {} for {:?}: {}",
+            request_index,
+            position.to_move(),
+            payload.split(",\"candidates\"").next().unwrap_or(&payload)
+        );
+        let _ = respond(&mut stream, "200 OK", &payload);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{field, parse_request, parse_stones};
+    use vgo_core::Color;
+
+    const BODY: &str = r#"{"radius":0.0556,"toMove":"W","stones":[
+        {"x":0.25,"y":0.5,"c":"B"},{"x":0.75,"y":0.5,"c":"W"}]}"#;
+
+    #[test]
+    fn parses_a_client_position() {
+        let request = parse_request(BODY).expect("body should parse");
+        assert!((request.radius - 0.0556).abs() < 1e-9);
+        assert_eq!(request.to_move, Color::White);
+        assert_eq!(request.stones.len(), 2);
+        assert_eq!(request.stones[0].color, Color::Black);
+        assert!((request.stones[1].x - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_empty_board_is_a_valid_position() {
+        let request =
+            parse_request(r#"{"radius":0.05,"toMove":"B","stones":[]}"#).expect("should parse");
+        assert!(request.stones.is_empty());
+    }
+
+    #[test]
+    fn malformed_bodies_are_rejected_rather_than_defaulted() {
+        // A missing radius must not silently become zero and produce a position
+        // the search would then reject deep inside.
+        assert!(parse_request(r#"{"toMove":"B","stones":[]}"#).is_err());
+        assert!(parse_request(r#"{"radius":0.05,"stones":[]}"#).is_err());
+        assert!(parse_request(r#"{"radius":9.0,"toMove":"B"}"#).is_err());
+    }
+
+    #[test]
+    fn stones_missing_a_field_are_skipped_not_guessed() {
+        let stones = parse_stones(r#"{"stones":[{"x":0.5,"c":"B"},{"x":0.1,"y":0.2,"c":"W"}]}"#);
+        assert_eq!(stones.len(), 1);
+        assert_eq!(stones[0].color, Color::White);
+    }
+
+    #[test]
+    fn field_stops_at_the_value_boundary() {
+        assert_eq!(field(BODY, "radius"), Some("0.0556"));
+        assert_eq!(field(BODY, "toMove"), Some("\"W\""));
+    }
+}

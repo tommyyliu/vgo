@@ -35,3 +35,7 @@ path = "src/arena.rs"
 [[bin]]
 name = "vgo-playout-duel"
 path = "src/playout_duel.rs"
+
+[[bin]]
+name = "vgo-serve-move"
+path = "src/serve_move.rs"
