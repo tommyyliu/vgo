@@ -267,3 +267,27 @@ class BatchedArenaTests(unittest.TestCase):
         # The single-document reader keeps only the last, which is why the
         # batched path needs its own reader.
         self.assertEqual(len(documents), 3)
+
+
+class LeafBatchTests(unittest.TestCase):
+    def test_leaf_batch_reaches_generation_and_arenas(self) -> None:
+        """Both seats of a comparison must search the same way.
+
+        Above 1, leaf parallelization changes which nodes get explored, so a
+        generation run and the arenas judging it have to agree. The flag existed
+        in both Rust binaries but rl_loop forwarded it to neither, pinning every
+        run to the sequential path.
+        """
+        arguments = parse_arguments(["--output", "run", "--leaf-batch", "8"])
+        root = Path("/repo")
+        generation = generation_command(
+            arguments, root, Path("/replay"), 1, Path("/model.onnx")
+        )
+        self.assertEqual(generation[generation.index("--leaf-batch") + 1], "8")
+        arena = arena_command(
+            arguments, root, Path("/candidate.onnx"), Path("/opponent.onnx"), 2
+        )
+        self.assertEqual(arena[arena.index("--leaf-batch") + 1], "8")
+
+    def test_leaf_batch_defaults_to_the_sequential_path(self) -> None:
+        self.assertEqual(parse_arguments(["--output", "run"]).leaf_batch, 1)

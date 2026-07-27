@@ -312,6 +312,8 @@ def generation_command(
         str(arguments.delay_ms),
         "--actors",
         str(arguments.actors),
+        "--leaf-batch",
+        str(arguments.leaf_batch),
         "--provider",
         arguments.provider,
         "--fp16",
@@ -348,6 +350,8 @@ def arena_command(
         str(arguments.maximum_plies),
         "--threads",
         str(arguments.arena_actors),
+        "--leaf-batch",
+        str(arguments.leaf_batch),
         "--resolution",
         str(arguments.resolution),
         "--policy-resolution",
@@ -893,6 +897,15 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--arena-pairs", type=int, default=16)
     parser.add_argument("--arena-simulations", type=int, default=16)
     parser.add_argument("--actors", type=int, default=8)
+    parser.add_argument(
+        "--leaf-batch",
+        type=int,
+        default=1,
+        help="leaves evaluated together per simulation round, raising in-flight "
+        "evaluations per game from one to this many. Above 1 the search explores "
+        "different nodes, so it is not a free throughput knob: 1 is the "
+        "sequential path pinned by test, and both arena seats must agree",
+    )
     parser.add_argument("--arena-actors", type=int, default=1)
     parser.add_argument("--maximum-batch", type=int, default=8)
     parser.add_argument("--delay-ms", type=int, default=1)
