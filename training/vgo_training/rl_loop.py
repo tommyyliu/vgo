@@ -753,9 +753,12 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
         baseline_text = (
             f"{baseline_arena['candidate_score']:.3f}" if baseline_arena else "skipped"
         )
+        promotion_text = (
+            f"{promotion_arena['candidate_score']:.3f}" if promotion_arena else "skipped"
+        )
         print(
             f"iteration={iteration} baseline_score={baseline_text} "
-            f"promotion_score={promotion_arena['candidate_score']:.3f} accepted={accepted}",
+            f"promotion_score={promotion_text} accepted={accepted}",
             flush=True,
         )
 
