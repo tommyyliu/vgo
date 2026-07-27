@@ -621,6 +621,8 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
             "--restore-optimizer"
             if arguments.restore_optimizer
             else "--no-restore-optimizer",
+            "--warmup-epochs",
+            str(arguments.warmup_epochs),
             "--seed",
             str(arguments.seed + iteration),
             "--report-every",
@@ -858,6 +860,14 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="carry Adam moments across iterations instead of restarting them "
         "cold each time (forwarded to training)",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=1,
+        help="wsd warmup epochs, forwarded to training. The train_demo default "
+        "of 5 suits long runs; at --epochs 10 it spends half the schedule "
+        "ramping the rate up, leaving only 3 epochs at the stable rate",
     )
     parser.add_argument("--report-every", type=int, default=10)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
