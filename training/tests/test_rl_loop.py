@@ -1,293 +1,714 @@
+import asyncio
+from dataclasses import asdict
 import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from vgo_training.rl_loop import (
-    arena_command,
-    generation_command,
-    json_from_log,
-    parse_arguments,
-    promotion_decision,
-    recover_progress,
-    require_artifacts,
-    validate_arguments,
+from vgo_training.pipeline import (
+    CommandResult,
+    ModelArtifact,
+    Pipeline,
+    PipelineConfig,
+    ReplayArtifact,
+    atomic_json,
+    config_from_arguments,
+    file_sha256,
 )
+from vgo_training.rl_loop import parse_arguments
 
 
-class RlLoopTests(unittest.TestCase):
-    def test_json_from_log_uses_final_json_document(self) -> None:
+def replay(sequence: int) -> ReplayArtifact:
+    return ReplayArtifact(
+        sequence=sequence,
+        path=f"/replay/{sequence}/dataset.vgo",
+        manifest=f"/replay/{sequence}/manifest.json",
+        samples=64,
+        behavior_model_sha256=None,
+        dataset_sha256=f"digest-{sequence}",
+        seed=sequence,
+    )
+
+
+class PipelineConfigurationTests(unittest.TestCase):
+    def test_defaults_select_the_utilization_oriented_path(self) -> None:
+        arguments = parse_arguments(["--output", "run"])
+        self.assertEqual(arguments.architecture, "ddrnet")
+        self.assertEqual(arguments.coarse_pool, 4)
+        self.assertTrue(arguments.overlap_actor_learner)
+        self.assertTrue(arguments.warm_inference)
+        self.assertEqual(arguments.inference_slots, 2)
+        self.assertEqual(arguments.samples_per_shard, 1024)
+        PipelineConfig(output="run").validate()
+
+    def test_invalid_resource_and_gate_settings_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "prefetch"):
+            PipelineConfig(
+                output="run", maximum_prefetch_shards=-1
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "nonzero"):
+            PipelineConfig(output="run", promotion_arena=True).validate()
+        with self.assertRaisesRegex(ValueError, "requires"):
+            PipelineConfig(output="run", promotion_score=0.52).validate()
+        with self.assertRaisesRegex(ValueError, "inference slots"):
+            PipelineConfig(output="run", inference_slots=0).validate()
+
+    def test_json_normalization_makes_a_run_resumable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "stage.log"
-            path.write_text(
-                "$ command\n\nSTDOUT\nepoch=1 loss=1.0\n{\n  \"schema\": \"test\"\n}\n\nSTDERR\nwarning\n",
-                encoding="utf-8",
+            config = PipelineConfig(
+                output=directory, initial_replay=(), updates=2
             )
-            self.assertEqual(json_from_log(path), {"schema": "test"})
+            first = Pipeline(config)
+            second = Pipeline(config)
+            self.assertEqual(first.config_digest, second.config_digest)
+            self.assertEqual(first.state.to_json(), second.state.to_json())
 
-    def test_recovery_ignores_an_incomplete_log(self) -> None:
+    def test_telemetry_controls_do_not_change_run_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "generate.log").write_text(
-                "$ command\n\nSTDOUT\npartial\n\nSTDERR\n",
-                encoding="utf-8",
+            arguments = parse_arguments(
+                ["--output", directory, "--drain-telemetry"]
             )
-            (root / "export.log").write_text(
-                "$ command\n\nSTDOUT\n{\"schema\": \"export\"}\n\nSTDERR\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(
-                recover_progress(root), {"export": {"schema": "export"}}
-            )
-            self.assertEqual(
-                json.loads((root / "progress.json").read_text(encoding="ascii")),
-                {"export": {"schema": "export"}},
-            )
+            config = config_from_arguments(arguments)
+            original = Pipeline(config)
+            resumed = Pipeline.resume(Path(directory))
+            self.assertEqual(original.config_digest, resumed.config_digest)
 
-    def test_progress_requires_every_declared_artifact(self) -> None:
+    def test_operational_controls_can_change_and_targets_can_extend(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            present = Path(directory) / "present"
-            present.touch()
-            missing = Path(directory) / "missing"
-            progress: dict[str, object] = {"training": {"schema": "test"}}
-            self.assertFalse(
-                require_artifacts(progress, "training", present, missing)
+            original = Pipeline(
+                PipelineConfig(output=directory, updates=2, actors=64)
             )
-            self.assertNotIn("training", progress)
+            tuned = Pipeline(
+                PipelineConfig(
+                    output=directory,
+                    updates=5,
+                    actors=12,
+                    inference_slots=3,
+                    maximum_prefetch_shards=2,
+                )
+            )
+            history = json.loads(
+                (
+                    Path(directory) / "pipeline-config-history.json"
+                ).read_text(encoding="utf-8")
+            )
 
-    def test_promotion_rejects_excessive_truncation(self) -> None:
-        arena: dict[str, object] = {
-            "games": 100,
-            "completed": 50,
-            "candidate_score": 1.0,
-        }
-        self.assertFalse(promotion_decision(arena, 0.52, 0.02))
-        arena["completed"] = 99
-        self.assertTrue(promotion_decision(arena, 0.52, 0.02))
+            self.assertEqual(original.config_digest, tuned.config_digest)
+            self.assertEqual(len(history), 2)
+            self.assertEqual(history[-1]["config"]["updates"], 5)
+            self.assertEqual(history[-1]["config"]["actors"], 12)
+            self.assertEqual(history[-1]["config"]["inference_slots"], 3)
 
-    def test_coarse_sampling_defaults_and_validation(self) -> None:
-        default = parse_arguments(["--output", "run"])
-        self.assertEqual(default.coarse_pool, 0)
-        self.assertEqual(default.architecture, "flat")
-        validate_arguments(default)
+    def test_learning_semantics_cannot_change_on_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Pipeline(PipelineConfig(output=directory))
+            with self.assertRaisesRegex(ValueError, "learning configuration"):
+                Pipeline(
+                    PipelineConfig(
+                        output=directory, generation_simulations=257
+                    )
+                )
 
-        invalid = parse_arguments(["--output", "run", "--coarse-pool", "-1"])
-        with self.assertRaisesRegex(ValueError, "coarse pool must be nonnegative"):
-            validate_arguments(invalid)
+    def test_target_cannot_be_reduced_below_completed_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            original = Pipeline(
+                PipelineConfig(output=directory, updates=3)
+            )
+            original.state.updates_completed = 2
+            original._save_state()
+            with self.assertRaisesRegex(ValueError, "cannot be reduced"):
+                Pipeline(PipelineConfig(output=directory, updates=1))
 
-        # The pool counts fine cells per coarse region on the placement grid,
-        # which is independent of the render resolution.
-        oversized_pool = parse_arguments(
-            ["--output", "run", "--policy-resolution", "16", "--coarse-pool", "17"]
-        )
-        with self.assertRaisesRegex(ValueError, "coarse pool must not exceed policy resolution"):
-            validate_arguments(oversized_pool)
 
-        decoupled = parse_arguments(
-            [
-                "--output",
-                "run",
-                "--resolution",
-                "16",
-                "--policy-resolution",
-                "32",
-                "--coarse-pool",
-                "17",
-            ]
-        )
-        validate_arguments(decoupled)
-
-        ddrnet = parse_arguments(
-            ["--output", "run", "--architecture", "ddrnet"]
-        )
-        self.assertEqual(ddrnet.architecture, "ddrnet")
-        validate_arguments(ddrnet)
-
-    @patch("vgo_training.rl_loop.cargo_executable", return_value="cargo")
-    def test_coarse_sampling_is_forwarded_to_generation_and_all_arenas(
+class PipelineCommandTests(unittest.TestCase):
+    @patch("vgo_training.pipeline.cargo_executable", return_value="cargo")
+    def test_actor_and_arena_commands_share_search_contract(
         self, _cargo: object
     ) -> None:
-        arguments = parse_arguments(
-            [
-                "--output",
-                "run",
-                "--coarse-pool",
-                "8",
-                "--elo-pool-pairs",
-                "3",
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(
+                PipelineConfig(
+                    output=directory,
+                    coarse_pool=8,
+                    leaf_batch=4,
+                    inference_batch=32,
+                    inference_slots=3,
+                )
+            )
+            model = ModelArtifact(
+                version=3,
+                checkpoint="/models/3.pt",
+                onnx="/models/3.onnx",
+                checkpoint_sha256="checkpoint",
+                onnx_sha256="onnx",
+                parent_version=2,
+            )
+            generation = pipeline.generation_command(
+                output=Path("/staging"), sequence=7, model=model
+            )
+            arena = pipeline.arena_command(
+                candidate=Path("/models/4.onnx"),
+                opponents=[Path("/models/3.onnx"), Path("/models/1.onnx")],
+                seed=9,
+                pairs=5,
+            )
+
+        for command in (generation, arena):
+            self.assertEqual(
+                command[command.index("--coarse-pool") + 1], "8"
+            )
+            self.assertEqual(command[command.index("--leaf-batch") + 1], "4")
+            self.assertEqual(
+                command[command.index("--maximum-batch") + 1], "32"
+            )
+        self.assertEqual(generation[generation.index("--runtime") + 1], "onnx")
+        self.assertEqual(
+            generation[generation.index("--writer-queue-games") + 1], "2"
+        )
+        self.assertEqual(
+            generation[generation.index("--inference-slots") + 1], "3"
+        )
+        self.assertEqual(arena.count("--opponent"), 2)
+        self.assertEqual(arena[arena.index("--pairs") + 1], "5")
+
+    def test_command_result_reads_every_json_document(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stdout = root / "stdout.log"
+            stderr = root / "stderr.log"
+            stdout.write_text(
+                'progress\n{"step":1}\nmore\n{"step":2}\n',
+                encoding="utf-8",
+            )
+            stderr.write_text("", encoding="utf-8")
+            result = CommandResult((), 0, 1.0, stdout, stderr)
+            self.assertEqual(
+                result.json_documents(), [{"step": 1}, {"step": 2}]
+            )
+            self.assertEqual(result.final_json(), {"step": 2})
+
+    def test_tensorrt_warmup_uses_the_actor_runtime_contract(self) -> None:
+        class Result:
+            @staticmethod
+            def final_json() -> dict[str, object]:
+                return {
+                    "provider": "tensorrt",
+                    "resolution": 96,
+                    "policy_resolution": 32,
+                    "batch": 24,
+                    "fp16": True,
+                }
+
+        class Runner:
+            def __init__(self) -> None:
+                self.command: list[str] | None = None
+
+            async def run(self, command, **_kwargs):
+                self.command = list(command)
+                return Result()
+
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(
+                PipelineConfig(
+                    output=directory,
+                    inference_batch=24,
+                    inference_device_id=2,
+                )
+            )
+            runner = Runner()
+            pipeline.runner = runner  # type: ignore[assignment]
+            report = asyncio.run(
+                pipeline._warm_inference(
+                    3, Path(directory) / "updates" / "update-000003"
+                )
+            )
+
+        assert runner.command is not None
+        self.assertEqual(report["batch"], 24)
+        self.assertEqual(
+            runner.command[runner.command.index("--device-id") + 1], "2"
+        )
+        self.assertEqual(
+            runner.command[
+                runner.command.index("--policy-resolution") + 1
+            ],
+            "32",
+        )
+        self.assertIn("--compare-python", runner.command)
+
+
+class PipelineSchedulingTests(unittest.TestCase):
+    def test_scheduler_fills_one_update_then_bounds_stale_prefetch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(
+                PipelineConfig(
+                    output=directory,
+                    updates=3,
+                    shards_per_update=2,
+                    maximum_prefetch_shards=2,
+                )
+            )
+            self.assertTrue(
+                pipeline._should_start_generation(
+                    [], learning_through=None, generation_active=False
+                )
+            )
+            first = [replay(0)]
+            self.assertTrue(
+                pipeline._should_start_generation(
+                    first, learning_through=None, generation_active=False
+                )
+            )
+            ready = first + [replay(1)]
+            self.assertFalse(
+                pipeline._should_start_generation(
+                    ready, learning_through=None, generation_active=False
+                )
+            )
+            self.assertTrue(
+                pipeline._should_start_generation(
+                    ready, learning_through=1, generation_active=False
+                )
+            )
+            self.assertTrue(
+                pipeline._should_start_generation(
+                    ready + [replay(2)],
+                    learning_through=1,
+                    generation_active=False,
+                )
+            )
+            self.assertFalse(
+                pipeline._should_start_generation(
+                    ready + [replay(2), replay(3)],
+                    learning_through=1,
+                    generation_active=False,
+                )
+            )
+
+    def test_remaining_demand_prevents_a_useless_final_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(
+                PipelineConfig(output=directory, updates=1)
+            )
+            self.assertFalse(
+                pipeline._should_start_generation(
+                    [replay(0)],
+                    learning_through=0,
+                    generation_active=False,
+                )
+            )
+
+    def test_async_state_machine_overlaps_both_completion_orders(self) -> None:
+        class FakeLearner:
+            async def close(self, *, force: bool = False) -> None:
+                del force
+
+        async def exercise(
+            directory: str, generation_delay: float, learning_delay: float
+        ) -> tuple[dict[str, object], list[int], list[int], int]:
+            pipeline = Pipeline(
+                PipelineConfig(
+                    output=directory,
+                    updates=3,
+                    maximum_prefetch_shards=1,
+                    telemetry_opponents=0,
+                )
+            )
+            generated: list[int] = []
+            learned: list[int] = []
+            active = 0
+            maximum_active = 0
+
+            async def generate(_model: ModelArtifact | None) -> ReplayArtifact:
+                nonlocal active, maximum_active
+                sequence = pipeline.state.next_shard
+                active += 1
+                maximum_active = max(maximum_active, active)
+                try:
+                    await asyncio.sleep(generation_delay)
+                    generated.append(sequence)
+                    return replay(sequence)
+                finally:
+                    active -= 1
+
+            async def learn(
+                update: int,
+                spec: dict[str, object] | None = None,
+                update_path: Path | None = None,
+            ) -> ModelArtifact:
+                nonlocal active, maximum_active
+                del update_path
+                assert spec is not None
+                active += 1
+                maximum_active = max(maximum_active, active)
+                try:
+                    await asyncio.sleep(learning_delay)
+                    learned.append(update)
+                    parent = pipeline.incumbent
+                    model = ModelArtifact(
+                        version=update,
+                        checkpoint=f"/models/{update}.pt",
+                        onnx=f"/models/{update}.onnx",
+                        checkpoint_sha256=f"{update + 1:064x}",
+                        onnx_sha256=f"{update + 2:064x}",
+                        parent_version=None if parent is None else parent.version,
+                    )
+                    pipeline._commit_publication(
+                        {
+                            "schema": "vgo.pipeline-publication.v1",
+                            "update": update,
+                            "through_shard": int(spec["through_shard"]),
+                            "accepted": True,
+                            "model": asdict(model),
+                        }
+                    )
+                    return model
+                finally:
+                    active -= 1
+
+            pipeline._generate_shard = generate  # type: ignore[method-assign]
+            pipeline._learn_and_publish = learn  # type: ignore[method-assign]
+            with patch(
+                "vgo_training.pipeline.LearnerService.start",
+                new=AsyncMock(return_value=FakeLearner()),
+            ):
+                report = await pipeline.run()
+            return report, generated, learned, maximum_active
+
+        for generation_delay, learning_delay in ((0.01, 0.001), (0.001, 0.01)):
+            with self.subTest(
+                generation_delay=generation_delay,
+                learning_delay=learning_delay,
+            ):
+                with tempfile.TemporaryDirectory() as directory:
+                    report, generated, learned, maximum_active = asyncio.run(
+                        exercise(
+                            directory, generation_delay, learning_delay
+                        )
+                    )
+                self.assertEqual(report["updates_completed"], 3)
+                self.assertEqual(generated, [0, 1, 2])
+                self.assertEqual(learned, [0, 1, 2])
+                self.assertEqual(maximum_active, 2)
+
+
+class PipelineRecoveryTests(unittest.TestCase):
+    def test_run_lease_excludes_a_second_coordinator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = Pipeline(PipelineConfig(output=directory))
+            second = Pipeline(PipelineConfig(output=directory))
+            with first._run_lease():
+                with self.assertRaisesRegex(RuntimeError, "another pipeline"):
+                    with second._run_lease():
+                        self.fail("the second lease must not be acquired")
+
+    def test_publication_recovery_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(
+                PipelineConfig(
+                    output=directory, updates=1, telemetry_opponents=0
+                )
+            )
+            checkpoint = Path(directory) / "candidate.pt"
+            onnx = Path(directory) / "candidate.onnx"
+            checkpoint.write_bytes(b"checkpoint")
+            onnx.write_bytes(b"onnx")
+            model = ModelArtifact(
+                version=0,
+                checkpoint=str(checkpoint),
+                onnx=str(onnx),
+                checkpoint_sha256=file_sha256(checkpoint),
+                onnx_sha256=file_sha256(onnx),
+                parent_version=None,
+            )
+            report = {
+                "schema": "vgo.pipeline-publication.v1",
+                "update": 0,
+                "through_shard": 0,
+                "accepted": True,
+                "model": asdict(model),
+            }
+            update_path = Path(directory) / "updates" / "update-000000"
+            atomic_json(update_path / "publication.json", report)
+            recovered = asyncio.run(
+                pipeline._learn_and_publish(
+                    0,
+                    {
+                        "schema": "vgo.pipeline-update.v1",
+                        "update": 0,
+                        "through_shard": 0,
+                    },
+                    update_path,
+                )
+            )
+            pipeline._commit_publication(report)
+
+            self.assertEqual(recovered, model)
+            self.assertEqual(len(pipeline.state.models), 1)
+            self.assertEqual(pipeline.state.updates_completed, 1)
+            self.assertEqual(pipeline.state.consumed_through_shard, 0)
+
+    def test_preconstructed_pipeline_reloads_state_after_acquiring_lease(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = PipelineConfig(
+                output=directory, updates=1, telemetry_opponents=0
+            )
+            first = Pipeline(config)
+            stale = Pipeline(config)
+            model = ModelArtifact(
+                version=0,
+                checkpoint="/models/0.pt",
+                onnx="/models/0.onnx",
+                checkpoint_sha256="01" * 32,
+                onnx_sha256="02" * 32,
+                parent_version=None,
+            )
+            first._commit_publication(
+                {
+                    "schema": "vgo.pipeline-publication.v1",
+                    "update": 0,
+                    "through_shard": 0,
+                    "accepted": True,
+                    "model": asdict(model),
+                }
+            )
+            with patch(
+                "vgo_training.pipeline.LearnerService.start",
+                new=AsyncMock(
+                    side_effect=AssertionError(
+                        "a completed run must not start the learner"
+                    )
+                ),
+            ):
+                report = asyncio.run(stale.run())
+
+            self.assertEqual(report["updates_completed"], 1)
+            self.assertEqual(stale.state.models, [asdict(model)])
+
+    def test_existing_replay_is_rehashed_before_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(
+                PipelineConfig(
+                    output=directory,
+                    samples_per_shard=1,
+                    telemetry_opponents=0,
+                )
+            )
+            shard = (
+                Path(directory) / "replay" / "shard-000000"
+            )
+            shard.mkdir(parents=True)
+            (shard / "dataset.vgo").write_bytes(b"corrupt")
+            atomic_json(
+                shard / "manifest.json",
+                {
+                    "schema": "vgo.replay-shard.v1",
+                    "samples": 1,
+                    "dataset_sha256": "00" * 32,
+                    "dataset_bytes": 7,
+                    "behavior_model_sha256": None,
+                    "seed": 1,
+                },
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "checksum"):
+                asyncio.run(pipeline._generate_shard(None))
+
+    def test_durable_update_spec_is_reconciled_with_run_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(
+                PipelineConfig(
+                    output=directory,
+                    updates=1,
+                    telemetry_opponents=0,
+                )
+            )
+            pipeline._commit_replay(replay(0))
+            spec_path = (
+                Path(directory)
+                / "updates"
+                / "update-000000"
+                / "update-spec.json"
+            )
+            atomic_json(
+                spec_path,
+                {
+                    "schema": "vgo.pipeline-update.v1",
+                    "update": 0,
+                    "through_shard": 1,
+                    "active_replay": [asdict(replay(0))],
+                    "parent_model": None,
+                },
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError, "different replay boundary"
+            ):
+                pipeline._update_spec(0)
+
+    def test_completed_state_reconstructs_a_missing_run_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(
+                PipelineConfig(output=directory, updates=1)
+            )
+            pipeline.state.updates_completed = 1
+            pipeline._save_state()
+            report = asyncio.run(pipeline.run())
+            self.assertEqual(report["updates_completed"], 1)
+            self.assertTrue((Path(directory) / "run.json").exists())
+
+    def test_run_report_exposes_overlap_and_batch_fill_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(
+                PipelineConfig(
+                    output=directory,
+                    updates=1,
+                    inference_batch=16,
+                )
+            )
+            manifest = Path(directory) / "manifest.json"
+            atomic_json(
+                manifest,
+                {
+                    "generation_metrics": {
+                        "wall_seconds": 8.0,
+                        "summed_game_seconds": 40.0,
+                        "writer_backpressure_seconds": 1.5,
+                    },
+                    "broker_metrics": {
+                        "positions": 24,
+                        "batches": 2,
+                        "inference_seconds": 3.0,
+                    },
+                },
+            )
+            pipeline.state.replay = [
+                {
+                    **asdict(replay(0)),
+                    "manifest": str(manifest),
+                }
             ]
-        )
-        root = Path("/repo")
+            pipeline.state.updates_completed = 1
+            pipeline.state.active_wall_seconds = 10.0
+            atomic_json(
+                Path(directory)
+                / "updates"
+                / "update-000000"
+                / "publication.json",
+                {
+                    "wall_seconds": 4.0,
+                    "training": {
+                        "wall_seconds": 3.0,
+                        "optimization_seconds": 2.0,
+                        "replay_cache_hits": 7,
+                        "replay_cache_misses": 1,
+                    },
+                },
+            )
 
-        generation = generation_command(
-            arguments,
-            root,
-            Path("/replay"),
-            123,
-            Path("/incumbent.onnx"),
-        )
-        self.assertEqual(generation[generation.index("--coarse-pool") + 1], "8")
+            utilization = pipeline.report()["utilization"]
 
-        baseline = arena_command(
-            arguments,
-            root,
-            Path("/candidate.onnx"),
-            None,
-            234,
-        )
-        self.assertEqual(baseline[baseline.index("--coarse-pool") + 1], "8")
-        self.assertNotIn("--opponent", baseline)
+            self.assertEqual(utilization["pipeline_overlap_factor"], 1.2)
+            self.assertEqual(utilization["average_active_games"], 5.0)
+            self.assertEqual(utilization["inference_batch_fill"], 0.75)
+            self.assertEqual(utilization["replay_cache_hit_ratio"], 0.875)
 
-        promotion = arena_command(
-            arguments,
-            root,
-            Path("/candidate.onnx"),
-            Path("/incumbent.onnx"),
-            456,
-        )
-        self.assertEqual(promotion[promotion.index("--coarse-pool") + 1], "8")
-        self.assertEqual(promotion[promotion.index("--pairs") + 1], "16")
+    def test_ratings_ignore_their_own_materialized_view(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(
+                PipelineConfig(output=directory, updates=1)
+            )
+            telemetry = Path(directory) / "telemetry"
+            atomic_json(
+                telemetry / "v000001-vs-v000000.json",
+                {
+                    "schema": "vgo.telemetry-result.v1",
+                    "candidate_version": 1,
+                    "opponent_version": 0,
+                    "arena": {
+                        "candidate_wins": 7,
+                        "candidate_losses": 1,
+                        "draws": 0,
+                    },
+                },
+            )
+            atomic_json(telemetry / "ratings.json", {"0": 0.0})
+            pipeline._refresh_ratings()
+            ratings = json.loads(
+                (telemetry / "ratings.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("1", ratings)
 
-        elo = arena_command(
-            arguments,
-            root,
-            Path("/candidate.onnx"),
-            Path("/past.onnx"),
-            789,
-            pairs=arguments.elo_pool_pairs,
-        )
-        self.assertEqual(elo[elo.index("--coarse-pool") + 1], "8")
-        self.assertEqual(elo[elo.index("--pairs") + 1], "3")
+    def test_telemetry_amortizes_one_candidate_load_across_opponents(
+        self,
+    ) -> None:
+        class Result:
+            @staticmethod
+            def json_documents() -> list[dict[str, object]]:
+                return [
+                    {
+                        "opponent_model": f"/models/{version}.onnx",
+                        "games": 4,
+                        "completed": 4,
+                        "candidate_wins": 3,
+                        "candidate_losses": 1,
+                        "draws": 0,
+                    }
+                    for version in (0, 1)
+                ]
+
+        class Runner:
+            def __init__(self) -> None:
+                self.commands: list[list[str]] = []
+
+            async def run(self, command, **_kwargs):
+                self.commands.append(list(command))
+                return Result()
+
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(
+                PipelineConfig(
+                    output=directory,
+                    updates=1,
+                    telemetry_pairs=2,
+                )
+            )
+            group_seed = 1_000
+            pipeline.state.telemetry_pending = [
+                {
+                    "schema": "vgo.telemetry-job.v1",
+                    "id": f"v000002-vs-v{opponent:06d}",
+                    "candidate_version": 2,
+                    "candidate": "/models/2.onnx",
+                    "opponent_version": opponent,
+                    "opponent": f"/models/{opponent}.onnx",
+                    "pairs": 2,
+                    "group_seed": group_seed,
+                    "group_index": index,
+                    "seed": group_seed + index * 1_000_003,
+                }
+                for index, opponent in enumerate((0, 1))
+            ]
+            pipeline._save_state()
+            runner = Runner()
+            pipeline.runner = runner  # type: ignore[assignment]
+
+            asyncio.run(pipeline.drain_telemetry())
+
+            self.assertEqual(len(runner.commands), 1)
+            self.assertEqual(runner.commands[0].count("--opponent"), 2)
+            self.assertEqual(pipeline.state.telemetry_pending, [])
+            self.assertEqual(len(pipeline.state.telemetry_completed), 2)
+
+    def test_promotion_rejects_excessive_truncation(self) -> None:
+        arena = {"games": 100, "completed": 50, "candidate_score": 1.0}
+        self.assertFalse(Pipeline._promotion_decision(arena, 0.52, 0.02))
+        arena["completed"] = 99
+        self.assertTrue(Pipeline._promotion_decision(arena, 0.52, 0.02))
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class EloPoolTests(unittest.TestCase):
-    """The Elo pool replaces the vs-incumbent arena once gating is off.
-
-    A promotion arena only ever answers "did N beat N-1", which is the least
-    informative comparison available: consecutive generations are nearly
-    identical, so a 60-pair result is mostly sampling noise. Bradley-Terry over
-    an accumulating match history pools every game ever played into every
-    rating, for a fraction of the games per iteration.
-    """
-
-    def test_ratings_recover_a_known_ladder(self) -> None:
-        import random
-
-        from vgo_training.bradley_terry import fit_ratings
-
-        rng = random.Random(7)
-        truth = {generation: generation * 15.0 for generation in range(30)}
-        matches = []
-        for generation in range(1, 30):
-            for opponent in rng.sample(range(generation), min(4, generation)):
-                wins = losses = 0
-                for _ in range(8):
-                    probability = 1.0 / (
-                        1.0 + 10.0 ** ((truth[opponent] - truth[generation]) / 400.0)
-                    )
-                    if rng.random() < probability:
-                        wins += 1
-                    else:
-                        losses += 1
-                matches.append(
-                    {"a": generation, "b": opponent, "a_wins": wins, "b_wins": losses}
-                )
-        ratings = fit_ratings(matches, anchor=0, prior_games=0.25)
-        self.assertAlmostEqual(ratings[0], 0.0)
-        # Monotone ladder: the last generation must rate well above the first.
-        self.assertGreater(ratings[29], 300.0)
-        errors = [abs(ratings[g] - truth[g]) for g in range(30)]
-        self.assertLess(sum(errors) / len(errors), 120.0)
-
-    def test_heavy_prior_shrinks_ratings_toward_the_anchor(self) -> None:
-        from vgo_training.bradley_terry import fit_ratings
-
-        matches = [{"a": 1, "b": 0, "a_wins": 16, "b_wins": 4}]
-        light = fit_ratings(matches, anchor=0, prior_games=0.25)
-        heavy = fit_ratings(matches, anchor=0, prior_games=2.0)
-        self.assertGreater(light[1], heavy[1])
-
-    def test_promotion_gate_and_arena_must_agree(self) -> None:
-        # Default: no arena, no gate, every candidate accepted.
-        default = parse_arguments(["--output", "out"])
-        self.assertFalse(default.promotion_arena)
-        self.assertEqual(default.promotion_score, 0.0)
-        validate_arguments(default)
-
-        # A score without the arena that measures it is a silent no-op.
-        orphan = parse_arguments(["--output", "out", "--promotion-score", "0.52"])
-        with self.assertRaisesRegex(ValueError, "no effect without"):
-            validate_arguments(orphan)
-
-        # An arena with a zero gate would run 120 games and accept regardless.
-        toothless = parse_arguments(["--output", "out", "--promotion-arena"])
-        with self.assertRaisesRegex(ValueError, "nonzero"):
-            validate_arguments(toothless)
-
-        gated = parse_arguments(
-            ["--output", "out", "--promotion-arena", "--promotion-score", "0.52"]
-        )
-        validate_arguments(gated)
-
-
-class BatchedArenaTests(unittest.TestCase):
-    def test_arena_command_repeats_the_opponent_flag(self) -> None:
-        arguments = parse_arguments(["--output", "out"])
-        single = arena_command(
-            arguments, Path("/root"), Path("cand.onnx"), Path("a.onnx"), 1
-        )
-        self.assertEqual(single.count("--opponent"), 1)
-        several = arena_command(
-            arguments,
-            Path("/root"),
-            Path("cand.onnx"),
-            [Path("a.onnx"), Path("b.onnx"), Path("c.onnx")],
-            1,
-        )
-        self.assertEqual(several.count("--opponent"), 3)
-        self.assertIn("b.onnx", several)
-
-    def test_every_record_is_read_from_a_batched_log(self) -> None:
-        from vgo_training.rl_loop import json_documents_from_log
-
-        body = "\n".join(
-            json.dumps({"candidate_score": score, "opponent_model": name})
-            for score, name in ((0.5, "a"), (0.75, "b"), (0.25, "c"))
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "pool.log"
-            path.write_text(f"COMMAND x\nSTDOUT\n{body}\nSTDERR\n", encoding="utf-8")
-            documents = json_documents_from_log(path)
-        self.assertEqual([d["opponent_model"] for d in documents], ["a", "b", "c"])
-        # The single-document reader keeps only the last, which is why the
-        # batched path needs its own reader.
-        self.assertEqual(len(documents), 3)
-
-
-class LeafBatchTests(unittest.TestCase):
-    def test_leaf_batch_reaches_generation_and_arenas(self) -> None:
-        """Both seats of a comparison must search the same way.
-
-        Above 1, leaf parallelization changes which nodes get explored, so a
-        generation run and the arenas judging it have to agree. The flag existed
-        in both Rust binaries but rl_loop forwarded it to neither, pinning every
-        run to the sequential path.
-        """
-        arguments = parse_arguments(["--output", "run", "--leaf-batch", "8"])
-        root = Path("/repo")
-        generation = generation_command(
-            arguments, root, Path("/replay"), 1, Path("/model.onnx")
-        )
-        self.assertEqual(generation[generation.index("--leaf-batch") + 1], "8")
-        arena = arena_command(
-            arguments, root, Path("/candidate.onnx"), Path("/opponent.onnx"), 2
-        )
-        self.assertEqual(arena[arena.index("--leaf-batch") + 1], "8")
-
-    def test_leaf_batch_defaults_to_the_sequential_path(self) -> None:
-        self.assertEqual(parse_arguments(["--output", "run"]).leaf_batch, 1)

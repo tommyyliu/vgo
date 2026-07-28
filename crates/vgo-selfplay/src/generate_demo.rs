@@ -6,32 +6,31 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::{ArgAction, Parser};
 use sha2::{Digest, Sha256};
 use vgo_core::{Color, Position};
 use vgo_inference::{
-    BatchedEvaluator, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
+    BatchedEvaluator, BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, OnnxBatchService,
+    OnnxProvider, OnnxServiceConfig,
 };
 use vgo_raster::{CHANNEL_COUNT, CHANNELS, RasterConfig, SemanticRaster, action_pixel, rasterize};
 use vgo_search::{
-    Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, SearchResult,
-    search_at_ply,
+    Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, SearchResult, search_at_ply,
 };
 use vgo_selfplay::play_game as run_playout;
 
-const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
-// v2 added raw per-cell visit counts and coarse->fine sampling probability
-// (beta). v3 additionally records the empirical proposal multiplicity per cell,
-// so training can correct using both beta and beta-hat without regenerating
-// replay.
-const REPLAY_VERSION: u32 = 3;
+mod replay_stream;
+
+use replay_stream::{
+    LabeledSample, PublishedReplay, REPLAY_VERSION, ReplayStream, sync_parent_directory,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GenerationRuntime {
@@ -68,20 +67,6 @@ struct PendingSample {
     beta: Vec<f32>,
     proposal_counts: Vec<u32>,
     to_move: Color,
-    selected_action: u32,
-    game: u64,
-    ply: u32,
-    seed: u64,
-}
-
-struct LabeledSample {
-    raster: SemanticRaster,
-    policy: Vec<f32>,
-    policy_mask: Vec<f32>,
-    visits: Vec<f32>,
-    beta: Vec<f32>,
-    proposal_counts: Vec<u32>,
-    value: f32,
     selected_action: u32,
     game: u64,
     ply: u32,
@@ -141,14 +126,25 @@ struct Config {
     model: Option<PathBuf>,
     #[arg(long, default_value = "tensorrt")]
     provider: OnnxProvider,
+    #[arg(long, default_value_t = 0)]
+    device_id: i32,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     fp16: bool,
     #[arg(long, default_value_t = 8)]
     maximum_batch: usize,
+    /// Independent inference brokers and native execution sessions. Multiple
+    /// lanes let host packing, device transfers, and execution overlap without
+    /// adding another per-position tensor copy.
+    #[arg(long, default_value_t = 2)]
+    inference_slots: usize,
     #[arg(long, default_value_t = 1)]
     delay_ms: u64,
     #[arg(long, default_value_t = 8)]
     actors: usize,
+    /// Maximum completed-game payloads waiting for the replay writer. Actors
+    /// backpressure here instead of allowing a multi-gigabyte in-memory shard.
+    #[arg(long, default_value_t = 2)]
+    writer_queue_games: usize,
     #[arg(long)]
     maximum_games: Option<u64>,
     #[arg(long, default_value = "artifacts/onnx-cache")]
@@ -235,12 +231,25 @@ fn validate_config(config: &Config) -> Result<(), &'static str> {
         || config.maximum_plies == 0
         || config.maximum_batch == 0
         || config.actors == 0
+        || config.writer_queue_games == 0
         || config.maximum_games.is_some_and(|games| games == 0)
     {
         return Err("generation counts, simulations, and dimensions must be positive");
     }
+    if u32::try_from(config.samples).is_err() {
+        return Err("--samples exceeds the replay-v3 header capacity");
+    }
     if config.policy_resolution == 0 {
         return Err("--policy-resolution must be positive");
+    }
+    if config.inference_slots == 0 {
+        return Err("--inference-slots must be positive");
+    }
+    if config.device_id < 0 {
+        return Err("--device-id must be nonnegative");
+    }
+    if config.policy_resolution > config.resolution {
+        return Err("--policy-resolution must not exceed --resolution");
     }
     // The pool counts fine cells per coarse region on the policy grid, which is
     // what the sampler actually walks -- not the render raster.
@@ -260,6 +269,7 @@ fn generate_game(
     config: &Config,
     evaluator: &dyn Evaluator,
     game_index: u64,
+    stopped: &AtomicBool,
 ) -> Result<GameSamples, EvaluationError> {
     let raster_config = RasterConfig::square(config.resolution);
     // Policy targets, the recorded action index, and the replay policy vector all
@@ -277,7 +287,12 @@ fn generate_game(
     let playout = run_playout(
         Position::new(config.radius, Vec::new(), Color::Black),
         config.maximum_plies,
-        |position, ply| search_at_ply(position, search_config, game_seed, evaluator, ply),
+        |position, ply| {
+            if stopped.load(Ordering::Acquire) {
+                return Err(EvaluationError::new("replay generation cancelled"));
+            }
+            search_at_ply(position, search_config, game_seed, evaluator, ply)
+        },
         |step| {
             let target = policy_target(step.search, policy_config);
             pending.push(PendingSample {
@@ -328,148 +343,290 @@ fn generate_game(
     })
 }
 
-fn generate(
+#[derive(Default)]
+struct AtomicGenerationMetrics {
+    games_started: AtomicU64,
+    games_finished: AtomicU64,
+    completed_games: AtomicU64,
+    discarded_games: AtomicU64,
+    failed_games: AtomicU64,
+    samples_generated: AtomicU64,
+    active_games: AtomicUsize,
+    peak_active_games: AtomicUsize,
+    writer_backlog: AtomicUsize,
+    peak_writer_backlog: AtomicUsize,
+    summed_game_nanoseconds: AtomicU64,
+}
+
+struct GameEnvelope {
+    result: Result<GameSamples, EvaluationError>,
+    ready_at: Instant,
+}
+
+/// Owns every replay actor together with the receiving side of their bounded
+/// result queue.
+///
+/// Native inference runtimes must never outlive `main` on detached threads:
+/// TensorRT installs process-exit handlers which are unsafe to run concurrently
+/// with an in-flight `Session::Run`. Closing the receiver before joining also
+/// wakes an actor which is already blocked while sending into a full queue.
+struct ActorPool {
+    stopped: Arc<AtomicBool>,
+    receiver: Option<mpsc::Receiver<GameEnvelope>>,
+    handles: Vec<thread::JoinHandle<()>>,
+}
+
+impl ActorPool {
+    fn new(stopped: Arc<AtomicBool>, receiver: mpsc::Receiver<GameEnvelope>) -> Self {
+        Self {
+            stopped,
+            receiver: Some(receiver),
+            handles: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, handle: thread::JoinHandle<()>) {
+        self.handles.push(handle);
+    }
+
+    fn recv(&self) -> Result<GameEnvelope, mpsc::RecvError> {
+        self.receiver
+            .as_ref()
+            .expect("actor receiver exists until shutdown")
+            .recv()
+    }
+
+    fn shutdown(&mut self) -> std::io::Result<()> {
+        self.stopped.store(true, Ordering::Release);
+        // This must precede the joins: a producer may already be blocked in
+        // SyncSender::send after the collector reached its exact sample count.
+        self.receiver.take();
+
+        let mut actor_panicked = false;
+        for handle in std::mem::take(&mut self.handles) {
+            actor_panicked |= handle.join().is_err();
+        }
+        if actor_panicked {
+            Err(std::io::Error::other(
+                "one or more replay actors panicked during shutdown",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for ActorPool {
+    fn drop(&mut self) {
+        // Every return path, including replay I/O and evaluator failures, must
+        // quiesce actors before the shared native inference session is dropped.
+        let _ = self.shutdown();
+    }
+}
+
+struct GenerationReport {
+    replay: PublishedReplay,
+    completed_games: usize,
+    discarded_games: usize,
+    samples_generated_by_received_games: usize,
+    serialization_truncated_samples: usize,
+    games_started: u64,
+    games_finished: u64,
+    generated_completed_games: u64,
+    generated_discarded_games: u64,
+    failed_games: u64,
+    generated_samples: u64,
+    peak_active_games: usize,
+    peak_writer_backlog: usize,
+    tail_games_in_flight: usize,
+    tail_writer_backlog: usize,
+    tail_completed_samples: u64,
+    writer_backpressure: Duration,
+    summed_game_time: Duration,
+    wall_time: Duration,
+}
+
+fn atomic_duration(nanoseconds: &AtomicU64) -> Duration {
+    Duration::from_nanos(nanoseconds.load(Ordering::Relaxed))
+}
+
+fn duration_nanoseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn generate_to_dataset(
     config: &Config,
     evaluator: Arc<dyn Evaluator>,
-) -> Result<(Vec<LabeledSample>, usize, usize), EvaluationError> {
+    dataset_path: &Path,
+) -> std::io::Result<GenerationReport> {
+    let started = Instant::now();
     let maximum_games = config
         .maximum_games
         .unwrap_or_else(|| (config.samples as u64).saturating_mul(8));
+    let raster = RasterConfig::square(config.resolution);
+    let policy_size = config.policy_resolution * config.policy_resolution + 1;
+    let mut replay = ReplayStream::create(
+        dataset_path,
+        config.samples,
+        raster,
+        policy_size,
+        config.examples,
+    )?;
     let next_game = Arc::new(AtomicU64::new(0));
     let stopped = Arc::new(AtomicBool::new(false));
-    let (sender, receiver) = mpsc::channel();
-    let mut handles = Vec::with_capacity(config.actors);
-    for _ in 0..config.actors {
+    let metrics = Arc::new(AtomicGenerationMetrics::default());
+    let (sender, receiver) = mpsc::sync_channel(config.writer_queue_games);
+    let mut actors = ActorPool::new(Arc::clone(&stopped), receiver);
+    actors.handles.reserve(config.actors);
+    for actor in 0..config.actors {
         let config = config.clone();
         let evaluator = Arc::clone(&evaluator);
         let next_game = Arc::clone(&next_game);
         let stopped = Arc::clone(&stopped);
+        let metrics = Arc::clone(&metrics);
         let sender = sender.clone();
-        handles.push(thread::spawn(move || {
-            while !stopped.load(Ordering::Relaxed) {
-                let index = next_game.fetch_add(1, Ordering::Relaxed);
-                if index >= maximum_games {
-                    break;
-                }
-                if sender
-                    .send(generate_game(&config, evaluator.as_ref(), index))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }));
+        actors.push(
+            thread::Builder::new()
+                .name(format!("vgo-replay-actor-{actor:03}"))
+                .spawn(move || {
+                    while !stopped.load(Ordering::Acquire) {
+                        let index = next_game.fetch_add(1, Ordering::Relaxed);
+                        if index >= maximum_games {
+                            break;
+                        }
+                        metrics.games_started.fetch_add(1, Ordering::Relaxed);
+                        let active = metrics.active_games.fetch_add(1, Ordering::Relaxed) + 1;
+                        metrics
+                            .peak_active_games
+                            .fetch_max(active, Ordering::Relaxed);
+                        let game_started = Instant::now();
+                        let result = generate_game(&config, evaluator.as_ref(), index, &stopped);
+                        metrics.summed_game_nanoseconds.fetch_add(
+                            duration_nanoseconds(game_started.elapsed()),
+                            Ordering::Relaxed,
+                        );
+                        metrics.active_games.fetch_sub(1, Ordering::Relaxed);
+                        metrics.games_finished.fetch_add(1, Ordering::Relaxed);
+                        match &result {
+                            Ok(game) if game.completed => {
+                                metrics.completed_games.fetch_add(1, Ordering::Relaxed);
+                                metrics
+                                    .samples_generated
+                                    .fetch_add(game.samples.len() as u64, Ordering::Relaxed);
+                            }
+                            Ok(_) => {
+                                metrics.discarded_games.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                metrics.failed_games.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        // The collector has already reached the exact record
+                        // boundary. Do not enqueue a just-finished tail game.
+                        if stopped.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let backlog = metrics.writer_backlog.fetch_add(1, Ordering::Relaxed) + 1;
+                        metrics
+                            .peak_writer_backlog
+                            .fetch_max(backlog, Ordering::Relaxed);
+                        let sent = sender.send(GameEnvelope {
+                            result,
+                            ready_at: Instant::now(),
+                        });
+                        if sent.is_err() {
+                            metrics.writer_backlog.fetch_sub(1, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                })?,
+        );
     }
     drop(sender);
 
-    // Games count toward the sample target as they arrive.
-    //
-    // This used to drain in game-index order, which stalled the collector on the
-    // slowest game in each contiguous prefix: with 64 actors and games varying
-    // from a few plies to the 256-ply limit, a finished game contributed nothing
-    // until every lower-indexed game completed. Actors stayed busy but the loop
-    // exits on sample count, so the wait was wall-clock time -- 7.9s per game
-    // against 2.4s for the arena, which has no such constraint.
-    //
-    // That ordering did not buy determinism and was not worth its cost. Which
-    // games reach the shard depends on which have finished when the target is
-    // met, and that is a function of scheduling either way; ordering the winners
-    // afterwards does not change the set. Replay is training data that gets
-    // shuffled and dihedrally augmented before use, and generation is already
-    // nondeterministic through temperature sampling and FP16 batch composition,
-    // so byte-identical shards were never a property this pipeline had.
-    let mut samples = Vec::with_capacity(config.samples);
-    let mut completed_games = 0;
-    let mut discarded_games = 0;
-    while samples.len() < config.samples {
-        let game = receiver.recv().map_err(|_| {
-            EvaluationError::new(format!(
-                "replay exhausted {maximum_games} game attempts after {completed_games} completed and {discarded_games} discarded games"
-            ))
-        })??;
+    let mut completed_games = 0_usize;
+    let mut discarded_games = 0_usize;
+    let mut samples_generated_by_received_games = 0_usize;
+    let mut serialization_truncated_samples = 0_usize;
+    let mut writer_backpressure = Duration::ZERO;
+    while !replay.is_full() {
+        let envelope = match actors.recv() {
+            Ok(envelope) => {
+                metrics.writer_backlog.fetch_sub(1, Ordering::Relaxed);
+                envelope
+            }
+            Err(_) => {
+                actors.shutdown()?;
+                return Err(std::io::Error::other(format!(
+                    "replay exhausted {maximum_games} game attempts after {completed_games} completed and {discarded_games} discarded games"
+                )));
+            }
+        };
+        writer_backpressure += envelope.ready_at.elapsed();
+        let game = envelope.result.map_err(|error| {
+            stopped.store(true, Ordering::Release);
+            std::io::Error::other(error)
+        })?;
         if game.completed {
             completed_games += 1;
-            samples.extend(game.samples);
+            samples_generated_by_received_games =
+                samples_generated_by_received_games.saturating_add(game.samples.len());
+            let written = replay.write_game(game.samples)?;
+            serialization_truncated_samples =
+                serialization_truncated_samples.saturating_add(written.samples_truncated);
         } else {
             discarded_games += 1;
         }
     }
-    samples.truncate(config.samples);
-    stopped.store(true, Ordering::Relaxed);
-    drop(receiver);
-    for handle in handles {
-        handle.join().expect("replay worker");
-    }
-    Ok((samples, completed_games, discarded_games))
-}
 
-fn write_f32(writer: &mut impl Write, value: f32) -> std::io::Result<()> {
-    writer.write_all(&value.to_le_bytes())
-}
-
-fn write_dataset(path: &Path, samples: &[LabeledSample]) -> std::io::Result<()> {
-    let temporary = path.with_extension("vgo.tmp");
-    if path.exists() || temporary.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("replay output already exists: {}", path.display()),
-        ));
-    }
-    let config = samples[0].raster.config();
-    // The policy vector lives on the placement grid, which may be coarser than
-    // the raster, so its own length is the authority for the header -- not
-    // `config.pixels() + 1`.
-    let policy_size = samples[0].policy.len();
-    let mut writer = BufWriter::new(File::create(&temporary)?);
-    writer.write_all(&REPLAY_MAGIC)?;
-    for value in [
-        REPLAY_VERSION,
-        samples.len() as u32,
-        CHANNEL_COUNT as u32,
-        config.height as u32,
-        config.width as u32,
-        policy_size as u32,
-    ] {
-        writer.write_all(&value.to_le_bytes())?;
-    }
-    for sample in samples {
-        for &value in sample.raster.data() {
-            write_f32(&mut writer, value)?;
-        }
-        for &value in &sample.policy {
-            write_f32(&mut writer, value)?;
-        }
-        for &value in &sample.policy_mask {
-            write_f32(&mut writer, value)?;
-        }
-        for &value in &sample.visits {
-            write_f32(&mut writer, value)?;
-        }
-        for &value in &sample.beta {
-            write_f32(&mut writer, value)?;
-        }
-        for &value in &sample.proposal_counts {
-            writer.write_all(&value.to_le_bytes())?;
-        }
-        write_f32(&mut writer, sample.value)?;
-        writer.write_all(&sample.selected_action.to_le_bytes())?;
-        writer.write_all(&sample.game.to_le_bytes())?;
-        writer.write_all(&sample.ply.to_le_bytes())?;
-        writer.write_all(&sample.seed.to_le_bytes())?;
-    }
-    writer.flush()?;
-    writer.into_inner()?.sync_all()?;
-    fs::rename(temporary, path)
+    // Preserve boundary telemetry before cancellation. Actors check the flag
+    // before each ply, so shutdown waits for at most their current search—not a
+    // maximum-length game.
+    let tail_games_in_flight = metrics.active_games.load(Ordering::Relaxed);
+    let tail_writer_backlog = metrics.writer_backlog.load(Ordering::Relaxed);
+    let generated_samples_at_boundary = metrics.samples_generated.load(Ordering::Relaxed);
+    let tail_completed_samples =
+        generated_samples_at_boundary.saturating_sub(samples_generated_by_received_games as u64);
+    let games_started = metrics.games_started.load(Ordering::Relaxed);
+    let games_finished = metrics.games_finished.load(Ordering::Relaxed);
+    let generated_completed_games = metrics.completed_games.load(Ordering::Relaxed);
+    let generated_discarded_games = metrics.discarded_games.load(Ordering::Relaxed);
+    let failed_games = metrics.failed_games.load(Ordering::Relaxed);
+    let peak_active_games = metrics.peak_active_games.load(Ordering::Relaxed);
+    let peak_writer_backlog = metrics.peak_writer_backlog.load(Ordering::Relaxed);
+    let summed_game_time = atomic_duration(&metrics.summed_game_nanoseconds);
+    actors.shutdown()?;
+    let published = replay.publish()?;
+    Ok(GenerationReport {
+        replay: published,
+        completed_games,
+        discarded_games,
+        samples_generated_by_received_games,
+        serialization_truncated_samples,
+        games_started,
+        games_finished,
+        generated_completed_games,
+        generated_discarded_games,
+        failed_games,
+        generated_samples: generated_samples_at_boundary,
+        peak_active_games,
+        peak_writer_backlog,
+        tail_games_in_flight,
+        tail_writer_backlog,
+        tail_completed_samples,
+        writer_backpressure,
+        summed_game_time,
+        wall_time: started.elapsed(),
+    })
 }
 
 fn write_manifest(
     path: &Path,
     config: &Config,
-    samples: &[LabeledSample],
-    completed_games: usize,
-    discarded_games: usize,
-    dataset_sha256: &str,
+    report: &GenerationReport,
     model_sha256: Option<&str>,
+    broker: BrokerMetrics,
+    inference_lanes: &[BrokerMetrics],
 ) -> std::io::Result<()> {
     let temporary = path.with_extension("json.tmp");
     if path.exists() || temporary.exists() {
@@ -483,10 +640,28 @@ fn write_manifest(
     writeln!(writer, "  \"schema\": \"vgo.replay-shard.v1\",")?;
     writeln!(writer, "  \"replay_version\": {REPLAY_VERSION},")?;
     writeln!(writer, "  \"dataset\": \"dataset.vgo\",")?;
-    writeln!(writer, "  \"dataset_sha256\": \"{dataset_sha256}\",")?;
-    writeln!(writer, "  \"samples\": {},", samples.len())?;
-    writeln!(writer, "  \"completed_games\": {completed_games},")?;
-    writeln!(writer, "  \"discarded_games\": {discarded_games},")?;
+    writeln!(
+        writer,
+        "  \"dataset_sha256\": \"{}\",",
+        report.replay.sha256
+    )?;
+    writeln!(
+        writer,
+        "  \"shard_id\": \"sha256:{}\",",
+        report.replay.sha256
+    )?;
+    writeln!(writer, "  \"dataset_bytes\": {},", report.replay.bytes)?;
+    writeln!(writer, "  \"samples\": {},", report.replay.samples)?;
+    writeln!(writer, "  \"completed_games\": {},", report.completed_games)?;
+    writeln!(writer, "  \"discarded_games\": {},", report.discarded_games)?;
+    match report.replay.first_game_id {
+        Some(game) => writeln!(writer, "  \"first_serialized_game_id\": {game},")?,
+        None => writeln!(writer, "  \"first_serialized_game_id\": null,")?,
+    }
+    match report.replay.last_game_id {
+        Some(game) => writeln!(writer, "  \"last_serialized_game_id\": {game},")?,
+        None => writeln!(writer, "  \"last_serialized_game_id\": null,")?,
+    }
     writeln!(writer, "  \"channels\": {},", CHANNEL_COUNT)?;
     writeln!(writer, "  \"height\": {},", config.resolution)?;
     writeln!(writer, "  \"width\": {},", config.resolution)?;
@@ -507,11 +682,167 @@ fn write_manifest(
     writeln!(writer, "  \"seed\": {},", config.seed)?;
     writeln!(writer, "  \"maximum_plies\": {},", config.maximum_plies)?;
     writeln!(writer, "  \"actors\": {},", config.actors)?;
+    writeln!(writer, "  \"leaf_batch\": {},", config.leaf_batch)?;
+    writeln!(
+        writer,
+        "  \"writer_queue_games\": {},",
+        config.writer_queue_games
+    )?;
     writeln!(writer, "  \"evaluator\": \"{}\",", config.runtime.as_str())?;
+    writeln!(writer, "  \"provider\": \"{}\",", config.provider.as_str())?;
+    writeln!(writer, "  \"device_id\": {},", config.device_id)?;
+    writeln!(writer, "  \"fp16\": {},", config.fp16)?;
+    writeln!(writer, "  \"maximum_batch\": {},", config.maximum_batch)?;
+    writeln!(
+        writer,
+        "  \"configured_inference_slots\": {},",
+        config.inference_slots
+    )?;
+    writeln!(
+        writer,
+        "  \"active_inference_slots\": {},",
+        inference_lanes.len()
+    )?;
+    writeln!(writer, "  \"delay_ms\": {},", config.delay_ms)?;
     match model_sha256 {
         Some(digest) => writeln!(writer, "  \"model_sha256\": \"{digest}\",")?,
         None => writeln!(writer, "  \"model_sha256\": null,")?,
     }
+    match model_sha256 {
+        Some(digest) => writeln!(writer, "  \"behavior_model_sha256\": \"{digest}\",")?,
+        None => writeln!(writer, "  \"behavior_model_sha256\": null,")?,
+    }
+    writeln!(
+        writer,
+        "  \"game_identity\": \"record game id plus record seed; behavior model is pinned for the shard\","
+    )?;
+    writeln!(writer, "  \"generation_metrics\": {{")?;
+    writeln!(
+        writer,
+        "    \"samples_generated_by_received_games\": {},",
+        report.samples_generated_by_received_games
+    )?;
+    writeln!(
+        writer,
+        "    \"serialization_truncated_samples\": {},",
+        report.serialization_truncated_samples
+    )?;
+    writeln!(writer, "    \"games_started\": {},", report.games_started)?;
+    writeln!(writer, "    \"games_finished\": {},", report.games_finished)?;
+    writeln!(
+        writer,
+        "    \"generated_completed_games\": {},",
+        report.generated_completed_games
+    )?;
+    writeln!(
+        writer,
+        "    \"generated_discarded_games\": {},",
+        report.generated_discarded_games
+    )?;
+    writeln!(writer, "    \"failed_games\": {},", report.failed_games)?;
+    writeln!(
+        writer,
+        "    \"generated_samples_at_boundary\": {},",
+        report.generated_samples
+    )?;
+    writeln!(
+        writer,
+        "    \"peak_active_games\": {},",
+        report.peak_active_games
+    )?;
+    writeln!(
+        writer,
+        "    \"peak_writer_backlog\": {},",
+        report.peak_writer_backlog
+    )?;
+    writeln!(
+        writer,
+        "    \"tail_games_in_flight\": {},",
+        report.tail_games_in_flight
+    )?;
+    writeln!(
+        writer,
+        "    \"tail_writer_backlog\": {},",
+        report.tail_writer_backlog
+    )?;
+    writeln!(
+        writer,
+        "    \"tail_completed_samples\": {},",
+        report.tail_completed_samples
+    )?;
+    writeln!(
+        writer,
+        "    \"wall_seconds\": {:.6},",
+        report.wall_time.as_secs_f64()
+    )?;
+    writeln!(
+        writer,
+        "    \"summed_game_seconds\": {:.6},",
+        report.summed_game_time.as_secs_f64()
+    )?;
+    writeln!(
+        writer,
+        "    \"writer_seconds\": {:.6},",
+        report.replay.write_time.as_secs_f64()
+    )?;
+    writeln!(
+        writer,
+        "    \"writer_backpressure_seconds\": {:.6},",
+        report.writer_backpressure.as_secs_f64()
+    )?;
+    writeln!(
+        writer,
+        "    \"publish_sync_seconds\": {:.6}",
+        report.replay.sync_time.as_secs_f64()
+    )?;
+    writeln!(writer, "  }},")?;
+    writeln!(writer, "  \"broker_metrics\": {{")?;
+    writeln!(writer, "    \"requests\": {},", broker.requests)?;
+    writeln!(writer, "    \"batches\": {},", broker.batches)?;
+    writeln!(writer, "    \"positions\": {},", broker.positions)?;
+    writeln!(
+        writer,
+        "    \"maximum_observed_batch\": {},",
+        broker.maximum_batch
+    )?;
+    writeln!(writer, "    \"failures\": {},", broker.failures)?;
+    writeln!(
+        writer,
+        "    \"encoding_seconds\": {:.6},",
+        broker.encoding_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        writer,
+        "    \"queue_seconds\": {:.6},",
+        broker.queue_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        writer,
+        "    \"inference_seconds\": {:.6}",
+        broker.inference_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(writer, "  }},")?;
+    writeln!(writer, "  \"inference_lane_metrics\": [")?;
+    for (slot, lane) in inference_lanes.iter().enumerate() {
+        let comma = if slot + 1 == inference_lanes.len() {
+            ""
+        } else {
+            ","
+        };
+        writeln!(
+            writer,
+            "    {{\"slot\": {slot}, \"requests\": {}, \"batches\": {}, \"positions\": {}, \"maximum_observed_batch\": {}, \"failures\": {}, \"encoding_seconds\": {:.6}, \"queue_seconds\": {:.6}, \"inference_seconds\": {:.6}}}{comma}",
+            lane.requests,
+            lane.batches,
+            lane.positions,
+            lane.maximum_batch,
+            lane.failures,
+            lane.encoding_nanoseconds as f64 / 1e9,
+            lane.queue_nanoseconds as f64 / 1e9,
+            lane.inference_nanoseconds as f64 / 1e9,
+        )?;
+    }
+    writeln!(writer, "  ],")?;
     writeln!(
         writer,
         "  \"orientation\": \"row 0 samples y near 0; column 0 samples x near 0\","
@@ -550,7 +881,8 @@ fn write_manifest(
     writeln!(writer, "}}")?;
     writer.flush()?;
     writer.into_inner()?.sync_all()?;
-    fs::rename(temporary, path)
+    fs::rename(temporary, path)?;
+    sync_parent_directory(path)
 }
 
 fn file_sha256(path: &Path) -> std::io::Result<String> {
@@ -613,17 +945,17 @@ fn write_bmp(
 
 fn write_examples(
     directory: &Path,
-    samples: &[LabeledSample],
+    rasters: &[SemanticRaster],
     count: usize,
 ) -> std::io::Result<()> {
     fs::create_dir_all(directory)?;
-    for (sample_index, sample) in samples.iter().take(count).enumerate() {
-        let config = sample.raster.config();
+    for (sample_index, raster) in rasters.iter().take(count).enumerate() {
+        let config = raster.config();
         write_bmp(
             &directory.join(format!("sample-{sample_index:03}-overview.bmp")),
             config.width,
             config.height,
-            &sample.raster.overview_rgb(),
+            &raster.overview_rgb(),
             6,
         )?;
         for (channel_index, channel) in CHANNELS.iter().enumerate() {
@@ -634,7 +966,7 @@ fn write_examples(
                 )),
                 config.width,
                 config.height,
-                &sample.raster.channel_rgb(channel_index),
+                &raster.channel_rgb(channel_index),
                 6,
             )?;
         }
@@ -668,106 +1000,345 @@ fn main() -> std::io::Result<()> {
 
     let raster = RasterConfig::square(config.resolution);
     let model_path = config.model.as_deref();
-    let evaluator: Arc<dyn Evaluator> = match config.runtime {
-        GenerationRuntime::Naive => Arc::new(NaiveEvaluator),
-        GenerationRuntime::Onnx => {
-            let model = model_path.ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "--model is required for ONNX generation",
-                )
-            })?;
-            let service = OnnxBatchService::load(&OnnxServiceConfig {
-                policy: Some(RasterConfig::square(config.policy_resolution)),
-                model: model.to_path_buf(),
-                raster,
-                maximum_batch: config.maximum_batch,
-                provider: config.provider,
-                device_id: 0,
-                fp16: config.fp16,
-                cache_directory: config.cache_directory.clone(),
-            })
-            .map_err(std::io::Error::other)?;
-            Arc::new(
-                BatchedEvaluator::spawn(
-                    BrokerConfig {
-                        maximum_delay: Duration::from_millis(config.delay_ms),
-                        queue_capacity: (config.actors * 4).max(config.maximum_batch * 2),
-                    },
-                    service,
-                )
-                .map_err(std::io::Error::other)?,
-            )
-        }
-    };
+    let (evaluator, broker): (Arc<dyn Evaluator>, Option<BatchedEvaluatorPool>) =
+        match config.runtime {
+            GenerationRuntime::Naive => (Arc::new(NaiveEvaluator), None),
+            GenerationRuntime::Onnx => {
+                let model = model_path.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--model is required for ONNX generation",
+                    )
+                })?;
+                let mut lanes = Vec::with_capacity(config.inference_slots);
+                // Load native sessions sequentially. TensorRT can reuse the
+                // engine cache without racing two simultaneous cache builders.
+                for _slot in 0..config.inference_slots {
+                    let service = OnnxBatchService::load(&OnnxServiceConfig {
+                        policy: Some(RasterConfig::square(config.policy_resolution)),
+                        model: model.to_path_buf(),
+                        raster,
+                        maximum_batch: config.maximum_batch,
+                        provider: config.provider,
+                        device_id: config.device_id,
+                        fp16: config.fp16,
+                        cache_directory: config.cache_directory.clone(),
+                    })
+                    .map_err(std::io::Error::other)?;
+                    lanes.push(
+                        BatchedEvaluator::spawn(
+                            BrokerConfig {
+                                maximum_delay: Duration::from_millis(config.delay_ms),
+                                queue_capacity: (config.actors * 4).max(config.maximum_batch * 2),
+                            },
+                            service,
+                        )
+                        .map_err(std::io::Error::other)?,
+                    );
+                }
+                let pool = BatchedEvaluatorPool::new(lanes).map_err(std::io::Error::other)?;
+                (Arc::new(pool.clone()), Some(pool))
+            }
+        };
     let model_sha256 = if config.runtime == GenerationRuntime::Onnx {
         model_path.map(file_sha256).transpose()?
     } else {
         None
     };
-    let (samples, completed_games, discarded_games) =
-        generate(&config, evaluator).map_err(std::io::Error::other)?;
     let dataset_path = config.output.join("dataset.vgo");
-    write_dataset(&dataset_path, &samples)?;
-    let dataset_sha256 = file_sha256(&dataset_path)?;
-    write_examples(&config.output.join("images"), &samples, config.examples)?;
+    let report = generate_to_dataset(&config, evaluator, &dataset_path)?;
+    let broker_metrics = broker
+        .as_ref()
+        .map(BatchedEvaluatorPool::metrics)
+        .unwrap_or_default();
+    let inference_lane_metrics = broker
+        .as_ref()
+        .map(BatchedEvaluatorPool::lane_metrics)
+        .unwrap_or_default();
+    // All actors have joined and the moved evaluator was dropped when
+    // generate_to_dataset returned. Destroy the final broker owner—and therefore
+    // the ORT/TensorRT session—while main is still in ordinary Rust control
+    // flow, before libc begins running native process-exit handlers.
+    drop(broker);
+    write_examples(
+        &config.output.join("images"),
+        &report.replay.examples,
+        config.examples,
+    )?;
     write_manifest(
         &config.output.join("manifest.json"),
         &config,
-        &samples,
-        completed_games,
-        discarded_games,
-        &dataset_sha256,
+        &report,
         model_sha256.as_deref(),
+        broker_metrics,
+        &inference_lane_metrics,
     )?;
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     write!(output, "{{\n  \"dataset\": ")?;
     write_json_string(&mut output, &dataset_path.to_string_lossy())?;
+    writeln!(output, ",\n  \"samples\": {},", report.replay.samples)?;
+    writeln!(output, "  \"completed_games\": {},", report.completed_games)?;
+    writeln!(output, "  \"discarded_games\": {},", report.discarded_games)?;
     writeln!(
         output,
-        concat!(
-            ",\n",
-            "  \"samples\": {},\n",
-            "  \"completed_games\": {},\n",
-            "  \"discarded_games\": {},\n",
-            "  \"dataset_sha256\": \"{}\",\n",
-            "  \"evaluator\": \"{}\",\n",
-            "  \"actors\": {},\n",
-            "  \"coarse_pool\": {},\n",
-            "  \"temperature\": {},\n",
-            "  \"temperature_plies\": {},\n",
-            "  \"channels\": {},\n",
-            "  \"resolution\": {},\n",
-            "  \"policy_size\": {},\n",
-            "  \"examples\": {}\n",
-            "}}"
-        ),
-        samples.len(),
-        completed_games,
-        discarded_games,
-        dataset_sha256,
-        config.runtime.as_str(),
-        config.actors,
-        config.coarse_pool,
-        config.temperature,
-        config.temperature_plies,
-        CHANNEL_COUNT,
-        config.resolution,
-        config.policy_resolution * config.policy_resolution + 1,
-        config.examples.min(samples.len()),
+        "  \"dataset_sha256\": \"{}\",",
+        report.replay.sha256
     )?;
+    writeln!(
+        output,
+        "  \"shard_id\": \"sha256:{}\",",
+        report.replay.sha256
+    )?;
+    writeln!(output, "  \"evaluator\": \"{}\",", config.runtime.as_str())?;
+    writeln!(output, "  \"actors\": {},", config.actors)?;
+    writeln!(
+        output,
+        "  \"configured_inference_slots\": {},",
+        config.inference_slots
+    )?;
+    writeln!(
+        output,
+        "  \"active_inference_slots\": {},",
+        inference_lane_metrics.len()
+    )?;
+    writeln!(
+        output,
+        "  \"writer_queue_games\": {},",
+        config.writer_queue_games
+    )?;
+    writeln!(output, "  \"coarse_pool\": {},", config.coarse_pool)?;
+    writeln!(output, "  \"temperature\": {},", config.temperature)?;
+    writeln!(
+        output,
+        "  \"temperature_plies\": {},",
+        config.temperature_plies
+    )?;
+    writeln!(output, "  \"channels\": {},", CHANNEL_COUNT)?;
+    writeln!(output, "  \"resolution\": {},", config.resolution)?;
+    writeln!(
+        output,
+        "  \"policy_size\": {},",
+        config.policy_resolution * config.policy_resolution + 1
+    )?;
+    writeln!(output, "  \"examples\": {},", report.replay.examples.len())?;
+    writeln!(output, "  \"generation_metrics\": {{")?;
+    writeln!(
+        output,
+        "    \"samples_generated_by_received_games\": {},",
+        report.samples_generated_by_received_games
+    )?;
+    writeln!(
+        output,
+        "    \"serialization_truncated_samples\": {},",
+        report.serialization_truncated_samples
+    )?;
+    writeln!(output, "    \"games_started\": {},", report.games_started)?;
+    writeln!(output, "    \"games_finished\": {},", report.games_finished)?;
+    writeln!(
+        output,
+        "    \"generated_completed_games\": {},",
+        report.generated_completed_games
+    )?;
+    writeln!(
+        output,
+        "    \"generated_discarded_games\": {},",
+        report.generated_discarded_games
+    )?;
+    writeln!(output, "    \"failed_games\": {},", report.failed_games)?;
+    writeln!(
+        output,
+        "    \"generated_samples_at_boundary\": {},",
+        report.generated_samples
+    )?;
+    writeln!(
+        output,
+        "    \"peak_active_games\": {},",
+        report.peak_active_games
+    )?;
+    writeln!(
+        output,
+        "    \"peak_writer_backlog\": {},",
+        report.peak_writer_backlog
+    )?;
+    writeln!(
+        output,
+        "    \"tail_games_in_flight\": {},",
+        report.tail_games_in_flight
+    )?;
+    writeln!(
+        output,
+        "    \"tail_writer_backlog\": {},",
+        report.tail_writer_backlog
+    )?;
+    writeln!(
+        output,
+        "    \"tail_completed_samples\": {},",
+        report.tail_completed_samples
+    )?;
+    writeln!(
+        output,
+        "    \"wall_seconds\": {:.6},",
+        report.wall_time.as_secs_f64()
+    )?;
+    writeln!(
+        output,
+        "    \"summed_game_seconds\": {:.6},",
+        report.summed_game_time.as_secs_f64()
+    )?;
+    writeln!(
+        output,
+        "    \"writer_seconds\": {:.6},",
+        report.replay.write_time.as_secs_f64()
+    )?;
+    writeln!(
+        output,
+        "    \"writer_backpressure_seconds\": {:.6},",
+        report.writer_backpressure.as_secs_f64()
+    )?;
+    writeln!(
+        output,
+        "    \"publish_sync_seconds\": {:.6}",
+        report.replay.sync_time.as_secs_f64()
+    )?;
+    writeln!(output, "  }},")?;
+    writeln!(output, "  \"broker_metrics\": {{")?;
+    writeln!(output, "    \"requests\": {},", broker_metrics.requests)?;
+    writeln!(output, "    \"batches\": {},", broker_metrics.batches)?;
+    writeln!(output, "    \"positions\": {},", broker_metrics.positions)?;
+    writeln!(
+        output,
+        "    \"maximum_observed_batch\": {},",
+        broker_metrics.maximum_batch
+    )?;
+    writeln!(
+        output,
+        "    \"encoding_seconds\": {:.6},",
+        broker_metrics.encoding_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        output,
+        "    \"queue_seconds\": {:.6},",
+        broker_metrics.queue_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        output,
+        "    \"inference_seconds\": {:.6},",
+        broker_metrics.inference_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        output,
+        "    \"failures\": {}\n  }},",
+        broker_metrics.failures
+    )?;
+    writeln!(output, "  \"inference_lane_metrics\": [")?;
+    for (slot, lane) in inference_lane_metrics.iter().enumerate() {
+        let comma = if slot + 1 == inference_lane_metrics.len() {
+            ""
+        } else {
+            ","
+        };
+        writeln!(
+            output,
+            "    {{\"slot\": {slot}, \"requests\": {}, \"batches\": {}, \"positions\": {}, \"maximum_observed_batch\": {}, \"failures\": {}, \"encoding_seconds\": {:.6}, \"queue_seconds\": {:.6}, \"inference_seconds\": {:.6}}}{comma}",
+            lane.requests,
+            lane.batches,
+            lane.positions,
+            lane.maximum_batch,
+            lane.failures,
+            lane.encoding_nanoseconds as f64 / 1e9,
+            lane.queue_nanoseconds as f64 / 1e9,
+            lane.inference_nanoseconds as f64 / 1e9,
+        )?;
+    }
+    writeln!(output, "  ]\n}}")?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
     use clap::Parser;
     use vgo_core::Point;
     use vgo_raster::RasterConfig;
     use vgo_search::{Action, CandidateSource, ChildSummary, SearchResult, SearchStats};
 
-    use super::{Config, policy_target, search_config, validate_config};
+    use super::{
+        ActorPool, Config, GameEnvelope, GameSamples, policy_target, search_config, validate_config,
+    };
+
+    #[test]
+    fn actor_pool_drop_cancels_and_joins_workers() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        let mut actors = ActorPool::new(stopped, receiver);
+        actors.push(thread::spawn(move || {
+            while !worker_stopped.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            worker_finished.store(true, Ordering::Release);
+        }));
+
+        drop(actors);
+
+        assert!(
+            finished.load(Ordering::Acquire),
+            "dropping the pool must not detach a live actor"
+        );
+    }
+
+    #[test]
+    fn actor_pool_closes_a_full_queue_before_joining() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(GameEnvelope {
+                result: Ok(GameSamples {
+                    samples: Vec::new(),
+                    completed: false,
+                }),
+                ready_at: Instant::now(),
+            })
+            .expect("fill the bounded queue");
+        let (sending, sending_receiver) = mpsc::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
+        let handle = thread::spawn(move || {
+            sending.send(()).expect("announce the blocked send");
+            let _ = sender.send(GameEnvelope {
+                result: Ok(GameSamples {
+                    samples: Vec::new(),
+                    completed: false,
+                }),
+                ready_at: Instant::now(),
+            });
+            worker_finished.store(true, Ordering::Release);
+        });
+        sending_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker reached its send");
+
+        let mut actors = ActorPool::new(stopped, receiver);
+        actors.push(handle);
+        actors.shutdown().expect("actor shutdown succeeds");
+
+        assert!(
+            finished.load(Ordering::Acquire),
+            "closing the receiver must wake a producer blocked on the full queue"
+        );
+    }
 
     #[test]
     fn malformed_cli_values_are_rejected() {
@@ -803,6 +1374,26 @@ mod tests {
     }
 
     #[test]
+    fn generation_defaults_to_two_inference_lanes() {
+        let default = Config::try_parse_from(["vgo-generate-demo"]).expect("default CLI parses");
+        assert_eq!(default.inference_slots, 2);
+
+        let configured = Config::try_parse_from(["vgo-generate-demo", "--inference-slots", "4"])
+            .expect("inference lane override parses");
+        assert_eq!(configured.inference_slots, 4);
+    }
+
+    #[test]
+    fn inference_lane_count_must_be_positive() {
+        let configured = Config::try_parse_from(["vgo-generate-demo", "--inference-slots", "0"])
+            .expect("CLI syntax parses");
+        assert_eq!(
+            validate_config(&configured),
+            Err("--inference-slots must be positive")
+        );
+    }
+
+    #[test]
     fn negative_temperature_is_rejected() {
         let configured =
             Config::try_parse_from(["vgo-generate-demo", "--temperature=-1"]).expect("CLI parses");
@@ -824,9 +1415,9 @@ mod tests {
             Err("--coarse-pool must not exceed --policy-resolution")
         );
 
-        // The placement grid is independent of the render raster, so a pool
-        // exceeding the raster is legitimate as long as it fits the policy grid.
-        let decoupled = Config::try_parse_from([
+        // A policy grid may be decoupled and coarser, but a finer policy cannot
+        // be derived from the rendered state and is rejected by the loader.
+        let finer_policy = Config::try_parse_from([
             "vgo-generate-demo",
             "--resolution",
             "16",
@@ -836,12 +1427,25 @@ mod tests {
             "17",
         ])
         .expect("CLI syntax parses");
-        assert_eq!(validate_config(&decoupled), Ok(()));
+        assert_eq!(
+            validate_config(&finer_policy),
+            Err("--policy-resolution must not exceed --resolution")
+        );
     }
 
     #[test]
     fn zero_maximum_plies_is_rejected_before_generation() {
         let config = Config::try_parse_from(["vgo-generate-demo", "--max-plies", "0"])
+            .expect("CLI syntax parses");
+        assert_eq!(
+            validate_config(&config),
+            Err("generation counts, simulations, and dimensions must be positive")
+        );
+    }
+
+    #[test]
+    fn completed_game_queue_must_be_bounded_and_positive() {
+        let config = Config::try_parse_from(["vgo-generate-demo", "--writer-queue-games", "0"])
             .expect("CLI syntax parses");
         assert_eq!(
             validate_config(&config),

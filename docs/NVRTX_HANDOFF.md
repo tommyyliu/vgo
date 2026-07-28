@@ -1,10 +1,11 @@
 # Blackwell (sm_120) GPU inference — hand-off notes
 
-Status updated 2026-07-24. Goal was "run the RL loop for a few steps" on this
-machine (Linux / Fedora 44, RTX 5070 Ti / Blackwell / sm_120). **RESOLVED — the
-RL loop runs end-to-end on `--provider cuda`.** This records the GPU path. The
-verification runs below predate the final coarse-to-fine replay-v3 design and
-are not evidence for that policy-sampling change.
+Status updated 2026-07-24; command syntax refreshed 2026-07-27. Goal was "run
+the RL loop for a few steps" on this machine (Linux / Fedora 44, RTX 5070 Ti /
+Blackwell / sm_120). **RESOLVED — the RL loop runs end-to-end on `--provider
+cuda`.** This records the GPU path. The measurements below predate the current
+pipelined coordinator, persistent learner, and final coarse-to-fine replay-v3
+design; use [`RL_LOOP.md`](RL_LOOP.md) as the operational source of truth.
 
 ## TL;DR
 
@@ -61,7 +62,8 @@ It was never the blocker — only TRT-RTX was; they do not share the failure.
   `tensorrt_libs` to `LD_LIBRARY_PATH`.
 - Correct: parity vs Torch = policy 0.006 / value 0.0005 at fp16 (matches the
   Windows TensorRT parity). Full RL loop runs end-to-end on `--provider tensorrt`
-  (2 iters, ~90s incl. one-time engine builds, 0 failures, both promoted).
+  (a historical two-update validation, ~90s including one-time engine builds,
+  zero failures, both candidates promoted).
 - Fast: isolated 128x128 fp16 throughput (positions/s), same RTX 5070 Ti:
 
   | batch | Windows TensorRT | Linux CUDA EP | Linux TensorRT |
@@ -113,28 +115,35 @@ random vs fixture input, opt level, tf32, max-workspace, and PyTorch's own CUDA
 conv (bit-exact). The tell was that isolated ops were fine but the assembled
 model drifted — pointing at a stateful fusion rather than a bad kernel.
 
-## Running (CPU and CUDA both work now)
+## Current pipeline invocation
 
 The loop sets `LD_LIBRARY_PATH` and `ORT_DYLIB_PATH` itself now. From `training/`:
 
 ```bash
 uv run python -m vgo_training.rl_loop \
   --output ../artifacts/rl-cuda-demo \
-  --iterations 2 --samples 256 --replay-window 2 \
-  --resolution 128 --coarse-pool 8 \
+  --updates 2 --samples-per-shard 256 --shards-per-update 1 \
+  --replay-window 2 --maximum-prefetch-shards 1 \
+  --resolution 128 --policy-resolution 32 --coarse-pool 8 \
   --generation-simulations 48 --arena-simulations 48 \
   --maximum-plies 64 \
-  --epochs 40 --training-batch 32 --warm-learning-rate 1e-4 --value-weight 0.1 \
-  --device cuda --actors 16 --arena-actors 1 --arena-pairs 12 \
-  --maximum-batch 32 --provider cuda \
-  --promotion-score 0.52 --maximum-truncation-rate 0.05
+  --training-epochs 40 --training-batch 32 \
+  --warm-learning-rate 1e-4 --value-weight 0.1 \
+  --training-device cuda --training-precision bfloat16 \
+  --actors 16 --arena-actors 1 --arena-pairs 12 \
+  --inference-batch 32 --provider cuda --inference-device-id 0 \
+  --promotion-arena --promotion-score 0.52 \
+  --maximum-truncation-rate 0.05
 ```
 
-Swap `--provider cpu --device cpu` to run the whole thing today without the bug.
+For a CPU-only smoke, use
+`--provider cpu --training-device cpu --training-precision float32`.
+The coordinator's default TensorRT engine warmup is skipped for both the CUDA
+provider used above and the CPU provider.
 
-`--coarse-pool` defaults to `0` for the legacy candidate path, is forwarded to
-generation and every arena, and must not exceed the raster resolution. In the
-command above, iteration-zero generation still falls back to legacy candidates:
+The pipeline's `--coarse-pool` default is `4`, is forwarded to generation and
+every arena, and must not exceed the policy resolution. In the command above,
+the first generation still falls back to legacy candidates:
 the naive bootstrap evaluator has no spatial policy grid. Supply both an initial
 checkpoint and ONNX model to use coarse generation immediately; otherwise it
 starts after the first accepted model. Coarse search uses the ordinary

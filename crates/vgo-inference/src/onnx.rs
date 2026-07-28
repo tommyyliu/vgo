@@ -71,6 +71,11 @@ pub struct OnnxBatchService {
     policy: RasterConfig,
     maximum_batch: usize,
     provider: OnnxProvider,
+    /// One broker thread owns the synchronous session, so its packed input can
+    /// reuse a maximum-batch allocation across every call. Reallocating and
+    /// freeing several megabytes for each short GPU run creates avoidable host
+    /// allocator pressure on the inference critical path.
+    states: Vec<f32>,
 }
 
 impl OnnxBatchService {
@@ -134,12 +139,18 @@ impl OnnxBatchService {
             .commit_from_file(&model)
             .map_err(|error| evaluation_error("load ONNX model", error))?;
         validate_model(&session, config)?;
+        let state_capacity = config
+            .maximum_batch
+            .checked_mul(CHANNEL_COUNT)
+            .and_then(|value| value.checked_mul(config.raster.pixels()))
+            .ok_or_else(|| EvaluationError::new("ONNX input allocation size overflow"))?;
         Ok(Self {
             session,
             raster: config.raster,
             policy: config.policy.unwrap_or(config.raster),
             maximum_batch: config.maximum_batch,
             provider: config.provider,
+            states: Vec::with_capacity(state_capacity),
         })
     }
 
@@ -177,10 +188,9 @@ impl BatchService for OnnxBatchService {
         {
             return Err(EvaluationError::new("ONNX batch raster shape mismatch"));
         }
-        let item_values = CHANNEL_COUNT * self.raster.pixels();
-        let mut states = Vec::with_capacity(batch.len() * item_values);
+        self.states.clear();
         for input in batch {
-            states.extend_from_slice(input.raster().data());
+            self.states.extend_from_slice(input.raster().data());
         }
         let input = TensorRef::from_array_view((
             [
@@ -189,7 +199,7 @@ impl BatchService for OnnxBatchService {
                 self.raster.height,
                 self.raster.width,
             ],
-            states.as_slice(),
+            self.states.as_slice(),
         ))
         .map_err(|error| evaluation_error("construct ONNX input tensor", error))?;
         let outputs = self
@@ -376,7 +386,11 @@ fn evaluation_error(context: &str, error: impl std::fmt::Display) -> EvaluationE
 
 #[cfg(test)]
 mod tests {
-    use super::OnnxProvider;
+    use std::path::PathBuf;
+
+    use vgo_raster::{CHANNEL_COUNT, RasterConfig};
+
+    use super::{OnnxProvider, OnnxServiceConfig, profile_shapes, scoped_cache_directory};
 
     #[test]
     fn providers_parse_without_implicit_fallback() {
@@ -385,5 +399,44 @@ mod tests {
         assert_eq!("tensorrt".parse(), Ok(OnnxProvider::TensorRt));
         assert!("tensorrt-rtx".parse::<OnnxProvider>().is_err());
         assert!("gpu".parse::<OnnxProvider>().is_err());
+    }
+
+    #[test]
+    fn tensorrt_profile_spans_one_through_the_configured_batch() {
+        let config = OnnxServiceConfig {
+            model: PathBuf::from("model.onnx"),
+            raster: RasterConfig::square(96),
+            policy: Some(RasterConfig::square(48)),
+            maximum_batch: 16,
+            provider: OnnxProvider::TensorRt,
+            device_id: 2,
+            fp16: true,
+            cache_directory: PathBuf::from("cache"),
+        };
+
+        let profiles = profile_shapes(&config);
+
+        assert_eq!(profiles.minimum, format!("states:1x{CHANNEL_COUNT}x96x96"));
+        assert_eq!(profiles.optimum, format!("states:16x{CHANNEL_COUNT}x96x96"));
+        assert_eq!(profiles.maximum, profiles.optimum);
+    }
+
+    #[test]
+    fn scoped_cache_uses_the_configured_base_directory() {
+        let config = OnnxServiceConfig {
+            model: PathBuf::from("model.onnx"),
+            raster: RasterConfig::square(96),
+            policy: None,
+            maximum_batch: 16,
+            provider: OnnxProvider::TensorRt,
+            device_id: 0,
+            fp16: true,
+            cache_directory: PathBuf::from("/mnt/model-cache"),
+        };
+
+        assert_eq!(
+            scoped_cache_directory(&config, &"a".repeat(64)),
+            PathBuf::from("/mnt/model-cache/tensorrt-fp16-96x96-batch16-aaaaaaaaaaaaaaaa")
+        );
     }
 }

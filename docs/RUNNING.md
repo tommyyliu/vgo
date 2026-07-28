@@ -12,8 +12,10 @@ lives.
   use.
 - Chrome at `C:\Program Files\Google\Chrome\Application\chrome.exe` for the
   browser test suites.
-- An NVIDIA GPU for `--device cuda` and `--provider tensorrt`. The CPU provider
-  works everywhere and is much slower.
+- An NVIDIA GPU for `--training-device cuda` and `--provider tensorrt`. Rust
+  inference selects it with `--inference-device-id`; PyTorch accepts ordinary
+  device strings such as `cuda`, `cuda:0`, or `cuda:1`. The CPU paths work
+  everywhere and are much slower.
 
 ## Tests
 
@@ -26,48 +28,62 @@ cargo test --workspace                 # Rust rules engine, search, self-play
 
 ```powershell
 cd training
-uv run python -m unittest tests.test_dataset tests.test_model `
-  tests.test_metrics_batching tests.test_rl_loop
+uv run python -m unittest discover -s tests -v
 ```
-
-The Python suites must be named explicitly. `unittest discover` fails with
-`Start directory is not importable` because `training/tests/` has no
-`__init__.py`.
 
 `run-tests.ps1` drives headless Chrome and fails the run if any fixture reports
 a status other than `pass`, so it is safe in a pipeline.
 
 ## The reinforcement-learning loop
 
-`docs/RL_LOOP.md` describes what the five stages do. This is how to drive them.
+[`RL_LOOP.md`](RL_LOOP.md) describes the queue, artifact, and recovery
+contracts. A representative run is:
 
 ```powershell
 cd training
 uv run python -m vgo_training.rl_loop `
   --output ../artifacts/rl-run-NAME `
-  --iterations 4 --samples 3072 --replay-window 4 `
+  --updates 20 --samples-per-shard 1024 `
+  --shards-per-update 1 --replay-window 8 --maximum-prefetch-shards 1 `
   --resolution 96 --policy-resolution 32 --coarse-pool 4 `
   --generation-simulations 256 --arena-simulations 256 `
-  --maximum-plies 96 `
-  --epochs 120 --training-batch 32 --warm-learning-rate 1e-4 --value-weight 0.1 `
-  --device cuda --actors 64 --arena-actors 32 --arena-pairs 40 `
-  --maximum-batch 64 --provider tensorrt `
-  --promotion-score 0.52 --maximum-truncation-rate 0.02
+  --maximum-plies 256 `
+  --training-epochs 10 --training-batch 64 `
+  --warm-learning-rate 5e-4 --value-weight 1.0 `
+  --training-device cuda --training-precision bfloat16 --actors 64 `
+  --inference-batch 16 --inference-slots 2 `
+  --provider tensorrt --inference-device-id 0 `
+  --warm-inference
 ```
 
-Continue from a published model by passing both halves of it, and add its replay
-so the window does not restart empty:
+Self-play and the persistent learner overlap by default. If same-GPU kernel or
+context contention hurts cadence, pass `--no-overlap-actor-learner`. That flag
+does not unload the learner's resident allocations; for memory isolation on a
+multi-GPU machine, use for example
+`--inference-device-id 0 --training-device cuda:1`.
+
+Learner execution defaults to BF16 autocast on supported CUDA hardware. Pass
+`--training-precision float32` for older GPUs. TensorRT's default `--fp16`
+controls inference separately.
+
+TensorRT inference warmup also defaults on. After exporting a candidate, the
+coordinator runs one full configured batch to populate the model-digest-scoped
+engine cache while the current actor tail finishes. Pass
+`--no-warm-inference` to opt out; CUDA and CPU providers skip this step.
+
+Continue from a published model by passing both halves, and optionally seed the
+replay window:
 
 ```powershell
-  --initial-checkpoint ../artifacts/PREV/iteration-000/model/candidate.pt `
-  --initial-onnx ../artifacts/PREV/iteration-000/model/candidate.onnx `
-  --initial-replay ../artifacts/PREV/iteration-000/replay/dataset.vgo
+  --initial-checkpoint ../artifacts/PREV/updates/update-000019/candidate.pt `
+  --initial-onnx ../artifacts/PREV/updates/update-000019/candidate.onnx `
+  --initial-replay ../artifacts/PREV/replay/shard-000019/dataset.vgo
 ```
 
-`--coarse-pool` is the coarse-sampling knob. Its default `0` uses legacy
-candidates; a positive value is forwarded unchanged to generation, every arena,
-and Elo telemetry, and must not exceed `--policy-resolution`. With no initial model,
-iteration-zero generation uses the naive evaluator and therefore falls back to
+`--coarse-pool` is the coarse-sampling knob. The pipeline default is `4`; zero
+uses legacy candidates. The value is forwarded unchanged to generation, every
+arena, and Elo telemetry, and must not exceed `--policy-resolution`. With no
+initial model, bootstrap generation uses the naive evaluator and falls back to
 legacy candidates because it has no spatial policy grid. Supply an initial
 checkpoint/ONNX pair to exercise coarse generation immediately, or let it begin
 after the first accepted model.
@@ -79,28 +95,68 @@ before training rather than recomputed each epoch.
 
 ### Resuming
 
-The driver writes `progress.json` after every stage, so rerunning the same
-`--output` with the same arguments resumes at the first incomplete stage rather
-than regenerating replay. A directory containing `run.json` is final and is not
-overwritten, and `run-config.json` refuses a resume whose parameters differ. To
-change a parameter, use a new output directory and pass the finished shards
-through `--initial-replay`.
+The driver atomically writes `pipeline-state.json`, immutable update
+specifications, and publication records. Rerunning the same `--output`
+revalidates already-published replay and model digests, then resumes the first
+incomplete unit. A file lease excludes a second coordinator, and state is
+reloaded after the lease is acquired.
+
+Learning-identity settings cannot change in place: these include replay/search
+semantics, shapes, architecture and optimization hyperparameters, training
+precision, provider/FP16 mode, inference batch contract, promotion policy,
+seeds, and bootstrap artifacts. Use a new output directory for one of those
+changes.
+
+Operational controls may change on restart. They include the update target,
+prefetch depth, actor/writer counts, inference delay/slots/device, training
+device/thread count/compilation, inference warmup, overlap mode, arena actors,
+and telemetry counts. Repeat the original command with the new operational
+values; any non-default learning settings must still be supplied unchanged.
+`--updates` may increase but cannot be set below completed work. Effective
+changes are recorded in `pipeline-config-history.json`.
+
+Elo jobs do not block the next learner update. Drain them independently:
+
+```powershell
+uv run python -m vgo_training.rl_loop `
+  --output ../artifacts/rl-run-NAME --telemetry-only
+```
+
+The drain batches all pending opponents for one candidate into one arena
+process, amortizing candidate/TensorRT startup while retaining one atomic result
+per comparison. It uses the run-directory lease, so invoke it after the learning
+coordinator exits rather than concurrently. `--drain-telemetry` performs the
+same drain after learning in one invocation.
+
+### Tuning utilization
+
+Inspect `run.json.utilization` after a steady-state run. It reports measured
+generation/update coverage, stage and learner wall times,
+`pipeline_overlap_factor`, `average_active_games`, inference batch
+fill/positions/batches/time, writer backpressure, the learner optimization
+fraction, and prepared-replay cache hits and misses. Use actor count and
+inference delay to tune occupancy and fill, vary `--inference-slots` to trade
+session memory for overlapped inference latency, use queue depth to absorb short writer
+bursts, and compare default overlap with `--no-overlap-actor-learner` when
+contention increases total cadence. The full field definitions and caveats are
+in [`RL_LOOP.md`](RL_LOOP.md#utilization-feedback-loop).
 
 ## Measuring strength
 
-The in-loop arenas answer two narrow questions: is the candidate better than the
-naive policy, and is it better than the model immediately before it. Neither
-places generations on a common scale, and the naive baseline saturates. To
-compare models directly, run the arena yourself:
+The optional promotion arena asks whether a candidate clears its incumbent.
+Queued telemetry compares accepted generations and fits common Bradley–Terry
+ratings without blocking publication. For an ad hoc head-to-head, run the arena
+yourself:
 
 ```powershell
 cargo run --release -p vgo-selfplay --bin vgo-arena -- `
-  --candidate artifacts/A/model/candidate.onnx `
-  --opponent  artifacts/B/model/candidate.onnx `
+  --candidate artifacts/A/updates/update-000019/candidate.onnx `
+  --opponent  artifacts/B/updates/update-000019/candidate.onnx `
   --pairs 75 --simulations 256 --max-plies 256 --threads 32 `
   --resolution 96 --policy-resolution 32 --coarse-pool 4 `
   --radius 0.05555555555555555 `
-  --maximum-batch 16 --provider tensorrt --cache-directory artifacts/onnx-cache
+  --maximum-batch 16 --provider tensorrt --device-id 0 `
+  --cache-directory artifacts/onnx-cache
 ```
 
 Omit `--opponent` to play the naive policy. Games are colour-swapped in pairs,
@@ -121,7 +177,7 @@ policy quality:
 
 ```powershell
 cargo run --release -p vgo-selfplay --bin vgo-playout-duel -- `
-  --model artifacts/A/model/candidate.onnx `
+  --model artifacts/A/updates/update-000019/candidate.onnx `
   --high 128 --low 16 --pairs 40 --coarse-pool 8 `
   --max-plies 160 --threads 32 --resolution 96 --policy-resolution 32 `
   --radius 0.05555555555555555 --maximum-batch 64 `
@@ -182,9 +238,10 @@ and cross-generation comparison. Re-export with
 **The ply-limit flag is spelled differently in each layer.** The driver takes
 `--maximum-plies`; the Rust binaries take `--max-plies`.
 
-**A coarse pool larger than the raster is rejected.** `--coarse-pool` counts
-fine cells per coarse region, so use a value from `1` through `--resolution`
-when enabling spatial sampling. Zero explicitly selects the legacy path.
+**A coarse pool larger than the policy grid is rejected.** `--coarse-pool`
+counts fine policy cells per coarse region, so use a value from `1` through
+`--policy-resolution` when enabling spatial sampling. Zero explicitly selects
+the legacy path.
 
 **Truncated games block promotion.** A game that hits the ply limit is excluded
 from the arena score, and `--maximum-truncation-rate` rejects the candidate if
@@ -193,12 +250,11 @@ early starts vetoing good candidates later. Raise `--maximum-plies` rather than
 the truncation tolerance: a truncated game is an invalid measurement, not a
 tolerable one.
 
-**Arena simulations default to 16 while generation defaults to 64.** Promotion
-is decided at a fraction of the search depth the training data was generated
-at, which measures a shallower player than the one being built. Measured on one
-model pair, the apparent edge fell from 63% at 16 simulations to 58% at 64 and
-128. Set `--arena-simulations` to match `--generation-simulations` unless you
-are deliberately measuring shallow play.
+**Direct-binary and pipeline defaults are different contracts.** The pipeline
+sets both generation and arena search to 256 simulations. Direct Rust binaries
+retain their own diagnostic defaults. When reproducing a pipeline generation or
+arena, pass `--simulations`, `--resolution`, `--policy-resolution`,
+`--maximum-batch`, and `--device-id` explicitly.
 
 **Draws mean the search is too shallow to separate moves.** Voronoi-area scoring
 ties only when the areas match to `1e-10`, which in practice means a
@@ -206,9 +262,16 @@ mirror-symmetric finish. Self-play at 128 simulations produces none at all;
 arenas at 16 produce 12-22%. A nonzero draw rate is a useful signal rather than
 a curiosity.
 
-**Replay shards are large.** 3072 samples at 96x96x10 float32 is 1.1 GB, so a
-four-deep window is roughly 5 GB of host memory. `artifacts/` is gitignored for
+**Replay shards are large.** Replay v3 stores semantic states plus several
+policy-supervision arrays. The persistent learner retains prepared tensors for
+every shard in `--replay-window`; use each manifest's `dataset_bytes` and the
+learner cache report when sizing host memory. `artifacts/` is gitignored for
 this reason.
+
+**BF16 training and FP16 inference are independent.** `--training-precision
+bfloat16` controls PyTorch autocast and fails early if the selected CUDA device
+does not support BF16. `--fp16` controls TensorRT engine precision. Changing
+training precision or inference FP16 mode changes the run's learning identity.
 
 **A silently killed training stage is usually the device running out of memory.**
 Under a process supervisor the traceback can be lost with the process tree,

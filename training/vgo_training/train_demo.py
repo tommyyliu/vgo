@@ -1,20 +1,17 @@
 from __future__ import annotations
 
 import argparse
-import copy
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
-import random
-import time
 
 import numpy as np
 import torch
 from torch import nn
 
-from .dataset import PreparedRasterDataset, RasterDataset, load_datasets
+from .dataset import PreparedRasterDataset, RasterDataset
 from .model import MODEL_ARCHITECTURES, build_model
-from .serve import load_model
 
 
 LEGAL_CLEARANCE_CHANNEL = 7
@@ -340,35 +337,45 @@ def metrics(
     if not np.isfinite(value_weight) or value_weight < 0.0:
         raise ValueError("value weight must be finite and nonnegative")
 
-    cross_entropy_total = 0.0
-    target_entropy_total = 0.0
-    squared_error_total = 0.0
-    top1_total = 0.0
-    absolute_error_total = 0.0
+    # Keep all reductions on the evaluation device. Converting each batch loss
+    # to float forces a CUDA synchronization per metric per batch; accumulating
+    # five scalar tensors and transferring once makes the pass one synchronization.
+    accumulator = torch.zeros(5, dtype=torch.float64, device=device)
 
     for start in range(0, total, batch_size):
         stop = min(start + batch_size, total)
-        count = stop - start
         states, targets, masks, values = gather_batch(
             dataset, torch.arange(start, stop), device
         )
         logits, predictions = model(states)
-        # Reuses the training objective so the two can never drift apart.
-        cross_entropy_total += float(policy_cross_entropy(logits, targets, masks)) * count
-        target_entropy_total += float(
-            -(targets * targets.clamp_min(1e-12).log()).sum(dim=1).mean()
-        ) * count
-        squared_error_total += float(nn.functional.mse_loss(predictions, values)) * count
-        top1_total += float(
+        masked_logits = logits.masked_fill(
+            ~masks, torch.finfo(logits.dtype).min
+        )
+        cross_entropy = -(
+            targets * torch.log_softmax(masked_logits, dim=1)
+        ).sum(dim=1)
+        target_entropy = -(
+            targets * targets.clamp_min(1e-12).log()
+        ).sum(dim=1)
+        accumulator += torch.stack(
             (
-                logits.masked_fill(~masks, torch.finfo(logits.dtype).min).argmax(dim=1)
-                == targets.argmax(dim=1)
+                cross_entropy.sum(),
+                target_entropy.sum(),
+                (predictions - values).square().sum(),
+                (
+                    masked_logits.argmax(dim=1) == targets.argmax(dim=1)
+                ).float().sum(),
+                (predictions - values).abs().sum(),
             )
-            .float()
-            .mean()
-        ) * count
-        absolute_error_total += float((predictions - values).abs().mean()) * count
+        ).to(dtype=torch.float64)
 
+    (
+        cross_entropy_total,
+        target_entropy_total,
+        squared_error_total,
+        top1_total,
+        absolute_error_total,
+    ) = accumulator.cpu().tolist()
     cross_entropy = cross_entropy_total / total
     target_entropy = target_entropy_total / total
     value_mse = squared_error_total / total
@@ -459,8 +466,17 @@ def subset(dataset: PreparedRasterDataset, indices: torch.Tensor) -> DatasetView
 
 def atomic_write_text(path: Path, text: str) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(text, encoding="ascii")
-    temporary.replace(path)
+    with temporary.open("w", encoding="ascii") as stream:
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    if os.name != "nt":
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def build_scheduler(
@@ -504,280 +520,45 @@ def build_scheduler(
 
 
 def train(arguments: argparse.Namespace) -> dict[str, object]:
-    random.seed(arguments.seed)
-    np.random.seed(arguments.seed)
-    torch.manual_seed(arguments.seed)
-    torch.set_num_threads(arguments.threads)
-    device = torch.device(arguments.device)
-    raw_dataset = load_datasets(arguments.datasets)
-    corrected_samples = int(
-        torch.count_nonzero(raw_dataset.proposal_counts[:, :-1], dim=1)
-        .gt(0)
-        .sum()
-        .item()
+    # Keep the historical CLI as a one-update adapter. The implementation lives
+    # in PersistentLearner so the RL loop can keep model weights, Adam moments,
+    # compiled code, prepared shards, and staging buffers alive between updates.
+    from .learner import LearnerConfig, LearnerUpdate, PersistentLearner
+
+    config = LearnerConfig(
+        epochs=arguments.epochs,
+        batch_size=arguments.batch_size,
+        learning_rate=arguments.learning_rate,
+        value_weight=arguments.value_weight,
+        model_width=arguments.model_width,
+        blocks=arguments.blocks,
+        architecture=arguments.architecture,
+        threads=arguments.threads,
+        device=arguments.device,
+        precision=arguments.precision,
+        seed=arguments.seed,
+        compile=arguments.compile,
+        restore_optimizer=arguments.restore_optimizer,
+        schedule=arguments.schedule,
+        warmup_epochs=arguments.warmup_epochs,
+        decay_fraction=arguments.decay_fraction,
+        final_learning_rate_fraction=arguments.final_learning_rate_fraction,
+        report_every=arguments.report_every,
+        validation_fraction=arguments.validation_fraction,
+        augment=arguments.augment,
     )
-    dataset = prepare_policy_supervision(
-        raw_dataset,
-        arguments.batch_size,
-        validate_targets=False,
-    )
-    del raw_dataset
-    policy_target_name = "progressive_empirical_importance_v1"
-    dataset_samples = dataset.samples
-    dataset_channels = dataset.channels
-    dataset_height = dataset.height
-    dataset_width = dataset.width
-    # The replay policy vector is `policy_resolution^2 + 1`, which is how the
-    # placement grid reaches training: it may be coarser than the raster the
-    # states were rendered at. Equal sizes mean the grids are coupled.
-    placement_cells = dataset.policies.shape[1] - 1
-    policy_resolution = int(round(placement_cells**0.5))
-    if policy_resolution * policy_resolution != placement_cells:
-        raise ValueError(
-            f"replay policy vector {dataset.policies.shape[1]} is not a square grid plus pass"
+    learner = PersistentLearner(defaults=config)
+    try:
+        report = learner.update(
+            LearnerUpdate(
+                datasets=tuple(arguments.datasets),
+                output=Path(arguments.output),
+                initial_checkpoint=arguments.initial_checkpoint,
+                config=config,
+            )
         )
-    decoupled_policy = (
-        policy_resolution if (policy_resolution, policy_resolution) != (dataset_height, dataset_width) else None
-    )
-    dataset_sources = dataset.sources
-    dataset_shape = tuple(dataset.states.shape)
-    generator = torch.Generator().manual_seed(arguments.seed)
-    split = torch.randperm(dataset_samples, generator=generator)
-    validation_samples = 0
-    if dataset_samples > 1 and arguments.validation_fraction > 0.0:
-        validation_samples = max(1, round(dataset_samples * arguments.validation_fraction))
-        validation_samples = min(validation_samples, dataset_samples - 1)
-    validation_indices = split[:validation_samples]
-    training_indices = split[validation_samples:]
-    training = subset(dataset, training_indices)
-    validation = subset(dataset, validation_indices) if validation_samples else training
-    # Both views reference `dataset`, so this drops only the local name -- the
-    # tensors stay alive for the batch gathers. Nothing here frees the window.
-    del dataset, split, validation_indices, training_indices
-
-    parent_checkpoint = None
-    if arguments.initial_checkpoint is not None:
-        model, parent = load_model(arguments.initial_checkpoint.resolve(strict=True))
-        if (
-            int(parent["channels"]),
-            int(parent["height"]),
-            int(parent["width"]),
-        ) != (dataset_channels, dataset_height, dataset_width):
-            raise ValueError("initial checkpoint does not match replay raster shape")
-        parent_checkpoint = str(arguments.initial_checkpoint.resolve())
-        model_width = int(parent["model_width"])
-        blocks = int(parent["blocks"])
-        architecture = str(parent.get("architecture", "flat"))
-    else:
-        model_width = arguments.model_width
-        blocks = arguments.blocks
-        architecture = arguments.architecture
-        model = build_model(
-            architecture=architecture,
-            channels=dataset_channels,
-            width=model_width,
-            blocks=blocks,
-            policy_resolution=decoupled_policy,
-        )
-    model = model.to(device)
-    # TF32 matmuls and compilation only pay off on CUDA. `Module.compile()`
-    # compiles in place, unlike `torch.compile(model)`, whose wrapper prefixes
-    # every state_dict key with `_orig_mod.` and would emit checkpoints that
-    # serve and export cannot load.
-    if arguments.compile and device.type == "cuda":
-        torch.set_float32_matmul_precision("high")
-        model.compile()
-    optimizer = torch.optim.Adam(model.parameters(), lr=arguments.learning_rate)
-    # Adam's moment estimates start at zero, and beta2=0.999 needs on the order
-    # of 2000 steps to build usable history. At ~432 steps/epoch a 10-epoch RL
-    # iteration is 4320 steps, so a cold start spends a large fraction of the
-    # run on noisy per-parameter step sizes -- a cost the old 150-epoch
-    # iterations amortized away. Carrying the parent's state over skips it.
-    # The replay window is mostly shared between consecutive iterations, so the
-    # gradient statistics the moments encode are still broadly valid.
-    optimizer_restored = False
-    if arguments.restore_optimizer and parent_checkpoint is not None:
-        state = parent.get("optimizer_state_dict")
-        if state is not None:
-            try:
-                optimizer.load_state_dict(state)
-                optimizer_restored = True
-            except (ValueError, KeyError) as error:
-                # A shape or param-group mismatch must not be fatal: falling back
-                # to a cold optimizer is exactly the previous behaviour.
-                print(f"optimizer state not restored: {error}", flush=True)
-    scheduler = build_scheduler(optimizer, arguments)
-    initial_training = metrics(
-        model,
-        training,
-        device,
-        arguments.batch_size,
-        value_weight=arguments.value_weight,
-    )
-    initial_validation = metrics(
-        model,
-        validation,
-        device,
-        arguments.batch_size,
-        value_weight=arguments.value_weight,
-    )
-    # Checkpoint selection is the plain weighted sum. It is only meaningful when
-    # the two terms can actually outvote each other, which is why
-    # --value-weight defaults to 1.0.
-    #
-    # The history is worth keeping: at value_weight 0.1 this selection discarded
-    # whole training runs twice. policy_kl sits near 1.8 and either jitters or
-    # drifts upward while value_mae improves 30-50%, but a 0.1 weight caps the
-    # value term's total possible contribution at 0.1 -- so any KL drift above
-    # ~10% of the value gain makes the untrained epoch-zero weights win. Both
-    # times the resulting checkpoint went to its promotion arena untrained and
-    # lost. Down-weighting a term in the *loss* is a statement about gradients;
-    # reusing that weight for *selection* silently gave the noisier term a veto.
-    def selection_score(current: dict[str, float]) -> float:
-        return current["policy_kl"] + arguments.value_weight * current["value_mae"]
-
-    best_epoch = 0
-    best = initial_validation
-    best_score = selection_score(initial_validation)
-    best_state = {
-        name: value.detach().cpu().clone() for name, value in model.state_dict().items()
-    }
-    # Captured alongside the weights so the saved moments describe the published
-    # epoch, not wherever training happened to end.
-    best_optimizer_state = copy.deepcopy(optimizer.state_dict())
-    started = time.perf_counter()
-
-    model.train()
-    for epoch in range(1, arguments.epochs + 1):
-        permutation = torch.randperm(training.samples, generator=generator)
-        for start in range(0, training.samples, arguments.batch_size):
-            indices = permutation[start : start + arguments.batch_size]
-            states, policy_targets, policy_masks, value_targets = training.batch(
-                indices, device
-            )
-            if arguments.augment:
-                # One symmetry per batch rather than per sample: the transform is
-                # a cheap view-and-copy, and over many epochs each position is
-                # still seen under all eight. Values are scalars and invariant.
-                transform = int(
-                    torch.randint(len(DIHEDRAL_TRANSFORMS), (1,), generator=generator).item()
-                )
-                states, policy_targets, policy_masks = apply_dihedral(
-                    states,
-                    policy_targets,
-                    policy_masks,
-                    transform,
-                    training.height,
-                    training.width,
-                    policy_resolution,
-                    policy_resolution,
-                )
-            logits, values = model(states)
-            policy_loss = policy_cross_entropy(logits, policy_targets, policy_masks)
-            value_loss = nn.functional.mse_loss(values, value_targets)
-            loss = policy_loss + arguments.value_weight * value_loss
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-        scheduler.step()
-        if epoch == 1 or epoch % arguments.report_every == 0 or epoch == arguments.epochs:
-            current = metrics(
-                model,
-                validation,
-                device,
-                arguments.batch_size,
-                value_weight=arguments.value_weight,
-            )
-            score = selection_score(current)
-            if score < best_score:
-                best_epoch = epoch
-                best = current
-                best_score = score
-                best_state = {
-                    name: value.detach().cpu().clone()
-                    for name, value in model.state_dict().items()
-                }
-                best_optimizer_state = copy.deepcopy(optimizer.state_dict())
-            print(
-                f"epoch={epoch:4d} policy_kl={current['policy_kl']:.5f} "
-                f"top1={current['policy_top1']:.3f} value_mae={current['value_mae']:.5f} "
-                f"lr={scheduler.get_last_lr()[0]:.6f}"
-            )
-            model.train()
-
-    elapsed = time.perf_counter() - started
-    model.load_state_dict(best_state)
-    final_training = metrics(
-        model,
-        training,
-        device,
-        arguments.batch_size,
-        value_weight=arguments.value_weight,
-    )
-    final_validation = metrics(
-        model,
-        validation,
-        device,
-        arguments.batch_size,
-        value_weight=arguments.value_weight,
-    )
-    output = Path(arguments.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint = {
-        "schema": "vgo.raster-policy-value.v1",
-        "channels": dataset_channels,
-        "height": dataset_height,
-        "width": dataset_width,
-        "policy_resolution": policy_resolution,
-        "model_width": model_width,
-        "blocks": blocks,
-        "architecture": architecture,
-        "state_dict": model.state_dict(),
-        "optimizer_state_dict": best_optimizer_state,
-        "parent_checkpoint": parent_checkpoint,
-        "replay_sources": list(dataset_sources),
-        "policy_target": policy_target_name,
-        "policy_denominator": "full_legal_raster_v1",
-    }
-    temporary = output.with_suffix(output.suffix + ".tmp")
-    torch.save(
-        checkpoint,
-        temporary,
-    )
-    temporary.replace(output)
-    report = {
-        "schema": "vgo.training-run.v2",
-        "datasets": list(dataset_sources),
-        "checkpoint": str(output),
-        "parent_checkpoint": parent_checkpoint,
-        "device": str(device),
-        "samples": dataset_samples,
-        "training_samples": training.samples,
-        "validation_samples": validation_samples,
-        "shape": list(dataset_shape),
-        "parameters": sum(parameter.numel() for parameter in model.parameters()),
-        "epochs": arguments.epochs,
-        "batch_size": arguments.batch_size,
-        "learning_rate": arguments.learning_rate,
-        "schedule": arguments.schedule,
-        "compiled": bool(arguments.compile and device.type == "cuda"),
-        "optimizer_restored": optimizer_restored,
-        "value_weight": arguments.value_weight,
-        "policy_target": policy_target_name,
-        "policy_denominator": "full_legal_raster_v1",
-        "importance_corrected_samples": corrected_samples,
-        "uncorrected_samples": dataset_samples - corrected_samples,
-        "selection_metric": "policy_kl + value_weight * value_mae",
-        "wall_seconds": elapsed,
-        "best_epoch": best_epoch,
-        "initial_training": initial_training,
-        "initial_validation": initial_validation,
-        "best_validation": best,
-        "final_training": final_training,
-        "final_validation": final_validation,
-    }
-    report_path = output.with_suffix(output.suffix + ".json")
-    atomic_write_text(report_path, json.dumps(report, indent=2) + "\n")
+    finally:
+        learner.close()
     print(json.dumps(report, indent=2))
     return report
 
@@ -798,6 +579,11 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--precision",
+        choices=("float32", "bfloat16"),
+        default="float32",
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--compile",

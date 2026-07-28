@@ -9,6 +9,7 @@
 //!   1. a coarse cell `C` ~ softmax over the coarse map (coarse cell value = MAX
 //!      of the fine logits it covers),
 //!   2. a fine cell within `C` ~ softmax over the fine logits restricted to `C`.
+//!
 //! The exact sampling probability is `beta = P_coarse(C) * P_fine(a | C)`, which
 //! we return so the training side can importance-correct the target.
 

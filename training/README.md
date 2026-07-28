@@ -15,6 +15,50 @@ No simulator or game-rule implementation belongs here.
 The end-to-end replay, training, export, arena, promotion, and restart workflow
 is documented in [`../docs/RL_LOOP.md`](../docs/RL_LOOP.md).
 
+## Production RL learner
+
+The RL coordinator starts `vgo_training.learner` once and speaks a strict
+JSON-lines protocol to it for every update. The process retains model weights,
+Adam moments, the optional compiled graph, prepared replay-window shards, pinned
+host buffers, and CUDA staging buffers. Do not launch that service manually for
+a normal run; from this directory use:
+
+```powershell
+uv run python -m vgo_training.rl_loop `
+  --output ../artifacts/rl-run-NAME `
+  --updates 20 --samples-per-shard 1024 --replay-window 8 `
+  --architecture ddrnet --model-width 64 --blocks 8 `
+  --training-device cuda --training-precision bfloat16 `
+  --provider tensorrt --inference-device-id 0 --inference-slots 2 `
+  --warm-inference
+```
+
+The pipeline defaults to BF16 autocast for CUDA training and FP16 TensorRT
+inference. These are independent controls: use `--training-precision float32`
+when BF16 is unsupported, and `--no-fp16` for an FP32 inference engine. The
+standalone `train_demo` adapter below remains FP32 by default.
+
+After each export, TensorRT warmup defaults on: one full configured batch builds
+the model-digest-scoped engine cache while the current actor tail is running.
+Use `--no-warm-inference` to disable it. CUDA and CPU providers skip the step.
+
+The learner is persistent across updates, not across coordinator processes. On
+restart the coordinator verifies durable replay/model identities, starts a new
+service, reloads the accepted parent checkpoint, and rebuilds its in-memory
+cache. Runtime controls such as update target, actor and inference-lane counts,
+prefetch depth, device placement, compilation, inference warmup, and telemetry
+capacity may change on restart; learning semantics and artifact contracts may
+not. See the
+configuration split and exact restart procedure in
+[`../docs/RL_LOOP.md`](../docs/RL_LOOP.md#recovery-and-artifacts).
+
+After a run, use `run.json.utilization` as the tuning feedback loop. It
+aggregates overlap, active actors, inference fill, writer backpressure,
+optimizer share, and prepared-replay cache reuse, with measured
+generation/update counts so partial aggregates are visible. Field definitions
+and tuning guidance are in
+[`../docs/RL_LOOP.md`](../docs/RL_LOOP.md#utilization-feedback-loop).
+
 ## Raster training workflow
 
 Generate a legacy bootstrap shard from the repository root:
@@ -31,11 +75,12 @@ replay with:
 ```powershell
 cargo run --release -p vgo-selfplay --bin vgo-generate-demo -- `
   --samples 96 --resolution 128 --simulations 100 --coarse-pool 8 `
-  --runtime onnx --model artifacts/PREV/iteration-000/model/candidate.onnx `
-  --provider cpu --output artifacts/raster-coarse-demo
+  --runtime onnx `
+  --model artifacts/PREV/updates/update-000019/candidate.onnx `
+  --provider cpu --device-id 0 --output artifacts/raster-coarse-demo
 ```
 
-`--coarse-pool` defaults to `0`, must not exceed the raster resolution, and is
+`--coarse-pool` defaults to `0`, must not exceed `--policy-resolution`, and is
 the only coarse-sampling control exposed by the generator.
 
 Then run the small policy/value overfit experiment from this directory:
@@ -71,8 +116,9 @@ based on Hong et al.,
 of Road Scenes"](https://arxiv.org/abs/2101.06085). The initial speed, export,
 and replay-training measurements are recorded in
 [`../benchmarks/results/2026-07-26-ddrnet-trial.json`](../benchmarks/results/2026-07-26-ddrnet-trial.json).
-Existing defaults remain `flat`; selecting DDRNet never changes how older
-checkpoints are loaded.
+The standalone `train_demo` default remains `flat`; the production RL pipeline
+defaults to `ddrnet` with width 64 and 8 blocks. Selecting DDRNet never changes
+how older checkpoints are loaded.
 
 An initial checkpoint always retains the architecture stored in that
 checkpoint; model families do not share compatible parameter layouts. To switch

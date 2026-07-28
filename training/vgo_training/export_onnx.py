@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -10,6 +11,7 @@ import onnx
 import torch
 
 from .serve import load_model
+from .train_demo import atomic_write_text
 
 
 for stream in (sys.stdout, sys.stderr):
@@ -70,7 +72,15 @@ def export(arguments: argparse.Namespace) -> dict[str, object]:
     onnx.helper.set_model_props(model_proto, properties)
     onnx.checker.check_model(model_proto, full_check=True)
     onnx.save_model(model_proto, temporary_path, save_as_external_data=False)
-    temporary_path.replace(output_path)
+    with temporary_path.open("rb") as stream:
+        os.fsync(stream.fileno())
+    os.replace(temporary_path, output_path)
+    if os.name != "nt":
+        descriptor = os.open(output_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     manifest = {
         "schema": "vgo.onnx-manifest.v1",
@@ -104,9 +114,9 @@ def export(arguments: argparse.Namespace) -> dict[str, object]:
         },
     }
     manifest_path = output_path.with_suffix(output_path.suffix + ".json")
-    manifest_temporary = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
-    manifest_temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="ascii")
-    manifest_temporary.replace(manifest_path)
+    atomic_write_text(
+        manifest_path, json.dumps(manifest, indent=2) + "\n"
+    )
     print(json.dumps(manifest, indent=2))
     return manifest
 

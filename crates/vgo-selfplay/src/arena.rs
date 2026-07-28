@@ -64,6 +64,8 @@ struct Arguments {
     delay_ms: u64,
     #[arg(long, default_value = "tensorrt")]
     provider: OnnxProvider,
+    #[arg(long, default_value_t = 0)]
+    device_id: i32,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     fp16: bool,
     #[arg(long, default_value = "artifacts/onnx-cache")]
@@ -85,7 +87,7 @@ fn load_model(model: PathBuf, arguments: &Arguments) -> Result<BatchedEvaluator,
         policy: Some(RasterConfig::square(arguments.policy_resolution)),
         maximum_batch: arguments.maximum_batch,
         provider: arguments.provider,
-        device_id: 0,
+        device_id: arguments.device_id,
         fp16: arguments.fp16,
         cache_directory: arguments.cache_directory.clone(),
     })?;
@@ -113,6 +115,7 @@ fn validate_arguments(arguments: &Arguments) -> Result<(), &'static str> {
         || arguments.maximum_batch == 0
         || arguments.resolution == 0
         || arguments.policy_resolution == 0
+        || arguments.device_id < 0
     {
         return Err("arena counts, simulations, and dimensions must be positive");
     }
@@ -146,7 +149,11 @@ fn play_game(
             };
             search_with_evaluator(
                 position,
-                search_config(arguments.simulations, arguments.coarse_pool, arguments.leaf_batch),
+                search_config(
+                    arguments.simulations,
+                    arguments.coarse_pool,
+                    arguments.leaf_batch,
+                ),
                 seed,
                 evaluator,
             )

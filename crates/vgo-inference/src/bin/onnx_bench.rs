@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 
-use std::{env, hint::black_box, path::PathBuf, time::Instant};
+use std::{
+    env,
+    hint::black_box,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use vgo_core::{Color, Position, Stone};
 use vgo_inference::{
@@ -9,24 +14,121 @@ use vgo_inference::{
 };
 use vgo_raster::{RasterConfig, rasterize};
 
+fn argument_value<'a>(arguments: &'a [String], name: &str) -> Result<Option<&'a str>, String> {
+    let Some(index) = arguments.iter().position(|argument| argument == name) else {
+        return Ok(None);
+    };
+    let Some(value) = arguments.get(index + 1) else {
+        return Err(format!("missing value for {name}"));
+    };
+    if value.starts_with("--") {
+        return Err(format!("missing value for {name}"));
+    }
+    Ok(Some(value))
+}
+
 fn value_argument<T>(arguments: &[String], name: &str, default: T) -> Result<T, String>
 where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    let Some(pair) = arguments.windows(2).find(|pair| pair[0] == name) else {
+    let Some(value) = argument_value(arguments, name)? else {
         return Ok(default);
     };
-    pair[1]
+    value
         .parse()
         .map_err(|error| format!("invalid value for {name}: {error}"))
 }
 
-fn path_argument(arguments: &[String], name: &str, default: PathBuf) -> PathBuf {
-    arguments
-        .windows(2)
-        .find(|pair| pair[0] == name)
-        .map_or(default, |pair| PathBuf::from(&pair[1]))
+fn path_argument(arguments: &[String], name: &str, default: PathBuf) -> Result<PathBuf, String> {
+    let Some(value) = argument_value(arguments, name)? else {
+        return Ok(default);
+    };
+    if value.is_empty() {
+        return Err(format!("{name} must not be empty"));
+    }
+    Ok(PathBuf::from(value))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct Arguments {
+    model: PathBuf,
+    checkpoint: PathBuf,
+    python: PathBuf,
+    training: PathBuf,
+    cache_directory: PathBuf,
+    provider: OnnxProvider,
+    resolution: usize,
+    policy_resolution: usize,
+    batch: usize,
+    warmup: usize,
+    iterations: usize,
+    device_id: i32,
+    fp16: bool,
+    compare_python: bool,
+    python_device: TorchDevice,
+    python_compile: bool,
+}
+
+fn parse_arguments(arguments: &[String], root: &Path) -> Result<Arguments, String> {
+    let model = path_argument(
+        arguments,
+        "--model",
+        root.join("artifacts/raster-demo/model.onnx"),
+    )?;
+    let checkpoint = path_argument(
+        arguments,
+        "--checkpoint",
+        root.join("artifacts/raster-demo/model.pt"),
+    )?;
+    let python = path_argument(
+        arguments,
+        "--python",
+        root.join("training/.venv/Scripts/python.exe"),
+    )?;
+    let training = path_argument(arguments, "--training", root.join("training"))?;
+    let cache_directory = path_argument(
+        arguments,
+        "--cache-directory",
+        root.join("artifacts/onnx-cache"),
+    )?;
+    let provider = value_argument(arguments, "--provider", OnnxProvider::Cuda)?;
+    let resolution = value_argument(arguments, "--resolution", 128_usize)?;
+    let policy_resolution = value_argument(arguments, "--policy-resolution", resolution)?;
+    let batch = value_argument(arguments, "--batch", 8_usize)?;
+    let warmup = value_argument(arguments, "--warmup", 10_usize)?;
+    let iterations = value_argument(arguments, "--iterations", 200_usize)?;
+    let device_id = value_argument(arguments, "--device-id", 0_i32)?;
+    let fp16 = value_argument(arguments, "--fp16", true)?;
+    let compare_python = value_argument(arguments, "--compare-python", true)?;
+    let python_device = value_argument(arguments, "--python-device", TorchDevice::Cpu)?;
+    let python_compile = value_argument(arguments, "--python-compile", false)?;
+
+    if resolution == 0 || policy_resolution == 0 || batch == 0 || warmup == 0 || iterations == 0 {
+        return Err("raster and policy resolutions and benchmark counts must be positive".into());
+    }
+    if device_id < 0 {
+        return Err("--device-id must be nonnegative".into());
+    }
+
+    Ok(Arguments {
+        model,
+        checkpoint,
+        python,
+        training,
+        cache_directory,
+        provider,
+        resolution,
+        policy_resolution,
+        batch,
+        warmup,
+        iterations,
+        device_id,
+        fp16,
+        compare_python,
+        python_device,
+        python_compile,
+    })
 }
 
 fn fixture_positions() -> Vec<Position> {
@@ -94,37 +196,25 @@ fn compare(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let arguments = env::args().collect::<Vec<_>>();
     let root = env::current_dir()?;
-    let model = path_argument(
-        &arguments,
-        "--model",
-        root.join("artifacts/raster-demo/model.onnx"),
-    );
-    let checkpoint = path_argument(
-        &arguments,
-        "--checkpoint",
-        root.join("artifacts/raster-demo/model.pt"),
-    );
-    let python = path_argument(
-        &arguments,
-        "--python",
-        root.join("training/.venv/Scripts/python.exe"),
-    );
-    let training = path_argument(&arguments, "--training", root.join("training"));
-    let provider = value_argument(&arguments, "--provider", OnnxProvider::Cuda)?;
-    let resolution = value_argument(&arguments, "--resolution", 128_usize)?;
-    let policy_resolution = value_argument(&arguments, "--policy-resolution", resolution)?;
-    let batch = value_argument(&arguments, "--batch", 8_usize)?;
-    let warmup = value_argument(&arguments, "--warmup", 10_usize)?;
-    let iterations = value_argument(&arguments, "--iterations", 200_usize)?;
-    let fp16 = value_argument(&arguments, "--fp16", true)?;
-    let compare_python = value_argument(&arguments, "--compare-python", true)?;
-    let python_device = value_argument(&arguments, "--python-device", TorchDevice::Cpu)?;
-    let python_compile = value_argument(&arguments, "--python-compile", false)?;
-    if resolution == 0 || policy_resolution == 0 || batch == 0 || warmup == 0 || iterations == 0 {
-        return Err("raster and policy resolutions and benchmark counts must be positive".into());
-    }
+    let Arguments {
+        model,
+        checkpoint,
+        python,
+        training,
+        cache_directory,
+        provider,
+        resolution,
+        policy_resolution,
+        batch,
+        warmup,
+        iterations,
+        device_id,
+        fp16,
+        compare_python,
+        python_device,
+        python_compile,
+    } = parse_arguments(&env::args().collect::<Vec<_>>(), &root)?;
     let raster_config = RasterConfig::square(resolution);
     let policy_config = RasterConfig::square(policy_resolution);
     let positions = fixture_positions();
@@ -136,7 +226,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .collect::<Vec<_>>();
-    let cache_directory = root.join("artifacts/onnx-cache");
     let load_started = Instant::now();
     let mut service = OnnxBatchService::load(&OnnxServiceConfig {
         model,
@@ -144,7 +233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         policy: Some(policy_config),
         maximum_batch: batch,
         provider,
-        device_id: 0,
+        device_id,
         fp16,
         cache_directory,
     })?;
@@ -225,4 +314,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         parity_json,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::parse_arguments;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn device_and_cache_defaults_match_the_existing_benchmark() {
+        let root = Path::new("/workspace/vgo");
+        let parsed = parse_arguments(&arguments(&["vgo-onnx-bench"]), root).unwrap();
+
+        assert_eq!(parsed.device_id, 0);
+        assert_eq!(parsed.cache_directory, root.join("artifacts/onnx-cache"));
+    }
+
+    #[test]
+    fn device_and_cache_overrides_are_preserved() {
+        let parsed = parse_arguments(
+            &arguments(&[
+                "vgo-onnx-bench",
+                "--device-id",
+                "2",
+                "--cache-directory",
+                "/mnt/tensorrt-cache",
+            ]),
+            Path::new("/workspace/vgo"),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.device_id, 2);
+        assert_eq!(parsed.cache_directory, PathBuf::from("/mnt/tensorrt-cache"));
+    }
+
+    #[test]
+    fn invalid_device_ids_are_rejected_before_loading_a_model() {
+        for value in ["-1", "gpu"] {
+            let error = parse_arguments(
+                &arguments(&["vgo-onnx-bench", "--device-id", value]),
+                Path::new("/workspace/vgo"),
+            )
+            .unwrap_err();
+            assert!(error.contains("--device-id"));
+        }
+    }
+
+    #[test]
+    fn cache_directory_requires_a_nonempty_value() {
+        for values in [
+            &["vgo-onnx-bench", "--cache-directory"][..],
+            &["vgo-onnx-bench", "--cache-directory", ""][..],
+            &["vgo-onnx-bench", "--cache-directory", "--device-id", "0"][..],
+        ] {
+            let error =
+                parse_arguments(&arguments(values), Path::new("/workspace/vgo")).unwrap_err();
+            assert!(error.contains("--cache-directory"));
+        }
+    }
 }

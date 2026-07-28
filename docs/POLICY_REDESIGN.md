@@ -18,9 +18,9 @@ Done:
   aliases. Corrected sparse targets and legal masks are materialized once on CPU
   and reused by training and metrics.
 - `vgo-generate-demo`, `vgo-arena`, and `vgo_training.rl_loop` accept
-  `--coarse-pool`; the loop passes the same value to generation, baseline,
-  promotion, and Elo arenas. Zero retains legacy candidate generation, and a
-  positive pool cannot exceed the raster resolution.
+  `--coarse-pool`; the loop passes the same value to generation, promotion, and
+  Elo telemetry arenas. Zero retains legacy candidate generation, and a
+  positive pool cannot exceed the policy resolution.
 - A retained CPU smoke generated replay v3 from an ONNX incumbent, trained with
   corrected full-legal supervision, exported ONNX, and completed a two-game
   coarse-to-fine promotion arena. See
@@ -81,7 +81,7 @@ Close the loop:
    placement sampler.
 4. Coarse pooling retains regional structure without averaging away a sharp
    fine-cell peak. `coarse_pool` is the number of fine cells per coarse region;
-   it must not exceed the raster resolution.
+   it must not exceed the policy resolution.
 5. Move played = the sampled fine cell (its center, or jitter within it). The net
    never predicts continuously; the grid resolution is the placement precision.
 

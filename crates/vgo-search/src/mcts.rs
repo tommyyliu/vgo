@@ -168,10 +168,14 @@ struct Node {
     /// In-flight descents through this node; see `Child::virtual_visits`.
     virtual_visits: u32,
     children: Vec<Child>,
-    candidates: CandidateSequence,
+    /// The legacy sequence is comparatively expensive to construct because it
+    /// enumerates legal vertices. Dense spatial policies never use it, so build
+    /// it only if coarse-to-fine sampling is unavailable.
+    candidates: Option<CandidateSequence>,
     candidates_exhausted: bool,
     terminal_black_value: Option<f64>,
     evaluation: Option<Evaluation>,
+    match_seed: u64,
     /// Counter-based RNG state for coarse-to-fine candidate sampling, seeded from
     /// the match seed and this node's position so sampling is deterministic per
     /// (match, position) yet advances across widening calls.
@@ -181,21 +185,25 @@ struct Node {
     /// Highest visit-count coarse proposal budget already serviced. `None` means
     /// the policy has not yet confirmed that it exposes a spatial fine grid.
     coarse_budget: Option<usize>,
+    /// Building a fine grid computes legality for every policy cell. Cache both
+    /// success and absence so progressive widening never repeats that work.
+    fine_grid: FineGridCache,
+}
+
+enum FineGridCache {
+    Uninitialized,
+    Unavailable,
+    Ready(FineGrid),
 }
 
 impl Node {
     /// Build a node whose evaluation was already computed elsewhere.
     ///
     /// The batched path evaluates a round of leaves together, so by the time a
-    /// node is constructed its evaluation exists. A finished position needs no
-    /// evaluation and takes its value from analysis instead.
+    /// node is constructed its evaluation exists. Finished positions are built
+    /// with `terminal` and never reach an evaluator.
     fn from_evaluation(position: Position, evaluation: Evaluation, match_seed: u64) -> Self {
-        let terminal_black_value = if position.phase() == Phase::Finished {
-            Some(Analysis::new(&position).outcome.black_utility())
-        } else {
-            None
-        };
-        let candidates = CandidateSequence::new(&position, match_seed);
+        debug_assert_eq!(position.phase(), Phase::Playing);
         let sample_rng =
             crate::candidates::splitmix64(match_seed ^ crate::candidates::position_hash(&position));
         Self {
@@ -203,17 +211,36 @@ impl Node {
             visits: 0,
             virtual_visits: 0,
             children: Vec::new(),
-            candidates,
+            candidates: None,
             candidates_exhausted: false,
-            evaluation: if terminal_black_value.is_some() {
-                None
-            } else {
-                Some(evaluation)
-            },
-            terminal_black_value,
+            evaluation: Some(evaluation),
+            terminal_black_value: None,
+            match_seed,
             sample_rng,
             proposal_draws: 0,
             coarse_budget: None,
+            fine_grid: FineGridCache::Uninitialized,
+        }
+    }
+
+    fn terminal(position: Position, black_value: f64, match_seed: u64) -> Self {
+        debug_assert_eq!(position.phase(), Phase::Finished);
+        let sample_rng =
+            crate::candidates::splitmix64(match_seed ^ crate::candidates::position_hash(&position));
+        Self {
+            position,
+            visits: 0,
+            virtual_visits: 0,
+            children: Vec::new(),
+            candidates: None,
+            candidates_exhausted: true,
+            terminal_black_value: Some(black_value),
+            evaluation: None,
+            match_seed,
+            sample_rng,
+            proposal_draws: 0,
+            coarse_budget: None,
+            fine_grid: FineGridCache::Unavailable,
         }
     }
 
@@ -233,28 +260,12 @@ impl Node {
         } else {
             None
         };
-        let evaluation = if terminal_black_value.is_some() {
-            None
-        } else {
-            stats.evaluations += 1;
-            Some(evaluator.evaluate(&position)?)
-        };
-        let candidates = CandidateSequence::new(&position, match_seed);
-        let sample_rng =
-            crate::candidates::splitmix64(match_seed ^ crate::candidates::position_hash(&position));
-        Ok(Self {
-            position,
-            visits: 0,
-            virtual_visits: 0,
-            children: Vec::new(),
-            candidates,
-            candidates_exhausted: false,
-            terminal_black_value,
-            evaluation,
-            sample_rng,
-            proposal_draws: 0,
-            coarse_budget: None,
-        })
+        if let Some(black_value) = terminal_black_value {
+            return Ok(Self::terminal(position, black_value, match_seed));
+        }
+        stats.evaluations += 1;
+        let evaluation = evaluator.evaluate(&position)?;
+        Ok(Self::from_evaluation(position, evaluation, match_seed))
     }
 
     fn black_evaluation(&self) -> f64 {
@@ -283,13 +294,16 @@ impl Node {
             if self.coarse_budget.is_some_and(|budget| budget >= desired) {
                 return;
             }
-            if let Some(grid) = self
-                .evaluation
-                .as_ref()
-                .expect("playable nodes are evaluated")
-                .fine_grid(&self.position, config.coarse_pool)
-            {
-                self.widen_coarse_fine(&grid, desired, stats);
+            if matches!(self.fine_grid, FineGridCache::Uninitialized) {
+                self.fine_grid = self
+                    .evaluation
+                    .as_ref()
+                    .expect("playable nodes are evaluated")
+                    .fine_grid(&self.position, config.coarse_pool)
+                    .map_or(FineGridCache::Unavailable, FineGridCache::Ready);
+            }
+            if matches!(self.fine_grid, FineGridCache::Ready(_)) {
+                self.widen_coarse_fine(desired, stats);
                 self.coarse_budget = Some(desired);
                 normalize_priors(&mut self.children);
                 return;
@@ -297,8 +311,16 @@ impl Node {
             // Policy is not spatial (e.g. naive): fall through to the legacy path.
         }
 
+        if self.candidates.is_none() {
+            self.candidates = Some(CandidateSequence::new(&self.position, self.match_seed));
+        }
         while self.children.len() < desired && !self.candidates_exhausted {
-            if let Some(candidate) = self.candidates.next_candidate() {
+            if let Some(candidate) = self
+                .candidates
+                .as_mut()
+                .expect("legacy candidate sequence initialized")
+                .next_candidate()
+            {
                 let policy_logit = self
                     .evaluation
                     .as_ref()
@@ -328,7 +350,10 @@ impl Node {
     /// multiplicity on the existing child rather than triggering a retry. Each
     /// child's exact sampling probability beta is recorded, and pass is always
     /// available.
-    fn widen_coarse_fine(&mut self, grid: &FineGrid, desired: usize, stats: &mut SearchStats) {
+    fn widen_coarse_fine(&mut self, desired: usize, stats: &mut SearchStats) {
+        let FineGridCache::Ready(grid) = &self.fine_grid else {
+            unreachable!("coarse-to-fine widening requires a cached grid");
+        };
         // Ensure Pass is a candidate exactly once (it is not part of the grid).
         if !self
             .children
@@ -517,7 +542,7 @@ fn sampled_child_indices(
     let mut order = Vec::with_capacity(children.len());
     while !pool.is_empty() {
         let total: f64 = pool.iter().map(|&(_, weight)| weight).sum();
-        if !(total > 0.0) || !total.is_finite() {
+        if total <= 0.0 || !total.is_finite() {
             // Degenerate weights (all zero, or non-finite): fall back to the
             // deterministic order for whatever remains.
             order.extend(pool.iter().map(|&(index, _)| index));
@@ -544,7 +569,7 @@ fn sampled_child_indices(
 }
 
 /// Run the simulation budget in rounds of up to `config.leaf_batch` descents,
-/// evaluating each round's leaves concurrently.
+/// evaluating each round's unique leaves as one batch.
 ///
 /// MCTS is sequential within a game -- a simulation cannot start until the
 /// previous one backs up -- so a single game keeps exactly one evaluation in
@@ -553,8 +578,11 @@ fn sampled_child_indices(
 /// game fill a batch. Virtual loss keeps the concurrent descents from all
 /// choosing the same branch.
 ///
-/// The evaluations run on scoped threads so the broker coalesces them, exactly
-/// as it already does for requests arriving from separate games.
+/// `Evaluator::evaluate_batch` is the concurrency boundary. Model-backed
+/// evaluators can submit the round directly to a vectorized backend; simple
+/// evaluators inherit the sequential default. Duplicate descents to the same
+/// pending tree edge share one evaluation, then back up in original descent
+/// order so the tree remains deterministic.
 fn run_batched_simulations(
     root: &mut Node,
     config: SearchConfig,
@@ -570,40 +598,68 @@ fn run_batched_simulations(
             descents.push(descend(root, config, stats));
         }
 
-        // Evaluate the pending leaves together. Terminal and depth-limited
-        // descents already carry their value and skip this entirely.
-        let pending = descents
-            .iter()
-            .filter_map(|descent| match descent {
-                Descent::Pending { position, .. } => Some(position.clone()),
-                Descent::Resolved { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        let evaluations = if pending.is_empty() {
+        // Build one ordered batch and coalesce repeated descents to the same
+        // unexpanded edge. Path identity is deliberately stricter than position
+        // identity: transpositions need distinct nodes, while a repeated path can
+        // safely attach one node and back up the remaining visits through it.
+        let mut pending_paths = Vec::<Vec<usize>>::new();
+        let mut pending_positions = Vec::<Position>::new();
+        let mut pending_index = Vec::with_capacity(descents.len());
+        for descent in &descents {
+            let Descent::Pending { path, position, .. } = descent else {
+                pending_index.push(None);
+                continue;
+            };
+            let index = pending_paths
+                .iter()
+                .position(|existing| existing == path)
+                .unwrap_or_else(|| {
+                    let index = pending_paths.len();
+                    pending_paths.push(path.clone());
+                    pending_positions.push(position.clone());
+                    index
+                });
+            pending_index.push(Some(index));
+        }
+
+        let evaluations = if pending_positions.is_empty() {
             Vec::new()
         } else {
-            stats.evaluations += pending.len() as u64;
-            evaluate_concurrently(&pending, evaluator)?
+            stats.evaluations += pending_positions.len() as u64;
+            let evaluations = evaluator.evaluate_batch(&pending_positions)?;
+            if evaluations.len() != pending_positions.len() {
+                return Err(EvaluationError::new(format!(
+                    "evaluator returned {} results for {} positions",
+                    evaluations.len(),
+                    pending_positions.len()
+                )));
+            }
+            evaluations
         };
+        let mut evaluated = pending_positions
+            .into_iter()
+            .zip(evaluations)
+            .map(|(position, evaluation)| {
+                let node = Node::from_evaluation(position, evaluation, match_seed);
+                let value = node.black_evaluation();
+                (value, Some(Box::new(node)))
+            })
+            .collect::<Vec<_>>();
 
-        let mut evaluated = evaluations.into_iter();
-        for descent in descents {
+        for (descent, pending_index) in descents.into_iter().zip(pending_index) {
             match descent {
-                Descent::Resolved { path, value } => {
-                    back_up(root, &path, value, None, stats);
-                }
-                Descent::Pending {
+                Descent::Resolved {
                     path,
-                    position,
-                    depth,
+                    value,
+                    expansion,
                 } => {
-                    let evaluation = evaluated.next().expect("one evaluation per pending leaf");
-                    let node = Node::from_evaluation(position, evaluation, match_seed);
-                    let value = node
-                        .terminal_black_value
-                        .unwrap_or_else(|| node.black_evaluation());
+                    back_up(root, &path, value, expansion, stats);
+                }
+                Descent::Pending { path, depth, .. } => {
+                    let index = pending_index.expect("pending descent has an evaluation index");
+                    let (value, node) = &mut evaluated[index];
                     stats.maximum_depth = stats.maximum_depth.max(depth);
-                    back_up(root, &path, value, Some(node), stats);
+                    back_up(root, &path, *value, node.take(), stats);
                 }
             }
             stats.simulations += 1;
@@ -613,39 +669,24 @@ fn run_batched_simulations(
     Ok(())
 }
 
-/// Evaluate positions concurrently so the inference broker can batch them.
-fn evaluate_concurrently(
-    positions: &[Position],
-    evaluator: &dyn Evaluator,
-) -> Result<Vec<Evaluation>, EvaluationError> {
-    if positions.len() == 1 {
-        return Ok(vec![evaluator.evaluate(&positions[0])?]);
-    }
-    std::thread::scope(|scope| {
-        let handles = positions
-            .iter()
-            .map(|position| scope.spawn(|| evaluator.evaluate(position)))
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("evaluation worker did not panic"))
-            .collect()
-    })
-}
-
 /// The outcome of descending to a leaf without evaluating it.
 enum Descent {
     /// A position needing evaluation, reached by the recorded child path. The
-    /// caller evaluates it (concurrently with other descents) and returns the
-    /// result through `back_up`.
+    /// caller evaluates it with the rest of the leaf batch and returns the result
+    /// through `back_up`.
     Pending {
         path: Vec<usize>,
         position: Position,
         depth: u32,
     },
     /// The descent ended at a terminal or depth-limited node, whose value is
-    /// already known. No evaluation is needed; `back_up` can be called directly.
-    Resolved { path: Vec<usize>, value: f64 },
+    /// already known. A newly discovered terminal child carries its node so the
+    /// tree records the expansion without ever sending it to inference.
+    Resolved {
+        path: Vec<usize>,
+        value: f64,
+        expansion: Option<Box<Node>>,
+    },
 }
 
 /// Descend from the root to a leaf, applying virtual loss along the way.
@@ -664,13 +705,21 @@ fn descend(node: &mut Node, config: SearchConfig, stats: &mut SearchStats) -> De
         if let Some(value) = current.terminal_black_value {
             stats.terminal_leaves += 1;
             current.virtual_visits += 1;
-            return Descent::Resolved { path, value };
+            return Descent::Resolved {
+                path,
+                value,
+                expansion: None,
+            };
         }
         if depth >= config.maximum_depth {
             stats.depth_limited_leaves += 1;
             let value = current.black_evaluation();
             current.virtual_visits += 1;
-            return Descent::Resolved { path, value };
+            return Descent::Resolved {
+                path,
+                value,
+                expansion: None,
+            };
         }
 
         current.widen(config, stats);
@@ -680,16 +729,28 @@ fn descend(node: &mut Node, config: SearchConfig, stats: &mut SearchStats) -> De
         path.push(index);
 
         if current.children[index].node.is_none() {
-            // Unexpanded: this is the leaf the caller must evaluate. The child
-            // node is created during back-up, once its evaluation exists.
-            let position = current.children[index]
+            // Resolve terminal children from the transition analysis. They have
+            // exact outcomes and must never consume a model slot.
+            let transition = current.children[index]
                 .candidate
                 .action
-                .apply(&current.position)
-                .position;
+                .apply(&current.position);
+            if transition.position.phase() == Phase::Finished {
+                let value = transition.analysis.outcome.black_utility();
+                let expansion = Node::terminal(transition.position, value, current.match_seed);
+                stats.maximum_depth = stats.maximum_depth.max(depth + 1);
+                stats.terminal_leaves += 1;
+                return Descent::Resolved {
+                    path,
+                    value,
+                    expansion: Some(Box::new(expansion)),
+                };
+            }
+            // A playable unexpanded leaf is evaluated by the caller and created
+            // during back-up once its evaluation exists.
             return Descent::Pending {
                 path,
-                position,
+                position: transition.position,
                 depth: depth + 1,
             };
         }
@@ -709,14 +770,14 @@ fn back_up(
     node: &mut Node,
     path: &[usize],
     black_value: f64,
-    mut expansion: Option<Node>,
+    mut expansion: Option<Box<Node>>,
     stats: &mut SearchStats,
 ) {
     fn recurse(
         node: &mut Node,
         path: &[usize],
         black_value: f64,
-        expansion: &mut Option<Node>,
+        expansion: &mut Option<Box<Node>>,
         stats: &mut SearchStats,
     ) {
         node.virtual_visits = node.virtual_visits.saturating_sub(1);
@@ -735,7 +796,7 @@ fn back_up(
             let mut created = created;
             // The freshly evaluated leaf counts one visit of its own.
             created.visits += 1;
-            child.node = Some(Box::new(created));
+            child.node = Some(created);
             stats.expanded_nodes += 1;
         }
     }
@@ -883,7 +944,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use vgo_core::{Color, Position};
+    use vgo_core::{Color, Phase, Position};
 
     use crate::{Action, Evaluation, EvaluationError, Evaluator, NaiveEvaluator, Policy};
 
@@ -951,7 +1012,11 @@ mod tests {
     /// fallback degrades to visit order rather than to noise.
     #[test]
     fn unvisited_children_sort_last() {
-        let children = vec![child(place(0.1), 0), child(place(0.2), 7), child(place(0.3), 3)];
+        let children = vec![
+            child(place(0.1), 0),
+            child(place(0.2), 7),
+            child(place(0.3), 3),
+        ];
         for seed in 0..50 {
             let order = sampled_child_indices(&children, Color::Black, 1.0, seed);
             assert_eq!(order.len(), 3);
@@ -962,7 +1027,11 @@ mod tests {
     /// Same seed, same order: replay and debugging depend on it.
     #[test]
     fn sampling_is_reproducible_for_a_seed() {
-        let children = vec![child(place(0.1), 40), child(place(0.2), 30), child(place(0.3), 20)];
+        let children = vec![
+            child(place(0.1), 40),
+            child(place(0.2), 30),
+            child(place(0.3), 20),
+        ];
         let first = sampled_child_indices(&children, Color::Black, 1.0, 12_345);
         let again = sampled_child_indices(&children, Color::Black, 1.0, 12_345);
         assert_eq!(first, again);
@@ -984,9 +1053,8 @@ mod tests {
             .expect("naive search is infallible");
         assert_eq!(left.action, right.action);
         assert_eq!(left.stats.simulations, right.stats.simulations);
-        let visits = |result: &SearchResult| {
-            result.children.iter().map(|c| c.visits).collect::<Vec<_>>()
-        };
+        let visits =
+            |result: &SearchResult| result.children.iter().map(|c| c.visits).collect::<Vec<_>>();
         assert_eq!(visits(&left), visits(&right));
     }
 
@@ -1050,12 +1118,11 @@ mod tests {
         // sees the previous descents' virtual loss.
         let mut chosen = std::collections::HashSet::new();
         for _ in 0..8 {
-            if let Descent::Pending { path, .. } | Descent::Resolved { path, .. } =
-                descend(&mut root, config, &mut stats)
-            {
-                if let Some(&first) = path.first() {
-                    chosen.insert(first);
-                }
+            let path = match descend(&mut root, config, &mut stats) {
+                Descent::Pending { path, .. } | Descent::Resolved { path, .. } => path,
+            };
+            if let Some(&first) = path.first() {
+                chosen.insert(first);
             }
         }
         assert!(
@@ -1185,6 +1252,44 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BatchCountingEvaluator {
+        single_calls: AtomicUsize,
+        batch_calls: AtomicUsize,
+        batch_positions: AtomicUsize,
+    }
+
+    impl Evaluator for BatchCountingEvaluator {
+        fn evaluate(&self, position: &Position) -> Result<Evaluation, EvaluationError> {
+            assert_eq!(
+                position.phase(),
+                Phase::Playing,
+                "terminal positions must not reach evaluate"
+            );
+            self.single_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Evaluation::new(0.0, Box::new(FlatPolicy)))
+        }
+
+        fn evaluate_batch(
+            &self,
+            positions: &[Position],
+        ) -> Result<Vec<Evaluation>, EvaluationError> {
+            assert!(
+                positions
+                    .iter()
+                    .all(|position| position.phase() == Phase::Playing),
+                "terminal positions must not reach evaluate_batch"
+            );
+            self.batch_calls.fetch_add(1, Ordering::Relaxed);
+            self.batch_positions
+                .fetch_add(positions.len(), Ordering::Relaxed);
+            Ok(positions
+                .iter()
+                .map(|_| Evaluation::new(0.0, Box::new(FlatPolicy)))
+                .collect())
+        }
+    }
+
     struct FailingEvaluator;
 
     impl Evaluator for FailingEvaluator {
@@ -1293,7 +1398,7 @@ mod tests {
     }
 
     #[test]
-    fn coarse_fine_grid_is_rebuilt_only_when_the_draw_budget_grows() {
+    fn coarse_fine_grid_is_built_once_per_node() {
         let fine_grid_calls = Arc::new(AtomicUsize::new(0));
         let evaluator = CountingGridEvaluator {
             fine_grid_calls: Arc::clone(&fine_grid_calls),
@@ -1321,8 +1426,33 @@ mod tests {
 
         node.visits = 4;
         node.widen(config, &mut stats);
-        assert_eq!(fine_grid_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(fine_grid_calls.load(Ordering::Relaxed), 1);
         assert_eq!(node.proposal_draws, 5);
+    }
+
+    #[test]
+    fn batched_search_coalesces_pending_edges_and_skips_terminal_children() {
+        let evaluator = BatchCountingEvaluator::default();
+        let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+        let mut config = SearchConfig::canary(16);
+        config.initial_candidates = 1;
+        config.maximum_candidates = 1;
+        config.leaf_batch = 8;
+
+        let result = search_with_evaluator(&position, config, 19, &evaluator)
+            .expect("counting evaluator succeeds");
+
+        // Root evaluation remains the ordinary single-position call. The first
+        // round descends eight times through the only pending edge, which must
+        // become one model position. The next eight descents end the game with a
+        // second pass and are resolved entirely from transition analysis.
+        assert_eq!(evaluator.single_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(evaluator.batch_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(evaluator.batch_positions.load(Ordering::Relaxed), 1);
+        assert_eq!(result.stats.evaluations, 2);
+        assert_eq!(result.stats.terminal_leaves, 8);
+        assert_eq!(result.stats.simulations, 16);
+        assert_eq!(result.children[0].visits, 16);
     }
 
     #[test]

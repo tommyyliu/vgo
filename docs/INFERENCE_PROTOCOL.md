@@ -21,10 +21,11 @@ batch, tensor names, and source-checkpoint digest embedded by the exporter.
 CUDA and TensorRT are explicit providers; unavailable requested acceleration is
 an error rather than a CPU fallback.
 
-The current implementation passes a contiguous host tensor to ONNX Runtime and
-collects owned outputs. TensorRT engine and timing caches are separated by model
-digest, precision, raster shape, and maximum batch. Reusable pinned buffers and
-device I/O binding remain later throughput work.
+The current implementation packs into one maximum-batch host allocation reused
+for the lifetime of the ONNX session and collects owned outputs. TensorRT engine
+and timing caches are separated by model digest, precision, raster shape, and
+maximum batch. Pinned buffers and device I/O binding remain later throughput
+work.
 
 ## Transport
 
@@ -74,11 +75,13 @@ as evaluator errors; search never substitutes neutral predictions silently.
 
 ## Broker
 
-Each actor rasterizes its position before submitting through a bounded
-synchronous channel. The broker takes the first encoded request, waits up to a
-short deadline for peers, caps the batch using the backend's declared contract,
-performs one service call, and returns each output to its waiting search thread.
-Encoding therefore scales with actors rather than occupying the single broker.
+Each actor rasterizes its leaf round before submitting one ordered group through
+a bounded synchronous channel. The broker takes the first group, waits up to a
+short deadline for peers, and flattens groups across backend batch boundaries up
+to the declared contract. A group larger than the backend ceiling may span
+several calls; its caller still receives exactly one ordered completion after
+every output is reassembled. Encoding therefore scales with actors rather than
+occupying a lane's broker.
 
 The implementation exposes three independent contracts:
 
@@ -87,14 +90,19 @@ The implementation exposes three independent contracts:
 - `BatchExecutor` separates batch submission from completion, declares its slot
   capacity, and permits out-of-order completion by sequence number.
 
-Both current backends are capacity-one `BatchService` implementations. A
-threaded executor adapter demonstrates the asynchronous contract; a future GPU
-implementation can provide multiple pinned-memory/stream slots without
-changing actors, encoding, batching, or response routing.
+Each `BatchService` remains synchronous, but generation can run multiple
+session-owned lanes with `--inference-slots` (default `2`). Requests are moved
+to one lane rather than cloned, so adding a lane does not add another tensor
+copy. Each lane does retain its own session, execution context, and reusable
+input storage; tune the lane count against device memory and end-to-end
+throughput. The `BatchExecutor` contract still permits a future backend to use
+multiple pinned-memory/stream slots inside one session without changing actors,
+encoding, batching, or response routing.
 
-Metrics count requests, batches, positions, maximum batch occupancy, failures,
-summed parallel encoding nanoseconds, total queue nanoseconds, and total
-subprocess-exchange nanoseconds. Summed durations may exceed wall time.
+Metrics count submitted request positions (the compatibility `requests`
+counter), executed batches and positions, maximum batch occupancy, failures,
+summed parallel encoding nanoseconds, total queue nanoseconds, and backend
+inference nanoseconds. Summed durations may exceed wall time.
 
 ## Verified smoke path
 
@@ -207,18 +215,20 @@ positions/s in isolation and 4,109 evaluations/s through 64 self-play actors,
 [`../benchmarks/results/2026-07-21-onnx-tensorrt.json`](../benchmarks/results/2026-07-21-onnx-tensorrt.json).
 
 The native path still gathers actor rasters into a contiguous host tensor and
-returns owned output tensors. Reusable pinned input/output slabs and I/O binding
-would leave one asynchronous host-to-device and device-to-host transfer per
-batch. `vgo-raster::rasterize_into` provides the caller-owned destination needed
-for direct writes into assigned slab rows.
+returns owned output tensors. The pageable packing allocation is now retained
+across calls, but reusable pinned input/output slabs and I/O binding would leave
+one asynchronous host-to-device and device-to-host transfer per batch.
+`vgo-raster::rasterize_into` provides the caller-owned destination needed for
+direct writes into assigned slab rows.
 
 ## Remaining production work
 
-- Write immutable, checksummed trajectory shards from the shared playout.
-- Pin a model digest for each generation and attach it to replay metadata.
-- Publish checkpoint replacement only between generation or arena runs.
-- Implement pinned reusable slabs and I/O binding before adding multiple GPU
-  execution slots.
+- Implement pinned reusable slabs and I/O binding to remove the remaining
+  pageable host packing and enable explicit asynchronous transfers per lane.
+- Keep actor workers and the ONNX session alive across same-model shard
+  boundaries when measurements show the residual process/session startup is
+  material; model-digest-scoped TensorRT warmup already removes engine build
+  from the next shard's critical path.
 - Benchmark the learned production model across batch windows and actor counts.
 - Retain the Python protocol as a parity oracle; optimize it only if a measured
   workflow still depends on it.

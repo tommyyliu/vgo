@@ -71,6 +71,19 @@ impl Error for EvaluationError {}
 
 pub trait Evaluator: Send + Sync {
     fn evaluate(&self, position: &Position) -> Result<Evaluation, EvaluationError>;
+
+    /// Evaluate several positions, returning results in the same order.
+    ///
+    /// The default keeps simple in-process evaluators source-compatible and is
+    /// intentionally allocation-light apart from the returned vector. Evaluators
+    /// backed by a vectorized model should override this method so a search can
+    /// submit a whole leaf round without spawning one thread per position.
+    fn evaluate_batch(&self, positions: &[Position]) -> Result<Vec<Evaluation>, EvaluationError> {
+        positions
+            .iter()
+            .map(|position| self.evaluate(position))
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
