@@ -25,7 +25,7 @@ use std::{
 };
 
 use vgo_core::Position;
-use vgo_raster::{RasterConfig, RasterKind, action_pixel, rasterize};
+use vgo_raster::{RasterConfig, action_pixel, rasterize};
 use vgo_search::{Action, Evaluation, EvaluationError, Evaluator, FineGrid, Policy};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1072,7 +1072,7 @@ mod tests {
             raster: RasterConfig {
                 width: 3,
                 height: 2,
-                kind: RasterKind::Semantic,
+                kind: vgo_raster::RasterKind::Semantic,
             },
             ..test_contract(2)
         };

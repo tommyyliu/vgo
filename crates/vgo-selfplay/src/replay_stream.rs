@@ -8,15 +8,36 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
-use vgo_raster::{RasterConfig, SemanticRaster};
+use vgo_core::{Color, Phase, Position};
+use vgo_raster::{RasterConfig, SemanticRaster, rasterize};
 
 pub(crate) const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
 // v2 added raw per-cell visit counts and coarse->fine sampling probability
 // (beta). v3 additionally records the empirical proposal multiplicity per cell.
-pub(crate) const REPLAY_VERSION: u32 = 3;
+//
+// v4 stores the *position* rather than a rendered raster, and the policy
+// targets sparsely. Rendering then becomes a training-time choice over a shard
+// generated once, which is what makes comparing rasterizations affordable --
+// see docs/POSITION_SHARDS.md. Nothing about the targets changes: they are
+// functions of board state and search, not of how the board was drawn.
+//
+// Records stay fixed-size so the Python loader can keep memory-mapping them, so
+// both variable-length parts carry a capacity and a live count. Measured on
+// ddrnet-pipe generations: at most 88 stones (bounded by --max-plies) and at
+// most 47 of 16385 policy cells nonzero, mean 31.6.
+pub(crate) const REPLAY_VERSION: u32 = 4;
+
+/// Stones a v4 record can hold. One stone per ply at most, and the longest
+/// observed game was 88 plies.
+pub(crate) const STONE_CAPACITY: usize = 128;
+
+/// Policy cells a v4 record can hold. Progressive widening surfaces a few dozen
+/// candidates from a 512-simulation search; 47 was the observed maximum.
+pub(crate) const POLICY_CAPACITY: usize = 64;
 
 pub(crate) struct LabeledSample {
-    pub(crate) raster: SemanticRaster,
+    /// The position itself. A shard records state, not a picture of it.
+    pub(crate) position: Position,
     pub(crate) policy: Vec<f32>,
     pub(crate) policy_mask: Vec<f32>,
     pub(crate) visits: Vec<f32>,
@@ -159,7 +180,9 @@ impl ReplayStream {
         for sample in samples.into_iter().take(to_write) {
             self.validate_sample(&sample)?;
             if self.examples.len() < self.examples_limit {
-                self.examples.push(sample.raster.clone());
+                // Preview images are a diagnostic, so render them here rather
+                // than storing pixels in every record.
+                self.examples.push(rasterize(&sample.position, self.raster));
             }
             self.first_game_id.get_or_insert(sample.game);
             self.last_game_id = Some(sample.game);
@@ -220,7 +243,9 @@ impl ReplayStream {
     }
 
     fn validate_sample(&self, sample: &LabeledSample) -> io::Result<()> {
-        let dimensions_match = sample.raster.config() == self.raster;
+        // A v4 record carries state, so there is no raster shape to check; what
+        // must hold is that the position fits the record's fixed capacity.
+        let dimensions_match = sample.position.stones().len() <= STONE_CAPACITY;
         let policies_match = [
             sample.policy.len(),
             sample.policy_mask.len(),
@@ -295,28 +320,93 @@ fn write_f32(writer: &mut impl Write, value: f32) -> io::Result<()> {
     writer.write_all(&value.to_le_bytes())
 }
 
+/// Writes one fixed-size v4 record: the position, then the policy targets as
+/// (cell, value...) pairs over the cells the search actually touched.
+///
+/// Both variable parts are padded to a capacity so records stay fixed-size and
+/// the Python loader can memory-map the file. Unused slots are zeroed and the
+/// live counts precede them.
 fn write_sample(writer: &mut impl Write, sample: &LabeledSample) -> io::Result<()> {
-    for &value in sample.raster.data() {
-        write_f32(writer, value)?;
+    let position = &sample.position;
+    let stones = position.stones();
+    if stones.len() > STONE_CAPACITY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "position has {} stones, exceeding the v4 capacity of {STONE_CAPACITY}",
+                stones.len()
+            ),
+        ));
     }
-    for values in [
-        &sample.policy,
-        &sample.policy_mask,
-        &sample.visits,
-        &sample.beta,
-    ] {
-        for &value in values {
-            write_f32(writer, value)?;
+    write_f64(writer, position.radius())?;
+    writer.write_all(&[color_code(position.to_move())])?;
+    writer.write_all(&position.consecutive_passes().to_le_bytes())?;
+    writer.write_all(&[phase_code(position)])?;
+    writer.write_all(&(stones.len() as u32).to_le_bytes())?;
+    for stone in stones {
+        write_f64(writer, stone.x)?;
+        write_f64(writer, stone.y)?;
+        writer.write_all(&[color_code(stone.color)])?;
+    }
+    // Pad the unused stone slots so every record occupies the same bytes.
+    for _ in stones.len()..STONE_CAPACITY {
+        write_f64(writer, 0.0)?;
+        write_f64(writer, 0.0)?;
+        writer.write_all(&[0])?;
+    }
+
+    // Sparse policy: only cells the search touched carry a target. The mask is
+    // implied by presence, so it is not stored.
+    let touched: Vec<usize> = (0..sample.policy_mask.len())
+        .filter(|&index| {
+            sample.policy_mask[index] != 0.0
+                || sample.visits[index] != 0.0
+                || sample.proposal_counts[index] != 0
+        })
+        .collect();
+    if touched.len() > POLICY_CAPACITY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "search touched {} policy cells, exceeding the v4 capacity of {POLICY_CAPACITY}",
+                touched.len()
+            ),
+        ));
+    }
+    writer.write_all(&(touched.len() as u32).to_le_bytes())?;
+    for &index in &touched {
+        writer.write_all(&(index as u32).to_le_bytes())?;
+        write_f32(writer, sample.policy[index])?;
+        write_f32(writer, sample.visits[index])?;
+        write_f32(writer, sample.beta[index])?;
+        writer.write_all(&sample.proposal_counts[index].to_le_bytes())?;
+    }
+    for _ in touched.len()..POLICY_CAPACITY {
+        for _ in 0..5 {
+            writer.write_all(&0u32.to_le_bytes())?;
         }
     }
-    for &value in &sample.proposal_counts {
-        writer.write_all(&value.to_le_bytes())?;
-    }
+
     write_f32(writer, sample.value)?;
     writer.write_all(&sample.selected_action.to_le_bytes())?;
     writer.write_all(&sample.game.to_le_bytes())?;
     writer.write_all(&sample.ply.to_le_bytes())?;
     writer.write_all(&sample.seed.to_le_bytes())
+}
+
+fn write_f64(writer: &mut impl Write, value: f64) -> io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+const fn color_code(color: Color) -> u8 {
+    match color {
+        Color::Black => 0,
+        Color::White => 1,
+    }
+}
+
+fn phase_code(position: &Position) -> u8 {
+    u8::from(position.phase() != Phase::Playing)
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -341,9 +431,12 @@ mod tests {
 
     use sha2::{Digest, Sha256};
     use vgo_core::{Color, Position};
-    use vgo_raster::{CHANNEL_COUNT, RasterConfig, rasterize};
+    use vgo_raster::RasterConfig;
 
-    use super::{LabeledSample, REPLAY_MAGIC, REPLAY_VERSION, ReplayStream, temporary_path};
+    use super::{
+        LabeledSample, POLICY_CAPACITY, REPLAY_MAGIC, REPLAY_VERSION, ReplayStream,
+        STONE_CAPACITY, temporary_path,
+    };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -369,7 +462,7 @@ mod tests {
         let config = RasterConfig::square(2);
         let policy_size = config.pixels() + 1;
         LabeledSample {
-            raster: rasterize(&Position::new(1.0 / 6.0, Vec::new(), Color::Black), config),
+            position: Position::new(1.0 / 6.0, Vec::new(), Color::Black),
             policy: vec![0.2; policy_size],
             policy_mask: vec![1.0; policy_size],
             visits: vec![1.0; policy_size],
@@ -384,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn streams_exactly_the_advertised_v3_records_and_hashes_them() {
+    fn streams_exactly_the_advertised_v4_records_and_hashes_them() {
         let directory = TestDirectory::create();
         let path = directory.0.join("dataset.vgo");
         let raster = RasterConfig::square(2);
@@ -413,8 +506,12 @@ mod tests {
         assert!(!temporary_path(&path).exists());
 
         let bytes = fs::read(&path).expect("read replay");
-        let record_bytes =
-            (CHANNEL_COUNT * raster.pixels() + 5 * policy_size) * size_of::<f32>() + 28;
+        // A v4 record is the position at STONE_CAPACITY, the sparse policy at
+        // POLICY_CAPACITY, and the trailing scalars -- fixed size regardless of
+        // how many stones or cells are actually live.
+        let position_bytes = 8 + 1 + 4 + 1 + 4 + STONE_CAPACITY * (8 + 8 + 1);
+        let policy_bytes = 4 + POLICY_CAPACITY * (4 * 4 + 4);
+        let record_bytes = position_bytes + policy_bytes + 28;
         assert_eq!(bytes.len(), 32 + 3 * record_bytes);
         assert_eq!(&bytes[..8], &REPLAY_MAGIC);
         assert_eq!(

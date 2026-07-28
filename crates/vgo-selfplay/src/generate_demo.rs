@@ -20,9 +20,7 @@ use vgo_inference::{
     BatchedEvaluator, BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, OnnxBatchService,
     OnnxProvider, OnnxServiceConfig,
 };
-use vgo_raster::{
-    CHANNELS, RasterConfig, RasterKind, SemanticRaster, action_pixel, rasterize,
-};
+use vgo_raster::{CHANNELS, RasterConfig, RasterKind, SemanticRaster, action_pixel};
 use vgo_search::{
     Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, SearchResult, search_at_ply,
 };
@@ -62,7 +60,7 @@ impl std::str::FromStr for GenerationRuntime {
 }
 
 struct PendingSample {
-    raster: SemanticRaster,
+    position: Position,
     policy: Vec<f32>,
     policy_mask: Vec<f32>,
     visits: Vec<f32>,
@@ -280,7 +278,6 @@ fn generate_game(
     game_index: u64,
     stopped: &AtomicBool,
 ) -> Result<GameSamples, EvaluationError> {
-    let raster_config = RasterConfig::square_of(config.resolution, config.raster_kind);
     // Policy targets, the recorded action index, and the replay policy vector all
     // live on the placement grid, which may be coarser than the render raster.
     let policy_config = RasterConfig::square(config.policy_resolution);
@@ -305,7 +302,9 @@ fn generate_game(
         |step| {
             let target = policy_target(step.search, policy_config);
             pending.push(PendingSample {
-                raster: rasterize(step.position, raster_config),
+                // Store the position; rendering is a training-time choice now,
+                // which also takes the rasterizer off the self-play hot path.
+                position: step.position.clone(),
                 policy: target.policy,
                 policy_mask: target.mask,
                 visits: target.visits,
@@ -329,7 +328,7 @@ fn generate_game(
     let samples = pending
         .into_iter()
         .map(|sample| LabeledSample {
-            raster: sample.raster,
+            position: sample.position,
             policy: sample.policy,
             policy_mask: sample.policy_mask,
             visits: sample.visits,
