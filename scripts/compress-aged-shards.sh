@@ -17,14 +17,16 @@
 # each archive round-trips before removing the original.
 set -euo pipefail
 
-run=${1:?usage: compress-aged-shards.sh <run-directory> [--keep-uncompressed N] [--apply]}
+run=${1:?usage: compress-aged-shards.sh <run-directory> [--keep-uncompressed N] [--apply] [--watch SECONDS]}
 keep_extra=2
 apply=0
+watch=0
 shift
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep-uncompressed) keep_extra=$2; shift 2 ;;
     --apply) apply=1; shift ;;
+    --watch) watch=$2; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -33,6 +35,7 @@ state="$run/pipeline-state.json"
 config="$run/pipeline-config.json"
 [[ -f $state && -f $config ]] || { echo "not a pipeline run directory: $run" >&2; exit 1; }
 
+sweep() {
 window=$(python3 -c "import json;print(json.load(open('$config'))['replay_window'])")
 highest=$(python3 -c "
 import json
@@ -45,7 +48,7 @@ print(max((int(r['sequence']) for r in s['replay']), default=-1))
 cutoff=$(( highest - window - keep_extra + 1 ))
 echo "highest shard=$highest  window=$window  extra margin=$keep_extra"
 if (( cutoff <= 0 )); then
-  echo "nothing has aged out yet (cutoff=$cutoff)"; exit 0
+  echo "nothing has aged out yet (cutoff=$cutoff)"; return 0
 fi
 echo "compressing shards with sequence < $cutoff"
 
@@ -91,7 +94,7 @@ print(next((r['dataset_sha256'] for r in s['replay'] if int(r['sequence'])==$seq
   total_before=$((total_before+before)); total_after=$((total_after+after)); count=$((count+1))
 done
 
-if (( count == 0 )); then echo "no aged-out shards to compress"; exit 0; fi
+if (( count == 0 )); then echo "no aged-out shards to compress"; return 0; fi
 if (( apply == 0 )); then
   printf "\ndry run: %d shard(s), %.1f GB. Re-run with --apply.\n" "$count" \
     "$(echo "scale=2;$total_before/1000000000"|bc)"
@@ -100,3 +103,23 @@ else
     "$(echo "scale=2;$total_before/1000000000"|bc)" "$(echo "scale=3;$total_after/1000000000"|bc)"
   echo "restore one with: zstd -d <shard>/dataset.vgo.zst"
 fi
+}
+
+if (( watch == 0 )); then
+  sweep
+  exit 0
+fi
+
+# Watch mode: re-read the live state each pass, so shards are picked up as they
+# age out of the window rather than at a moment chosen in advance. Each sweep is
+# independent -- there is no accumulated state to go stale if the run restarts,
+# and a sweep that finds nothing is a no-op.
+echo "watching $run every ${watch}s (Ctrl-C to stop)"
+trap 'echo; echo "stopped"; exit 0' INT TERM
+while true; do
+  echo "--- $(date "+%H:%M:%S") ---"
+  # A failed sweep must not end the watch: the run may be mid-write, or the
+  # state file may be momentarily absent during its atomic replace.
+  sweep || echo "  sweep failed, retrying next pass"
+  sleep "$watch"
+done
