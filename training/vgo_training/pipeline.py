@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import signal
 import shutil
+import subprocess
 import sys
 import time
 from typing import Any, BinaryIO
@@ -41,7 +42,61 @@ OPERATIONAL_CONFIG_FIELDS = {
     "arena_actors",
     "telemetry_opponents",
     "telemetry_pairs",
+    # Neither changes what is learned: one picks which checkpoints get rated,
+    # the other is disk housekeeping. Both must be adjustable on a resume.
+    "telemetry_every",
+    "retire_shards",
 }
+
+
+def _compress_shard(path: Path) -> tuple[Path, int, int]:
+    """Compress one shard in place, leaving `<name>.zst` and removing the source.
+
+    Verifies the archive round-trips to the exact original bytes before deleting
+    anything: the shard is the only copy of that generation's self-play.
+    """
+    archive = path.with_suffix(path.suffix + ".zst")
+    before = path.stat().st_size
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    expected = digest.hexdigest()
+
+    temporary = archive.with_suffix(archive.suffix + ".tmp")
+    subprocess.run(
+        ["zstd", "-3", "-T2", "-q", "-f", str(path), "-o", str(temporary)],
+        check=True,
+    )
+    verify = subprocess.run(
+        ["zstd", "-dc", str(temporary)], stdout=subprocess.PIPE, check=True
+    )
+    if hashlib.sha256(verify.stdout).hexdigest() != expected:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(f"compressed shard does not round-trip: {path}")
+    os.replace(temporary, archive)
+    after = archive.stat().st_size
+    path.unlink()
+    return path, before, after
+
+
+def _log_completed_retirement(path: Path, before: int, after: int) -> None:
+    print(
+        f"[retire] {path.parent.name}: "
+        f"{before / 1e9:.2f} GB -> {after / 1e9:.3f} GB "
+        f"({before / max(after, 1):.1f}x)",
+        flush=True,
+    )
+
+
+def _log_retirement(task: "asyncio.Task[tuple[Path, int, int]]") -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        print(f"[retire] failed: {error}", flush=True)
+        return
+    _log_completed_retirement(*task.result())
 
 
 def atomic_json(path: Path, value: object) -> None:
@@ -240,6 +295,13 @@ class PipelineConfig:
     arena_actors: int = 32
     telemetry_opponents: int = 2
     telemetry_pairs: int = 16
+    # Rate an every-Nth checkpoint instead of all of them. The loop's Elo curve
+    # is a trend, and a rating every update costs an arena per update while
+    # telling you little the neighbouring points did not. 1 rates everything.
+    telemetry_every: int = 1
+    # Compress shards once they leave the replay window. Housekeeping only: it
+    # never blocks an update, and a missed shard is retried after the next one.
+    retire_shards: bool = True
     seed: int = 700_001
     arena_seed: int = 900_001
     initial_checkpoint: str | None = None
@@ -630,6 +692,10 @@ class Pipeline:
         self.environment = runtime_environment()
         self.runner = CommandRunner(self.environment)
         self.state_path = self.output / "pipeline-state.json"
+        # Strong references to in-flight shard compressions. asyncio only holds
+        # weak references to tasks, so without this a retirement can be garbage
+        # collected mid-run; each task discards itself on completion.
+        self._retirements: set[asyncio.Task[Any]] = set()
         # Normalize tuples and Path-like values to their on-disk JSON forms so
         # a freshly constructed config compares equal to the same resumed run.
         config_value = json.loads(
@@ -1357,6 +1423,12 @@ class Pipeline:
     def _queue_telemetry(self, model: ModelArtifact) -> None:
         if self.config.telemetry_opponents <= 0:
             return
+        # Rating every checkpoint costs an arena per update to resolve a curve
+        # that is legible from a fraction of the points. Version 0 is always
+        # rated so the trend has an anchor at the origin.
+        every = max(1, self.config.telemetry_every)
+        if model.version % every != 0:
+            return
         opponents = [
             ModelArtifact(**value)
             for value in self.state.models
@@ -1516,7 +1588,60 @@ class Pipeline:
             "wall_seconds": time.perf_counter() - started,
         }
         atomic_json(publication_path, report)
-        return self._commit_publication(report)
+        published = self._commit_publication(report)
+        self._retire_aged_shards(int(spec["through_shard"]))
+        return published
+
+    def _retire_aged_shards(self, through_sequence: int) -> None:
+        """Compress shards the learner has finished with.
+
+        An update trains on `_active_replay(through_sequence)`, the last
+        `replay_window` shards, so anything older is never read again by this
+        run. This is the moment that is certainly true: the update has published
+        and its replay boundary is durably recorded.
+
+        The shards are still worth keeping -- each one records the model that
+        generated it, so the set is a reproducible history -- but a 6.04 GB
+        dense shard compresses 30-70x here, because five policy-shaped arrays
+        store 16385 float32 slots per sample to hold ~24 nonzero values.
+
+        Compression runs in a thread and is never awaited: it is housekeeping,
+        and a slow or failed compression must not delay the next update. A shard
+        that is missed simply gets picked up after the following update.
+        """
+        if not self.config.retire_shards:
+            return
+        cutoff = through_sequence - self.config.replay_window + 1
+        if cutoff <= 0:
+            return
+        stale = [
+            Path(value["path"])
+            for value in self.state.replay
+            if int(value["sequence"]) < cutoff
+        ]
+        pending = [path for path in stale if path.exists()]
+        if not pending:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Retirement is housekeeping scheduled from the running pipeline. If
+            # there is no loop -- a synchronous caller, or a test -- do it inline
+            # rather than failing the update that just published.
+            for path in pending:
+                try:
+                    _log_completed_retirement(*_compress_shard(path))
+                except Exception as error:  # never fail an update over cleanup
+                    print(f"[retire] failed: {error}", flush=True)
+            return
+        for path in pending:
+            # Fire and forget. asyncio.to_thread returns a task we deliberately
+            # do not await; the callback exists only so a failure is visible in
+            # the log rather than swallowed as a never-retrieved exception.
+            task = asyncio.ensure_future(asyncio.to_thread(_compress_shard, path))
+            task.add_done_callback(_log_retirement)
+            self._retirements.add(task)
+            task.add_done_callback(self._retirements.discard)
 
     def _should_start_generation(
         self,
@@ -1994,6 +2119,24 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--arena-actors", type=int, default=32)
     parser.add_argument("--telemetry-opponents", type=int, default=2)
     parser.add_argument("--telemetry-pairs", type=int, default=16)
+    parser.add_argument(
+        "--telemetry-every",
+        type=int,
+        default=1,
+        help=(
+            "queue Elo work for every Nth checkpoint; the loop's rating curve is "
+            "a trend and does not need every point"
+        ),
+    )
+    parser.add_argument(
+        "--retire-shards",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "compress replay shards once they leave the training window; runs "
+            "off the critical path and never delays an update"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=700_001)
     parser.add_argument("--arena-seed", type=int, default=900_001)
     parser.add_argument("--initial-checkpoint", type=Path)

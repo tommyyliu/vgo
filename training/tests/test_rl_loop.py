@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import asdict
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -12,6 +13,7 @@ from vgo_training.pipeline import (
     Pipeline,
     PipelineConfig,
     ReplayArtifact,
+    _compress_shard,
     atomic_json,
     config_from_arguments,
     file_sha256,
@@ -708,6 +710,105 @@ class PipelineRecoveryTests(unittest.TestCase):
         self.assertFalse(Pipeline._promotion_decision(arena, 0.52, 0.02))
         arena["completed"] = 99
         self.assertTrue(Pipeline._promotion_decision(arena, 0.52, 0.02))
+
+
+class ShardRetirementTests(unittest.TestCase):
+    def _pipeline(self, directory: str, **overrides: object) -> Pipeline:
+        return Pipeline(
+            PipelineConfig(output=directory, replay_window=3, **overrides)
+        )
+
+    def test_compression_round_trips_before_the_original_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            shard = Path(directory) / "shard-000000"
+            shard.mkdir()
+            source = shard / "dataset.vgo"
+            payload = bytes(range(256)) * 4096
+            source.write_bytes(payload)
+
+            path, before, after = _compress_shard(source)
+
+            self.assertEqual(path, source)
+            self.assertEqual(before, len(payload))
+            self.assertFalse(source.exists(), "original should be removed")
+            archive = source.with_suffix(source.suffix + ".zst")
+            self.assertTrue(archive.exists())
+            self.assertEqual(after, archive.stat().st_size)
+            restored = subprocess.run(
+                ["zstd", "-dc", str(archive)], stdout=subprocess.PIPE, check=True
+            ).stdout
+            self.assertEqual(restored, payload, "archive must restore exactly")
+
+    def test_retirement_spares_every_shard_the_window_still_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = self._pipeline(directory)
+            pipeline.state.replay = [asdict(replay(index)) for index in range(6)]
+            retired: list[Path] = []
+
+            def record(path: Path) -> tuple[Path, int, int]:
+                retired.append(path)
+                return path, 1, 1
+
+            # through_shard 5 with window 3 means the learner read 3, 4, and 5.
+            # Without a running loop the retirement runs inline, which is what
+            # makes this assertable without driving an event loop.
+            with patch("vgo_training.pipeline._compress_shard", side_effect=record):
+                with patch.object(Path, "exists", return_value=True):
+                    pipeline._retire_aged_shards(5)
+
+            sequences = sorted(int(path.parent.name) for path in retired)
+            self.assertEqual(
+                sequences,
+                [0, 1, 2],
+                "only shards below the window may be retired",
+            )
+
+    def test_retirement_can_be_switched_off(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = self._pipeline(directory, retire_shards=False)
+            pipeline.state.replay = [asdict(replay(index)) for index in range(6)]
+            with patch("vgo_training.pipeline._compress_shard") as compress:
+                pipeline._retire_aged_shards(5)
+            compress.assert_not_called()
+            self.assertFalse(pipeline._retirements)
+
+
+class TelemetrySubsetTests(unittest.TestCase):
+    def _model(self, version: int) -> ModelArtifact:
+        return ModelArtifact(
+            version=version,
+            checkpoint=f"/models/{version}/candidate.pt",
+            onnx=f"/models/{version}/candidate.onnx",
+            checkpoint_sha256=f"checkpoint-{version}",
+            onnx_sha256=f"onnx-{version}",
+            parent_version=version - 1 if version else None,
+            accepted=True,
+        )
+
+    def test_every_nth_checkpoint_is_queued(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(
+                PipelineConfig(output=directory, telemetry_every=3)
+            )
+            pipeline.state.models = [asdict(self._model(v)) for v in range(7)]
+            for version in range(7):
+                pipeline._queue_telemetry(self._model(version))
+            rated = sorted(
+                {int(job["candidate_version"]) for job in pipeline.state.telemetry_pending}
+            )
+            # 0 has no prior opponent to play, so the first rated point is 3.
+            self.assertEqual(rated, [3, 6])
+
+    def test_default_rates_every_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(PipelineConfig(output=directory))
+            pipeline.state.models = [asdict(self._model(v)) for v in range(4)]
+            for version in range(4):
+                pipeline._queue_telemetry(self._model(version))
+            rated = sorted(
+                {int(job["candidate_version"]) for job in pipeline.state.telemetry_pending}
+            )
+            self.assertEqual(rated, [1, 2, 3])
 
 
 if __name__ == "__main__":
