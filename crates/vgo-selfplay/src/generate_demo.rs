@@ -472,7 +472,7 @@ fn generate_to_dataset(
     let maximum_games = config
         .maximum_games
         .unwrap_or_else(|| (config.samples as u64).saturating_mul(8));
-    let raster = RasterConfig::square(config.resolution);
+    let raster = RasterConfig::square_of(config.resolution, config.raster_kind);
     let policy_size = config.policy_resolution * config.policy_resolution + 1;
     let mut replay = ReplayStream::create(
         dataset_path,
@@ -1011,6 +1011,13 @@ fn main() -> std::io::Result<()> {
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
     fs::create_dir_all(&config.output)?;
 
+    // The behaviour model's input layout is fixed at export and is independent
+    // of what the shard records. Search only needs the model to guide MCTS; the
+    // targets it produces -- visit counts, beta, proposal multiplicities, and
+    // the terminal value -- are functions of board state, not of how the board
+    // was drawn for the network. So a semantic model can generate a shard in
+    // any layout, which is what makes two --raster-kind runs paired data over
+    // identical positions rather than two different games.
     let raster = RasterConfig::square(config.resolution);
     let model_path = config.model.as_deref();
     let (evaluator, broker): (Arc<dyn Evaluator>, Option<BatchedEvaluatorPool>) =
