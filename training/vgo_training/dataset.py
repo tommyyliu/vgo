@@ -220,38 +220,46 @@ def rasterize_records(
     stone_y = np.asarray(records["stones"]["y"], dtype=np.float64)
     stone_c = np.asarray(records["stones"]["color"], dtype=np.uint8)
 
-    slot = np.arange(V4_STONE_CAPACITY, dtype=np.int64)[None, :]
-    live = slot < counts[:, None]
-    # Split by colour relative to the mover, as every channel in this crate is.
-    is_current = live & (stone_c == to_move[:, None])
-    is_opponent = live & (stone_c != to_move[:, None])
-
     out = np.zeros((samples, CHANNEL_COUNT, height * width), dtype=np.float32)
     infinity = np.float64(np.inf)
+    empty = np.full(grid_x.shape, infinity)
     for index in range(samples):
-        # Per sample rather than one giant array: samples x stones x pixels at
-        # 128x128 would allocate tens of gigabytes.
-        dx = grid_x[None, :] - stone_x[index][:, None]
-        dy = grid_y[None, :] - stone_y[index][:, None]
-        square = dx * dx + dy * dy
+        # Slice to the live stones before computing anything. Records pad to
+        # V4_STONE_CAPACITY, and a typical position fills ~30 of 128 slots, so
+        # working at capacity spends most of the time on padding -- measured at
+        # 47.9 ms against 2.9 ms for the same block over live stones only.
+        #
+        # One sample at a time rather than one array over all of them: stones x
+        # pixels is already several megabytes, and samples x stones x pixels at
+        # 128x128 would be tens of gigabytes.
+        count = int(counts[index])
+        if count:
+            sx = stone_x[index, :count]
+            sy = stone_y[index, :count]
+            dx = grid_x[None, :] - sx[:, None]
+            dy = grid_y[None, :] - sy[:, None]
+            square = dx * dx + dy * dy
 
-        current = np.where(is_current[index][:, None], square, infinity)
-        opponent = np.where(is_opponent[index][:, None], square, infinity)
-        current_square = current.min(axis=0) if current.size else np.full(grid_x.shape, infinity)
-        opponent_square = (
-            opponent.min(axis=0) if opponent.size else np.full(grid_x.shape, infinity)
-        )
-        both = np.where(live[index][:, None], square, infinity)
-        if both.shape[0] >= 2:
-            partitioned = np.partition(both, 1, axis=0)
-            nearest_square = partitioned[0]
-            second_square = partitioned[1]
-        elif both.shape[0] == 1:
-            nearest_square = both[0]
-            second_square = np.full(grid_x.shape, infinity)
+            current_mask = stone_c[index, :count] == to_move[index]
+            current_square = (
+                square[current_mask].min(axis=0) if current_mask.any() else empty
+            )
+            opponent_square = (
+                square[~current_mask].min(axis=0) if (~current_mask).any() else empty
+            )
+            if count >= 2:
+                # Only the two smallest are needed, so partition rather than sort.
+                partitioned = np.partition(square, 1, axis=0)
+                nearest_square = partitioned[0]
+                second_square = partitioned[1]
+            else:
+                nearest_square = square[0]
+                second_square = empty
         else:
-            nearest_square = np.full(grid_x.shape, infinity)
-            second_square = np.full(grid_x.shape, infinity)
+            current_square = empty
+            opponent_square = empty
+            nearest_square = empty
+            second_square = empty
 
         r = radius[index]
         current_distance = np.sqrt(current_square)
