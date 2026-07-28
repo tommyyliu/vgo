@@ -400,6 +400,11 @@ const OPPONENT_STONE: [f32; 3] = [240.0, 151.0, 90.0]; // #f0975a
 const OPPONENT_REGION: [f32; 3] = [104.0, 57.0, 26.0]; // #68391a
 const BOARD_BACKGROUND: [f32; 3] = [14.0, 17.0, 22.0]; // #0e1116
 
+/// The legal-placement overlay from `freeMaskSVG` (voronoi_go.html line 369):
+/// legal cells tinted `rgb(205,214,232)` at alpha 42/255, illegal left bare.
+const LEGAL_TINT: [f32; 3] = [205.0, 214.0, 232.0];
+const LEGAL_TINT_ALPHA: f32 = 42.0 / 255.0;
+
 /// Renders the board as a player sees it: three channels, stone discs over
 /// Voronoi territory fill.
 ///
@@ -456,10 +461,24 @@ pub fn rasterize_rgb_into(position: &Position, config: RasterConfig, data: &mut 
                     opponent_square = square;
                 }
             }
+            // Nearest stone of either colour, which is what legality turns on.
+            let nearest_square = current_square.min(opponent_square);
 
             let mut color = BOARD_BACKGROUND;
-            // Territory first, then stones over it, matching renderBoard()'s
-            // draw order: filled cells, then discs.
+            // Draw order follows renderBoard(): filled cells, then the legal
+            // mask, then stones on top.
+            //
+            // The legal overlay is the reason this is worth carrying. A plain
+            // picture of stones and territory does not say where a move is
+            // *allowed*, so a model reading it has to infer the placement rule
+            // from scratch -- and the first RGB run predicted MCTS targets well
+            // (policy_kl 1.21 against semantic's 4.48) while losing the
+            // head-to-head 0.271, which is what a policy proposing unplayable
+            // moves during search would look like.
+            //
+            // Legality is the same predicate `legal_clearance` computes above:
+            // a placement is legal when it clears the board edge and sits at
+            // least two radii from every stone.
             //
             // `ownership` only compares its two arguments and tests them for
             // finiteness, and squaring preserves both on nonnegative reals
@@ -468,6 +487,20 @@ pub fn rasterize_rgb_into(position: &Position, config: RasterConfig, data: &mut 
             let (current_area, opponent_area) = ownership(current_square, opponent_square);
             blend(&mut color, CURRENT_REGION, current_area);
             blend(&mut color, OPPONENT_REGION, opponent_area);
+
+            let board_clearance = (x - radius)
+                .min(1.0 - radius - x)
+                .min(y - radius)
+                .min(1.0 - radius - y);
+            let stone_clearance = if nearest_square.is_finite() {
+                nearest_square.sqrt() - 2.0 * radius
+            } else {
+                f64::INFINITY
+            };
+            if board_clearance.min(stone_clearance) > 0.0 {
+                blend(&mut color, LEGAL_TINT, LEGAL_TINT_ALPHA);
+            }
+
             if current_square <= radius * radius {
                 blend(&mut color, CURRENT_STONE, 1.0);
             }
@@ -560,8 +593,8 @@ mod tests {
     use vgo_core::{Color, Position, Stone};
 
     use super::{
-        CHANNEL_COUNT, RGB_CHANNEL_COUNT, RasterConfig, RasterKind, action_pixel, rasterize,
-        rasterize_into, rasterize_rgb,
+        BOARD_BACKGROUND, CHANNEL_COUNT, RGB_CHANNEL_COUNT, RasterConfig, RasterKind,
+        action_pixel, rasterize, rasterize_into, rasterize_rgb,
     };
 
     /// The pre-optimization formulation: one `hypot` per (pixel, stone) pair.
@@ -775,6 +808,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rgb_legal_overlay_agrees_with_the_semantic_clearance_channel() {
+        // The overlay exists so the picture states where a move is allowed.
+        // Both rasters must agree about legality, or the RGB model is being
+        // taught a different rule than the search enforces.
+        //
+        // Territory fill varies the base colour across the board, so this
+        // compares the two populations rather than each pixel against a fixed
+        // background: every legal cell is brighter than every illegal one that
+        // shares its territory owner.
+        let config = RasterConfig::square(48);
+        let rgb_config = RasterConfig::square_of(48, RasterKind::Rgb);
+        let position = two_stone_position();
+        let semantic = rasterize(&position, config);
+        let rgb = rasterize_rgb(&position, rgb_config);
+        let pixels = config.pixels();
+
+        let mut legal_brightness: Vec<f32> = Vec::new();
+        let mut illegal_brightness: Vec<f32> = Vec::new();
+        for pixel in 0..pixels {
+            // Skip stones: a disc paints over the tint, so legality is not
+            // readable there in either raster. Skip the current player's
+            // territory too, so both populations share one base colour.
+            if semantic.channel(0)[pixel] > 0.0
+                || semantic.channel(1)[pixel] > 0.0
+                || semantic.channel(2)[pixel] > 0.0
+            {
+                continue;
+            }
+            let clearance = semantic.channel(7)[pixel];
+            // Near the boundary a half-pixel of sampling difference decides the
+            // sign, so only compare where the predicate is unambiguous.
+            if clearance.abs() < 0.05 {
+                continue;
+            }
+            let brightness: f32 = (0..3).map(|c| rgb[c * pixels + pixel]).sum();
+            if clearance > 0.0 {
+                legal_brightness.push(brightness);
+            } else {
+                illegal_brightness.push(brightness);
+            }
+        }
+
+        assert!(
+            legal_brightness.len() > 50 && illegal_brightness.len() > 50,
+            "expected a meaningful sample of each: {} legal, {} illegal",
+            legal_brightness.len(),
+            illegal_brightness.len()
+        );
+        let dimmest_legal = legal_brightness.iter().copied().fold(f32::MAX, f32::min);
+        let brightest_illegal =
+            illegal_brightness.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            dimmest_legal > brightest_illegal,
+            "legal cells must be tinted brighter than illegal ones: \
+             dimmest legal {dimmest_legal}, brightest illegal {brightest_illegal}"
+        );
     }
 
     #[test]
