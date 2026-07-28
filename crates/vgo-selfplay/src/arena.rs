@@ -16,7 +16,7 @@ use vgo_inference::{
     BatchedEvaluator, BrokerConfig, BrokerMetrics, OnnxBatchService, OnnxProvider,
     OnnxServiceConfig,
 };
-use vgo_raster::RasterConfig;
+use vgo_raster::{RasterConfig, RasterKind};
 use vgo_search::{EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, search_with_evaluator};
 use vgo_selfplay::play_game as run_playout;
 
@@ -25,6 +25,14 @@ use vgo_selfplay::play_game as run_playout;
 struct Arguments {
     #[arg(long)]
     candidate: PathBuf,
+    /// Channel layout the candidate was exported with. Each model reads only
+    /// its own layout, so a semantic and an RGB model can still play: both see
+    /// the same positions, each rendered the way it was trained to read.
+    #[arg(long, default_value = "semantic")]
+    candidate_raster_kind: RasterKind,
+    /// Layout for every --opponent. Defaults to the candidate's.
+    #[arg(long)]
+    opponent_raster_kind: Option<RasterKind>,
     /// Repeatable. Each opponent plays `--pairs` color-swapped pairs against the
     /// same loaded candidate and emits its own JSON record. Batching them here
     /// amortizes the provider's per-process model load and warmup, which is
@@ -80,10 +88,14 @@ struct GameResult {
     plies: u32,
 }
 
-fn load_model(model: PathBuf, arguments: &Arguments) -> Result<BatchedEvaluator, EvaluationError> {
+fn load_model(
+    model: PathBuf,
+    kind: RasterKind,
+    arguments: &Arguments,
+) -> Result<BatchedEvaluator, EvaluationError> {
     let service = OnnxBatchService::load(&OnnxServiceConfig {
         model,
-        raster: RasterConfig::square(arguments.resolution),
+        raster: RasterConfig::square_of(arguments.resolution, kind),
         policy: Some(RasterConfig::square(arguments.policy_resolution)),
         maximum_batch: arguments.maximum_batch,
         provider: arguments.provider,
@@ -188,7 +200,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(message) = validate_arguments(&arguments) {
         return Err(message.into());
     }
-    let candidate = load_model(arguments.candidate.clone(), &arguments)?;
+    let candidate = load_model(
+        arguments.candidate.clone(),
+        arguments.candidate_raster_kind,
+        &arguments,
+    )?;
     // One record per opponent, or a single naive-evaluator record when none are
     // given. The candidate is loaded once and reused across every match.
     let opponents: Vec<Option<PathBuf>> = if arguments.opponent.is_empty() {
@@ -199,7 +215,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (index, opponent_path) in opponents.into_iter().enumerate() {
         let opponent = opponent_path
             .clone()
-            .map(|model| load_model(model, &arguments))
+            .map(|model| {
+                load_model(
+                    model,
+                    arguments
+                        .opponent_raster_kind
+                        .unwrap_or(arguments.candidate_raster_kind),
+                    &arguments,
+                )
+            })
             .transpose()?;
         // Distinct seeds per opponent, or every match would replay one game set.
         let seed_base = arguments.seed + (index as u64) * 1_000_003;
