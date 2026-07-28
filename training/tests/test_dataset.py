@@ -267,7 +267,9 @@ class DatasetTests(unittest.TestCase):
                 stream.write(
                     HEADER.pack(
                         REPLAY_MAGIC,
-                        REPLAY_VERSION,
+                        # v3 layout: these fixtures pin the legacy read path,
+                        # which must keep working for shards already on disk.
+                        3,
                         samples,
                         channels,
                         height,
@@ -319,7 +321,9 @@ class DatasetTests(unittest.TestCase):
                 stream.write(
                     HEADER.pack(
                         REPLAY_MAGIC,
-                        REPLAY_VERSION,
+                        # v3 layout: these fixtures pin the legacy read path,
+                        # which must keep working for shards already on disk.
+                        3,
                         1,
                         channels,
                         height,
@@ -455,3 +459,89 @@ class ReplayDiagnosticsTests(unittest.TestCase):
         report = replay_diagnostics(self._dataset([[0]], [0], [[4, 0, 0, 0, 0]]))
         self.assertTrue(math.isnan(report["ply0_candidate_jaccard"]))
         self.assertEqual(report["ply0_games"], 1)
+
+
+class V4PositionShardTests(unittest.TestCase):
+    """A v4 shard stores positions; these pin what load-time rendering must do."""
+
+    def _shard(self, directory: Path, samples: int = 3) -> Path:
+        """Writes a minimal v4 shard by hand, so the test does not need self-play."""
+        from vgo_training.dataset import (
+            HEADER,
+            REPLAY_MAGIC,
+            V4_POLICY_CAPACITY,
+            V4_STONE_CAPACITY,
+        )
+
+        height = width = 8
+        policy_size = height * width + 1
+        path = directory / "dataset.vgo"
+        with path.open("wb") as stream:
+            stream.write(REPLAY_MAGIC)
+            for value in (4, samples, 10, height, width, policy_size):
+                stream.write(struct.pack("<I", value))
+            for index in range(samples):
+                stones = [(0.25, 0.25, 0), (0.75, 0.6, 1)][: index + 1]
+                stream.write(struct.pack("<d", 0.1))
+                stream.write(bytes([0]))
+                stream.write(struct.pack("<I", 1 if index == 2 else 0))
+                stream.write(bytes([0]))
+                stream.write(struct.pack("<I", len(stones)))
+                for x, y, color in stones:
+                    stream.write(struct.pack("<dd", x, y))
+                    stream.write(bytes([color]))
+                for _ in range(V4_STONE_CAPACITY - len(stones)):
+                    stream.write(struct.pack("<dd", 0.0, 0.0))
+                    stream.write(bytes([0]))
+                touched = [(3, 0.75, 6.0, 0.5, 2), (policy_size - 1, 0.25, 2.0, 0.0, 0)]
+                stream.write(struct.pack("<I", len(touched)))
+                for cell, policy, visits, beta, counts in touched:
+                    stream.write(struct.pack("<I", cell))
+                    stream.write(struct.pack("<fff", policy, visits, beta))
+                    stream.write(struct.pack("<I", counts))
+                for _ in range(V4_POLICY_CAPACITY - len(touched)):
+                    stream.write(struct.pack("<IfffI", 0, 0.0, 0.0, 0.0, 0))
+                stream.write(struct.pack("<f", 1.0 if index % 2 == 0 else -1.0))
+                stream.write(struct.pack("<I", 3))
+                stream.write(struct.pack("<Q", 7))
+                stream.write(struct.pack("<I", index))
+                stream.write(struct.pack("<Q", 99))
+        manifest = {
+            "schema": "vgo.replay-shard.v1",
+            "dataset_sha256": file_sha256(path),
+        }
+        (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return path
+
+    def test_sparse_policy_expands_and_presence_is_the_mask(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = load_dataset(self._shard(Path(directory)))
+            self.assertEqual(dataset.samples, 3)
+            policy_size = dataset.policies.shape[1]
+            # Exactly the two touched cells carry a target; the rest are zero,
+            # and the mask is presence rather than a stored array.
+            self.assertEqual(int(dataset.policy_masks[0].sum()), 2)
+            self.assertAlmostEqual(float(dataset.policies[0, 3]), 0.75, places=6)
+            self.assertAlmostEqual(float(dataset.visits[0, 3]), 6.0, places=6)
+            self.assertAlmostEqual(float(dataset.betas[0, 3]), 0.5, places=6)
+            self.assertEqual(int(dataset.proposal_counts[0, 3]), 2)
+            self.assertAlmostEqual(float(dataset.policies[0, policy_size - 1]), 0.25, places=6)
+            untouched = [
+                index for index in range(policy_size) if index not in (3, policy_size - 1)
+            ]
+            self.assertEqual(float(dataset.policies[0, untouched].abs().sum()), 0.0)
+            self.assertEqual(float(dataset.policy_masks[0, untouched].sum()), 0.0)
+
+    def test_positions_render_the_channels_they_describe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = load_dataset(self._shard(Path(directory)))
+            self.assertEqual(dataset.channels, 10)
+            # Sample 0 has one black stone and black to move, so it reads as the
+            # current player's; sample 1 adds a white stone as the opponent's.
+            self.assertGreater(float(dataset.states[0, 0].sum()), 0.0)
+            self.assertEqual(float(dataset.states[0, 1].sum()), 0.0)
+            self.assertGreater(float(dataset.states[1, 1].sum()), 0.0)
+            # radius is 2r everywhere, and previous_pass follows the stored count.
+            self.assertAlmostEqual(float(dataset.states[0, 8].mean()), 0.2, places=5)
+            self.assertEqual(float(dataset.states[0, 9].mean()), 0.0)
+            self.assertEqual(float(dataset.states[2, 9].mean()), 1.0)

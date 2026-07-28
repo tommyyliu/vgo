@@ -20,8 +20,16 @@ REPLAY_MAGIC = b"VGORPLY1"
 #
 # Older records synthesize unavailable fields so replay windows can span schema
 # versions. REPLAY_VERSION is the version the current generator writes.
-REPLAY_VERSION = 3
-REPLAY_VERSIONS = (1, 2, 3)
+REPLAY_VERSION = 4
+REPLAY_VERSIONS = (1, 2, 3, 4)
+
+# v4 stores the position and a sparse policy instead of a rendered raster.
+# These capacities are the writer's, in crates/vgo-selfplay/src/replay_stream.rs,
+# and a mismatch silently misparses every record -- the size check in
+# _load_replay_v4 is what catches it.
+V4_STONE_CAPACITY = 128
+V4_POLICY_CAPACITY = 64
+CHANNEL_COUNT = 10
 HEADER = struct.Struct("<8s6I")
 
 
@@ -178,6 +186,242 @@ def _load_legacy(
     )
 
 
+def rasterize_records(
+    records: np.ndarray, channels: int, height: int, width: int
+) -> np.ndarray:
+    """Renders v4 positions into semantic rasters.
+
+    A port of `rasterize_into` in `crates/vgo-raster/src/lib.rs`, vectorized over
+    samples and pixels. The two must agree exactly: generation feeds the model
+    from the Rust path and training feeds it from here, so any divergence is a
+    train/serve skew that no test downstream of this would catch. See
+    `tests/test_dataset.py::rasterization_matches_the_rust_reference`.
+
+    Distances are accumulated squared, as in the Rust, so the two take square
+    roots at the same points and round identically.
+    """
+    if channels != CHANNEL_COUNT:
+        raise ValueError(
+            f"v4 shards render {CHANNEL_COUNT} semantic channels, header says {channels}"
+        )
+    samples = records.shape[0]
+    # Pixel centres, matching the Rust's (index + 0.5) / extent.
+    ys = (np.arange(height, dtype=np.float64) + 0.5) / height
+    xs = (np.arange(width, dtype=np.float64) + 0.5) / width
+    grid_y, grid_x = np.meshgrid(ys, xs, indexing="ij")
+    grid_x = grid_x.reshape(-1)
+    grid_y = grid_y.reshape(-1)
+
+    radius = np.asarray(records["radius"], dtype=np.float64)
+    to_move = np.asarray(records["to_move"], dtype=np.uint8)
+    passes = np.asarray(records["consecutive_passes"], dtype=np.uint32)
+    counts = np.asarray(records["stone_count"], dtype=np.int64)
+    stone_x = np.asarray(records["stones"]["x"], dtype=np.float64)
+    stone_y = np.asarray(records["stones"]["y"], dtype=np.float64)
+    stone_c = np.asarray(records["stones"]["color"], dtype=np.uint8)
+
+    slot = np.arange(V4_STONE_CAPACITY, dtype=np.int64)[None, :]
+    live = slot < counts[:, None]
+    # Split by colour relative to the mover, as every channel in this crate is.
+    is_current = live & (stone_c == to_move[:, None])
+    is_opponent = live & (stone_c != to_move[:, None])
+
+    out = np.zeros((samples, CHANNEL_COUNT, height * width), dtype=np.float32)
+    infinity = np.float64(np.inf)
+    for index in range(samples):
+        # Per sample rather than one giant array: samples x stones x pixels at
+        # 128x128 would allocate tens of gigabytes.
+        dx = grid_x[None, :] - stone_x[index][:, None]
+        dy = grid_y[None, :] - stone_y[index][:, None]
+        square = dx * dx + dy * dy
+
+        current = np.where(is_current[index][:, None], square, infinity)
+        opponent = np.where(is_opponent[index][:, None], square, infinity)
+        current_square = current.min(axis=0) if current.size else np.full(grid_x.shape, infinity)
+        opponent_square = (
+            opponent.min(axis=0) if opponent.size else np.full(grid_x.shape, infinity)
+        )
+        both = np.where(live[index][:, None], square, infinity)
+        if both.shape[0] >= 2:
+            partitioned = np.partition(both, 1, axis=0)
+            nearest_square = partitioned[0]
+            second_square = partitioned[1]
+        elif both.shape[0] == 1:
+            nearest_square = both[0]
+            second_square = np.full(grid_x.shape, infinity)
+        else:
+            nearest_square = np.full(grid_x.shape, infinity)
+            second_square = np.full(grid_x.shape, infinity)
+
+        r = radius[index]
+        current_distance = np.sqrt(current_square)
+        opponent_distance = np.sqrt(opponent_square)
+        nearest = np.sqrt(nearest_square)
+        second = np.sqrt(second_square)
+        scale = max(4.0 * r, np.finfo(np.float64).eps)
+
+        out[index, 0] = (current_distance <= r).astype(np.float32)
+        out[index, 1] = (opponent_distance <= r).astype(np.float32)
+        # ownership(): nearer side takes the cell, a tie splits it, and neither
+        # owns a cell when the board is empty.
+        both_infinite = ~np.isfinite(current_distance) & ~np.isfinite(opponent_distance)
+        current_area = np.where(current_distance < opponent_distance, 1.0, 0.0)
+        opponent_area = np.where(opponent_distance < current_distance, 1.0, 0.0)
+        tie = (current_distance == opponent_distance) & ~both_infinite
+        current_area = np.where(tie, 0.5, current_area)
+        opponent_area = np.where(tie, 0.5, opponent_area)
+        out[index, 2] = current_area
+        out[index, 3] = opponent_area
+        out[index, 4] = np.where(
+            np.isfinite(current_distance), np.clip(current_distance / scale, 0.0, 1.0), 1.0
+        )
+        out[index, 5] = np.where(
+            np.isfinite(opponent_distance), np.clip(opponent_distance / scale, 0.0, 1.0), 1.0
+        )
+        # second - nearest is inf - inf on an empty board; isfinite discards it,
+        # but compute it under errstate so the warning does not train readers to
+        # ignore warnings.
+        with np.errstate(invalid="ignore"):
+            ridge = np.clip(1.0 - (second - nearest) / r, 0.0, 1.0)
+        out[index, 6] = np.where(np.isfinite(second), ridge, 0.0)
+        board_clearance = np.minimum(
+            np.minimum(grid_x - r, 1.0 - r - grid_x),
+            np.minimum(grid_y - r, 1.0 - r - grid_y),
+        )
+        stone_clearance = np.where(np.isfinite(nearest), nearest - 2.0 * r, infinity)
+        out[index, 7] = np.clip(
+            np.minimum(board_clearance, stone_clearance) / r, -1.0, 1.0
+        )
+        out[index, 8] = 2.0 * r
+        out[index, 9] = 1.0 if passes[index] > 0 else 0.0
+
+    return out.reshape(samples, CHANNEL_COUNT * height * width)
+
+
+def _v4_record_dtype(policy_size: int) -> np.dtype:
+    """Fixed-size v4 record: position, sparse policy, scalars.
+
+    Both variable-length parts pad to a capacity so records stay memory-mappable;
+    the live counts precede them. Capacities are the writer's, in
+    `crates/vgo-selfplay/src/replay_stream.rs`, and must match exactly.
+    """
+    return np.dtype(
+        [
+            ("radius", "<f8"),
+            ("to_move", "u1"),
+            ("consecutive_passes", "<u4"),
+            ("phase", "u1"),
+            ("stone_count", "<u4"),
+            (
+                "stones",
+                np.dtype([("x", "<f8"), ("y", "<f8"), ("color", "u1")]),
+                (V4_STONE_CAPACITY,),
+            ),
+            ("touched", "<u4"),
+            (
+                "cells",
+                np.dtype(
+                    [
+                        ("index", "<u4"),
+                        ("policy", "<f4"),
+                        ("visits", "<f4"),
+                        ("beta", "<f4"),
+                        ("proposal_counts", "<u4"),
+                    ]
+                ),
+                (V4_POLICY_CAPACITY,),
+            ),
+            ("value", "<f4"),
+            ("selected_action", "<u4"),
+            ("game", "<u8"),
+            ("ply", "<u4"),
+            ("seed", "<u8"),
+        ],
+        align=False,
+    )
+
+
+def _expand_sparse_policy(
+    records: np.ndarray, samples: int, policy_size: int
+) -> tuple[np.ndarray, ...]:
+    """Scatter the touched cells back into dense per-sample arrays.
+
+    The mask is not stored: presence in the sparse list is the mask, so a cell
+    absent from a record's list has zero policy, visits, beta, and proposals.
+    """
+    policies = np.zeros((samples, policy_size), dtype=np.float32)
+    masks = np.zeros((samples, policy_size), dtype=np.float32)
+    visits = np.zeros((samples, policy_size), dtype=np.float32)
+    beta = np.zeros((samples, policy_size), dtype=np.float32)
+    proposal_counts = np.zeros((samples, policy_size), dtype=np.uint32)
+
+    counts = np.asarray(records["touched"], dtype=np.int64)
+    if int(counts.max(initial=0)) > V4_POLICY_CAPACITY:
+        raise ValueError("replay record claims more touched cells than the capacity")
+    cells = records["cells"]
+    # One flat scatter rather than a per-sample loop: build the row index for
+    # every live cell, then index once.
+    slot = np.arange(V4_POLICY_CAPACITY, dtype=np.int64)[None, :]
+    live = slot < counts[:, None]
+    rows = np.broadcast_to(
+        np.arange(samples, dtype=np.int64)[:, None], live.shape
+    )[live]
+    columns = np.asarray(cells["index"], dtype=np.int64)[live]
+    if columns.size and int(columns.max()) >= policy_size:
+        raise ValueError("replay cell index is outside the policy tensor")
+    policies[rows, columns] = np.asarray(cells["policy"])[live]
+    masks[rows, columns] = 1.0
+    visits[rows, columns] = np.asarray(cells["visits"])[live]
+    beta[rows, columns] = np.asarray(cells["beta"])[live]
+    proposal_counts[rows, columns] = np.asarray(cells["proposal_counts"])[live]
+    return policies, masks, visits, beta, proposal_counts
+
+
+def _load_replay_v4(
+    path: Path,
+    samples: int,
+    channels: int,
+    height: int,
+    width: int,
+    policy_size: int,
+) -> tuple[np.ndarray, ...]:
+    """Loads a position shard, rendering each state at load time.
+
+    v4 stores the position rather than a picture of it, so the raster is
+    produced here and the layout is a training-time choice rather than a
+    property of the data -- see docs/POSITION_SHARDS.md.
+    """
+    record_dtype = _v4_record_dtype(policy_size)
+    expected_bytes = HEADER.size + samples * record_dtype.itemsize
+    if path.stat().st_size != expected_bytes:
+        raise ValueError(
+            f"replay size mismatch: expected {expected_bytes}, got {path.stat().st_size}"
+        )
+    records = np.memmap(
+        path, dtype=record_dtype, mode="r", offset=HEADER.size, shape=(samples,)
+    )
+    if int(np.asarray(records["stone_count"]).max(initial=0)) > V4_STONE_CAPACITY:
+        raise ValueError("replay record claims more stones than the capacity")
+
+    states = rasterize_records(records, channels, height, width)
+    policies, masks, visits, beta, proposal_counts = _expand_sparse_policy(
+        records, samples, policy_size
+    )
+    return (
+        states,
+        policies,
+        masks,
+        visits,
+        beta,
+        proposal_counts,
+        np.array(records["value"], copy=True),
+        np.array(records["selected_action"], copy=True).astype(np.int64),
+        np.array(records["game"], copy=True).astype(np.int64),
+        np.array(records["ply"], copy=True).astype(np.int64),
+        np.array(records["seed"], copy=True).astype(np.int64),
+    )
+
+
 def _load_replay(
     path: Path,
     version: int,
@@ -254,7 +498,14 @@ def load_dataset(path: str | Path) -> RasterDataset:
     magic, version, samples, channels, height, width, policy_size = _read_header(path)
     if magic == REPLAY_MAGIC:
         _validate_manifest(path)
-        arrays = _load_replay(path, version, samples, channels, height, width, policy_size)
+        if version >= 4:
+            arrays = _load_replay_v4(
+                path, samples, channels, height, width, policy_size
+            )
+        else:
+            arrays = _load_replay(
+                path, version, samples, channels, height, width, policy_size
+            )
     else:
         arrays = _load_legacy(path, samples, channels, height, width, policy_size)
     (
