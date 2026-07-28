@@ -3,6 +3,9 @@
 use vgo_core::Position;
 
 pub const CHANNEL_COUNT: usize = 10;
+
+/// Channels written by [`rasterize_rgb_into`]: red, green, blue.
+pub const RGB_CHANNEL_COUNT: usize = 3;
 pub const DATASET_MAGIC: [u8; 8] = *b"VGODATA1";
 pub const DATASET_VERSION: u32 = 2;
 
@@ -60,6 +63,49 @@ pub const CHANNELS: [ChannelSpec; CHANNEL_COUNT] = [
         scale: ChannelScale::Unit,
     },
 ];
+
+/// Which channel layout a raster carries.
+///
+/// `Semantic` is the ten engineered channels. `Rgb` is the board as a player
+/// sees it -- stone discs over Voronoi territory fill, three channels, no
+/// derived fields. The two are not interchangeable inputs: a model trained on
+/// one cannot read the other, so this belongs to a run's identity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RasterKind {
+    #[default]
+    Semantic,
+    Rgb,
+}
+
+impl RasterKind {
+    #[must_use]
+    pub const fn channels(self) -> usize {
+        match self {
+            Self::Semantic => CHANNEL_COUNT,
+            Self::Rgb => RGB_CHANNEL_COUNT,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Rgb => "rgb",
+        }
+    }
+}
+
+impl std::str::FromStr for RasterKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "semantic" => Ok(Self::Semantic),
+            "rgb" => Ok(Self::Rgb),
+            _ => Err(format!("unsupported raster kind: {value}")),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RasterConfig {
@@ -306,6 +352,109 @@ pub fn action_pixel(x: f64, y: f64, config: RasterConfig) -> usize {
     row.min(config.height - 1) * config.width + column.min(config.width - 1)
 }
 
+/// The player-facing palette, taken from `reference/js-reference/voronoi_go.html`
+/// (`COLORS`, line 199) so the network sees the same picture a human does.
+/// Values are 0-255 to keep them legible against the source; the raster is
+/// normalized to unit range on write.
+///
+/// The JS names the two sides Black and White but draws them blue and orange.
+/// Here they are relative to the side to move, matching every other channel in
+/// this crate: `CURRENT_*` is whoever is about to play.
+const CURRENT_STONE: [f32; 3] = [90.0, 162.0, 236.0]; // #5aa2ec
+const CURRENT_REGION: [f32; 3] = [34.0, 64.0, 92.0]; // #22405c
+const OPPONENT_STONE: [f32; 3] = [240.0, 151.0, 90.0]; // #f0975a
+const OPPONENT_REGION: [f32; 3] = [104.0, 57.0, 26.0]; // #68391a
+const BOARD_BACKGROUND: [f32; 3] = [14.0, 17.0, 22.0]; // #0e1116
+
+/// Renders the board as a player sees it: three channels, stone discs over
+/// Voronoi territory fill.
+///
+/// This deliberately carries no derived fields -- no distance transform, no
+/// ridge, no legality map. The question it exists to answer is whether a
+/// convolutional tower can recover that structure from the picture alone, so
+/// handing it any of those channels would defeat the experiment. See
+/// `docs/RGB_REPRESENTATION_EXPERIMENT.md`.
+///
+/// Geometry is shared with [`rasterize_into`]: territory is the nearer-stone
+/// test and a stone is the disc within `radius`, so the two rasters agree about
+/// the position and differ only in what they expose.
+pub fn rasterize_rgb_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
+    assert!(config.width > 0 && config.height > 0);
+    assert!(position.validate().is_playable());
+    let pixels = config.pixels();
+    assert_eq!(data.len(), RGB_CHANNEL_COUNT * pixels);
+    let radius = position.radius();
+
+    let to_move = position.to_move();
+    let mut current_stones = Vec::with_capacity(position.stones().len());
+    let mut opponent_stones = Vec::with_capacity(position.stones().len());
+    for stone in position.stones() {
+        if stone.color == to_move {
+            current_stones.push((stone.x, stone.y));
+        } else {
+            opponent_stones.push((stone.x, stone.y));
+        }
+    }
+
+    for row in 0..config.height {
+        let y = (row as f64 + 0.5) / config.height as f64;
+        for column in 0..config.width {
+            let x = (column as f64 + 0.5) / config.width as f64;
+            let pixel = row * config.width + column;
+
+            // Squared distances for the same reason as the semantic raster: the
+            // ordering is unchanged and it keeps a hypot out of the inner loop.
+            let mut current_square = f64::INFINITY;
+            let mut opponent_square = f64::INFINITY;
+            for &(sx, sy) in &current_stones {
+                let dx = x - sx;
+                let dy = y - sy;
+                let square = dx * dx + dy * dy;
+                if square < current_square {
+                    current_square = square;
+                }
+            }
+            for &(sx, sy) in &opponent_stones {
+                let dx = x - sx;
+                let dy = y - sy;
+                let square = dx * dx + dy * dy;
+                if square < opponent_square {
+                    opponent_square = square;
+                }
+            }
+
+            let mut color = BOARD_BACKGROUND;
+            // Territory first, then stones over it, matching renderBoard()'s
+            // draw order: filled cells, then discs.
+            //
+            // `ownership` only compares its two arguments and tests them for
+            // finiteness, and squaring preserves both on nonnegative reals
+            // (INFINITY squared is still INFINITY), so squared distances give
+            // the same answer without the square roots.
+            let (current_area, opponent_area) = ownership(current_square, opponent_square);
+            blend(&mut color, CURRENT_REGION, current_area);
+            blend(&mut color, OPPONENT_REGION, opponent_area);
+            if current_square <= radius * radius {
+                blend(&mut color, CURRENT_STONE, 1.0);
+            }
+            if opponent_square <= radius * radius {
+                blend(&mut color, OPPONENT_STONE, 1.0);
+            }
+
+            for (channel, value) in color.iter().enumerate() {
+                set(data, pixels, channel, pixel, value / 255.0);
+            }
+        }
+    }
+}
+
+#[must_use]
+pub fn rasterize_rgb(position: &Position, config: RasterConfig) -> Vec<f32> {
+    let mut data = vec![0.0_f32; RGB_CHANNEL_COUNT * config.pixels()];
+    rasterize_rgb_into(position, config, &mut data);
+    data
+}
+
 fn set(data: &mut [f32], pixels: usize, channel: usize, pixel: usize, value: f32) {
     data[channel * pixels + pixel] = value;
 }
@@ -376,7 +525,10 @@ fn to_u8(value: f32) -> u8 {
 mod tests {
     use vgo_core::{Color, Position, Stone};
 
-    use super::{CHANNEL_COUNT, RasterConfig, action_pixel, rasterize, rasterize_into};
+    use super::{
+        CHANNEL_COUNT, RGB_CHANNEL_COUNT, RasterConfig, RasterKind, action_pixel, rasterize,
+        rasterize_into, rasterize_rgb,
+    };
 
     /// The pre-optimization formulation: one `hypot` per (pixel, stone) pair.
     /// `rasterize_into` now accumulates squared distances and takes four square
@@ -508,6 +660,107 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn two_stone_position() -> Position {
+        Position::new(
+            0.1,
+            vec![
+                Stone::new(0.25, 0.25, Color::Black),
+                Stone::new(0.75, 0.75, Color::White),
+            ],
+            Color::Black,
+        )
+    }
+
+    #[test]
+    fn rgb_raster_has_three_channels_in_unit_range() {
+        let raster = rasterize_rgb(&two_stone_position(), RasterConfig::square(32));
+        assert_eq!(raster.len(), RGB_CHANNEL_COUNT * 32 * 32);
+        assert_eq!(RasterKind::Rgb.channels(), RGB_CHANNEL_COUNT);
+        assert_eq!(RasterKind::Semantic.channels(), CHANNEL_COUNT);
+        assert!(raster.iter().all(|value| *value >= 0.0 && *value <= 1.0));
+    }
+
+    #[test]
+    fn rgb_raster_paints_each_stone_in_its_own_colour() {
+        let config = RasterConfig::square(64);
+        let raster = rasterize_rgb(&two_stone_position(), config);
+        let pixels = config.pixels();
+        let sample = |x: f64, y: f64| {
+            let column = (x * config.width as f64) as usize;
+            let row = (y * config.height as f64) as usize;
+            let pixel = row * config.width + column;
+            [
+                raster[pixel],
+                raster[pixels + pixel],
+                raster[2 * pixels + pixel],
+            ]
+        };
+
+        // The side to move is Black, so its stone takes the current colour and
+        // White's takes the opponent colour. CURRENT_STONE is blue-dominant and
+        // OPPONENT_STONE is red-dominant, which is the cheapest stable way to
+        // tell them apart without pinning exact palette values.
+        let current = sample(0.25, 0.25);
+        assert!(
+            current[2] > current[0],
+            "current stone should be blue-dominant, got {current:?}"
+        );
+        let opponent = sample(0.75, 0.75);
+        assert!(
+            opponent[0] > opponent[2],
+            "opponent stone should be red-dominant, got {opponent:?}"
+        );
+    }
+
+    #[test]
+    fn rgb_and_semantic_rasters_agree_about_stones_and_territory() {
+        // The experiment only means anything if both rasters describe the same
+        // position; they must differ in what they expose, not in what they show.
+        let config = RasterConfig::square(48);
+        let position = two_stone_position();
+        let semantic = rasterize(&position, config);
+        let rgb = rasterize_rgb(&position, config);
+        let pixels = config.pixels();
+
+        for pixel in 0..pixels {
+            let current_stone = semantic.channel(0)[pixel] > 0.0;
+            let opponent_stone = semantic.channel(1)[pixel] > 0.0;
+            let color = [rgb[pixel], rgb[pixels + pixel], rgb[2 * pixels + pixel]];
+            if current_stone {
+                assert!(
+                    color[2] > color[0],
+                    "pixel {pixel} is a current stone in the semantic raster but not blue-dominant in RGB"
+                );
+            }
+            if opponent_stone {
+                assert!(
+                    color[0] > color[2],
+                    "pixel {pixel} is an opponent stone in the semantic raster but not red-dominant in RGB"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rgb_raster_is_a_relative_view_like_every_other_channel() {
+        // Swapping both the stone colours and the side to move leaves the
+        // position identical from the mover's seat, so the picture must not move.
+        let config = RasterConfig::square(32);
+        let black_to_play = rasterize_rgb(&two_stone_position(), config);
+        let white_to_play = rasterize_rgb(
+            &Position::new(
+                0.1,
+                vec![
+                    Stone::new(0.25, 0.25, Color::White),
+                    Stone::new(0.75, 0.75, Color::Black),
+                ],
+                Color::White,
+            ),
+            config,
+        );
+        assert_eq!(black_to_play, white_to_play);
     }
 
     #[test]
