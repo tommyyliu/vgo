@@ -8,7 +8,7 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
-use vgo_raster::{CHANNEL_COUNT, RasterConfig, SemanticRaster};
+use vgo_raster::{RasterConfig, SemanticRaster};
 
 pub(crate) const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
 // v2 added raw per-cell visit counts and coarse->fine sampling probability
@@ -84,7 +84,11 @@ impl ReplayStream {
                 "replay sample count does not fit the v3 header",
             )
         })?;
-        let channels_u32 = u32::try_from(CHANNEL_COUNT).expect("channel count fits in u32");
+        // The header must describe the raster it will actually receive: an RGB
+        // shard carries three planes, not the semantic ten, and validate_sample
+        // compares each sample's config against this one.
+        let channels_u32 =
+            u32::try_from(raster.channels()).expect("channel count fits in u32");
         let height_u32 = u32::try_from(raster.height).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,

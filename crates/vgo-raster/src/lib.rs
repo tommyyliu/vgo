@@ -111,6 +111,10 @@ impl std::str::FromStr for RasterKind {
 pub struct RasterConfig {
     pub width: usize,
     pub height: usize,
+    /// Which channel layout to write. Carried here because every consumer that
+    /// needs the raster's shape already has the config, so nothing else has to
+    /// be threaded alongside it.
+    pub kind: RasterKind,
 }
 
 impl RasterConfig {
@@ -119,7 +123,23 @@ impl RasterConfig {
         Self {
             width: size,
             height: size,
+            kind: RasterKind::Semantic,
         }
+    }
+
+    #[must_use]
+    pub const fn square_of(size: usize, kind: RasterKind) -> Self {
+        Self {
+            width: size,
+            height: size,
+            kind,
+        }
+    }
+
+    /// Channels a raster written with this config carries.
+    #[must_use]
+    pub const fn channels(self) -> usize {
+        self.kind.channels()
     }
 
     #[must_use]
@@ -207,11 +227,25 @@ impl SemanticRaster {
     }
 }
 
+/// Rasterize a position into whichever layout `config.kind` names.
+///
+/// Callers hold a `SemanticRaster` either way and never index channels by
+/// meaning, so the two layouts are interchangeable everywhere downstream of
+/// this call: the search, the broker, and the shard writer all treat the data
+/// as an opaque block of `config.channels()` planes.
 #[must_use]
 pub fn rasterize(position: &Position, config: RasterConfig) -> SemanticRaster {
-    let mut data = vec![0.0_f32; CHANNEL_COUNT * config.pixels()];
-    rasterize_into(position, config, &mut data);
+    let mut data = vec![0.0_f32; config.channels() * config.pixels()];
+    rasterize_any_into(position, config, &mut data);
     SemanticRaster { config, data }
+}
+
+/// Writes whichever layout `config.kind` names into caller-owned storage.
+pub fn rasterize_any_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
+    match config.kind {
+        RasterKind::Semantic => rasterize_into(position, config, data),
+        RasterKind::Rgb => rasterize_rgb_into(position, config, data),
+    }
 }
 
 /// Writes a semantic raster into caller-owned contiguous channel-first storage.
@@ -811,6 +845,7 @@ mod tests {
         let config = RasterConfig {
             width: 4,
             height: 2,
+            kind: RasterKind::Semantic,
         };
         assert_eq!(action_pixel(0.1, 0.1, config), 0);
         assert_eq!(action_pixel(0.9, 0.9, config), 7);

@@ -20,7 +20,9 @@ use vgo_inference::{
     BatchedEvaluator, BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, OnnxBatchService,
     OnnxProvider, OnnxServiceConfig,
 };
-use vgo_raster::{CHANNEL_COUNT, CHANNELS, RasterConfig, SemanticRaster, action_pixel, rasterize};
+use vgo_raster::{
+    CHANNELS, RasterConfig, RasterKind, SemanticRaster, action_pixel, rasterize,
+};
 use vgo_search::{
     Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, SearchResult, search_at_ply,
 };
@@ -85,6 +87,13 @@ struct Config {
     samples: usize,
     #[arg(long, default_value_t = 96)]
     resolution: usize,
+    /// Channel layout written into the shard. `semantic` is the ten engineered
+    /// channels; `rgb` is the board as a player sees it -- stone discs over
+    /// Voronoi fill, three channels, no derived fields. Games are unaffected:
+    /// the same seed and model produce the same play either way, so two runs
+    /// differing only here are paired data over identical positions.
+    #[arg(long, default_value = "semantic")]
+    raster_kind: RasterKind,
     /// Placement grid the policy head emits, independent of the render
     /// resolution. The board is only ~9 stones across, so 128x128 of placement
     /// precision mostly splits single moves across many cells while spreading
@@ -271,7 +280,7 @@ fn generate_game(
     game_index: u64,
     stopped: &AtomicBool,
 ) -> Result<GameSamples, EvaluationError> {
-    let raster_config = RasterConfig::square(config.resolution);
+    let raster_config = RasterConfig::square_of(config.resolution, config.raster_kind);
     // Policy targets, the recorded action index, and the replay policy vector all
     // live on the placement grid, which may be coarser than the render raster.
     let policy_config = RasterConfig::square(config.policy_resolution);
@@ -662,7 +671,7 @@ fn write_manifest(
         Some(game) => writeln!(writer, "  \"last_serialized_game_id\": {game},")?,
         None => writeln!(writer, "  \"last_serialized_game_id\": null,")?,
     }
-    writeln!(writer, "  \"channels\": {},", CHANNEL_COUNT)?;
+    writeln!(writer, "  \"channels\": {},", config.raster_kind.channels())?;
     writeln!(writer, "  \"height\": {},", config.resolution)?;
     writeln!(writer, "  \"width\": {},", config.resolution)?;
     writeln!(
@@ -873,9 +882,13 @@ fn write_manifest(
         "  \"value_target\": \"terminal utility in [-1, 1] for current player\","
     )?;
     writeln!(writer, "  \"channel_names\": [")?;
-    for (index, channel) in CHANNELS.iter().enumerate() {
-        let comma = if index + 1 == CHANNEL_COUNT { "" } else { "," };
-        writeln!(writer, "    \"{}\"{}", channel.name, comma)?;
+    let names: Vec<&str> = match config.raster_kind {
+        RasterKind::Semantic => CHANNELS.iter().map(|channel| channel.name).collect(),
+        RasterKind::Rgb => vec!["red", "green", "blue"],
+    };
+    for (index, name) in names.iter().enumerate() {
+        let comma = if index + 1 == names.len() { "" } else { "," };
+        writeln!(writer, "    \"{name}\"{comma}")?;
     }
     writeln!(writer, "  ]")?;
     writeln!(writer, "}}")?;
@@ -1114,7 +1127,7 @@ fn main() -> std::io::Result<()> {
         "  \"temperature_plies\": {},",
         config.temperature_plies
     )?;
-    writeln!(output, "  \"channels\": {},", CHANNEL_COUNT)?;
+    writeln!(output, "  \"channels\": {},", config.raster_kind.channels())?;
     writeln!(output, "  \"resolution\": {},", config.resolution)?;
     writeln!(
         output,

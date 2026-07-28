@@ -10,7 +10,7 @@ use ort::{
     value::TensorRef,
 };
 use sha2::{Digest, Sha256};
-use vgo_raster::{CHANNEL_COUNT, RasterConfig};
+use vgo_raster::RasterConfig;
 use vgo_search::EvaluationError;
 
 use crate::{BatchContract, BatchService, InferenceInput, InferenceOutput};
@@ -141,7 +141,7 @@ impl OnnxBatchService {
         validate_model(&session, config)?;
         let state_capacity = config
             .maximum_batch
-            .checked_mul(CHANNEL_COUNT)
+            .checked_mul(config.raster.channels())
             .and_then(|value| value.checked_mul(config.raster.pixels()))
             .ok_or_else(|| EvaluationError::new("ONNX input allocation size overflow"))?;
         Ok(Self {
@@ -195,7 +195,7 @@ impl BatchService for OnnxBatchService {
         let input = TensorRef::from_array_view((
             [
                 batch.len(),
-                CHANNEL_COUNT,
+                self.raster.channels(),
                 self.raster.height,
                 self.raster.width,
             ],
@@ -260,7 +260,7 @@ fn profile_shapes(config: &OnnxServiceConfig) -> ProfileShapes {
     let shape = |batch| {
         format!(
             "states:{batch}x{}x{}x{}",
-            CHANNEL_COUNT, config.raster.height, config.raster.width
+            config.raster.channels(), config.raster.height, config.raster.width
         )
     };
     ProfileShapes {
@@ -328,7 +328,7 @@ fn validate_model(session: &Session, config: &OnnxServiceConfig) -> Result<(), E
     }
     let policy = config.policy.unwrap_or(config.raster);
     for (key, expected) in [
-        ("vgo.channels", CHANNEL_COUNT),
+        ("vgo.channels", config.raster.channels()),
         ("vgo.height", config.raster.height),
         ("vgo.width", config.raster.width),
         ("vgo.policy_size", policy.pixels() + 1),
