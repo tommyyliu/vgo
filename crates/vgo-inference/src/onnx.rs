@@ -97,8 +97,19 @@ impl OnnxBatchService {
                 let cache_directory = scoped_cache_directory(config, &model_digest);
                 fs::create_dir_all(&cache_directory)
                     .map_err(|error| evaluation_error("create TensorRT cache", error))?;
+                // The engine is weight-specific, so its cache is keyed on the model
+                // digest and every trained model rebuilds. The timing cache is not:
+                // it records how fast each kernel tactic runs for a given layer shape
+                // on this device, which is identical across RL iterations because only
+                // the weights change. Leaving it inside the per-digest directory made
+                // every rebuild re-benchmark tactics from scratch -- ~10.9s cold versus
+                // ~0.3s warm. Hoisting it one level up shares those measurements.
+                let timing_directory = timing_cache_directory(config);
+                fs::create_dir_all(&timing_directory)
+                    .map_err(|error| evaluation_error("create TensorRT timing cache", error))?;
                 let profiles = profile_shapes(config);
                 let cache = path_text(&cache_directory)?;
+                let timing_cache = path_text(&timing_directory)?;
                 builder
                     .with_execution_providers([
                         ep::TensorRT::default()
@@ -107,6 +118,7 @@ impl OnnxBatchService {
                             .with_engine_cache(true)
                             .with_engine_cache_path(cache)
                             .with_timing_cache(true)
+                            .with_timing_cache_path(timing_cache)
                             .with_profile_min_shapes(&profiles.minimum)
                             .with_profile_opt_shapes(&profiles.optimum)
                             .with_profile_max_shapes(&profiles.maximum)
@@ -246,6 +258,20 @@ fn profile_shapes(config: &OnnxServiceConfig) -> ProfileShapes {
         optimum: shape(config.maximum_batch),
         maximum: shape(config.maximum_batch),
     }
+}
+
+/// Timing-cache location, scoped to everything the kernel measurements depend on
+/// except the weights: provider, precision, raster shape, and batch profile. Two
+/// models that differ only by training iteration share this directory.
+fn timing_cache_directory(config: &OnnxServiceConfig) -> PathBuf {
+    config.cache_directory.join(format!(
+        "timing-{}-{}-{}x{}-batch{}",
+        config.provider.as_str(),
+        if config.fp16 { "fp16" } else { "fp32" },
+        config.raster.width,
+        config.raster.height,
+        config.maximum_batch,
+    ))
 }
 
 fn scoped_cache_directory(config: &OnnxServiceConfig, model_digest: &str) -> PathBuf {
