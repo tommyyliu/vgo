@@ -33,9 +33,48 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "training"))
+_TRAINING = Path(__file__).resolve().parents[1] / "training"
+sys.path.insert(0, str(_TRAINING))
 from vgo_training.bradley_terry import fit_ratings  # noqa: E402
 from vgo_training.pipeline import runtime_environment  # noqa: E402
+
+
+def arena_environment() -> dict[str, str]:
+    """Environment for vgo-arena, independent of the interpreter running us.
+
+    `runtime_environment` derives the ONNX Runtime and TensorRT library paths
+    from `sys.prefix`, so it only produces a usable environment when called from
+    the training venv. Run under the system interpreter it silently yields no
+    ORT_DYLIB_PATH, and the arena then hangs rather than failing: a failed dylib
+    load inside `ort` builds its error through `ort::api()`, which waits on the
+    same initialization lock the failing load still holds.
+
+    Re-exec through the venv interpreter to collect the environment, so this
+    script works however it was invoked.
+    """
+    if Path(sys.prefix).resolve() == _TRAINING / ".venv":
+        return runtime_environment()
+    interpreter = _TRAINING / ".venv/bin/python3"
+    if not interpreter.exists():
+        raise SystemExit(f"training venv not found at {interpreter}")
+    collected = subprocess.run(
+        [
+            str(interpreter),
+            "-c",
+            "import json,sys;sys.path.insert(0,%r);"
+            "from vgo_training.pipeline import runtime_environment;"
+            "print(json.dumps(runtime_environment()))" % str(_TRAINING),
+        ],
+        stdout=subprocess.PIPE,
+        check=True,
+        text=True,
+    )
+    environment = json.loads(collected.stdout)
+    if not environment.get("ORT_DYLIB_PATH"):
+        raise SystemExit(
+            "ORT_DYLIB_PATH is unset; the arena would hang instead of failing"
+        )
+    return environment
 
 
 def discover_checkpoints(run: Path) -> dict[int, Path]:
@@ -154,6 +193,14 @@ def main() -> None:
         "--anchor", type=int,
         help="version every other plays against; defaults to the earliest rated",
     )
+    parser.add_argument(
+        "--round-robin", action="store_true",
+        help=(
+            "play every chosen checkpoint against every other, not just the "
+            "anchor; keeps late ratings pinned by close games instead of by "
+            "the prior once the field beats the anchor outright"
+        ),
+    )
     parser.add_argument("--pairs", type=int, default=16)
     parser.add_argument("--seed", type=int, default=5_000_001)
     parser.add_argument(
@@ -181,26 +228,44 @@ def main() -> None:
     anchor = arguments.anchor if arguments.anchor is not None else chosen[0]
     if anchor not in available:
         raise SystemExit(f"no checkpoint for anchor version {anchor}")
-    challengers = [version for version in chosen if version != anchor]
-    if not challengers:
-        raise SystemExit("need at least one checkpoint besides the anchor")
+
+    if arguments.round_robin:
+        # Every checkpoint against every other. Rating against one anchor stops
+        # discriminating once the field beats it outright -- an undefeated record
+        # has no finite Elo, so the fit falls back on the prior rather than on
+        # evidence. Cross-play keeps every rating pinned by games that were
+        # actually close.
+        pairings = [
+            (a, b)
+            for index, a in enumerate(chosen)
+            for b in chosen[index + 1 :]
+        ]
+    else:
+        pairings = [(version, anchor) for version in chosen if version != anchor]
+    if not pairings:
+        raise SystemExit("need at least two checkpoints to play")
 
     print(f"run       : {run}")
     print(f"available : {len(available)} checkpoints (versions {min(available)}-{max(available)})")
-    print(f"rating    : {challengers}")
-    print(f"anchor    : {anchor}")
-    print(f"matches   : {len(challengers)} x {arguments.pairs} pairs")
+    print(f"rating    : {chosen}")
+    print(f"anchor    : {anchor} (ratings are relative to this)")
+    print(f"matches   : {len(pairings)} pairing(s) x {arguments.pairs} pairs")
 
-    # One process per candidate, with every opponent batched into it: the
-    # arena's own help notes model load is ~21s against ~0.93s per extra pair,
-    # so batching opponents is most of the cost saved.
-    command = build_command(
-        root, config, available[challengers[-1]], [available[anchor]],
-        arguments.seed, arguments.pairs,
-    )
     if arguments.dry_run:
-        print("\nwould run, per challenger:")
-        print("  " + " ".join(command))
+        preview: dict[int, list[int]] = {}
+        for candidate, opponent in pairings:
+            preview.setdefault(candidate, []).append(opponent)
+        print(f"\nwould run {len(preview)} arena process(es):")
+        for candidate, opponents in sorted(preview.items()):
+            listed = ", ".join(f"v{version}" for version in opponents)
+            print(f"  v{candidate} vs {listed}")
+        sample = sorted(preview)[0]
+        print("\nfirst command:")
+        print("  " + " ".join(build_command(
+            root, config, available[sample],
+            [available[version] for version in preview[sample]],
+            arguments.seed, arguments.pairs,
+        )))
         return
 
     output = run / "manual-elo"
@@ -215,19 +280,37 @@ def main() -> None:
         ]
         print(f"resuming  : {len(matches)} existing match record(s)")
 
-    already = {(match["a"], match["b"]) for match in matches}
-    environment = runtime_environment()
+    # A pairing already played in either direction is not replayed: colours are
+    # swapped within a match, so v10-vs-v0 and v0-vs-v10 measure the same thing.
+    already = {frozenset((match["a"], match["b"])) for match in matches}
+    todo = [
+        pairing for pairing in pairings if frozenset(pairing) not in already
+    ]
+    skipped = len(pairings) - len(todo)
+    if skipped:
+        print(f"skipping  : {skipped} pairing(s) already in matches.jsonl")
+    if not todo:
+        print("nothing new to play")
+
+    # One process per candidate with all of its opponents batched in. The
+    # arena loads the candidate once and emits a record per opponent, and model
+    # load is ~21s against ~0.93s per additional pair -- so grouping turns 10
+    # processes into 4 here.
+    grouped: dict[int, list[int]] = {}
+    for candidate, opponent in todo:
+        grouped.setdefault(candidate, []).append(opponent)
+
+    environment = arena_environment()
     started = time.perf_counter()
 
-    for index, version in enumerate(challengers, start=1):
-        if (version, anchor) in already:
-            print(f"\n[{index}/{len(challengers)}] v{version} vs v{anchor}: already rated, skipping")
-            continue
+    for index, (candidate, opponents) in enumerate(sorted(grouped.items()), start=1):
         command = build_command(
-            root, config, available[version], [available[anchor]],
-            arguments.seed + version * 1_000_003, arguments.pairs,
+            root, config, available[candidate],
+            [available[version] for version in opponents],
+            arguments.seed + candidate * 1_000_003, arguments.pairs,
         )
-        print(f"\n[{index}/{len(challengers)}] v{version} vs v{anchor} ...", flush=True)
+        listed = ", ".join(f"v{version}" for version in opponents)
+        print(f"\n[{index}/{len(grouped)}] v{candidate} vs {listed} ...", flush=True)
         completed = subprocess.run(
             command, env=environment, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True,
@@ -239,28 +322,32 @@ def main() -> None:
                 print(f"    {line}")
             continue
         records = parse_records(completed.stdout)
-        if not records:
-            print("  FAILED: no arena record in output")
+        if len(records) != len(opponents):
+            print(
+                f"  FAILED: expected {len(opponents)} arena record(s), "
+                f"got {len(records)}"
+            )
             continue
-        record = records[0]
-        match = {
-            "a": version,
-            "b": anchor,
-            "a_wins": int(record["candidate_wins"]),
-            "b_wins": int(record["candidate_losses"]),
-            "draws": int(record["draws"]),
-            "score": float(record["candidate_score"]),
-            "games": int(record["games"]),
-            "wall_seconds": float(record["wall_seconds"]),
-        }
-        matches.append(match)
-        with matches_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(match) + "\n")
-        print(
-            f"  score {match['score']:.3f} "
-            f"({match['a_wins']}-{match['b_wins']}-{match['draws']}) "
-            f"in {match['wall_seconds']:.0f}s"
-        )
+        # Records come back in the order the opponents were passed.
+        for opponent, record in zip(opponents, records):
+            match = {
+                "a": candidate,
+                "b": opponent,
+                "a_wins": int(record["candidate_wins"]),
+                "b_wins": int(record["candidate_losses"]),
+                "draws": int(record["draws"]),
+                "score": float(record["candidate_score"]),
+                "games": int(record["games"]),
+                "wall_seconds": float(record["wall_seconds"]),
+            }
+            matches.append(match)
+            with matches_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(match) + "\n")
+            print(
+                f"  vs v{opponent}: score {match['score']:.3f} "
+                f"({match['a_wins']}-{match['b_wins']}-{match['draws']}) "
+                f"in {match['wall_seconds']:.0f}s"
+            )
 
     if not matches:
         raise SystemExit("no matches completed")
@@ -271,12 +358,30 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    print(f"\n{'version':>9}{'elo':>9}{'score':>9}")
-    scores = {match["a"]: match["score"] for match in matches}
+    # Aggregate every game a version played, from either seat.
+    wins: dict[int, float] = {}
+    played: dict[int, int] = {}
+    for match in matches:
+        a, b = int(match["a"]), int(match["b"])
+        half = 0.5 * float(match["draws"])
+        wins[a] = wins.get(a, 0.0) + float(match["a_wins"]) + half
+        wins[b] = wins.get(b, 0.0) + float(match["b_wins"]) + half
+        played[a] = played.get(a, 0) + int(match["games"])
+        played[b] = played.get(b, 0) + int(match["games"])
+
+    print(f"\n{'version':>9}{'elo':>9}{'score':>9}{'games':>8}")
     for version in sorted(ratings):
-        score = scores.get(version)
-        column = f"{score:.3f}" if score is not None else "anchor"
-        print(f"{version:>9}{ratings[version]:>9.0f}{column:>9}")
+        total = played.get(version, 0)
+        score = wins.get(version, 0.0) / total if total else float("nan")
+        flag = ""
+        # An unbeaten or winless record has no finite maximum-likelihood rating,
+        # so its Elo is set by --prior-games rather than by evidence. Say so
+        # rather than letting the number be read as a measurement.
+        if total and (score >= 1.0 or score <= 0.0):
+            flag = "  <- no finite Elo; rating pinned by the prior"
+        print(
+            f"{version:>9}{ratings[version]:>9.0f}{score:>9.3f}{total:>8}{flag}"
+        )
     print(f"\n{time.perf_counter() - started:.0f}s total -> {output}/ratings.json")
 
 
