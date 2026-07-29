@@ -696,15 +696,14 @@ function updateHover(e) {
   let t = (opt('ovSnap') || locked)
     ? nearestLegal(q.x, q.y)
     : { x: q.x, y: q.y, legal: isLegalPlacement(q.x, q.y), snapped: false };
-  // The sampler bounds its projection to the cell that named it, so a cell
-  // never stands in for a placement elsewhere on the board. Match that when
-  // locked, or the human could reach points the model cannot.
-  if (locked && t.legal) {
-    const n = +document.getElementById('gridN').value;
-    if (Math.abs(t.x - q.x) > 0.5 / n || Math.abs(t.y - q.y) > 0.5 / n) {
-      t = { x: q.x, y: q.y, legal: false, snapped: false };
-    }
-  }
+  // No cell bound here, deliberately. The sampler bounds its projection to the
+  // originating cell, but only ever applies it to cells already at the legality
+  // boundary -- it gates on the centre being within half a cell diagonal of the
+  // exclusion radius, so the projection is short by construction. A click can
+  // land anywhere, including deep inside a stone, where the nearest legal point
+  // is many cells away and the useful behaviour is to go there. Applying the
+  // cell bound to every click rejected 3184 of 3226 illegal probes on a
+  // 30-stone position, which looked exactly like no snapping at all.
   hover = { rawX: p.x, rawY: p.y, x: t.x, y: t.y, legal: t.legal, snapped: t.snapped };
 }
 cv.addEventListener('mousemove', e => { updateHover(e); draw(); });
