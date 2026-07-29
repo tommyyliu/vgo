@@ -240,25 +240,40 @@ class DDRNetPolicyValueNet(nn.Module):
         width: int = 64,
         blocks: int = 8,
         policy_resolution: int | None = None,
+        stem_stride: int = 4,
     ) -> None:
         super().__init__()
+        if stem_stride not in (1, 2, 4):
+            raise ValueError("stem stride must be 1, 2, or 4")
         self.policy_resolution = policy_resolution
+        self.stem_stride = stem_stride
         stem_channels = max(8, width // 2)
         detail_channels = width
         context_channels = width * 2
         deep_channels = width * 4
         stage_blocks = max(1, (blocks + 3) // 4)
 
+        # The stem sets the resolution the whole tower reasons at, which the
+        # default 4 puts at raster/4 -- 32x32 from a 128 input, where a stone of
+        # radius 1/18 spans 3.6 cells and the context branch's 8x8 fusion sees
+        # 0.89 cells per stone. Legal placement turns on a 2r clearance that is
+        # sub-cell at those strides, so configurations that differ by whether a
+        # gap is playable can be the same tensor to the model.
+        #
+        # Lowering it trades compute for spatial fidelity: stride 2 doubles the
+        # detail branch's resolution, stride 1 keeps the raster's.
+        first = 2 if stem_stride >= 2 else 1
+        second = 2 if stem_stride >= 4 else 1
         self.stem = nn.Sequential(
             nn.Conv2d(
-                channels, stem_channels, kernel_size=3, stride=2, padding=1
+                channels, stem_channels, kernel_size=3, stride=first, padding=1
             ),
             nn.ReLU(),
             nn.Conv2d(
                 stem_channels,
                 detail_channels,
                 kernel_size=3,
-                stride=2,
+                stride=second,
                 padding=1,
             ),
             nn.ReLU(),
@@ -414,6 +429,7 @@ def build_model(
     width: int,
     blocks: int,
     policy_resolution: int | None = None,
+    stem_stride: int = 4,
 ) -> nn.Module:
     """Construct a policy-value net by architecture name. Older checkpoints without
     an architecture field are the flat residual tower.
@@ -434,5 +450,6 @@ def build_model(
             width=width,
             blocks=blocks,
             policy_resolution=policy_resolution,
+            stem_stride=stem_stride,
         )
     raise ValueError(f"unknown model architecture: {architecture!r}")
