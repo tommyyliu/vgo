@@ -188,6 +188,103 @@ pub fn distance(position: &Position, point: Point, known_vertices: Option<&[Poin
     best
 }
 
+/// Where a placement lands after projecting it onto the legal set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Nearest {
+    pub point: Point,
+    pub legal: bool,
+    pub snapped: bool,
+}
+
+/// The legal point closest to `point`, or `point` itself when already legal.
+///
+/// A policy head emits a fixed lattice, so it can only ever name those cells --
+/// but legality is continuous, and a legal region thinner than one cell has no
+/// cell centre inside it. Such a region is unreachable: a group whose last
+/// liberty sits there can never be captured, however many stones surround it.
+/// Observed in a real game at 128x128, where a legal sliver of area 2.9e-5 had
+/// no reachable cell and produced an uncapturable group with no eyes.
+///
+/// Projecting a proposal onto the legal set closes that gap exactly, rather
+/// than asymptotically the way a finer lattice would: no lattice makes every
+/// sliver reachable, but every sliver is reachable from some nearby point. It
+/// also matches what the client already does for a human click
+/// (`legalSet.nearest` in voronoi_go.html), so both sides play the same game.
+///
+/// The candidate set is finite and mirrors the JS reference: the clamped query,
+/// each stone pushed off at exactly one diameter along the ray from the query,
+/// the four board-edge projections, and the legal-set vertices. The nearest
+/// legal point is always one of these -- the legal set is an intersection of
+/// half-planes and disc complements, so its closest point to a query lies on a
+/// boundary feature, and those are exactly what this enumerates.
+#[must_use]
+pub fn nearest(position: &Position, point: Point) -> Nearest {
+    if contains(position, point.x, point.y) {
+        return Nearest {
+            point,
+            legal: true,
+            snapped: false,
+        };
+    }
+    let radius = position.radius();
+    let diameter = 2.0 * radius;
+    let clamp = |value: f64| value.clamp(radius, 1.0 - radius);
+
+    let mut candidates = vec![Point::new(clamp(point.x), clamp(point.y))];
+    for stone in position.stones() {
+        let dx = point.x - stone.x;
+        let dy = point.y - stone.y;
+        let radial = dx.hypot(dy);
+        // A query exactly on a stone's centre has no ray to push along, so try
+        // the four axes instead of dividing by zero.
+        if radial < numeric::EDGE_EPSILON {
+            for (ux, uy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                candidates.push(Point::new(
+                    clamp(stone.x + diameter * ux),
+                    clamp(stone.y + diameter * uy),
+                ));
+            }
+        } else {
+            candidates.push(Point::new(
+                clamp(stone.x + diameter * dx / radial),
+                clamp(stone.y + diameter * dy / radial),
+            ));
+        }
+    }
+    candidates.push(Point::new(radius, clamp(point.y)));
+    candidates.push(Point::new(1.0 - radius, clamp(point.y)));
+    candidates.push(Point::new(clamp(point.x), radius));
+    candidates.push(Point::new(clamp(point.x), 1.0 - radius));
+    candidates.extend(vertices(position));
+
+    let mut best: Option<(f64, Point)> = None;
+    for candidate in candidates {
+        if !contains(position, candidate.x, candidate.y) {
+            continue;
+        }
+        let dx = candidate.x - point.x;
+        let dy = candidate.y - point.y;
+        let squared = dx.mul_add(dx, dy * dy);
+        if best.is_none_or(|(best_squared, _)| squared < best_squared) {
+            best = Some((squared, candidate));
+        }
+    }
+    match best {
+        // No legal point exists anywhere: the board is full, and the caller
+        // must treat the move as unplayable rather than substituting one.
+        None => Nearest {
+            point,
+            legal: false,
+            snapped: false,
+        },
+        Some((_, found)) => Nearest {
+            point: found,
+            legal: true,
+            snapped: true,
+        },
+    }
+}
+
 #[must_use]
 pub(crate) fn escape_witness(
     position: &Position,
@@ -211,7 +308,7 @@ pub(crate) fn escape_witness(
 mod tests {
     use crate::{Color, Point, Position, Stone};
 
-    use super::{contains, distance, vertices};
+    use super::{contains, distance, nearest, vertices};
 
     #[test]
     fn closed_boundaries_are_legal() {
@@ -236,5 +333,83 @@ mod tests {
         let legal_vertices = vertices(&position);
         assert!(legal_vertices.is_empty());
         assert!(distance(&position, Point::new(0.5, 0.5), Some(&legal_vertices)).is_infinite());
+    }
+
+    #[test]
+    fn nearest_returns_a_legal_query_unchanged() {
+        let position = Position::new(
+            0.1,
+            vec![Stone::new(0.25, 0.25, Color::Black)],
+            Color::Black,
+        );
+        let query = Point::new(0.7, 0.7);
+        let found = nearest(&position, query);
+        assert_eq!(found.point, query);
+        assert!(found.legal);
+        assert!(!found.snapped, "a legal query must not be moved");
+    }
+
+    #[test]
+    fn nearest_projects_an_illegal_query_onto_the_legal_set() {
+        let position = Position::new(
+            0.1,
+            vec![Stone::new(0.5, 0.5, Color::Black)],
+            Color::Black,
+        );
+        // Directly on the stone's centre: illegal, and with no ray to push
+        // along, so this also covers the degenerate direction case.
+        let found = nearest(&position, Point::new(0.5, 0.5));
+        assert!(found.legal);
+        assert!(found.snapped);
+        assert!(contains(&position, found.point.x, found.point.y));
+        // Pushed to exactly one diameter from the stone it collided with.
+        let distance = (found.point.x - 0.5).hypot(found.point.y - 0.5);
+        assert!(
+            (distance - 0.2).abs() < 1.0e-9,
+            "expected a diameter of clearance, got {distance}"
+        );
+    }
+
+    #[test]
+    fn nearest_reaches_a_region_no_lattice_cell_can_name() {
+        // The failure this exists for: a legal region thinner than a policy
+        // cell. Two stones a little over two diameters apart leave a legal
+        // sliver between them that a coarse lattice can miss entirely, and a
+        // group whose last liberty sits there is uncapturable.
+        let radius = 1.0 / 18.0;
+        let gap = 4.0 * radius + 0.004;
+        let position = Position::new(
+            radius,
+            vec![
+                Stone::new(0.5 - gap / 2.0, 0.5, Color::Black),
+                Stone::new(0.5 + gap / 2.0, 0.5, Color::Black),
+            ],
+            Color::White,
+        );
+        let midpoint = Point::new(0.5, 0.5);
+        assert!(
+            contains(&position, midpoint.x, midpoint.y),
+            "the sliver between the stones must be legal"
+        );
+
+        // A lattice that steps over the sliver cannot name it, but the nearest
+        // cell it can name projects back into it.
+        let coarse = 0.5 + 0.003;
+        assert!(!contains(&position, coarse, 0.5), "the probe must be illegal");
+        let found = nearest(&position, Point::new(coarse, 0.5));
+        assert!(found.legal && found.snapped);
+        assert!(contains(&position, found.point.x, found.point.y));
+    }
+
+    #[test]
+    fn nearest_reports_failure_when_nothing_is_legal() {
+        // A radius that leaves no inset at all: there is no legal point to
+        // snap to, and the caller must not be handed a fabricated one.
+        let position = Position::new(0.5, Vec::new(), Color::Black);
+        let found = nearest(&position, Point::new(0.1, 0.9));
+        if !found.legal {
+            assert!(!found.snapped);
+            assert_eq!(found.point, Point::new(0.1, 0.9));
+        }
     }
 }

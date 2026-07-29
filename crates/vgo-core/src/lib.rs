@@ -10,8 +10,8 @@ mod voronoi;
 pub use analysis::{Analysis, Outcome, Score};
 pub use game::{GameEvent, MoveError, MoveResult, pass, place};
 pub use legal_set::{
-    contains as is_legal_placement, distance as distance_to_legal_set,
-    vertices as legal_set_vertices,
+    Nearest, contains as is_legal_placement, distance as distance_to_legal_set,
+    nearest as nearest_legal_placement, vertices as legal_set_vertices,
 };
 pub use model::{Color, Phase, Position, Stone, Validation, ValidationIssue};
 pub use numeric::COORDINATE_EPSILON;
