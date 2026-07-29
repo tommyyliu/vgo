@@ -13,7 +13,7 @@
 //! The exact sampling probability is `beta = P_coarse(C) * P_fine(a | C)`, which
 //! we return so the training side can importance-correct the target.
 
-use vgo_core::{Point, Position, is_legal_placement};
+use vgo_core::{Point, Position, is_legal_placement, nearest_legal_placement};
 
 /// A sampled placement candidate and the probability it was drawn with.
 #[derive(Clone, Copy, Debug)]
@@ -33,6 +33,9 @@ pub struct FineGrid {
     coarse: usize, // coarse-cell size in fine cells (pool factor), both axes
     logits: Vec<f32>,
     legal: Vec<bool>,
+    /// Where each playable cell places a stone: the cell centre, unless the
+    /// centre was just illegal and projected onto legal area inside the cell.
+    placement: Vec<Point>,
 }
 
 impl FineGrid {
@@ -50,13 +53,45 @@ impl FineGrid {
         let coarse = coarse.clamp(1, width.min(height));
         let mut logits = vec![f32::NEG_INFINITY; width * height];
         let mut legal = vec![false; width * height];
+        // A cell is playable when its centre is legal, or when the centre is
+        // only just illegal and projects onto legal area still inside the cell.
+        // The second case is what keeps thin legal regions reachable: legality
+        // is continuous but the grid is not, so a sliver narrower than a cell
+        // contains no cell centre, and a group whose last liberty sits there
+        // could never be answered.
+        //
+        // Projection is expensive -- it enumerates candidates over every stone
+        // and the whole vertex set -- and this loop runs over every cell at
+        // every node, so it is gated. A cell can only hold legal area its
+        // centre misses when the centre sits just inside the exclusion radius
+        // of its nearest stone, within half a cell diagonal of the boundary.
+        // Cells deeper inside a stone cannot be rescued, and cells already
+        // clear need no rescuing, so only that thin band pays for a projection.
+        let mut placement = vec![Point::new(0.0, 0.0); width * height];
+        let half_diagonal = 0.5
+            * ((1.0 / width as f64).powi(2) + (1.0 / height as f64).powi(2)).sqrt();
+        let exclusion = 2.0 * position.radius();
+        let half_x = 0.5 / width as f64;
+        let half_y = 0.5 / height as f64;
         for row in 0..height {
             for col in 0..width {
                 let point = cell_center(row, col, width, height);
-                if is_legal_placement(position, point.x, point.y) {
-                    let idx = row * width + col;
+                let idx = row * width + col;
+                let resolved = if is_legal_placement(position, point.x, point.y) {
+                    Some(point)
+                } else if straddles_boundary(position, point, exclusion, half_diagonal) {
+                    let snapped = nearest_legal_placement(position, point);
+                    let inside = snapped.legal
+                        && (snapped.point.x - point.x).abs() <= half_x
+                        && (snapped.point.y - point.y).abs() <= half_y;
+                    inside.then_some(snapped.point)
+                } else {
+                    None
+                };
+                if let Some(resolved) = resolved {
                     legal[idx] = true;
                     logits[idx] = logit_at(row, col);
+                    placement[idx] = resolved;
                 }
             }
         }
@@ -66,6 +101,7 @@ impl FineGrid {
             coarse,
             logits,
             legal,
+            placement,
         }
     }
 
@@ -162,11 +198,39 @@ pub fn sample_candidates(
         let p_fine = fine_probs[fi];
 
         out.push(CandidateSample {
-            point: cell_center(row, col, grid.width, grid.height),
+            point: grid.placement[row * grid.width + col],
             beta: p_coarse * p_fine,
         });
     }
     out
+}
+
+/// Whether a cell's illegal centre is close enough to the legal boundary that
+/// the cell might still contain legal area.
+///
+/// Cheap rejection for the projection above. A centre excluded by a stone can
+/// only have legal area within its own cell if it sits within half a cell
+/// diagonal of that stone's exclusion circle; deeper than that, every point in
+/// the cell is excluded too. Board-edge exclusion is treated the same way.
+fn straddles_boundary(
+    position: &Position,
+    point: Point,
+    exclusion: f64,
+    half_diagonal: f64,
+) -> bool {
+    let radius = position.radius();
+    let edge_slack = (point.x - radius)
+        .min(1.0 - radius - point.x)
+        .min(point.y - radius)
+        .min(1.0 - radius - point.y);
+    if edge_slack < -half_diagonal {
+        return false;
+    }
+    position.stones().iter().all(|stone| {
+        let dx = point.x - stone.x;
+        let dy = point.y - stone.y;
+        dx.hypot(dy) >= exclusion - half_diagonal
+    })
 }
 
 fn cell_center(row: usize, col: usize, width: usize, height: usize) -> Point {
@@ -352,5 +416,95 @@ mod tests {
         let grid = FineGrid::build(&empty_board(), 4, 4, 2, |_, _| 0.0);
         let s = sample_candidates(&grid, 3, stream(vec![0.5]));
         assert_eq!(s.len(), 3);
+    }
+
+    #[test]
+    fn a_legal_sliver_narrower_than_a_cell_stays_playable() {
+        use vgo_core::Stone;
+
+        // Two stones leaving a legal gap between them that is thinner than one
+        // grid cell, so no cell centre lands inside it. Before projection the
+        // sampler could not name any point there, which is what let a group
+        // with its last liberty in such a gap survive indefinitely.
+        let radius = 1.0 / 18.0;
+        let gap = 4.0 * radius + 0.004;
+        let position = Position::new(
+            radius,
+            vec![
+                Stone::new(0.5 - gap / 2.0, 0.5, Color::Black),
+                Stone::new(0.5 + gap / 2.0, 0.5, Color::Black),
+            ],
+            Color::White,
+        );
+        assert!(
+            is_legal_placement(&position, 0.5, 0.5),
+            "the gap between the stones must be legal"
+        );
+
+        let width = 32;
+        let height = 32;
+        let grid = FineGrid::build(&position, width, height, 4, |_, _| 0.0);
+
+        // Some cell overlapping the gap is now playable, and it places inside
+        // the gap rather than at its own illegal centre.
+        let row = (0.5 * height as f64) as usize;
+        let mut reached = false;
+        for col in 0..width {
+            let idx = row * width + col;
+            if !grid.legal[idx] {
+                continue;
+            }
+            let placement = grid.placement[idx];
+            if is_legal_placement(&position, placement.x, placement.y)
+                && (placement.y - 0.5).abs() < 0.05
+                && (placement.x - 0.5).abs() < 0.05
+            {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "the sliver between the stones must be reachable");
+    }
+
+    #[test]
+    fn projection_never_places_outside_the_cell_that_named_it() {
+        use vgo_core::Stone;
+
+        // A cell stands in for its own logit, so it must not resolve to a
+        // placement elsewhere on the board: that would let the sampler reach a
+        // point whose logit it never read.
+        let position = Position::new(
+            1.0 / 18.0,
+            vec![
+                Stone::new(0.30, 0.30, Color::Black),
+                Stone::new(0.55, 0.42, Color::White),
+                Stone::new(0.70, 0.65, Color::Black),
+            ],
+            Color::White,
+        );
+        let width = 24;
+        let height = 24;
+        let grid = FineGrid::build(&position, width, height, 4, |_, _| 0.0);
+        let half_x = 0.5 / width as f64;
+        let half_y = 0.5 / height as f64;
+        for row in 0..height {
+            for col in 0..width {
+                let idx = row * width + col;
+                if !grid.legal[idx] {
+                    continue;
+                }
+                let centre = cell_center(row, col, width, height);
+                let placement = grid.placement[idx];
+                assert!(
+                    (placement.x - centre.x).abs() <= half_x + 1.0e-12
+                        && (placement.y - centre.y).abs() <= half_y + 1.0e-12,
+                    "cell ({row},{col}) placed outside itself"
+                );
+                assert!(
+                    is_legal_placement(&position, placement.x, placement.y),
+                    "cell ({row},{col}) marked playable but places illegally"
+                );
+            }
+        }
     }
 }
