@@ -116,6 +116,33 @@ mismatch there corrupts training rather than failing loudly.
 The RGB-versus-semantic question then reruns as two training runs against one
 shard, with no regeneration -- which is the point.
 
+## Verified equivalent to v3
+
+Generation is deterministic given a seed, so the same seed and model under the
+v3 and v4 writers produce the same games. Comparing the two through
+`load_dataset` -- v3 reading stored rasters, v4 rendering at load time -- is
+therefore a direct test of whether the format changed what training sees.
+
+Run on 192 positions from seed 31337 with ddrnet-pipe's update-52 as the
+behaviour model, aligned on (game, ply):
+
+    states             IDENTICAL
+    policies           IDENTICAL
+    policy_masks       IDENTICAL
+    visits             IDENTICAL
+    betas              IDENTICAL
+    proposal_counts    IDENTICAL
+    values             IDENTICAL
+    selected_actions   IDENTICAL
+
+The shards were 188.8 MB and 0.7 MB respectively.
+
+This is the check worth repeating after any change to the rasterizer or the
+record layout. Byte-exactness of the rasterizer alone is not sufficient: it
+would not catch a sparse-policy scatter that dropped a cell, an off-by-one in
+the record offsets, or a field written in the wrong order. Comparing the loaded
+tensors covers the whole read path at once.
+
 ## Speculative: store moves, and paint incrementally
 
 Two further ideas, neither urgent. The first is a clean simplification; the
