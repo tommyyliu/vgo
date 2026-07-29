@@ -681,12 +681,30 @@ function snapToPolicyGrid(x, y) {
 
 function updateHover(e) {
   const p = evtToBoard(e);
-  // Lattice restriction happens first: snapping to the nearest legal spot
-  // afterwards would pull the move straight back off the lattice.
-  const q = document.getElementById('gridLock').checked ? snapToPolicyGrid(p.x, p.y) : p;
-  const t = (opt('ovSnap') && !document.getElementById('gridLock').checked)
+  // Quantize first, then project onto the legal set -- the same two steps the
+  // sampler takes. It draws a fine cell and plays the nearest legal point
+  // inside it, so a legal region thinner than a cell is reachable rather than
+  // unplayable. Composing the two here means a locked click lands where the
+  // model would land, instead of being rejected for missing a cell centre.
+  //
+  // These used to be mutually exclusive, on the reasoning that projecting after
+  // locking would pull the move back off the lattice. That was right while the
+  // model could only ever play cell centres; now that it projects too, refusing
+  // to would make the human the more restricted player.
+  const locked = document.getElementById('gridLock').checked;
+  const q = locked ? snapToPolicyGrid(p.x, p.y) : p;
+  let t = (opt('ovSnap') || locked)
     ? nearestLegal(q.x, q.y)
     : { x: q.x, y: q.y, legal: isLegalPlacement(q.x, q.y), snapped: false };
+  // The sampler bounds its projection to the cell that named it, so a cell
+  // never stands in for a placement elsewhere on the board. Match that when
+  // locked, or the human could reach points the model cannot.
+  if (locked && t.legal) {
+    const n = +document.getElementById('gridN').value;
+    if (Math.abs(t.x - q.x) > 0.5 / n || Math.abs(t.y - q.y) > 0.5 / n) {
+      t = { x: q.x, y: q.y, legal: false, snapped: false };
+    }
+  }
   hover = { rawX: p.x, rawY: p.y, x: t.x, y: t.y, legal: t.legal, snapped: t.snapped };
 }
 cv.addEventListener('mousemove', e => { updateHover(e); draw(); });
