@@ -38,17 +38,40 @@ fi
 export ORT_DYLIB_PATH="$ort"
 export LD_LIBRARY_PATH="$venv/onnxruntime_trt:$venv/tensorrt_libs:$venv/nvidia/cu13/lib:$venv/nvidia/cudnn/lib:$venv/torch/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+# Read the raster shape from the model rather than hardcoding it. The server
+# validates its --resolution and --policy-resolution against the exported
+# contract, so a stale default fails at load: these were 96/32 from the
+# ddrnet-fast3 era while every model since ddrnet-wide is 128/128.
+read -r resolution policy_resolution < <(
+  "$root/training/.venv/bin/python3" - "$model" <<'PY'
+import sys, onnx
+metadata = {p.key: p.value for p in onnx.load(sys.argv[1]).metadata_props}
+height = int(metadata["vgo.height"])
+policy_size = int(metadata["vgo.policy_size"])
+side = round((policy_size - 1) ** 0.5)
+print(height, side)
+PY
+)
+# The coarse pool is a search setting, not part of the model contract, so it
+# cannot be read back. 16 is what every 128-policy run trained against; a model
+# searched with a different pool than it learned under plays worse.
+coarse_pool=16
+if (( policy_resolution <= 32 )); then
+  coarse_pool=4
+fi
+
 echo "model:       ${model#"$root/"}"
-echo "simulations: ${SIMULATIONS:-128}"
+echo "raster:      ${resolution}x${resolution}  policy ${policy_resolution}x${policy_resolution}  coarse-pool ${COARSE_POOL:-$coarse_pool}"
+echo "simulations: ${SIMULATIONS:-1600}"
 echo "first start builds a TensorRT engine for this model and takes ~30s."
 echo
 
 exec "$root/target/release/vgo-serve-move" \
   --model "$model" \
-  --simulations "${SIMULATIONS:-128}" \
-  --coarse-pool 4 \
+  --simulations "${SIMULATIONS:-1600}" \
+  --coarse-pool "${COARSE_POOL:-$coarse_pool}" \
   --leaf-batch 4 \
-  --resolution 96 \
-  --policy-resolution 32 \
+  --resolution "$resolution" \
+  --policy-resolution "$policy_resolution" \
   --cache-directory "$root/artifacts/onnx-cache" \
   --address "${ADDRESS:-127.0.0.1:8181}"
