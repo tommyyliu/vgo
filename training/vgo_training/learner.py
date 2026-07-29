@@ -1222,9 +1222,40 @@ class PersistentLearner:
                 )
                 self.model.train()
 
+        # Snapshot after the loop so this is the weights training actually ended
+        # on. config.epochs is always evaluated, so `current` above is the final
+        # epoch's metrics, but taking the state here does not depend on that.
+        final_state = {
+            name: value.detach().cpu().clone()
+            for name, value in self.model.state_dict().items()
+        }
+        final_optimizer_state = _cpu_clone(self.optimizer.state_dict())
+        # epochs=0 would leave `current` unbound; fall back to the initial
+        # measurement so the field always describes the published weights.
+        final_validation_metrics = current if config.epochs else initial_validation
+
         optimization_seconds = time.perf_counter() - optimization_started
-        self.model.load_state_dict(best_state)
-        self.optimizer.load_state_dict(best_optimizer_state)
+        # Publish the last epoch, not the best-scoring one.
+        #
+        # Selection compares candidates that differ by ~0.07 on
+        # policy_kl + value_weight * value_mae, using a validation set of ~38
+        # *games* -- the split hashes games rather than rows, and every ply of a
+        # game shares one terminal value, so value_mae is estimated from ~38
+        # binary outcomes. Its standard error is ~0.16, doubled to ~0.32 by
+        # value_weight=2. The signal is roughly a quarter of its own noise, so
+        # picking the argmin mostly selects the luckiest measurement.
+        #
+        # That shows up in the best_epoch distribution across two runs: heavy
+        # mass at both 0 (kept nothing: 38% of ddrnet-pipe's updates) and at the
+        # final epoch, with a thin middle -- the shape of a max over a random
+        # walk, not of a curve that improves then flattens.
+        #
+        # The last epoch is at least unbiased. best_* stay in the report as
+        # diagnostics: their disagreement with the final epoch is the running
+        # measure of how noisy selection is, and a validation set large enough
+        # to make selection meaningful would show them converging.
+        self.model.load_state_dict(final_state)
+        self.optimizer.load_state_dict(final_optimizer_state)
         final_training = evaluate(
             self.model,
             split.training,
@@ -1247,8 +1278,8 @@ class PersistentLearner:
         checkpoint = {
             "schema": "vgo.raster-policy-value.v1",
             **self._model_metadata,
-            "state_dict": best_state,
-            "optimizer_state_dict": best_optimizer_state,
+            "state_dict": final_state,
+            "optimizer_state_dict": final_optimizer_state,
             "parent_checkpoint": parent_checkpoint,
             "parent_checkpoint_sha256": parent_checkpoint_digest,
             "replay_sources": list(window.sources),
@@ -1302,7 +1333,17 @@ class PersistentLearner:
             "policy_denominator": POLICY_DENOMINATOR,
             "importance_corrected_samples": corrected_samples,
             "uncorrected_samples": window.samples - corrected_samples,
+            # The published weights are the final epoch's. best_* are kept as
+            # diagnostics: selection_regret is how much better the best-scoring
+            # epoch measured than the one actually published, and it is the
+            # running estimate of how much of that gap is noise. On a validation
+            # set large enough for selection to mean something, best_epoch would
+            # concentrate near the end and this would go to roughly zero.
+            "published_epoch": "final",
             "selection_metric": "policy_kl + value_weight * value_mae",
+            "selection_regret": (
+                selection_score(final_validation_metrics) - best_score
+            ),
             "wall_seconds": time.perf_counter() - update_started,
             "optimization_seconds": optimization_seconds,
             "best_epoch": best_epoch,
