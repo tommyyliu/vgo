@@ -90,13 +90,16 @@
       </label>
     </div>
     <div class="row mut"><span>server</span><span><input id="aiUrl" value="http://127.0.0.1:8181/move" style="width:180px"></span></div>
-    <!-- TEMPORARY: remove once the policy-resolution question is settled. Plays
-         you on the same fixed lattice the model is limited to, so a game is not
-         confounded by the model being unable to answer off-lattice moves. -->
-    <div class="row mut" title="temporary: restrict your moves to the model's policy lattice">
-      <span>[temp] lock to model grid</span>
+    <!-- Restricts you to the model's policy lattice. Off by default: at the
+         current 128x128 policy a cell is ~1/14 of a stone diameter, so the
+         lattice is finer than a click is precise and locking to it changes
+         nothing. It mattered at 32x32, where a stone spanned 3.6 cells and an
+         unrestricted human played points the model could not answer. Kept for
+         testing models exported at a coarser policy. -->
+    <div class="row mut" title="restrict your moves to the model's policy lattice; only meaningful for coarse-policy models">
+      <span>lock to model grid</span>
       <span><input type="checkbox" id="gridLock">
-        <select id="gridN"><option>32</option><option>48</option><option>64</option><option>96</option></select></span>
+        <select id="gridN"><option>128</option><option>96</option><option>64</option><option>48</option><option>32</option></select></span>
     </div>
     <div id="aiReadout" class="mut" style="font-size:11px; white-space:pre; margin-top:4px;"></div>
     <hr>
@@ -201,7 +204,10 @@ const COLORS = {
   W: { name:'White', stone:'#f0975a', region:'#68391a' },
 };
 const RULES = VGO.model.DEFAULT_RULES;
-let state = VGO.model.createPosition({ stones: [], toMove: 'B', radius: 0.05 });
+// 1/18, the radius every model since ddrnet-wide trained at. The radius is
+// sent to the move server and shapes every raster channel, so starting off
+// it puts the model outside its self-play distribution before the first move.
+let state = VGO.model.createPosition({ stones: [], toMove: 'B', radius: 1 / 18 });
 
 /* The record is a tree, not a list. `current` is where we are standing in it and
    `state` mirrors its position, so the rest of the page reads exactly as before.
@@ -657,13 +663,16 @@ function savePNG() {
    9. INPUT + CONTROLS
    ========================================================================= */
 function evtToBoard(e) { const r = cv.getBoundingClientRect(); return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }; }
-/* TEMPORARY -- remove once the policy resolution question is settled.
+/* The model's policy head emits a fixed NxN lattice, so it can only play those
+   N^2 points while a human clicks anywhere in the continuum. When the lattice
+   is coarse relative to a stone, that difference is real: at 32x32 a stone
+   spanned 3.6 cells, so an unrestricted human kept playing points the model had
+   never seen in self-play, confounding "the model is weak" with "the model is
+   handicapped here".
 
-   The model's policy head emits a fixed NxN lattice, so it can only ever play
-   those N^2 points, while a human clicks anywhere in the continuum. That makes
-   every human game an off-lattice game the model has never seen in self-play,
-   and confounds "the model is weak" with "the model is handicapped here".
-   Restricting the human to the same lattice separates the two. */
+   At the current 128x128 policy a cell is ~1/14 of a stone diameter, finer than
+   a click is precise, so the restriction is a no-op and defaults off. It stays
+   for models exported at a coarser policy. */
 function snapToPolicyGrid(x, y) {
   const n = +document.getElementById('gridN').value;
   const cell = (v) => (Math.min(n - 1, Math.max(0, Math.floor(v * n))) + 0.5) / n;
