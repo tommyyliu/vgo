@@ -79,6 +79,11 @@ struct PendingSample {
 struct GameSamples {
     samples: Vec<LabeledSample>,
     completed: bool,
+    /// Counterfactual resignation outcomes for this game, one entry per
+    /// candidate threshold. Only produced for games exempt from resignation,
+    /// which are the only ones whose true result is known independently of the
+    /// rule being measured.
+    calibration: Vec<ResignTrial>,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -193,6 +198,80 @@ struct PolicyTarget {
     /// Number of raw coarse->fine proposal draws landing in each cell. Legacy
     /// candidates and pass have zero multiplicity.
     proposal_counts: Vec<u32>,
+}
+
+/// Thresholds the calibrator evaluates each shard.
+///
+/// Spanning the range where a value head this saturated might plausibly be
+/// trusted. The pipeline picks the lowest whose measured error rate is
+/// acceptable -- lower concedes earlier and saves more.
+const CALIBRATION_THRESHOLDS: [f64; 6] = [0.70, 0.80, 0.85, 0.90, 0.95, 0.98];
+
+/// What resignation would have done to one exempt game at one threshold.
+#[derive(Clone, Copy, Debug)]
+struct ResignTrial {
+    threshold: f64,
+    /// The rule would have conceded this game.
+    fired: bool,
+    /// It would have conceded for the side that actually won: a false positive,
+    /// and the label the loop would have learned is the wrong one.
+    wrong: bool,
+    /// Plies that would have been skipped had it fired.
+    plies_saved: u32,
+}
+
+/// Replays the resign rule over a finished game at each candidate threshold.
+///
+/// Only meaningful for games played to a real result, which is why this runs on
+/// the exempt set: the rule's error rate is how often it would have conceded
+/// for the eventual winner, and that is unknowable for a game the rule already
+/// ended.
+fn calibration_trials(
+    pending: &[PendingSample],
+    window: u32,
+    black_won: bool,
+) -> Vec<ResignTrial> {
+    CALIBRATION_THRESHOLDS
+        .iter()
+        .map(|&threshold| {
+            let mut streak = 0_u32;
+            let mut fired_at = None;
+            for (index, sample) in pending.iter().enumerate() {
+                let mover_value = if sample.to_move == Color::Black {
+                    sample.root_black_value
+                } else {
+                    -sample.root_black_value
+                };
+                if mover_value <= -threshold {
+                    streak += 1;
+                } else {
+                    streak = 0;
+                }
+                if streak >= window {
+                    fired_at = Some((index, sample.to_move));
+                    break;
+                }
+            }
+            match fired_at {
+                None => ResignTrial {
+                    threshold,
+                    fired: false,
+                    wrong: false,
+                    plies_saved: 0,
+                },
+                Some((index, conceding)) => {
+                    let conceding_won =
+                        (conceding == Color::Black) == black_won;
+                    ResignTrial {
+                        threshold,
+                        fired: true,
+                        wrong: conceding_won,
+                        plies_saved: (pending.len() - index - 1) as u32,
+                    }
+                }
+            }
+        })
+        .collect()
 }
 
 /// Whether a game is exempt from resignation, decided from its seed.
@@ -455,11 +534,20 @@ fn generate_game(
                 return Ok(GameSamples {
                     samples: Vec::new(),
                     completed: false,
+                    calibration: Vec::new(),
                 });
             }
         },
     };
     let black_value = outcome.black_utility() as f32;
+    // Measured before `pending` is consumed below. Only exempt games can
+    // calibrate: a game the rule already ended cannot say whether ending it was
+    // right, and a resigned game's outcome was assigned by the rule under test.
+    let calibration = if exempt_from_resignation && !playout.resigned {
+        calibration_trials(&pending, config.resign_window, black_value > 0.0)
+    } else {
+        Vec::new()
+    };
     let samples = pending
         .into_iter()
         .map(|sample| LabeledSample {
@@ -483,6 +571,7 @@ fn generate_game(
     Ok(GameSamples {
         samples,
         completed: true,
+        calibration,
     })
 }
 
@@ -571,6 +660,12 @@ struct GenerationReport {
     replay: PublishedReplay,
     completed_games: usize,
     discarded_games: usize,
+    /// Per-threshold resignation counterfactuals over this shard's exempt
+    /// games: (threshold, games measured, would have fired, would have been
+    /// wrong, plies saved). The pipeline reads these to pick the next shard's
+    /// threshold, so it tracks the value head as it changes rather than being
+    /// fixed once.
+    calibration: Vec<(f64, u32, u32, u32, u64)>,
     samples_generated_by_received_games: usize,
     serialization_truncated_samples: usize,
     games_started: u64,
@@ -689,6 +784,10 @@ fn generate_to_dataset(
 
     let mut completed_games = 0_usize;
     let mut discarded_games = 0_usize;
+    // threshold bits -> (games measured, would have fired, would have been
+    // wrong, plies that would have been saved)
+    let mut calibration_totals: std::collections::BTreeMap<u64, (u32, u32, u32, u64)> =
+        std::collections::BTreeMap::new();
     let mut samples_generated_by_received_games = 0_usize;
     let mut serialization_truncated_samples = 0_usize;
     let mut writer_backpressure = Duration::ZERO;
@@ -710,6 +809,15 @@ fn generate_to_dataset(
             stopped.store(true, Ordering::Release);
             std::io::Error::other(error)
         })?;
+        for trial in &game.calibration {
+            let entry = calibration_totals
+                .entry(trial.threshold.to_bits())
+                .or_insert((0_u32, 0_u32, 0_u32, 0_u64));
+            entry.0 += 1;
+            entry.1 += u32::from(trial.fired);
+            entry.2 += u32::from(trial.wrong);
+            entry.3 += u64::from(trial.plies_saved);
+        }
         if game.completed {
             completed_games += 1;
             samples_generated_by_received_games =
@@ -744,6 +852,12 @@ fn generate_to_dataset(
         replay: published,
         completed_games,
         discarded_games,
+        calibration: calibration_totals
+            .into_iter()
+            .map(|(bits, (measured, fired, wrong, saved))| {
+                (f64::from_bits(bits), measured, fired, wrong, saved)
+            })
+            .collect(),
         samples_generated_by_received_games,
         serialization_truncated_samples,
         games_started,
@@ -797,6 +911,18 @@ fn write_manifest(
     writeln!(writer, "  \"samples\": {},", report.replay.samples)?;
     writeln!(writer, "  \"completed_games\": {},", report.completed_games)?;
     writeln!(writer, "  \"discarded_games\": {},", report.discarded_games)?;
+    writeln!(writer, "  \"resign_calibration\": [")?;
+    for (index, (threshold, measured, fired, wrong, saved)) in
+        report.calibration.iter().enumerate()
+    {
+        let comma = if index + 1 == report.calibration.len() { "" } else { "," };
+        writeln!(
+            writer,
+            "    {{\"threshold\": {threshold}, \"games\": {measured}, \"fired\": {fired}, \"wrong\": {wrong}, \"plies_saved\": {saved}}}{comma}"
+        )?;
+    }
+    writeln!(writer, "  ],")?;
+
     match report.replay.first_game_id {
         Some(game) => writeln!(writer, "  \"first_serialized_game_id\": {game},")?,
         None => writeln!(writer, "  \"first_serialized_game_id\": null,")?,
@@ -1427,8 +1553,8 @@ mod tests {
     use vgo_search::{Action, CandidateSource, ChildSummary, SearchResult, SearchStats};
 
     use super::{
-        ActorPool, Config, GameEnvelope, GameSamples, PendingSample, adjudicate, policy_target,
-        resign_exempt, search_config, validate_config,
+        ActorPool, Config, GameEnvelope, GameSamples, PendingSample, adjudicate,
+        calibration_trials, policy_target, resign_exempt, search_config, validate_config,
     };
     use vgo_core::{Color, Position};
 
@@ -1464,6 +1590,7 @@ mod tests {
                 result: Ok(GameSamples {
                     samples: Vec::new(),
                     completed: false,
+                    calibration: Vec::new(),
                 }),
                 ready_at: Instant::now(),
             })
@@ -1477,6 +1604,7 @@ mod tests {
                 result: Ok(GameSamples {
                     samples: Vec::new(),
                     completed: false,
+                    calibration: Vec::new(),
                 }),
                 ready_at: Instant::now(),
             });
@@ -1738,5 +1866,54 @@ mod tests {
         assert!(seeds.iter().all(|&s| resign_exempt(s, 0.1) == resign_exempt(s, 0.1)));
         assert!(seeds.iter().all(|&s| !resign_exempt(s, 0.0)));
         assert!(seeds.iter().all(|&s| resign_exempt(s, 1.0)));
+    }
+
+    #[test]
+    fn calibration_marks_a_concession_by_the_eventual_winner_as_wrong() {
+        // Black's search says Black is losing badly for the whole game, but
+        // Black in fact wins. Resignation would have conceded for the winner,
+        // which is exactly the error the calibration exists to count -- and the
+        // reason a threshold cannot be chosen without measuring.
+        // The root value is Black-relative and flips for the mover, so a
+        // constant value can never produce a streak: whichever side is behind
+        // sees -v while the other sees +v, and the run resets every ply. A real
+        // losing streak is consecutive plies *by the same player*, which is what
+        // the window counts. Using single-seat plies here isolates that.
+        let pending: Vec<PendingSample> =
+            (0..20).map(|_| adjudication_sample(Color::Black, -0.99)).collect();
+        let trials = calibration_trials(&pending, 5, true);
+        let strict = trials.iter().find(|t| t.threshold == 0.90).unwrap();
+        assert!(strict.fired, "a sustained despairing evaluation should fire");
+        assert!(strict.wrong, "conceding for the eventual winner is a false positive");
+        assert!(strict.plies_saved > 0);
+    }
+
+    #[test]
+    fn calibration_marks_a_correct_concession_as_right() {
+        // Same evaluations, but Black really does lose: the rule would have
+        // been correct, and the plies after it are pure waste.
+        let pending: Vec<PendingSample> =
+            (0..20).map(|_| adjudication_sample(Color::Black, -0.99)).collect();
+        let trials = calibration_trials(&pending, 5, false);
+        let strict = trials.iter().find(|t| t.threshold == 0.90).unwrap();
+        assert!(strict.fired);
+        assert!(!strict.wrong);
+    }
+
+    #[test]
+    fn a_higher_threshold_never_fires_more_often() {
+        // Monotonicity is what lets the pipeline pick the lowest acceptable
+        // threshold: raising it can only make the rule more cautious.
+        let pending: Vec<PendingSample> =
+            (0..30).map(|_| adjudication_sample(Color::Black, -0.88)).collect();
+        let trials = calibration_trials(&pending, 5, false);
+        for pair in trials.windows(2) {
+            assert!(
+                !(pair[1].fired && !pair[0].fired),
+                "threshold {} fired while the looser {} did not",
+                pair[1].threshold,
+                pair[0].threshold
+            );
+        }
     }
 }
