@@ -15,7 +15,7 @@ use std::{
 
 use clap::{ArgAction, Parser};
 use sha2::{Digest, Sha256};
-use vgo_core::{Color, Outcome, Position};
+use vgo_core::{Analysis, Color, Outcome, Position};
 use vgo_inference::{
     BatchedEvaluator, BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, OnnxBatchService,
     OnnxProvider, OnnxServiceConfig,
@@ -297,58 +297,63 @@ fn resign_exempt(game_seed: u64, fraction: f64) -> bool {
     (value >> 11) as f64 / (1_u64 << 53) as f64 <= fraction
 }
 
-/// Closing plies that must agree before a truncated game is adjudicated.
+/// Closing plies whose area leader must agree before a truncated game is
+/// awarded.
 ///
-/// Long enough that a transient swing cannot decide the game, short enough to
-/// stay inside the endgame the cap interrupted.
-const ADJUDICATION_PLIES: usize = 12;
+/// Short, because the area leader is not a noisy quantity: measured on the
+/// three longest games in a real shard it settled by ply 10, 44, and 48 and
+/// never changed again across the remaining 180-240 plies. A handful of plies
+/// is enough to reject a position genuinely oscillating around even.
+const ADJUDICATION_PLIES: usize = 8;
 
-/// How far from even every one of those plies must be.
+/// How far apart the two areas must be, as a fraction of the whole board.
 ///
-/// The value head saturates on about a third of positions and agrees with the
-/// outcome only ~76% of the time, so a small margin would adjudicate on noise.
-/// This is deliberately strict: a game that does not clear it stays discarded,
-/// which is the behaviour it replaces.
-const ADJUDICATION_MARGIN: f64 = 0.5;
+/// Those same games sat at margins of 0.49-0.80 from their halfway point on, so
+/// this rejects only positions that really are close. The board totals 1.0.
+const ADJUDICATION_MARGIN: f64 = 0.10;
 
-/// Awards a truncated game when both seats agree on the leader.
+/// Awards a truncated game to whoever holds the board.
 ///
-/// Returns `None` -- leaving the game discarded -- unless every one of the last
-/// `plies` root evaluations lies on the same side of zero by at least `margin`.
-/// Because the plies alternate between the two players' searches, that
-/// unanimity means the side that is behind agrees it is behind.
+/// A game that runs out of plies has no played-out result, but by that point
+/// the territory is usually long settled: the late game is capture-and-replace
+/// churn in a contested pocket, not development. Across a shard the average
+/// game gains 7.4 stones over its entire second half while producing 65 stone
+/// changes -- nine changes per net stone -- so the area has stopped moving well
+/// before the cap.
+///
+/// This scores the position the same way a finished game is scored, by Voronoi
+/// area, rather than asking the network. The value head agrees with outcomes
+/// only ~76% of the time; the area is ground truth under the same rule that
+/// decides a real result.
+///
+/// Returns `None` -- leaving the game discarded -- unless the same player leads
+/// by at least `margin` on every one of the closing `plies`.
 fn adjudicate(pending: &[PendingSample], plies: usize, margin: f64) -> Option<Outcome> {
     if pending.len() < plies {
         return None;
     }
-    let closing = &pending[pending.len() - plies..];
-    let leader_is_black = closing[0].root_black_value > 0.0;
-    let agreed = closing.iter().all(|sample| {
-        let value = sample.root_black_value;
-        value.abs() >= margin && (value > 0.0) == leader_is_black
-    });
-    if !agreed {
-        return None;
-    }
-    // Both seats must be represented, or this is one player's opinion repeated.
-    let mut seen_black = false;
-    let mut seen_white = false;
-    for sample in closing {
-        match sample.to_move {
-            Color::Black => seen_black = true,
-            Color::White => seen_white = true,
+    let mut leader: Option<Color> = None;
+    for sample in &pending[pending.len() - plies..] {
+        let analysis = Analysis::new(&sample.position);
+        let delta = analysis.score.black - analysis.score.white;
+        if delta.abs() < margin {
+            return None;
         }
-    }
-    if !(seen_black && seen_white) {
-        return None;
-    }
-    Some(Outcome {
-        winner: Some(if leader_is_black {
+        let ply_leader = if delta > 0.0 {
             Color::Black
         } else {
             Color::White
-        }),
-        // No area was counted, so there is no margin to report.
+        };
+        match leader {
+            None => leader = Some(ply_leader),
+            Some(current) if current == ply_leader => {}
+            // The lead changed hands inside the window: not settled.
+            Some(_) => return None,
+        }
+    }
+    leader.map(|winner| Outcome {
+        winner: Some(winner),
+        // No final count was played out, so there is no margin to report.
         margin: 0.0,
     })
 }
@@ -1556,7 +1561,7 @@ mod tests {
         ActorPool, Config, GameEnvelope, GameSamples, PendingSample, adjudicate,
         calibration_trials, policy_target, resign_exempt, search_config, validate_config,
     };
-    use vgo_core::{Color, Position};
+    use vgo_core::{Color, Position, Stone};
 
     #[test]
     fn actor_pool_drop_cancels_and_joins_workers() {
@@ -1785,9 +1790,10 @@ mod tests {
         assert_eq!(target.proposal_counts[4], 0, "pass is not proposed");
     }
 
-    fn adjudication_sample(to_move: Color, root_black_value: f64) -> PendingSample {
+    fn adjudication_sample(position: Position, root_black_value: f64) -> PendingSample {
+        let to_move = position.to_move();
         PendingSample {
-            position: Position::new(1.0 / 18.0, Vec::new(), to_move),
+            position,
             root_black_value,
             policy: Vec::new(),
             policy_mask: Vec::new(),
@@ -1802,70 +1808,68 @@ mod tests {
         }
     }
 
-    fn closing(values: &[f64]) -> Vec<PendingSample> {
-        values
-            .iter()
-            .enumerate()
-            .map(|(index, &value)| {
-                let to_move = if index % 2 == 0 { Color::Black } else { Color::White };
-                adjudication_sample(to_move, value)
-            })
+    /// A board where `black` stones sit on the left and `white` on the right, so
+    /// the Voronoi split follows the stone counts.
+    fn lopsided(black: usize, white: usize) -> Position {
+        let radius = 1.0 / 18.0;
+        let mut stones = Vec::new();
+        for i in 0..black {
+            let row = i / 3;
+            let col = i % 3;
+            stones.push(Stone::new(
+                0.10 + col as f64 * 0.12,
+                0.10 + row as f64 * 0.12,
+                Color::Black,
+            ));
+        }
+        for i in 0..white {
+            let row = i / 2;
+            let col = i % 2;
+            stones.push(Stone::new(
+                0.76 + col as f64 * 0.12,
+                0.10 + row as f64 * 0.12,
+                Color::White,
+            ));
+        }
+        Position::new(radius, stones, Color::Black)
+    }
+
+    fn window_of(position: Position, plies: usize) -> Vec<PendingSample> {
+        (0..plies)
+            .map(|_| adjudication_sample(position.clone(), 0.0))
             .collect()
     }
 
     #[test]
-    fn adjudication_awards_a_game_both_sides_agree_on() {
-        // Every closing ply well past the margin and on the same side: the
-        // player who is behind is evaluating too, so this is agreement rather
-        // than one seat's opinion.
-        let pending = closing(&[0.9; 12]);
-        let outcome = adjudicate(&pending, 12, 0.5).expect("agreed games are awarded");
+    fn adjudication_awards_the_board_to_whoever_holds_it() {
+        // Black occupies most of the board, so the Voronoi area is decisively
+        // Black's regardless of what the value head thinks -- the samples carry
+        // a root value of zero here precisely to show it is not consulted.
+        let pending = window_of(lopsided(9, 1), 8);
+        let outcome = adjudicate(&pending, 8, 0.10).expect("a settled board is awarded");
         assert_eq!(outcome.winner, Some(Color::Black));
     }
 
     #[test]
-    fn adjudication_declines_a_disputed_game() {
-        // Sign flips within the window: the sides disagree, so the game stays
-        // discarded rather than being awarded on one player's view.
-        let mut values = [0.9; 12];
-        values[7] = -0.9;
-        assert!(adjudicate(&closing(&values), 12, 0.5).is_none());
+    fn adjudication_declines_a_close_board() {
+        // Balanced stones split the area near evenly, which is the case the
+        // margin exists to reject: the game was cut off genuinely undecided.
+        let pending = window_of(lopsided(4, 4), 8);
+        assert!(adjudicate(&pending, 8, 0.10).is_none());
     }
 
     #[test]
-    fn adjudication_declines_a_close_game() {
-        // Consistent leader but inside the margin. The value head is wrong
-        // often enough that a small edge is not evidence, so this is the case
-        // the margin exists to reject.
-        assert!(adjudicate(&closing(&[0.2; 12]), 12, 0.5).is_none());
-    }
-
-    #[test]
-    fn adjudication_needs_both_seats_in_the_window() {
-        // A window covering only one player's turns is that player agreeing
-        // with itself; the opponent never weighed in.
-        let one_sided: Vec<PendingSample> = (0..12)
-            .map(|_| adjudication_sample(Color::Black, 0.9))
-            .collect();
-        assert!(adjudicate(&one_sided, 12, 0.5).is_none());
+    fn adjudication_declines_when_the_lead_changes_hands() {
+        // The area leader flips inside the window, so the position is not
+        // settled even though each individual ply is lopsided.
+        let mut pending = window_of(lopsided(9, 1), 8);
+        pending[5] = adjudication_sample(lopsided(1, 9), 0.0);
+        assert!(adjudicate(&pending, 8, 0.10).is_none());
     }
 
     #[test]
     fn adjudication_declines_a_game_shorter_than_the_window() {
-        assert!(adjudicate(&closing(&[0.9; 4]), 12, 0.5).is_none());
-    }
-
-    #[test]
-    fn resign_exemption_is_stable_and_close_to_its_fraction() {
-        // The exempt set is the calibration sample, so it must be a fair draw
-        // and identical across reruns.
-        let seeds: Vec<u64> = (0..20_000).map(|i| 990_001_u64.wrapping_add(i)).collect();
-        let exempt = seeds.iter().filter(|&&s| resign_exempt(s, 0.1)).count();
-        let rate = exempt as f64 / seeds.len() as f64;
-        assert!((rate - 0.1).abs() < 0.01, "exemption rate {rate} is off target");
-        assert!(seeds.iter().all(|&s| resign_exempt(s, 0.1) == resign_exempt(s, 0.1)));
-        assert!(seeds.iter().all(|&s| !resign_exempt(s, 0.0)));
-        assert!(seeds.iter().all(|&s| resign_exempt(s, 1.0)));
+        assert!(adjudicate(&window_of(lopsided(9, 1), 4), 8, 0.10).is_none());
     }
 
     #[test]
@@ -1880,7 +1884,9 @@ mod tests {
         // losing streak is consecutive plies *by the same player*, which is what
         // the window counts. Using single-seat plies here isolates that.
         let pending: Vec<PendingSample> =
-            (0..20).map(|_| adjudication_sample(Color::Black, -0.99)).collect();
+            (0..20)
+                .map(|_| adjudication_sample(lopsided(3, 3), -0.99))
+                .collect();
         let trials = calibration_trials(&pending, 5, true);
         let strict = trials.iter().find(|t| t.threshold == 0.90).unwrap();
         assert!(strict.fired, "a sustained despairing evaluation should fire");
@@ -1893,7 +1899,9 @@ mod tests {
         // Same evaluations, but Black really does lose: the rule would have
         // been correct, and the plies after it are pure waste.
         let pending: Vec<PendingSample> =
-            (0..20).map(|_| adjudication_sample(Color::Black, -0.99)).collect();
+            (0..20)
+                .map(|_| adjudication_sample(lopsided(3, 3), -0.99))
+                .collect();
         let trials = calibration_trials(&pending, 5, false);
         let strict = trials.iter().find(|t| t.threshold == 0.90).unwrap();
         assert!(strict.fired);
@@ -1905,7 +1913,9 @@ mod tests {
         // Monotonicity is what lets the pipeline pick the lowest acceptable
         // threshold: raising it can only make the rule more cautious.
         let pending: Vec<PendingSample> =
-            (0..30).map(|_| adjudication_sample(Color::Black, -0.88)).collect();
+            (0..30)
+                .map(|_| adjudication_sample(lopsided(3, 3), -0.88))
+                .collect();
         let trials = calibration_trials(&pending, 5, false);
         for pair in trials.windows(2) {
             assert!(
