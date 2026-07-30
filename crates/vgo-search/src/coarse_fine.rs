@@ -13,7 +13,9 @@
 //! The exact sampling probability is `beta = P_coarse(C) * P_fine(a | C)`, which
 //! we return so the training side can importance-correct the target.
 
-use vgo_core::{Point, Position, is_legal_placement, nearest_legal_placement};
+use vgo_core::{
+    Point, Position, is_legal_placement, legal_set_vertices, nearest_legal_placement_with,
+};
 
 /// A sampled placement candidate and the probability it was drawn with.
 #[derive(Clone, Copy, Debug)]
@@ -68,6 +70,11 @@ impl FineGrid {
         // Cells deeper inside a stone cannot be rescued, and cells already
         // clear need no rescuing, so only that thin band pays for a projection.
         let mut placement = vec![Point::new(0.0, 0.0); width * height];
+        // The vertex set depends only on the position but is ~78% of a single
+        // projection's cost, and this loop projects several hundred cells.
+        // Computing it once per grid rather than once per cell is the
+        // difference between snapping being affordable and not.
+        let known_vertices = legal_set_vertices(position);
         let half_diagonal = 0.5
             * ((1.0 / width as f64).powi(2) + (1.0 / height as f64).powi(2)).sqrt();
         let exclusion = 2.0 * position.radius();
@@ -80,7 +87,8 @@ impl FineGrid {
                 let resolved = if is_legal_placement(position, point.x, point.y) {
                     Some(point)
                 } else if straddles_boundary(position, point, exclusion, half_diagonal) {
-                    let snapped = nearest_legal_placement(position, point);
+                    let snapped =
+                        nearest_legal_placement_with(position, point, Some(&known_vertices));
                     let inside = snapped.legal
                         && (snapped.point.x - point.x).abs() <= half_x
                         && (snapped.point.y - point.y).abs() <= half_y;

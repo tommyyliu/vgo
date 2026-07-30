@@ -219,6 +219,21 @@ pub struct Nearest {
 /// boundary feature, and those are exactly what this enumerates.
 #[must_use]
 pub fn nearest(position: &Position, point: Point) -> Nearest {
+    nearest_with(position, point, None)
+}
+
+/// [`nearest`] with a precomputed vertex set.
+///
+/// The vertices depend only on the position, but make up ~78% of a single
+/// `nearest` call. A caller projecting many points against one position -- the
+/// sampler does several hundred per grid -- should compute them once and pass
+/// them here, matching how `distance` and `escape_witness` take them.
+#[must_use]
+pub fn nearest_with(
+    position: &Position,
+    point: Point,
+    known_vertices: Option<&[Point]>,
+) -> Nearest {
     if contains(position, point.x, point.y) {
         return Nearest {
             point,
@@ -255,7 +270,10 @@ pub fn nearest(position: &Position, point: Point) -> Nearest {
     candidates.push(Point::new(1.0 - radius, clamp(point.y)));
     candidates.push(Point::new(clamp(point.x), radius));
     candidates.push(Point::new(clamp(point.x), 1.0 - radius));
-    candidates.extend(vertices(position));
+    match known_vertices {
+        Some(known) => candidates.extend_from_slice(known),
+        None => candidates.extend(vertices(position)),
+    }
 
     let mut best: Option<(f64, Point)> = None;
     for candidate in candidates {
