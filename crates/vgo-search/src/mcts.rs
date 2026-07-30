@@ -118,9 +118,6 @@ impl SearchResult {
         }
     }
 
-    /// Actions in selection order. `to_move` is retained for API compatibility;
-    /// the order is already resolved from the searching player's perspective.
-    #[must_use]
     /// Root evaluation from Black's perspective: the visit-weighted mean of the
     /// children's values.
     ///
@@ -141,6 +138,9 @@ impl SearchResult {
             / f64::from(visits)
     }
 
+    /// Actions in selection order. `to_move` is retained for API compatibility;
+    /// the order is already resolved from the searching player's perspective.
+    #[must_use]
     pub fn actions_by_preference(&self, _to_move: Color) -> Vec<Action> {
         self.order
             .iter()
