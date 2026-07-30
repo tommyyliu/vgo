@@ -121,6 +121,26 @@ impl SearchResult {
     /// Actions in selection order. `to_move` is retained for API compatibility;
     /// the order is already resolved from the searching player's perspective.
     #[must_use]
+    /// Root evaluation from Black's perspective: the visit-weighted mean of the
+    /// children's values.
+    ///
+    /// Each child's `black_value` is the mean outcome backed up through it, so
+    /// weighting by visits reconstructs what the root's own accumulator holds.
+    /// Callers use this to judge whether a game is decided; it is deliberately
+    /// not the raw network head, which has not been corrected by search.
+    #[must_use]
+    pub fn root_black_value(&self) -> f64 {
+        let visits: u32 = self.children.iter().map(|child| child.visits).sum();
+        if visits == 0 {
+            return 0.0;
+        }
+        self.children
+            .iter()
+            .map(|child| child.black_value * f64::from(child.visits))
+            .sum::<f64>()
+            / f64::from(visits)
+    }
+
     pub fn actions_by_preference(&self, _to_move: Color) -> Vec<Action> {
         self.order
             .iter()

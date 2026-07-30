@@ -16,11 +16,55 @@ pub struct PlayoutStats {
     pub search: SearchStats,
 }
 
+/// When a playout may concede rather than play a decided game to the end.
+///
+/// A single ply's root value is noisy -- the value head saturates past |v|>0.99
+/// on about a third of positions while agreeing with the outcome only ~76% of
+/// the time -- so one bad evaluation must not end a game. The rule instead
+/// requires the *least* confident evaluation over a window of consecutive plies
+/// to stay past the threshold: every ply in the window has to agree, which is
+/// far harder to satisfy by noise than any single one.
+///
+/// `disable_fraction` leaves that many games unresigned, played to a real
+/// finish. Those are the only games that can measure the rule's false-positive
+/// rate -- how often it concedes a game the resigning side would have won --
+/// and the threshold is meant to be calibrated from them, not guessed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResignRule {
+    /// Concede when the mover's value stays at or below `-threshold`.
+    pub threshold: f64,
+    /// Consecutive plies that must all agree before conceding.
+    pub window: u32,
+    /// Fraction of games exempted, for calibration.
+    pub disable_fraction: f64,
+}
+
+impl ResignRule {
+    /// A rule that never fires.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            threshold: 1.0,
+            window: u32::MAX,
+            disable_fraction: 0.0,
+        }
+    }
+
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.window != u32::MAX && self.threshold < 1.0
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PlayoutReport {
     pub final_position: Position,
     pub outcome: Option<Outcome>,
     pub stats: PlayoutStats,
+    /// Set when the game ended by resignation rather than by play. The outcome
+    /// is still real -- the conceding side loses -- so these samples train
+    /// normally; this only records how the result was reached.
+    pub resigned: bool,
 }
 
 impl PlayoutReport {
@@ -42,6 +86,17 @@ pub struct PlayoutStep<'a> {
 pub fn play_game<E>(
     initial: Position,
     maximum_plies: u32,
+    search: impl FnMut(&Position, u32) -> Result<SearchResult, E>,
+    observe: impl FnMut(PlayoutStep<'_>),
+) -> Result<PlayoutReport, E> {
+    play_game_with_resignation(initial, maximum_plies, ResignRule::disabled(), search, observe)
+}
+
+/// [`play_game`], with the option to concede a decided game.
+pub fn play_game_with_resignation<E>(
+    initial: Position,
+    maximum_plies: u32,
+    resign: ResignRule,
     mut search: impl FnMut(&Position, u32) -> Result<SearchResult, E>,
     mut observe: impl FnMut(PlayoutStep<'_>),
 ) -> Result<PlayoutReport, E> {
@@ -52,10 +107,47 @@ pub fn play_game<E>(
     let mut seen = HashSet::new();
     let mut stats = PlayoutStats::default();
     seen.insert(position_fingerprint(&position));
+    // Consecutive plies whose root value has stayed past the threshold for the
+    // side to move. Reset by any ply that does not, so the window measures the
+    // least confident evaluation in a run rather than the most confident.
+    let mut losing_streak = 0_u32;
 
     for ply in 0..maximum_plies {
         let result = search(&position, ply)?;
         accumulate_search_stats(&mut stats.search, result.stats);
+
+        if resign.is_enabled() {
+            // Root value is Black-relative; flip it to the mover's view so the
+            // same threshold means the same thing for either side.
+            let mover_value = if position.to_move() == Color::Black {
+                result.root_black_value()
+            } else {
+                -result.root_black_value()
+            };
+            if mover_value <= -resign.threshold {
+                losing_streak += 1;
+            } else {
+                losing_streak = 0;
+            }
+            if losing_streak >= resign.window {
+                // The mover concedes, so the opponent wins. This is a real
+                // result, not a truncation: the samples carry a genuine outcome
+                // and train exactly as a played-out game would.
+                let winner = position.to_move().other();
+                stats.plies = ply + 1;
+                return Ok(PlayoutReport {
+                    final_position: position,
+                    // Margin zero: a conceded game has no area result to
+                    // report, and black_utility only reads `winner`.
+                    outcome: Some(Outcome {
+                        winner: Some(winner),
+                        margin: 0.0,
+                    }),
+                    stats,
+                    resigned: true,
+                });
+            }
+        }
         let mut selected = None;
         let mut repetition_avoids = 0_u32;
         for action in result.actions_by_preference(position.to_move()) {
@@ -100,6 +192,7 @@ pub fn play_game<E>(
                 final_position: position,
                 outcome: Some(transition.analysis.outcome),
                 stats,
+                resigned: false,
             });
         }
         let inserted = seen.insert(position_fingerprint(&position));
@@ -110,6 +203,7 @@ pub fn play_game<E>(
         final_position: position,
         outcome: None,
         stats,
+        resigned: false,
     })
 }
 
@@ -161,7 +255,7 @@ pub fn accumulate_search_stats(total: &mut SearchStats, next: SearchStats) {
 mod tests {
     use std::convert::Infallible;
 
-    use super::{play_game, position_fingerprint};
+    use super::{ResignRule, play_game, play_game_with_resignation, position_fingerprint};
     use vgo_core::{Color, Position, Stone};
     use vgo_search::{SearchConfig, search};
 
@@ -202,5 +296,107 @@ mod tests {
             position_fingerprint(&first),
             position_fingerprint(&color_swapped)
         );
+    }
+
+    /// A search result whose root value is fixed, for driving the resign rule.
+    fn fixed_value(position: &vgo_core::Position, black_value: f64) -> vgo_search::SearchResult {
+        use vgo_search::{Action, CandidateSource, ChildSummary, SearchResult, SearchStats};
+        // Pass is always legal and needs no geometry. These tests exercise the
+        // resign rule, which reads only the root value, so the action is
+        // immaterial -- using Pass keeps the fixture from depending on where a
+        // legal placement happens to be.
+        let _ = position;
+        let action = Action::Pass;
+        SearchResult::from_children(
+            action,
+            vec![ChildSummary {
+                action,
+                source: CandidateSource::AreaSequence,
+                prior: 1.0,
+                visits: 8,
+                black_value,
+                proposal_count: 0,
+                beta: None,
+            }],
+            SearchStats::default(),
+            position.to_move(),
+        )
+    }
+
+    #[test]
+    fn a_single_bad_evaluation_does_not_end_a_game() {
+        // The window exists because one ply's root value is noisy. A lone
+        // hopeless evaluation surrounded by even ones must not concede.
+        let rule = ResignRule { threshold: 0.9, window: 5, disable_fraction: 0.0 };
+        let mut ply = 0;
+        let report = play_game_with_resignation(
+            Position::new(1.0 / 6.0, Vec::new(), Color::Black),
+            12,
+            rule,
+            |position, _| {
+                ply += 1;
+                // One deeply losing ply, the rest neutral.
+                let value = if ply == 3 { -1.0 } else { 0.0 };
+                Ok::<_, Infallible>(fixed_value(position, value))
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert!(!report.resigned, "one bad ply must not trigger resignation");
+    }
+
+    #[test]
+    fn a_sustained_loss_concedes_and_reports_a_real_winner() {
+        // Black to move and losing on every ply: after `window` consecutive
+        // plies the mover concedes, and White is recorded as the winner so the
+        // samples carry a genuine outcome rather than being discarded.
+        // Window 1 so the rule fires before the fixture's repeated Pass ends
+        // the game by double-pass; the window's behaviour is covered by
+        // `a_single_bad_evaluation_does_not_end_a_game`.
+        let rule = ResignRule { threshold: 0.9, window: 1, disable_fraction: 0.0 };
+        let report = play_game_with_resignation(
+            Position::new(1.0 / 6.0, Vec::new(), Color::Black),
+            40,
+            rule,
+            |position, _| Ok::<_, Infallible>(fixed_value(position, -1.0)),
+            |_| {},
+        )
+        .unwrap();
+        assert!(report.resigned);
+        let outcome = report.outcome.expect("a resigned game still has a winner");
+        assert_eq!(outcome.winner, Some(Color::White));
+        assert!(report.stats.plies <= 2, "should concede promptly, got {}", report.stats.plies);
+    }
+
+    #[test]
+    fn resignation_is_relative_to_the_side_to_move() {
+        // The root value is Black-relative. A strongly positive value means
+        // Black is winning, so Black must never concede on it however long it
+        // persists -- only the side actually losing may resign.
+        let rule = ResignRule { threshold: 0.9, window: 3, disable_fraction: 0.0 };
+        let report = play_game_with_resignation(
+            Position::new(1.0 / 6.0, Vec::new(), Color::Black),
+            8,
+            rule,
+            |position, _| Ok::<_, Infallible>(fixed_value(position, 1.0)),
+            |_| {},
+        )
+        .unwrap();
+        // Black never resigns while ahead; if anyone concedes it is White, and
+        // never on the first ply.
+        assert!(report.stats.plies > 1);
+    }
+
+    #[test]
+    fn a_disabled_rule_never_fires() {
+        let report = play_game_with_resignation(
+            Position::new(1.0 / 6.0, Vec::new(), Color::Black),
+            6,
+            ResignRule::disabled(),
+            |position, _| Ok::<_, Infallible>(fixed_value(position, -1.0)),
+            |_| {},
+        )
+        .unwrap();
+        assert!(!report.resigned);
     }
 }
