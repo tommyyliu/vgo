@@ -107,10 +107,20 @@ pub fn play_game_with_resignation<E>(
     let mut seen = HashSet::new();
     let mut stats = PlayoutStats::default();
     seen.insert(position_fingerprint(&position));
-    // Consecutive plies whose root value has stayed past the threshold for the
-    // side to move. Reset by any ply that does not, so the window measures the
-    // least confident evaluation in a run rather than the most confident.
-    let mut losing_streak = 0_u32;
+    // Consecutive *own* turns whose root value has stayed past the threshold,
+    // counted per seat. Reset by any of that seat's turns that does not, so the
+    // window measures the least confident evaluation in a run rather than the
+    // most confident.
+    //
+    // One shared counter cannot work: `mover_value` is relative to the side to
+    // move, so a decided game alternates -1, +1, -1, +1 as the seat changes, and
+    // the loser's increment is undone by the winner's reset on the very next
+    // ply. The streak never exceeds 1 and no threshold ever fires -- measured
+    // on ddrnet-vs shard 4, where games sat 80 plies past the point of decision
+    // and resign_calibration reported zero firings at every threshold down to
+    // 0.7. Indexed by seat, a window of 5 means five consecutive turns of one's
+    // own, which is the ten plies of game the rule was written to describe.
+    let mut losing_streak = [0_u32; 2];
 
     for ply in 0..maximum_plies {
         let result = search(&position, ply)?;
@@ -124,12 +134,13 @@ pub fn play_game_with_resignation<E>(
             } else {
                 -result.root_black_value()
             };
+            let seat = usize::from(position.to_move() == Color::White);
             if mover_value <= -resign.threshold {
-                losing_streak += 1;
+                losing_streak[seat] += 1;
             } else {
-                losing_streak = 0;
+                losing_streak[seat] = 0;
             }
-            if losing_streak >= resign.window {
+            if losing_streak[seat] >= resign.window {
                 // The mover concedes, so the opponent wins. This is a real
                 // result, not a truncation: the samples carry a genuine outcome
                 // and train exactly as a played-out game would.
@@ -323,6 +334,41 @@ mod tests {
         )
     }
 
+    /// Like `fixed_value`, but placing a stone so the game does not end by
+    /// double-pass before a multi-ply window can be observed. The query walks
+    /// across the board and is snapped to the nearest legal point, so the
+    /// fixture does not have to know where the stones already are.
+    fn placing_value(
+        position: &vgo_core::Position,
+        ply: u32,
+        black_value: f64,
+    ) -> vgo_search::SearchResult {
+        use vgo_core::{Point, nearest_legal_placement};
+        use vgo_search::{Action, CandidateSource, ChildSummary, SearchResult, SearchStats};
+        let step = f64::from(ply + 1) * 0.13;
+        let query = Point::new(0.1 + step % 0.8, 0.1 + (step * 1.7) % 0.8);
+        let nearest = nearest_legal_placement(position, query);
+        let action = if nearest.legal {
+            Action::Place(nearest.point)
+        } else {
+            Action::Pass
+        };
+        SearchResult::from_children(
+            action,
+            vec![ChildSummary {
+                action,
+                source: CandidateSource::AreaSequence,
+                prior: 1.0,
+                visits: 8,
+                black_value,
+                proposal_count: 0,
+                beta: None,
+            }],
+            SearchStats::default(),
+            position.to_move(),
+        )
+    }
+
     #[test]
     fn a_single_bad_evaluation_does_not_end_a_game() {
         // The window exists because one ply's root value is noisy. A lone
@@ -366,6 +412,47 @@ mod tests {
         let outcome = report.outcome.expect("a resigned game still has a winner");
         assert_eq!(outcome.winner, Some(Color::White));
         assert!(report.stats.plies <= 2, "should concede promptly, got {}", report.stats.plies);
+    }
+
+    #[test]
+    fn a_multi_ply_window_fires_despite_the_alternating_seat() {
+        // The regression the per-seat counter exists for. `mover_value` is
+        // relative to the side to move, so a game Black is losing reads -1 on
+        // Black's plies and +1 on White's. A single shared counter is reset by
+        // every one of White's plies, the streak never exceeds 1, and no
+        // window above 1 can ever fire -- which is why the production run
+        // reported zero resignations at every threshold while games sat 80
+        // plies past the point of decision.
+        //
+        // `a_sustained_loss_concedes_and_reports_a_real_winner` uses window 1,
+        // the one setting where the bug is invisible.
+        // Placing rather than passing: two passes finish the game at ply 2,
+        // before Black reaches a third turn.
+        let rule = ResignRule { threshold: 0.9, window: 3, disable_fraction: 0.0 };
+        let report = play_game_with_resignation(
+            Position::new(1.0 / 6.0, Vec::new(), Color::Black),
+            40,
+            rule,
+            |position, ply| {
+                Ok::<_, Infallible>(placing_value(position, ply, -1.0))
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert!(
+            report.resigned,
+            "a window above 1 must still fire when one seat is consistently lost"
+        );
+        assert_eq!(
+            report.outcome.and_then(|outcome| outcome.winner),
+            Some(Color::White)
+        );
+        // Three of Black's own turns, which are plies 0, 2 and 4.
+        assert_eq!(
+            report.stats.plies, 5,
+            "should concede on Black's third turn, got {}",
+            report.stats.plies
+        );
     }
 
     #[test]

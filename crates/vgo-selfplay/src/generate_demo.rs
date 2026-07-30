@@ -234,7 +234,9 @@ fn calibration_trials(
     CALIBRATION_THRESHOLDS
         .iter()
         .map(|&threshold| {
-            let mut streak = 0_u32;
+            // Per seat, matching the live rule: a shared counter is reset by the
+            // winning side's ply and can never reach the window.
+            let mut streak = [0_u32; 2];
             let mut fired_at = None;
             for (index, sample) in pending.iter().enumerate() {
                 let mover_value = if sample.to_move == Color::Black {
@@ -242,12 +244,13 @@ fn calibration_trials(
                 } else {
                     -sample.root_black_value
                 };
+                let seat = usize::from(sample.to_move == Color::White);
                 if mover_value <= -threshold {
-                    streak += 1;
+                    streak[seat] += 1;
                 } else {
-                    streak = 0;
+                    streak[seat] = 0;
                 }
-                if streak >= window {
+                if streak[seat] >= window {
                     fired_at = Some((index, sample.to_move));
                     break;
                 }
