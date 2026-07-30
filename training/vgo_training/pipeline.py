@@ -290,6 +290,12 @@ class PipelineConfig:
     promotion_arena: bool = False
     promotion_score: float = 0.0
     maximum_truncation_rate: float = 0.02
+    # Concede once the side to move has been losing for resign_window
+    # consecutive plies. Zero disables it. This belongs to run identity: it
+    # changes which positions reach the shard.
+    resign_threshold: float = 0.0
+    resign_window: int = 5
+    resign_disable_fraction: float = 0.1
     arena_pairs: int = 16
     arena_simulations: int = 256
     arena_actors: int = 32
@@ -882,6 +888,12 @@ class Pipeline:
             str(config.temperature_plies),
             "--max-plies",
             str(config.maximum_plies),
+            "--resign-threshold",
+            str(config.resign_threshold),
+            "--resign-window",
+            str(config.resign_window),
+            "--resign-disable-fraction",
+            str(config.resign_disable_fraction),
             "--radius",
             str(config.radius),
             "--seed",
@@ -2114,6 +2126,25 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--promotion-score", type=float, default=0.0)
     parser.add_argument("--maximum-truncation-rate", type=float, default=0.02)
+    parser.add_argument(
+        "--resign-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "concede a game once the side to move has been losing by this much "
+            "for --resign-window consecutive plies; 0 disables resignation"
+        ),
+    )
+    parser.add_argument("--resign-window", type=int, default=5)
+    parser.add_argument(
+        "--resign-disable-fraction",
+        type=float,
+        default=0.1,
+        help=(
+            "fraction of games played to a real finish regardless of the "
+            "threshold, which are what the shard's calibration is measured on"
+        ),
+    )
     parser.add_argument("--arena-pairs", type=int, default=16)
     parser.add_argument("--arena-simulations", type=int, default=256)
     parser.add_argument("--arena-actors", type=int, default=32)
