@@ -15,7 +15,7 @@ use std::{
 
 use clap::{ArgAction, Parser};
 use sha2::{Digest, Sha256};
-use vgo_core::{Color, Position};
+use vgo_core::{Color, Outcome, Position};
 use vgo_inference::{
     BatchedEvaluator, BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, OnnxBatchService,
     OnnxProvider, OnnxServiceConfig,
@@ -24,7 +24,9 @@ use vgo_raster::{CHANNELS, RasterConfig, RasterKind, SemanticRaster, action_pixe
 use vgo_search::{
     Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, SearchResult, search_at_ply,
 };
-use vgo_selfplay::play_game as run_playout;
+use vgo_selfplay::{
+    ResignRule, play_game_with_resignation as run_playout_with_resignation,
+};
 
 mod replay_stream;
 
@@ -61,6 +63,7 @@ impl std::str::FromStr for GenerationRuntime {
 
 struct PendingSample {
     position: Position,
+    root_black_value: f64,
     policy: Vec<f32>,
     policy_mask: Vec<f32>,
     visits: Vec<f32>,
@@ -119,6 +122,25 @@ struct Config {
     temperature_plies: u32,
     #[arg(long = "max-plies", default_value_t = 48)]
     maximum_plies: u32,
+    /// Concede once the side to move has been losing by at least this much for
+    /// `--resign-window` consecutive plies. Zero disables resignation.
+    ///
+    /// Do not set this from intuition. A value head that is confidently wrong
+    /// concedes won games, and the samples then carry the wrong label; measure
+    /// the false-positive rate on games exempted by --resign-disable-fraction
+    /// and pick a threshold that keeps it acceptable.
+    #[arg(long, default_value_t = 0.0)]
+    resign_threshold: f64,
+    /// Consecutive plies that must all agree before conceding. One ply's root
+    /// value is noisy; requiring a run of them is what keeps noise from ending
+    /// games.
+    #[arg(long, default_value_t = 5)]
+    resign_window: u32,
+    /// Fraction of games played to a real finish regardless of the threshold.
+    /// These are the only games that can measure how often resignation would
+    /// have been wrong, so a run that resigns should always keep some.
+    #[arg(long, default_value_t = 0.1)]
+    resign_disable_fraction: f64,
     #[arg(long, default_value_t = 1.0 / 6.0)]
     radius: f64,
     #[arg(long, default_value_t = 50_001)]
@@ -171,6 +193,85 @@ struct PolicyTarget {
     /// Number of raw coarse->fine proposal draws landing in each cell. Legacy
     /// candidates and pass have zero multiplicity.
     proposal_counts: Vec<u32>,
+}
+
+/// Whether a game is exempt from resignation, decided from its seed.
+///
+/// Hashing the seed rather than counting games keeps the exempt set stable
+/// across reruns and independent of actor scheduling, which matters because
+/// these games are the calibration sample: they have to be a fair draw, not
+/// whichever games happened to land on a particular worker.
+fn resign_exempt(game_seed: u64, fraction: f64) -> bool {
+    if fraction <= 0.0 {
+        return false;
+    }
+    if fraction >= 1.0 {
+        return true;
+    }
+    // SplitMix64 finalizer: cheap, and well distributed for consecutive seeds.
+    let mut value = game_seed ^ 0x9e37_79b9_7f4a_7c15;
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    (value >> 11) as f64 / (1_u64 << 53) as f64 <= fraction
+}
+
+/// Closing plies that must agree before a truncated game is adjudicated.
+///
+/// Long enough that a transient swing cannot decide the game, short enough to
+/// stay inside the endgame the cap interrupted.
+const ADJUDICATION_PLIES: usize = 12;
+
+/// How far from even every one of those plies must be.
+///
+/// The value head saturates on about a third of positions and agrees with the
+/// outcome only ~76% of the time, so a small margin would adjudicate on noise.
+/// This is deliberately strict: a game that does not clear it stays discarded,
+/// which is the behaviour it replaces.
+const ADJUDICATION_MARGIN: f64 = 0.5;
+
+/// Awards a truncated game when both seats agree on the leader.
+///
+/// Returns `None` -- leaving the game discarded -- unless every one of the last
+/// `plies` root evaluations lies on the same side of zero by at least `margin`.
+/// Because the plies alternate between the two players' searches, that
+/// unanimity means the side that is behind agrees it is behind.
+fn adjudicate(pending: &[PendingSample], plies: usize, margin: f64) -> Option<Outcome> {
+    if pending.len() < plies {
+        return None;
+    }
+    let closing = &pending[pending.len() - plies..];
+    let leader_is_black = closing[0].root_black_value > 0.0;
+    let agreed = closing.iter().all(|sample| {
+        let value = sample.root_black_value;
+        value.abs() >= margin && (value > 0.0) == leader_is_black
+    });
+    if !agreed {
+        return None;
+    }
+    // Both seats must be represented, or this is one player's opinion repeated.
+    let mut seen_black = false;
+    let mut seen_white = false;
+    for sample in closing {
+        match sample.to_move {
+            Color::Black => seen_black = true,
+            Color::White => seen_white = true,
+        }
+    }
+    if !(seen_black && seen_white) {
+        return None;
+    }
+    Some(Outcome {
+        winner: Some(if leader_is_black {
+            Color::Black
+        } else {
+            Color::White
+        }),
+        // No area was counted, so there is no margin to report.
+        margin: 0.0,
+    })
 }
 
 fn policy_target(result: &SearchResult, config: RasterConfig) -> PolicyTarget {
@@ -290,9 +391,24 @@ fn generate_game(
     );
     let game_seed = config.seed.wrapping_add(game_index);
     let mut pending = Vec::new();
-    let playout = run_playout(
+    // Exempt a deterministic fraction of games from resignation. Deriving the
+    // choice from the game seed rather than a counter keeps it reproducible and
+    // independent of how games are distributed across actors, so a rerun
+    // exempts exactly the same games.
+    let exempt_from_resignation = resign_exempt(game_seed, config.resign_disable_fraction);
+    let resign = if config.resign_threshold > 0.0 && !exempt_from_resignation {
+        ResignRule {
+            threshold: config.resign_threshold,
+            window: config.resign_window,
+            disable_fraction: config.resign_disable_fraction,
+        }
+    } else {
+        ResignRule::disabled()
+    };
+    let playout = run_playout_with_resignation(
         Position::new(config.radius, Vec::new(), Color::Black),
         config.maximum_plies,
+        resign,
         |position, ply| {
             if stopped.load(Ordering::Acquire) {
                 return Err(EvaluationError::new("replay generation cancelled"));
@@ -311,6 +427,9 @@ fn generate_game(
                 beta: target.beta,
                 proposal_counts: target.proposal_counts,
                 to_move: step.position.to_move(),
+                // Root evaluation from Black's perspective, kept so a game cut
+                // off at the ply cap can be adjudicated rather than discarded.
+                root_black_value: step.search.root_black_value(),
                 selected_action: action_index(step.action, policy_config),
                 game: game_index,
                 ply: step.ply,
@@ -318,11 +437,27 @@ fn generate_game(
             });
         },
     )?;
-    let Some(outcome) = playout.outcome else {
-        return Ok(GameSamples {
-            samples: Vec::new(),
-            completed: false,
-        });
+    // A game that ran out of plies has no played-out result, but it is not
+    // necessarily undecided: if both sides' own searches have agreed on who is
+    // ahead over the closing plies, the position is settled in the only sense
+    // the loop can observe, and discarding it throws away a real label.
+    //
+    // Agreement is required from *both* seats. The root value is Black-relative
+    // and each ply is evaluated by the side to move, so alternating plies are
+    // independent judgements; demanding the same sign from all of them means
+    // the player who is behind concurs. A margin keeps near-even positions --
+    // where the sides would disagree by noise alone -- discarded as before.
+    let outcome = match playout.outcome {
+        Some(outcome) => outcome,
+        None => match adjudicate(&pending, ADJUDICATION_PLIES, ADJUDICATION_MARGIN) {
+            Some(outcome) => outcome,
+            None => {
+                return Ok(GameSamples {
+                    samples: Vec::new(),
+                    completed: false,
+                });
+            }
+        },
     };
     let black_value = outcome.black_utility() as f32;
     let samples = pending
@@ -1292,8 +1427,10 @@ mod tests {
     use vgo_search::{Action, CandidateSource, ChildSummary, SearchResult, SearchStats};
 
     use super::{
-        ActorPool, Config, GameEnvelope, GameSamples, policy_target, search_config, validate_config,
+        ActorPool, Config, GameEnvelope, GameSamples, PendingSample, adjudicate, policy_target,
+        resign_exempt, search_config, validate_config,
     };
+    use vgo_core::{Color, Position};
 
     #[test]
     fn actor_pool_drop_cancels_and_joins_workers() {
@@ -1518,5 +1655,88 @@ mod tests {
 
         assert_eq!(target.proposal_counts, vec![5, 0, 0, 0, 0]);
         assert_eq!(target.proposal_counts[4], 0, "pass is not proposed");
+    }
+
+    fn adjudication_sample(to_move: Color, root_black_value: f64) -> PendingSample {
+        PendingSample {
+            position: Position::new(1.0 / 18.0, Vec::new(), to_move),
+            root_black_value,
+            policy: Vec::new(),
+            policy_mask: Vec::new(),
+            visits: Vec::new(),
+            beta: Vec::new(),
+            proposal_counts: Vec::new(),
+            to_move,
+            selected_action: 0,
+            game: 0,
+            ply: 0,
+            seed: 0,
+        }
+    }
+
+    fn closing(values: &[f64]) -> Vec<PendingSample> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                let to_move = if index % 2 == 0 { Color::Black } else { Color::White };
+                adjudication_sample(to_move, value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn adjudication_awards_a_game_both_sides_agree_on() {
+        // Every closing ply well past the margin and on the same side: the
+        // player who is behind is evaluating too, so this is agreement rather
+        // than one seat's opinion.
+        let pending = closing(&[0.9; 12]);
+        let outcome = adjudicate(&pending, 12, 0.5).expect("agreed games are awarded");
+        assert_eq!(outcome.winner, Some(Color::Black));
+    }
+
+    #[test]
+    fn adjudication_declines_a_disputed_game() {
+        // Sign flips within the window: the sides disagree, so the game stays
+        // discarded rather than being awarded on one player's view.
+        let mut values = [0.9; 12];
+        values[7] = -0.9;
+        assert!(adjudicate(&closing(&values), 12, 0.5).is_none());
+    }
+
+    #[test]
+    fn adjudication_declines_a_close_game() {
+        // Consistent leader but inside the margin. The value head is wrong
+        // often enough that a small edge is not evidence, so this is the case
+        // the margin exists to reject.
+        assert!(adjudicate(&closing(&[0.2; 12]), 12, 0.5).is_none());
+    }
+
+    #[test]
+    fn adjudication_needs_both_seats_in_the_window() {
+        // A window covering only one player's turns is that player agreeing
+        // with itself; the opponent never weighed in.
+        let one_sided: Vec<PendingSample> = (0..12)
+            .map(|_| adjudication_sample(Color::Black, 0.9))
+            .collect();
+        assert!(adjudicate(&one_sided, 12, 0.5).is_none());
+    }
+
+    #[test]
+    fn adjudication_declines_a_game_shorter_than_the_window() {
+        assert!(adjudicate(&closing(&[0.9; 4]), 12, 0.5).is_none());
+    }
+
+    #[test]
+    fn resign_exemption_is_stable_and_close_to_its_fraction() {
+        // The exempt set is the calibration sample, so it must be a fair draw
+        // and identical across reruns.
+        let seeds: Vec<u64> = (0..20_000).map(|i| 990_001_u64.wrapping_add(i)).collect();
+        let exempt = seeds.iter().filter(|&&s| resign_exempt(s, 0.1)).count();
+        let rate = exempt as f64 / seeds.len() as f64;
+        assert!((rate - 0.1).abs() < 0.01, "exemption rate {rate} is off target");
+        assert!(seeds.iter().all(|&s| resign_exempt(s, 0.1) == resign_exempt(s, 0.1)));
+        assert!(seeds.iter().all(|&s| !resign_exempt(s, 0.0)));
+        assert!(seeds.iter().all(|&s| resign_exempt(s, 1.0)));
     }
 }
