@@ -38,6 +38,10 @@ POLICY_TARGET = "progressive_empirical_importance_v1"
 POLICY_DENOMINATOR = "full_legal_raster_v1"
 PREPARATION_VERSION = "importance-full-legal-v1"
 PROTOCOL_SCHEMA = "vgo.learner.protocol.v1"
+# Share of the loss carried by the batch-normalized heads, following KataGo.
+# They dominate optimization so the trunk gains nothing from inflating weights;
+# the remainder trains the unnormalized heads that inference actually uses.
+NORMED_HEAD_WEIGHT = 0.8
 
 
 @dataclass(frozen=True)
@@ -58,6 +62,10 @@ class LearnerConfig:
     model_width: int = 32
     blocks: int = 3
     architecture: str = "flat"
+    # Fixed-variance init plus He-scale convs (ddrnet). Changes the computed
+    # function, so it is recorded in the checkpoint and cannot be toggled on a
+    # warm start.
+    variance_scaled: bool = False
     threads: int = 4
     device: str = "cuda"
     precision: str = "float32"
@@ -985,6 +993,12 @@ class PersistentLearner:
                     "model_width": int(checkpoint["model_width"]),
                     "blocks": int(checkpoint["blocks"]),
                     "architecture": str(checkpoint.get("architecture", "flat")),
+                    # Follows the parent, not the config: the K constants are
+                    # part of the function the loaded weights were trained for,
+                    # so a warm start cannot switch this on or off.
+                    "variance_scaled": bool(
+                        checkpoint.get("variance_scaled", False)
+                    ),
                 }
             else:
                 model = build_model(
@@ -993,6 +1007,7 @@ class PersistentLearner:
                     width=config.model_width,
                     blocks=config.blocks,
                     policy_resolution=decoupled,
+                    variance_scaled=config.variance_scaled,
                 )
                 checkpoint = {}
                 metadata = {
@@ -1003,6 +1018,7 @@ class PersistentLearner:
                     "model_width": config.model_width,
                     "blocks": config.blocks,
                     "architecture": config.architecture,
+                    "variance_scaled": config.variance_scaled,
                 }
             model = model.to(device)
             compiled = bool(config.compile and device.type == "cuda")
@@ -1179,7 +1195,8 @@ class PersistentLearner:
                         and config.precision == "bfloat16"
                     ),
                 ):
-                    logits, values = self.model(states)
+                    outputs = self.model(states)
+                    logits, values = outputs[0], outputs[1]
                     policy_loss = policy_cross_entropy(
                         logits, policy_targets, policy_masks
                     )
@@ -1187,6 +1204,22 @@ class PersistentLearner:
                         values, value_targets
                     )
                     loss = policy_loss + config.value_weight * value_loss
+                    # KataGo's one-batch-norm split: the normalized heads take
+                    # most of the weight so they drive the trunk, while the
+                    # inference heads above learn the same targets without
+                    # normalization. Architectures that emit only two outputs
+                    # are unaffected.
+                    if len(outputs) == 4:
+                        normed_logits, normed_values = outputs[2], outputs[3]
+                        normed_loss = policy_cross_entropy(
+                            normed_logits, policy_targets, policy_masks
+                        ) + config.value_weight * nn.functional.mse_loss(
+                            normed_values, value_targets
+                        )
+                        loss = (
+                            NORMED_HEAD_WEIGHT * normed_loss
+                            + (1.0 - NORMED_HEAD_WEIGHT) * loss
+                        )
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 self.optimizer.step()

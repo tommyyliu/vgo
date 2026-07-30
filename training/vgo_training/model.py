@@ -7,9 +7,63 @@ from torch import nn
 MODEL_ARCHITECTURES = ("flat", "unet", "ddrnet")
 
 
+def residual_stack(
+    width: int, blocks: int, variance_scaled: bool, start: int = 1
+) -> list["ResidualBlock"]:
+    """Blocks for one stack, scaled by depth when variance scaling is on.
+
+    ``start`` is the trunk variance already accumulated when the stack begins,
+    so a stack that continues an existing trunk keeps counting rather than
+    restarting at 1.
+    """
+    return [
+        ResidualBlock(
+            width,
+            residual_scale=(index**-0.5) if variance_scaled else None,
+        )
+        for index in range(start, start + blocks)
+    ]
+
+
+def apply_he_initialization(module: nn.Module) -> None:
+    """Re-initialize convolutions to He/Kaiming scale for ReLU fan-in.
+
+    ``nn.Conv2d`` defaults to Kaiming-uniform with ``a=sqrt(5)``, which is about
+    2.4x below He scale for ReLU. Measured on a fresh DDRNet that leaves every
+    block contractive -- the residual branch carries a fifth of the variance the
+    skip does -- so training has to inflate weights merely to propagate signal,
+    and then overshoots. Fixed-variance scaling assumes variance-preserving
+    convolutions, so the two changes only make sense together: He alone raises
+    the fresh peak to 4514, and scaling alone corrects growth that is not
+    happening yet.
+    """
+    for child in module.modules():
+        if isinstance(child, nn.Conv2d):
+            nn.init.kaiming_normal_(
+                child.weight, mode="fan_in", nonlinearity="relu"
+            )
+            if child.bias is not None:
+                nn.init.zeros_(child.bias)
+
+
 class ResidualBlock(nn.Module):
-    def __init__(self, width: int) -> None:
+    """Pre-activation-free residual block, optionally variance-scaled.
+
+    ``residual_scale`` is KataGo's fixed-variance initialization: a constant
+    where a normalization layer would otherwise sit, chosen so the idealized
+    variance leaving the block is 1. Treating each conv-activation pair as
+    variance-preserving and the skip sum as adding variances, a trunk whose
+    blocks each contribute variance 1 reaches variance ``n`` at the nth block,
+    so that block scales its residual branch by ``1/sqrt(n)``.
+
+    The constant is not a parameter and does not appear in the state dict; it
+    folds into the exported graph as a multiply. ``None`` reproduces the
+    original unscaled block for checkpoints that predate this.
+    """
+
+    def __init__(self, width: int, residual_scale: float | None = None) -> None:
         super().__init__()
+        self.residual_scale = residual_scale
         self.layers = nn.Sequential(
             nn.Conv2d(width, width, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -17,7 +71,10 @@ class ResidualBlock(nn.Module):
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return torch.relu(inputs + self.layers(inputs))
+        residual = self.layers(inputs)
+        if self.residual_scale is not None:
+            residual = residual * self.residual_scale
+        return torch.relu(inputs + residual)
 
 
 class RasterPolicyValueNet(nn.Module):
@@ -63,13 +120,22 @@ class RasterPolicyValueNet(nn.Module):
 class _Down(nn.Module):
     """Stride-2 conv downsample followed by residual blocks at the smaller scale."""
 
-    def __init__(self, channels_in: int, channels_out: int, blocks: int) -> None:
+    def __init__(
+        self,
+        channels_in: int,
+        channels_out: int,
+        blocks: int,
+        variance_scaled: bool = False,
+        start: int = 1,
+    ) -> None:
         super().__init__()
         self.reduce = nn.Sequential(
             nn.Conv2d(channels_in, channels_out, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
         )
-        self.body = nn.Sequential(*(ResidualBlock(channels_out) for _ in range(blocks)))
+        self.body = nn.Sequential(
+            *residual_stack(channels_out, blocks, variance_scaled, start)
+        )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.body(self.reduce(inputs))
@@ -241,12 +307,14 @@ class DDRNetPolicyValueNet(nn.Module):
         blocks: int = 8,
         policy_resolution: int | None = None,
         stem_stride: int = 4,
+        variance_scaled: bool = False,
     ) -> None:
         super().__init__()
         if stem_stride not in (1, 2, 4):
             raise ValueError("stem stride must be 1, 2, or 4")
         self.policy_resolution = policy_resolution
         self.stem_stride = stem_stride
+        self.variance_scaled = variance_scaled
         stem_channels = max(8, width // 2)
         detail_channels = width
         context_channels = width * 2
@@ -278,15 +346,19 @@ class DDRNetPolicyValueNet(nn.Module):
             ),
             nn.ReLU(),
         )
+        # The detail branch is one continuous trunk across its three stacks, so
+        # the variance count carries over rather than restarting per stack.
         self.detail_entry = nn.Sequential(
-            *(ResidualBlock(detail_channels) for _ in range(stage_blocks))
+            *residual_stack(detail_channels, stage_blocks, variance_scaled, 1)
         )
 
         self.detail_stage1 = nn.Sequential(
-            *(ResidualBlock(detail_channels) for _ in range(stage_blocks))
+            *residual_stack(
+                detail_channels, stage_blocks, variance_scaled, 1 + stage_blocks
+            )
         )
         self.context_stage1 = _Down(
-            detail_channels, context_channels, stage_blocks
+            detail_channels, context_channels, stage_blocks, variance_scaled
         )
         self.context_to_detail1 = nn.Conv2d(
             context_channels, detail_channels, kernel_size=1
@@ -300,10 +372,19 @@ class DDRNetPolicyValueNet(nn.Module):
         )
 
         self.detail_stage2 = nn.Sequential(
-            *(ResidualBlock(detail_channels) for _ in range(stage_blocks))
+            *residual_stack(
+                detail_channels,
+                stage_blocks,
+                variance_scaled,
+                1 + 2 * stage_blocks,
+            )
         )
         self.context_stage2 = _Down(
-            context_channels, deep_channels, stage_blocks
+            context_channels,
+            deep_channels,
+            stage_blocks,
+            variance_scaled,
+            start=1 + stage_blocks,
         )
         self.context_to_detail2 = nn.Conv2d(
             deep_channels, detail_channels, kernel_size=1
@@ -330,10 +411,31 @@ class DDRNetPolicyValueNet(nn.Module):
         self.context = _DDRContext(
             deep_channels, context_branch, context_channels
         )
+
+        # One batch norm, after KataGo's method. Without normalization anywhere,
+        # nothing penalizes weight magnitude: scaling a conv up costs nothing, so
+        # training inflates it. Measured on ddrnet-fp32 update 2, the residual
+        # weights drift to 7.6x He scale, each conv multiplies std by ~24x, the
+        # trunk peaks at 68824 against fp16's 65504 limit, and the value head's
+        # tanh saturates on 67% of positions. A freshly initialized net peaks at
+        # 1.5 with 0% saturation, so this is drift, not the topology.
+        #
+        # A norm in front of the heads removes the incentive: trunk weight scale
+        # becomes a no-op on the normalized output, so there is nothing to gain
+        # by growing it. Heads attach at two places here -- value and pass read
+        # the pooled 8x8 semantic map, policy reads the 32x32 fusion -- so
+        # covering all three takes two norms rather than DDRNet's single trunk.
+        #
+        # Each norm feeds a *training* head that carries most of the loss. A
+        # second copy of each head reads the unnormalized features and carries
+        # the rest; that copy is what inference uses, so no running statistics
+        # are needed at export and there is no train/inference divergence.
+        self.semantic_norm = nn.BatchNorm2d(context_channels)
+        self.fused_norm = nn.BatchNorm2d(context_channels)
         self.detail_tail = nn.Sequential(
             nn.Conv2d(detail_channels, context_channels, kernel_size=1),
             nn.ReLU(),
-            ResidualBlock(context_channels),
+            *residual_stack(context_channels, 1, variance_scaled, 1),
         )
         self.policy_features = nn.Sequential(
             nn.Conv2d(
@@ -349,6 +451,27 @@ class DDRNetPolicyValueNet(nn.Module):
             nn.Linear(context_channels, 1),
             nn.Tanh(),
         )
+
+        # The normalized twins. These see batch-normalized features and take the
+        # bulk of the loss, so they drive optimization; the heads above learn the
+        # same predictions from unnormalized features and are used at inference.
+        self.policy_features_normed = nn.Sequential(
+            nn.Conv2d(
+                context_channels, detail_channels, kernel_size=3, padding=1
+            ),
+            nn.ReLU(),
+        )
+        self.policy_map_normed = nn.Conv2d(detail_channels, 1, kernel_size=1)
+        self.pass_head_normed = nn.Linear(context_channels, 1)
+        self.value_head_normed = nn.Sequential(
+            nn.Linear(context_channels, context_channels),
+            nn.ReLU(),
+            nn.Linear(context_channels, 1),
+            nn.Tanh(),
+        )
+
+        if variance_scaled:
+            apply_he_initialization(self)
 
     @staticmethod
     def _resize(inputs: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
@@ -406,21 +529,51 @@ class DDRNetPolicyValueNet(nn.Module):
             self.detail_tail(detail)
             + self._resize(semantic, detail.shape[-2:])
         )
-        placement_logits = self.policy_map(self.policy_features(fused))
         target_size = (
             (self.policy_resolution, self.policy_resolution)
             if self.policy_resolution is not None
             else states.shape[-2:]
         )
-        placement_logits = self._resize_policy(
-            placement_logits, target_size
-        ).flatten(start_dim=1)
 
-        pooled = semantic.mean(dim=(-2, -1))
-        pass_logit = self.pass_head(pooled)
-        policy_logits = torch.cat((placement_logits, pass_logit), dim=1)
-        values = self.value_head(pooled).squeeze(1)
-        return policy_logits, values
+        def heads(
+            semantic_features: torch.Tensor,
+            fused_features: torch.Tensor,
+            policy_features: nn.Module,
+            policy_map: nn.Module,
+            pass_head: nn.Module,
+            value_head: nn.Module,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            placement = policy_map(policy_features(fused_features))
+            placement = self._resize_policy(placement, target_size).flatten(
+                start_dim=1
+            )
+            pooled = semantic_features.mean(dim=(-2, -1))
+            logits = torch.cat((placement, pass_head(pooled)), dim=1)
+            return logits, value_head(pooled).squeeze(1)
+
+        policy_logits, values = heads(
+            semantic,
+            fused,
+            self.policy_features,
+            self.policy_map,
+            self.pass_head,
+            self.value_head,
+        )
+        if not self.training:
+            return policy_logits, values
+
+        # Training only. The normalized heads carry most of the loss and so are
+        # what actually shapes the trunk; returning them lets the learner add
+        # their loss without the exported graph ever seeing a BatchNorm.
+        normed_logits, normed_values = heads(
+            self.semantic_norm(semantic),
+            self.fused_norm(fused),
+            self.policy_features_normed,
+            self.policy_map_normed,
+            self.pass_head_normed,
+            self.value_head_normed,
+        )
+        return policy_logits, values, normed_logits, normed_values
 
 
 def build_model(
@@ -430,12 +583,18 @@ def build_model(
     blocks: int,
     policy_resolution: int | None = None,
     stem_stride: int = 4,
+    variance_scaled: bool = False,
 ) -> nn.Module:
     """Construct a policy-value net by architecture name. Older checkpoints without
     an architecture field are the flat residual tower.
 
     `policy_resolution` coarsens the placement grid the policy head emits while
-    leaving the input raster untouched; None keeps them equal."""
+    leaving the input raster untouched; None keeps them equal.
+
+    `variance_scaled` applies fixed-variance initialization and He-scale convs
+    (ddrnet only). It changes the function the network computes, so it must be
+    recorded in the checkpoint and passed back when rebuilding for export --
+    rebuilding without it silently drops the K constants."""
     if architecture in ("", "flat", "raster"):
         return RasterPolicyValueNet(
             channels=channels, width=width, blocks=blocks, policy_resolution=policy_resolution
@@ -451,5 +610,6 @@ def build_model(
             blocks=blocks,
             policy_resolution=policy_resolution,
             stem_stride=stem_stride,
+            variance_scaled=variance_scaled,
         )
     raise ValueError(f"unknown model architecture: {architecture!r}")

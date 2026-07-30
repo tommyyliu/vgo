@@ -9,6 +9,7 @@ import torch
 from vgo_training.model import (
     DDRNetPolicyValueNet,
     RasterPolicyValueNet,
+    ResidualBlock,
     build_model,
 )
 from vgo_training.serve import load_model
@@ -34,6 +35,9 @@ class ModelTests(unittest.TestCase):
 
     def test_ddrnet_handles_odd_rasters_and_backpropagates_both_fusions(self) -> None:
         model = DDRNetPolicyValueNet(channels=10, width=16, blocks=2)
+        # Training mode also returns the batch-normalized twin heads; this test
+        # is about the pair inference consumes.
+        model.eval()
         policy, value = model(torch.randn(2, 10, 19, 23))
         self.assertEqual(tuple(policy.shape), (2, 19 * 23 + 1))
         self.assertEqual(tuple(value.shape), (2,))
@@ -50,6 +54,74 @@ class ModelTests(unittest.TestCase):
             self.assertIsNotNone(parameter.grad)
             self.assertTrue(bool(torch.isfinite(parameter.grad).all()))
 
+    def test_ddrnet_training_mode_emits_normalized_twin_heads(self) -> None:
+        """Training returns four outputs; inference returns the usual two.
+
+        The normalized heads carry most of the loss so they shape the trunk,
+        but inference reads the unnormalized pair, which is what gets exported.
+        """
+        model = DDRNetPolicyValueNet(channels=10, width=16, blocks=2)
+        model.train()
+        outputs = model(torch.randn(2, 10, 19, 23))
+        self.assertEqual(len(outputs), 4)
+        policy, value, normed_policy, normed_value = outputs
+        self.assertEqual(policy.shape, normed_policy.shape)
+        self.assertEqual(value.shape, normed_value.shape)
+
+        # Both fusions still receive gradient through the training path.
+        (normed_policy.square().mean() + normed_value.square().mean()).backward()
+        for parameter in (
+            model.context_to_detail1.weight,
+            model.detail_to_context1.weight,
+            model.context_to_detail2.weight,
+            model.detail_to_context2[0].weight,
+        ):
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(bool(torch.isfinite(parameter.grad).all()))
+
+        model.eval()
+        self.assertEqual(len(model(torch.randn(2, 10, 19, 23))), 2)
+
+    def test_variance_scaling_adds_no_parameters_and_changes_output(self) -> None:
+        """K constants are fixed scalars, not weights.
+
+        The state dict must be unchanged so a scaled model exports and loads by
+        the same path, while the computed function genuinely differs -- which is
+        why the flag has to be recorded in the checkpoint.
+        """
+        torch.manual_seed(0)
+        scaled = DDRNetPolicyValueNet(
+            channels=10, width=16, blocks=2, variance_scaled=True
+        ).eval()
+        torch.manual_seed(0)
+        plain = DDRNetPolicyValueNet(
+            channels=10, width=16, blocks=2, variance_scaled=False
+        ).eval()
+        self.assertEqual(
+            set(scaled.state_dict()), set(plain.state_dict())
+        )
+
+        plain.load_state_dict(scaled.state_dict())
+        states = torch.randn(2, 10, 19, 23)
+        with torch.no_grad():
+            scaled_policy, _ = scaled(states)
+            plain_policy, _ = plain(states)
+        self.assertFalse(torch.allclose(scaled_policy, plain_policy, atol=1e-4))
+
+        scales = [
+            block.residual_scale
+            for block in scaled.modules()
+            if isinstance(block, ResidualBlock)
+        ]
+        self.assertTrue(all(scale is not None for scale in scales))
+        self.assertTrue(
+            all(
+                block.residual_scale is None
+                for block in plain.modules()
+                if isinstance(block, ResidualBlock)
+            )
+        )
+
     def test_ddrnet_emits_decoupled_policy_grid(self) -> None:
         model = build_model(
             "ddrnet",
@@ -58,6 +130,7 @@ class ModelTests(unittest.TestCase):
             blocks=2,
             policy_resolution=7,
         )
+        model.eval()
         policy, value = model(torch.zeros(1, 10, 31, 31))
         self.assertIsInstance(model, DDRNetPolicyValueNet)
         self.assertEqual(tuple(policy.shape), (1, 7 * 7 + 1))

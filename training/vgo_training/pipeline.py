@@ -270,6 +270,7 @@ class PipelineConfig:
     fp16: bool = True
     warm_inference: bool = True
     architecture: str = "ddrnet"
+    variance_scaled: bool = False
     model_width: int = 64
     blocks: int = 8
     training_epochs: int = 10
@@ -1210,6 +1211,7 @@ class Pipeline:
             "model_width": self.config.model_width,
             "blocks": self.config.blocks,
             "architecture": self.config.architecture,
+            "variance_scaled": self.config.variance_scaled,
             "threads": self.config.training_threads,
             "device": self.config.training_device,
             "precision": self.config.training_precision,
@@ -2087,6 +2089,17 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--architecture", choices=MODEL_ARCHITECTURES, default="ddrnet"
+    )
+    parser.add_argument(
+        "--variance-scaled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "scale each residual branch by 1/sqrt(depth) and initialize convs "
+            "at He scale; bounds trunk variance instead of letting training "
+            "inflate weights (ddrnet only, cannot be warm-started onto an "
+            "unscaled checkpoint)"
+        ),
     )
     parser.add_argument("--model-width", type=int, default=64)
     parser.add_argument("--blocks", type=int, default=8)

@@ -46,8 +46,24 @@ def load_model(checkpoint_path: Path) -> tuple[nn.Module, dict[str, object]]:
         width=int(checkpoint["model_width"]),
         blocks=int(checkpoint["blocks"]),
         policy_resolution=policy_resolution,
+        variance_scaled=bool(checkpoint.get("variance_scaled", False)),
     )
-    model.load_state_dict(checkpoint["state_dict"])
+    # The batch-normalized twin heads exist only while training; inference runs
+    # the unnormalized heads, so their weights are absent from an exported model
+    # and present-but-unused in a training checkpoint. Either way they must not
+    # fail the load -- but everything inference *does* read still has to be
+    # there, so a genuinely truncated checkpoint is not quietly accepted.
+    missing, _ = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    required = [
+        name
+        for name in missing
+        if not (name.endswith("_normed") or "_normed." in name or name.endswith("_norm.num_batches_tracked") or "_norm." in name)
+    ]
+    if required:
+        raise RuntimeError(
+            f"checkpoint is missing {len(required)} inference weight(s), "
+            f"starting with {required[0]}"
+        )
     model.eval()
     return model, checkpoint
 
