@@ -37,5 +37,9 @@ name = "vgo-playout-duel"
 path = "src/playout_duel.rs"
 
 [[bin]]
+name = "vgo-render-board"
+path = "src/render_board.rs"
+
+[[bin]]
 name = "vgo-serve-move"
 path = "src/serve_move.rs"

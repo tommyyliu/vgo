@@ -2,6 +2,8 @@
 
 use std::collections::HashSet;
 
+pub mod render_svg;
+
 use vgo_core::{Color, GameEvent, Outcome, Phase, Position};
 use vgo_search::{Action, SearchResult, SearchStats};
 
