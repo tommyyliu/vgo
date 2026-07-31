@@ -47,6 +47,7 @@ def load_model(checkpoint_path: Path) -> tuple[nn.Module, dict[str, object]]:
         blocks=int(checkpoint["blocks"]),
         policy_resolution=policy_resolution,
         variance_scaled=bool(checkpoint.get("variance_scaled", False)),
+        norm_groups=checkpoint.get("norm_groups"),
     )
     # The batch-normalized twin heads exist only while training; inference runs
     # the unnormalized heads, so their weights are absent from an exported model

@@ -7,19 +7,41 @@ from torch import nn
 MODEL_ARCHITECTURES = ("flat", "unet", "ddrnet")
 
 
+def _group_count(width: int, preferred: int) -> int:
+    """Largest divisor of ``width`` not exceeding ``preferred``.
+
+    Channel counts vary through the network -- 96 in the detail branch, 192 and
+    384 in the context branch -- and GroupNorm requires the group count to
+    divide the channels exactly. Falling back to the nearest divisor keeps one
+    setting valid at every width instead of constraining the widths themselves.
+    """
+    for candidate in range(min(preferred, width), 0, -1):
+        if width % candidate == 0:
+            return candidate
+    return 1
+
+
 def residual_stack(
-    width: int, blocks: int, variance_scaled: bool, start: int = 1
+    width: int,
+    blocks: int,
+    variance_scaled: bool,
+    start: int = 1,
+    groups: int | None = None,
 ) -> list["ResidualBlock"]:
     """Blocks for one stack, scaled by depth when variance scaling is on.
 
     ``start`` is the trunk variance already accumulated when the stack begins,
     so a stack that continues an existing trunk keeps counting rather than
-    restarting at 1.
+    restarting at 1. It is unused under normalization, which needs no notion of
+    accumulated variance.
     """
     return [
         ResidualBlock(
             width,
-            residual_scale=(index**-0.5) if variance_scaled else None,
+            residual_scale=(
+                (index**-0.5) if (variance_scaled and groups is None) else None
+            ),
+            groups=groups,
         )
         for index in range(start, start + blocks)
     ]
@@ -47,7 +69,7 @@ def apply_he_initialization(module: nn.Module) -> None:
 
 
 class ResidualBlock(nn.Module):
-    """Pre-activation-free residual block, optionally variance-scaled.
+    """Residual block, optionally variance-scaled or normalized.
 
     ``residual_scale`` is KataGo's fixed-variance initialization: a constant
     where a normalization layer would otherwise sit, chosen so the idealized
@@ -56,19 +78,52 @@ class ResidualBlock(nn.Module):
     blocks each contribute variance 1 reaches variance ``n`` at the nth block,
     so that block scales its residual branch by ``1/sqrt(n)``.
 
-    The constant is not a parameter and does not appear in the state dict; it
-    folds into the exported graph as a multiply. ``None`` reproduces the
-    original unscaled block for checkpoints that predate this.
+    ``groups`` instead puts a GroupNorm after each convolution, which is what
+    the reference DDRNet does and what the scaling was standing in for.
+
+    The two differ in what they can promise. A fixed constant is chosen once,
+    from the weights' scale at initialization, and cannot respond when training
+    moves them: measured on ddrnet-vs, weight scale grows sublinearly -- the
+    context branch's He ratio fits sqrt(updates) with r=0.99 and its slope
+    decays from 0.23 to 0.04 per update -- yet peak activation still compounds
+    at 1.07x per update after update 30, because peak follows the *product* of
+    per-layer gains and eight sublinear factors still multiply. Scaling every
+    conv weight by 1.5 takes the scaled model from 308 to 665088, past fp16's
+    65504; the same perturbation takes the normalized model from 9.7 to 15.3.
+    Normalization divides the drift out at every block, so growth is polynomial
+    rather than exponential.
+
+    Cost is small: +4.9% forward in eager PyTorch, backward unchanged, +0.01M
+    parameters, and it lowers to ONNX ``InstanceNormalization``.
     """
 
-    def __init__(self, width: int, residual_scale: float | None = None) -> None:
+    def __init__(
+        self,
+        width: int,
+        residual_scale: float | None = None,
+        groups: int | None = None,
+    ) -> None:
         super().__init__()
+        if groups is not None and residual_scale is not None:
+            raise ValueError(
+                "a normalized block does not also take a residual scale"
+            )
         self.residual_scale = residual_scale
-        self.layers = nn.Sequential(
-            nn.Conv2d(width, width, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(width, width, kernel_size=3, padding=1),
-        )
+        if groups is None:
+            self.layers = nn.Sequential(
+                nn.Conv2d(width, width, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(width, width, kernel_size=3, padding=1),
+            )
+        else:
+            divisor = _group_count(width, groups)
+            self.layers = nn.Sequential(
+                nn.Conv2d(width, width, kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(divisor, width),
+                nn.ReLU(),
+                nn.Conv2d(width, width, kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(divisor, width),
+            )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         residual = self.layers(inputs)
@@ -127,6 +182,7 @@ class _Down(nn.Module):
         blocks: int,
         variance_scaled: bool = False,
         start: int = 1,
+        groups: int | None = None,
     ) -> None:
         super().__init__()
         self.reduce = nn.Sequential(
@@ -134,7 +190,7 @@ class _Down(nn.Module):
             nn.ReLU(),
         )
         self.body = nn.Sequential(
-            *residual_stack(channels_out, blocks, variance_scaled, start)
+            *residual_stack(channels_out, blocks, variance_scaled, start, groups)
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -308,13 +364,18 @@ class DDRNetPolicyValueNet(nn.Module):
         policy_resolution: int | None = None,
         stem_stride: int = 4,
         variance_scaled: bool = False,
+        norm_groups: int | None = None,
     ) -> None:
         super().__init__()
         if stem_stride not in (1, 2, 4):
             raise ValueError("stem stride must be 1, 2, or 4")
         self.policy_resolution = policy_resolution
         self.stem_stride = stem_stride
-        self.variance_scaled = variance_scaled
+        # Normalization supersedes the fixed scaling: both stand where a norm
+        # would go, and a block takes one or the other.
+        self.variance_scaled = variance_scaled and norm_groups is None
+        self.norm_groups = norm_groups
+        variance_scaled = self.variance_scaled
         stem_channels = max(8, width // 2)
         detail_channels = width
         context_channels = width * 2
@@ -349,16 +410,24 @@ class DDRNetPolicyValueNet(nn.Module):
         # The detail branch is one continuous trunk across its three stacks, so
         # the variance count carries over rather than restarting per stack.
         self.detail_entry = nn.Sequential(
-            *residual_stack(detail_channels, stage_blocks, variance_scaled, 1)
+            *residual_stack(detail_channels, stage_blocks, variance_scaled, 1, norm_groups)
         )
 
         self.detail_stage1 = nn.Sequential(
             *residual_stack(
-                detail_channels, stage_blocks, variance_scaled, 1 + stage_blocks
+                detail_channels,
+                stage_blocks,
+                variance_scaled,
+                1 + stage_blocks,
+                norm_groups,
             )
         )
         self.context_stage1 = _Down(
-            detail_channels, context_channels, stage_blocks, variance_scaled
+            detail_channels,
+            context_channels,
+            stage_blocks,
+            variance_scaled,
+            groups=norm_groups,
         )
         self.context_to_detail1 = nn.Conv2d(
             context_channels, detail_channels, kernel_size=1
@@ -377,6 +446,7 @@ class DDRNetPolicyValueNet(nn.Module):
                 stage_blocks,
                 variance_scaled,
                 1 + 2 * stage_blocks,
+                norm_groups,
             )
         )
         self.context_stage2 = _Down(
@@ -385,6 +455,7 @@ class DDRNetPolicyValueNet(nn.Module):
             stage_blocks,
             variance_scaled,
             start=1 + stage_blocks,
+            groups=norm_groups,
         )
         self.context_to_detail2 = nn.Conv2d(
             deep_channels, detail_channels, kernel_size=1
@@ -435,7 +506,7 @@ class DDRNetPolicyValueNet(nn.Module):
         self.detail_tail = nn.Sequential(
             nn.Conv2d(detail_channels, context_channels, kernel_size=1),
             nn.ReLU(),
-            *residual_stack(context_channels, 1, variance_scaled, 1),
+            *residual_stack(context_channels, 1, variance_scaled, 1, norm_groups),
         )
         self.policy_features = nn.Sequential(
             nn.Conv2d(
@@ -470,7 +541,9 @@ class DDRNetPolicyValueNet(nn.Module):
             nn.Tanh(),
         )
 
-        if variance_scaled:
+        # He scale is what both schemes assume: the fixed constants are derived
+        # from it, and a normalized block wants unit-variance convolutions too.
+        if variance_scaled or norm_groups is not None:
             apply_he_initialization(self)
 
     @staticmethod
@@ -584,6 +657,7 @@ def build_model(
     policy_resolution: int | None = None,
     stem_stride: int = 4,
     variance_scaled: bool = False,
+    norm_groups: int | None = None,
 ) -> nn.Module:
     """Construct a policy-value net by architecture name. Older checkpoints without
     an architecture field are the flat residual tower.
@@ -592,9 +666,11 @@ def build_model(
     leaving the input raster untouched; None keeps them equal.
 
     `variance_scaled` applies fixed-variance initialization and He-scale convs
-    (ddrnet only). It changes the function the network computes, so it must be
-    recorded in the checkpoint and passed back when rebuilding for export --
-    rebuilding without it silently drops the K constants."""
+    (ddrnet only). `norm_groups` instead puts GroupNorm in every residual block
+    and supersedes it. Both change the function the network computes, so both
+    must be recorded in the checkpoint and passed back when rebuilding for
+    export -- rebuilding without them silently drops the constants or the
+    normalization layers."""
     if architecture in ("", "flat", "raster"):
         return RasterPolicyValueNet(
             channels=channels, width=width, blocks=blocks, policy_resolution=policy_resolution
@@ -611,5 +687,6 @@ def build_model(
             policy_resolution=policy_resolution,
             stem_stride=stem_stride,
             variance_scaled=variance_scaled,
+            norm_groups=norm_groups,
         )
     raise ValueError(f"unknown model architecture: {architecture!r}")

@@ -66,6 +66,9 @@ class LearnerConfig:
     # function, so it is recorded in the checkpoint and cannot be toggled on a
     # warm start.
     variance_scaled: bool = False
+    # GroupNorm groups per residual block; None leaves the block unnormalized.
+    # Supersedes variance_scaled, which stands in the same place.
+    norm_groups: int | None = None
     threads: int = 4
     device: str = "cuda"
     precision: str = "float32"
@@ -999,6 +1002,7 @@ class PersistentLearner:
                     "variance_scaled": bool(
                         checkpoint.get("variance_scaled", False)
                     ),
+                    "norm_groups": checkpoint.get("norm_groups"),
                 }
             else:
                 model = build_model(
@@ -1008,6 +1012,7 @@ class PersistentLearner:
                     blocks=config.blocks,
                     policy_resolution=decoupled,
                     variance_scaled=config.variance_scaled,
+                    norm_groups=config.norm_groups,
                 )
                 checkpoint = {}
                 metadata = {
@@ -1019,6 +1024,7 @@ class PersistentLearner:
                     "blocks": config.blocks,
                     "architecture": config.architecture,
                     "variance_scaled": config.variance_scaled,
+                    "norm_groups": config.norm_groups,
                 }
             model = model.to(device)
             compiled = bool(config.compile and device.type == "cuda")

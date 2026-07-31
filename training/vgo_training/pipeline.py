@@ -46,6 +46,25 @@ OPERATIONAL_CONFIG_FIELDS = {
     # the other is disk housekeeping. Both must be adjustable on a resume.
     "telemetry_every",
     "retire_shards",
+    # Inference precision is an execution choice, not a learning one. It does
+    # perturb the numbers a generator sees, so this is a judgement rather than
+    # an identity: measured on ddrnet-vs update 14 over 256 real positions,
+    # fp16 agrees with fp32 on 100% of policy argmaxes and differs on value by
+    # 0.004, which is far below the noise between two searches of the same
+    # position. What it does change is speed -- 41.4 ms/batch against 17.5 --
+    # and a run that cannot adopt that without starting over pays for the
+    # decision twice.
+    #
+    # The failure this guards against is real -- fp16 overflows when
+    # activations approach 65504, which is what ended ddrnet-short -- but a
+    # config digest is the wrong place to catch it. Overflow is a property of
+    # the checkpoint, which drifts every update, not of the flag, which only
+    # changes when someone edits it. What actually catches it is generation
+    # failing loudly on a non-finite evaluation, plus checking peak activation
+    # against the limit before enabling this (diagnostics in the run's
+    # launch.sh). Freezing the flag would only mean a run cannot adopt fp16
+    # without starting over.
+    "fp16",
 }
 
 
@@ -271,6 +290,7 @@ class PipelineConfig:
     warm_inference: bool = True
     architecture: str = "ddrnet"
     variance_scaled: bool = False
+    norm_groups: int | None = None
     model_width: int = 64
     blocks: int = 8
     training_epochs: int = 10
@@ -1212,6 +1232,7 @@ class Pipeline:
             "blocks": self.config.blocks,
             "architecture": self.config.architecture,
             "variance_scaled": self.config.variance_scaled,
+            "norm_groups": self.config.norm_groups,
             "threads": self.config.training_threads,
             "device": self.config.training_device,
             "precision": self.config.training_precision,
@@ -2089,6 +2110,16 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--architecture", choices=MODEL_ARCHITECTURES, default="ddrnet"
+    )
+    parser.add_argument(
+        "--norm-groups",
+        type=int,
+        default=None,
+        help=(
+            "GroupNorm groups in every residual block (ddrnet only); "
+            "supersedes --variance-scaled. Bounds activation magnitude "
+            "structurally rather than by a constant fixed at initialization"
+        ),
     )
     parser.add_argument(
         "--variance-scaled",
