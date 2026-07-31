@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::{
     path::PathBuf,
     sync::{
@@ -18,7 +19,10 @@ use vgo_inference::{
 };
 use vgo_raster::{RasterConfig, RasterKind};
 use vgo_search::{EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, search_with_evaluator};
-use vgo_selfplay::play_game as run_playout;
+use vgo_selfplay::{
+    ADJUDICATION_MARGIN, ADJUDICATION_PLIES, adjudicate_positions,
+    play_game as run_playout,
+};
 
 #[derive(Debug, Parser)]
 #[command(about = "Run a color-swapped held-out arena for an ONNX candidate")]
@@ -148,6 +152,10 @@ fn play_game(
     arguments: &Arguments,
 ) -> Result<GameResult, EvaluationError> {
     let naive = NaiveEvaluator;
+    // The closing positions, for adjudicating a game that reaches the cap.
+    // Only the last ADJUDICATION_PLIES are needed, so this stays bounded rather
+    // than retaining the whole game.
+    let mut closing: VecDeque<Position> = VecDeque::with_capacity(ADJUDICATION_PLIES);
     let playout = run_playout(
         Position::new(arguments.radius, Vec::new(), Color::Black),
         arguments.maximum_plies,
@@ -170,11 +178,24 @@ fn play_game(
                 evaluator,
             )
         },
-        |_| {},
+        |step| {
+            if closing.len() == ADJUDICATION_PLIES {
+                closing.pop_front();
+            }
+            closing.push_back(step.transition.position.clone());
+        },
     )?;
+    // A game that runs out of plies is awarded by area, the same rule self-play
+    // uses. Discarding it instead is not neutral: at a 100-ply cap 69% of arena
+    // games went undecided, and the ones that survive are those that resolve
+    // quickly, which reflects playing style rather than strength.
+    let outcome = playout.outcome.or_else(|| {
+        let positions: Vec<_> = closing.iter().cloned().collect();
+        adjudicate_positions(&positions, ADJUDICATION_PLIES, ADJUDICATION_MARGIN)
+    });
     Ok(GameResult {
-        completed: playout.completed(),
-        outcome: playout.outcome,
+        completed: outcome.is_some(),
+        outcome,
         candidate_color,
         plies: playout.stats.plies,
     })
@@ -312,6 +333,11 @@ fn run_match(
             }
         }
     }
+    // No decided game is no evidence, not a defeat -- but `candidate_score`
+    // has to stay a JSON number, so `completed` is what callers must test.
+    // Reporting 0.0 and letting a consumer read it as a result fed the
+    // Bradley-Terry fit a fabricated shutout: one ddrnet-vs pairing decided
+    // none of its 16 games and was recorded as the candidate losing all 16.
     let score = if completed == 0 {
         0.0
     } else {

@@ -140,7 +140,9 @@ def build_command(
         "--pairs", str(pairs),
         "--simulations", str(simulations),
         "--coarse-pool", str(int(config.get("coarse_pool", 16))),
-        "--max-plies", str(int(config.get("maximum_plies", 256))),
+        # Above the run's own cap. Arena games have no resignation to shorten
+        # them, so a cap tuned for self-play truncates more of them here.
+        "--max-plies", str(int(config.get("arena_maximum_plies", 120))),
         "--threads", str(int(config.get("arena_actors", 64))),
         "--leaf-batch", str(int(config.get("leaf_batch", 4))),
         "--resolution", str(int(config.get("resolution", 128))),
@@ -330,6 +332,17 @@ def main() -> None:
             continue
         # Records come back in the order the opponents were passed.
         for opponent, record in zip(opponents, records):
+            # A pairing that decided nothing is no evidence. The arena still
+            # reports candidate_score 0.0 there because the field has to stay a
+            # JSON number, so `completed` is what distinguishes "lost every
+            # game" from "played none to a result" -- recording the former fed
+            # the fit a fabricated 16-game shutout.
+            if int(record["completed"]) == 0:
+                print(
+                    f"  vs v{opponent}: no decided games in "
+                    f"{int(record['games'])}; not recorded"
+                )
+                continue
             match = {
                 "a": candidate,
                 "b": opponent,
@@ -338,6 +351,7 @@ def main() -> None:
                 "draws": int(record["draws"]),
                 "score": float(record["candidate_score"]),
                 "games": int(record["games"]),
+                "completed": int(record["completed"]),
                 "wall_seconds": float(record["wall_seconds"]),
             }
             matches.append(match)
@@ -346,6 +360,7 @@ def main() -> None:
             print(
                 f"  vs v{opponent}: score {match['score']:.3f} "
                 f"({match['a_wins']}-{match['b_wins']}-{match['draws']}) "
+                f"{match['completed']}/{match['games']} decided "
                 f"in {match['wall_seconds']:.0f}s"
             )
 
