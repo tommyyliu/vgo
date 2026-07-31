@@ -242,8 +242,17 @@ pub fn nearest_with(
         };
     }
     let radius = position.radius();
-    let diameter = 2.0 * radius;
-    let clamp = |value: f64| value.clamp(radius, 1.0 - radius);
+    // Each candidate is pushed `SNAP_MARGIN` past the constraint that produced
+    // it rather than placed exactly on it. A point on the boundary is legal
+    // only by the `2r - COORDINATE_EPSILON` slack in `clear_of_stones`, which
+    // makes its legality a question of floating-point association order -- and
+    // two implementations that associate differently then disagree about a
+    // move one of them just proposed.
+    let diameter = 2.0 * radius + numeric::SNAP_MARGIN;
+    // A radius leaving no inset at all admits no legal point; the margin must
+    // not invert the clamp range on the way to reporting that.
+    let inset = (radius + numeric::SNAP_MARGIN).min(0.5);
+    let clamp = |value: f64| value.clamp(inset.min(1.0 - inset), inset.max(1.0 - inset));
 
     let mut candidates = vec![Point::new(clamp(point.x), clamp(point.y))];
     for stone in position.stones() {
@@ -266,10 +275,10 @@ pub fn nearest_with(
             ));
         }
     }
-    candidates.push(Point::new(radius, clamp(point.y)));
-    candidates.push(Point::new(1.0 - radius, clamp(point.y)));
-    candidates.push(Point::new(clamp(point.x), radius));
-    candidates.push(Point::new(clamp(point.x), 1.0 - radius));
+    candidates.push(Point::new(inset, clamp(point.y)));
+    candidates.push(Point::new(1.0 - inset, clamp(point.y)));
+    candidates.push(Point::new(clamp(point.x), inset));
+    candidates.push(Point::new(clamp(point.x), 1.0 - inset));
     match known_vertices {
         Some(known) => candidates.extend_from_slice(known),
         None => candidates.extend(vertices(position)),
@@ -380,11 +389,18 @@ mod tests {
         assert!(found.legal);
         assert!(found.snapped);
         assert!(contains(&position, found.point.x, found.point.y));
-        // Pushed to exactly one diameter from the stone it collided with.
+        // A diameter of clearance plus the snap margin. Landing exactly on the
+        // constraint would make the result legal only by the tolerance in
+        // `clear_of_stones`, so a second implementation re-checking the same
+        // point could disagree; the margin puts it unambiguously inside.
         let distance = (found.point.x - 0.5).hypot(found.point.y - 0.5);
         assert!(
-            (distance - 0.2).abs() < 1.0e-9,
-            "expected a diameter of clearance, got {distance}"
+            distance >= 0.2,
+            "expected at least a diameter of clearance, got {distance}"
+        );
+        assert!(
+            (distance - (0.2 + crate::numeric::SNAP_MARGIN)).abs() < 1.0e-9,
+            "expected a diameter plus the snap margin, got {distance}"
         );
     }
 
@@ -417,6 +433,46 @@ mod tests {
         let found = nearest(&position, Point::new(coarse, 0.5));
         assert!(found.legal && found.snapped);
         assert!(contains(&position, found.point.x, found.point.y));
+    }
+
+    #[test]
+    fn a_snapped_placement_survives_an_independent_recheck() {
+        // The move server stalled a browser game here. It snapped White's move
+        // to (0.721723, 0.425648), one diameter from Black at (0.83203,
+        // 0.44141) at radius 39/700 -- legal to the search that proposed it,
+        // and 1.1e-6 inside the exclusion disc once the client re-derived the
+        // distance its own way. The client refused the move, re-asked, and the
+        // stateless server returned the same point twenty times.
+        //
+        // The margin is what makes a snapped point survive being re-checked by
+        // an implementation that associates its arithmetic differently.
+        let position = Position::new(
+            39.0 / 700.0,
+            vec![
+                Stone::new(0.62891, 0.80078, Color::Black),
+                Stone::new(0.61328, 0.63672, Color::White),
+                Stone::new(0.47266, 0.71484, Color::Black),
+                Stone::new(0.54272, 0.55048, Color::White),
+                Stone::new(0.75391, 0.68359, Color::Black),
+                Stone::new(0.74597, 0.57245, Color::White),
+                Stone::new(0.89453, 0.59766, Color::Black),
+                Stone::new(0.39386, 0.63605, Color::White),
+                Stone::new(0.83203, 0.44141, Color::Black),
+            ],
+            Color::White,
+        );
+        let found = nearest(&position, Point::new(0.721723, 0.425648));
+        assert!(found.legal);
+        let minimum = 2.0 * position.radius();
+        for stone in position.stones() {
+            let distance = (found.point.x - stone.x).hypot(found.point.y - stone.y);
+            assert!(
+                distance >= minimum,
+                "snapped point sits {:.3e} inside a stone's exclusion disc; a \
+                 recheck that does not subtract COORDINATE_EPSILON rejects it",
+                minimum - distance
+            );
+        }
     }
 
     #[test]

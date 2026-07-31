@@ -136,6 +136,14 @@
 
   const numeric = Object.freeze({
     coordinateEpsilon: 1e-7,
+    // How far past a constraint a snapped placement is pushed. `nearest`
+    // projects onto the boundary of the legal set, so its result sits exactly
+    // on a constraint and `contains` accepts it only by the tolerance in
+    // clearOfStones. That is fine for one implementation checking its own
+    // point and not fine across two: the Rust move server proposed a snapped
+    // point this page then rejected, and the game stalled. Must match
+    // SNAP_MARGIN in crates/vgo-core/src/numeric.rs.
+    snapMargin: 1e-6,
     edgeEpsilon: 1e-10,
     collinearEpsilon: 1e-11,
     comparisonEpsilon: 1e-10,

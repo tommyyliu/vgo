@@ -5,6 +5,22 @@ use num_bigint::BigInt;
 use crate::Point;
 
 pub const COORDINATE_EPSILON: f64 = 1.0e-7;
+
+/// How far past a constraint a snapped placement is pushed.
+///
+/// `nearest` projects onto the boundary of the legal set, so its result sits
+/// exactly on a constraint: `contains` accepts it only because the clearance
+/// test allows `2r - COORDINATE_EPSILON`. That is fine for one implementation
+/// evaluating its own point, and not fine across two. The move server proposed
+/// a snapped point 1.1e-6 inside a stone's exclusion disc, which its own search
+/// accepted and the browser rejected; the client then re-asked, the stateless
+/// server returned the identical point, and the game stalled for 20 requests.
+///
+/// An order of magnitude above `COORDINATE_EPSILON`, so a snapped point clears
+/// the constraint by more than the tolerance either side compares with, while
+/// staying far below the resolution any board is played at -- a 1/18 radius
+/// spans 0.056, and this moves a point by 0.00001% of that.
+pub const SNAP_MARGIN: f64 = 1.0e-6;
 pub const EDGE_EPSILON: f64 = 1.0e-10;
 pub const COLLINEAR_EPSILON: f64 = 1.0e-11;
 pub const COMPARISON_EPSILON: f64 = 1.0e-10;

@@ -139,8 +139,13 @@
   function nearest(position, x, y) {
     if (contains(position, x, y)) return { x: x, y: y, legal: true, snapped: false };
     const r = position.radius;
-    const diameter = 2 * r;
-    const clamp = function (value) { return Math.min(1 - r, Math.max(r, value)); };
+    // Pushed past each constraint rather than placed on it, so a snapped point
+    // survives being re-checked by an implementation whose arithmetic
+    // associates differently. See numeric.snapMargin.
+    const diameter = 2 * r + N.snapMargin;
+    const inset = Math.min(r + N.snapMargin, 0.5);
+    const lo = Math.min(inset, 1 - inset), hi = Math.max(inset, 1 - inset);
+    const clamp = function (value) { return Math.min(hi, Math.max(lo, value)); };
     const candidates = [[clamp(x), clamp(y)]];
     for (const stone of position.stones) {
       const dx = x - stone.x, dy = y - stone.y;
@@ -155,7 +160,7 @@
         ]);
       }
     }
-    candidates.push([r, clamp(y)], [1 - r, clamp(y)], [clamp(x), r], [clamp(x), 1 - r]);
+    candidates.push([inset, clamp(y)], [1 - inset, clamp(y)], [clamp(x), inset], [clamp(x), 1 - inset]);
     for (const vertex of vertices(position)) candidates.push(vertex);
 
     let best = null;
