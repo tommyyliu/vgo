@@ -436,6 +436,44 @@ mod tests {
     }
 
     #[test]
+    fn snapped_placements_do_not_accumulate_an_invalid_position() {
+        // A second stalled browser game, further in. Four of the server's
+        // twelve moves had landed 1.6e-6 to 2.7e-6 inside a neighbour, each
+        // legal to the search that snapped it. Those stones stay on the board,
+        // so `analyze` reports four overlapping pairs and `place` refuses every
+        // subsequent move with `invalid-position` -- the model appears stuck
+        // while the real damage happened several moves earlier.
+        //
+        // One bad snap is a rejected move; a bad snap that gets played corrupts
+        // the position for the rest of the game.
+        let radius = 39.0 / 700.0;
+        let position = Position::new(
+            radius,
+            vec![
+                Stone::new(0.69922, 0.59766, Color::Black),
+                Stone::new(0.628657, 0.511415, Color::White),
+                Stone::new(0.75391, 0.44922, Color::Black),
+                Stone::new(0.605469, 0.660156, Color::White),
+                Stone::new(0.61328, 0.33984, Color::Black),
+            ],
+            Color::White,
+        );
+        // The cell the search wanted at move 5, which snapped to a point
+        // 2.4e-6 inside the stone at (0.69922, 0.59766).
+        let found = nearest(&position, Point::new(0.739220, 0.701659));
+        assert!(found.legal);
+        for stone in position.stones() {
+            let distance = (found.point.x - stone.x).hypot(found.point.y - stone.y);
+            assert!(
+                distance >= 2.0 * radius,
+                "a snapped placement that is played must leave the position \
+                 valid; this one sits {:.3e} inside a stone",
+                2.0 * radius - distance
+            );
+        }
+    }
+
+    #[test]
     fn a_snapped_placement_survives_an_independent_recheck() {
         // The move server stalled a browser game here. It snapped White's move
         // to (0.721723, 0.425648), one diameter from Black at (0.83203,
