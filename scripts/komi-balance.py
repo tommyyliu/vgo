@@ -175,11 +175,12 @@ def main() -> int:
         try:
             plot(latest, history, arguments)
         except ModuleNotFoundError:
-            # matplotlib is not a training dependency and this is a diagnostic;
-            # the numbers above are the result, the plot is a convenience.
+            # matplotlib ships in the `plots` extra, not the base dependencies.
+            # The numbers above are the result; the plot is a convenience, so a
+            # missing plotting stack must not fail the analysis.
             print(f"\nmatplotlib unavailable in {sys.executable}; skipped {arguments.output}",
                   file=sys.stderr)
-            print("Run with a Python that has it, e.g. /usr/bin/python3.", file=sys.stderr)
+            print("Install it with: uv sync --extra plots --extra tensorrt", file=sys.stderr)
             return 0
         print(f"\nwrote {arguments.output}")
     return 0

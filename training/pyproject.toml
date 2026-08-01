@@ -11,6 +11,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Plotting only, for the diagnostic scripts under scripts/. Kept out of the
+# base dependencies so the training environment does not carry a GUI stack.
+plots = [
+    "matplotlib>=3.10",
+]
 tensorrt = [
     "tensorrt-cu13-libs==10.16.1.11; sys_platform == 'win32' or sys_platform == 'linux'",
 ]
