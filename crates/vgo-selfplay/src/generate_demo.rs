@@ -101,6 +101,12 @@ struct Config {
     /// differing only here are paired data over identical positions.
     #[arg(long, default_value = "semantic")]
     raster_kind: RasterKind,
+    /// Layout the behaviour model reads, which is fixed at its export and is
+    /// independent of `--raster-kind`: the shard records one layout while the
+    /// model may have been trained on another. Defaults to the shard's, which
+    /// is right whenever a run generates with the model it is training.
+    #[arg(long)]
+    model_raster_kind: Option<RasterKind>,
     /// Placement grid the policy head emits, independent of the render
     /// resolution. The board is only ~9 stones across, so 128x128 of placement
     /// precision mostly splits single moves across many cells while spreading
@@ -1295,7 +1301,10 @@ fn main() -> std::io::Result<()> {
     // was drawn for the network. So a semantic model can generate a shard in
     // any layout, which is what makes two --raster-kind runs paired data over
     // identical positions rather than two different games.
-    let raster = RasterConfig::square(config.resolution);
+    let raster = RasterConfig::square_of(
+        config.resolution,
+        config.model_raster_kind.unwrap_or(config.raster_kind),
+    );
     let model_path = config.model.as_deref();
     let (evaluator, broker): (Arc<dyn Evaluator>, Option<BatchedEvaluatorPool>) =
         match config.runtime {

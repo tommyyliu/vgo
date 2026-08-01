@@ -140,6 +140,9 @@ def build_command(
         "--pairs", str(pairs),
         "--simulations", str(simulations),
         "--coarse-pool", str(int(config.get("coarse_pool", 16))),
+        # A model exported under a non-default layout declares its own channel
+        # count, and loading validates it against the raster the arena builds.
+        "--candidate-raster-kind", str(config.get("raster_kind", "semantic")),
         # Above the run's own cap. Arena games have no resignation to shorten
         # them, so a cap tuned for self-play truncates more of them here.
         "--max-plies", str(int(config.get("arena_maximum_plies", 120))),

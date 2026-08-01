@@ -927,6 +927,8 @@ class Pipeline:
             f"--komi-high={config.komi_high}",
             "--raster-kind",
             str(config.raster_kind),
+            "--model-raster-kind",
+            str(config.raster_kind),
             "--resign-disable-fraction",
             str(config.resign_disable_fraction),
             "--radius",
@@ -976,6 +978,9 @@ class Pipeline:
         command = self._rust_command("vgo-arena") + [
             "--candidate",
             str(candidate),
+            # Both seats are this run's own models, so both read its layout.
+            "--candidate-raster-kind",
+            str(self.config.raster_kind),
             "--pairs",
             str(pairs),
             "--simulations",
