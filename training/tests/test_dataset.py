@@ -542,6 +542,10 @@ class V4PositionShardTests(unittest.TestCase):
             self.assertEqual(float(dataset.states[0, 1].sum()), 0.0)
             self.assertGreater(float(dataset.states[1, 1].sum()), 0.0)
             # radius is 2r everywhere, and previous_pass follows the stored count.
-            self.assertAlmostEqual(float(dataset.states[0, 8].mean()), 0.2, places=5)
+            # places=4, not 5: rasters are stored half, and 0.2 is not exactly
+            # representable there. The observed error is one fp16 ulp.
+            self.assertAlmostEqual(
+                float(dataset.states[0, 8].mean()), 0.2, places=4
+            )
             self.assertEqual(float(dataset.states[0, 9].mean()), 0.0)
             self.assertEqual(float(dataset.states[2, 9].mean()), 1.0)

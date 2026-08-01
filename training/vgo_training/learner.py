@@ -747,7 +747,7 @@ def evaluate(
             dtype=torch.bfloat16,
             enabled=stager.device.type == "cuda" and precision == "bfloat16",
         ):
-            logits, predictions = model(states)
+            logits, predictions = model(states.float())
             masked_logits = logits.masked_fill(
                 ~masks, torch.finfo(logits.dtype).min
             )
@@ -1201,7 +1201,10 @@ class PersistentLearner:
                         and config.precision == "bfloat16"
                     ),
                 ):
-                    outputs = self.model(states)
+                    # Rasters are stored half; the model runs in its own
+                    # precision, so widen at the boundary rather than storing
+                    # four bytes a pixel for the whole window.
+                    outputs = self.model(states.float())
                     logits, values = outputs[0], outputs[1]
                     policy_loss = policy_cross_entropy(
                         logits, policy_targets, policy_masks
