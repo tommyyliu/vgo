@@ -142,6 +142,17 @@ struct Config {
     /// games.
     #[arg(long, default_value_t = 5)]
     resign_window: u32,
+    /// Earliest ply a game may be conceded at, regardless of the window.
+    ///
+    /// The window counts a seat's own turns and a seat moves every other ply,
+    /// so a window of five permits resignation at ply 8 -- five stones each on
+    /// a board that holds thirty-five. Measured on ddrnet-vs update 59 that is
+    /// what happened: 17 of 28 games ended at ply 8, White conceded 26 of 28,
+    /// and the same seed with resignation off ran every game to a hundred
+    /// plies. A floor keeps the confidence test at five turns and forbids
+    /// acting on it while the board is still an opening.
+    #[arg(long, default_value_t = 0)]
+    resign_minimum_ply: u32,
     /// Fraction of games played to a real finish regardless of the threshold.
     /// These are the only games that can measure how often resignation would
     /// have been wrong, so a run that resigns should always keep some.
@@ -428,6 +439,7 @@ fn generate_game(
             threshold: config.resign_threshold,
             window: config.resign_window,
             disable_fraction: config.resign_disable_fraction,
+            minimum_ply: config.resign_minimum_ply,
         }
     } else {
         ResignRule::disabled()

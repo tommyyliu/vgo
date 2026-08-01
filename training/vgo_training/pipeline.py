@@ -316,6 +316,7 @@ class PipelineConfig:
     # changes which positions reach the shard.
     resign_threshold: float = 0.0
     resign_window: int = 5
+    resign_minimum_ply: int = 0
     resign_disable_fraction: float = 0.1
     arena_pairs: int = 16
     arena_simulations: int = 256
@@ -913,6 +914,8 @@ class Pipeline:
             str(config.resign_threshold),
             "--resign-window",
             str(config.resign_window),
+            "--resign-minimum-ply",
+            str(config.resign_minimum_ply),
             "--resign-disable-fraction",
             str(config.resign_disable_fraction),
             "--radius",
@@ -2180,6 +2183,16 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--resign-window", type=int, default=5)
+    parser.add_argument(
+        "--resign-minimum-ply",
+        type=int,
+        default=0,
+        help=(
+            "earliest ply a game may be conceded at. The window counts a "
+            "seat's own turns and a seat moves every other ply, so window 5 "
+            "concedes at ply 8 -- five stones each on a board holding 35"
+        ),
+    )
     parser.add_argument(
         "--resign-disable-fraction",
         type=float,

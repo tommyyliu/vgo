@@ -107,6 +107,22 @@ pub struct ResignRule {
     pub window: u32,
     /// Fraction of games exempted, for calibration.
     pub disable_fraction: f64,
+    /// Earliest ply at which a game may be conceded.
+    ///
+    /// The window alone cannot express this: it counts a seat's own turns, and
+    /// a seat moves every other ply, so `window` 5 permits resignation at ply 8
+    /// -- before either side has placed five stones on a board that holds
+    /// thirty-five. Measured on ddrnet-vs update 59, that is exactly what
+    /// happened: with resignation on, 17 of 28 games ended at ply 8 and White
+    /// conceded 26 of 28; with the same seed and resignation off, all six games
+    /// ran the full hundred plies. The value head is confident about an opening
+    /// it has no grounds to judge, and resigning on that confidence writes the
+    /// belief back into the data as a label.
+    ///
+    /// Raising the window instead would also delay the confidence test itself,
+    /// which is the part that works. A floor leaves the test at five turns and
+    /// only forbids acting on it while the board is still empty.
+    pub minimum_ply: u32,
 }
 
 impl ResignRule {
@@ -117,6 +133,7 @@ impl ResignRule {
             threshold: 1.0,
             window: u32::MAX,
             disable_fraction: 0.0,
+            minimum_ply: 0,
         }
     }
 
@@ -207,7 +224,7 @@ pub fn play_game_with_resignation<E>(
             } else {
                 losing_streak[seat] = 0;
             }
-            if losing_streak[seat] >= resign.window {
+            if losing_streak[seat] >= resign.window && ply >= resign.minimum_ply {
                 // The mover concedes, so the opponent wins. This is a real
                 // result, not a truncation: the samples carry a genuine outcome
                 // and train exactly as a played-out game would.
@@ -376,7 +393,7 @@ mod tests {
     fn a_single_bad_evaluation_does_not_end_a_game() {
         // The window exists because one ply's root value is noisy. A lone
         // hopeless evaluation surrounded by even ones must not concede.
-        let rule = ResignRule { threshold: 0.9, window: 5, disable_fraction: 0.0 };
+        let rule = ResignRule { threshold: 0.9, window: 5, disable_fraction: 0.0, minimum_ply: 0 };
         let mut ply = 0;
         let report = play_game_with_resignation(
             Position::new(1.0 / 6.0, Vec::new(), Color::Black),
@@ -402,7 +419,7 @@ mod tests {
         // Window 1 so the rule fires before the fixture's repeated Pass ends
         // the game by double-pass; the window's behaviour is covered by
         // `a_single_bad_evaluation_does_not_end_a_game`.
-        let rule = ResignRule { threshold: 0.9, window: 1, disable_fraction: 0.0 };
+        let rule = ResignRule { threshold: 0.9, window: 1, disable_fraction: 0.0, minimum_ply: 0 };
         let report = play_game_with_resignation(
             Position::new(1.0 / 6.0, Vec::new(), Color::Black),
             40,
@@ -431,7 +448,7 @@ mod tests {
         // the one setting where the bug is invisible.
         // Placing rather than passing: two passes finish the game at ply 2,
         // before Black reaches a third turn.
-        let rule = ResignRule { threshold: 0.9, window: 3, disable_fraction: 0.0 };
+        let rule = ResignRule { threshold: 0.9, window: 3, disable_fraction: 0.0, minimum_ply: 0 };
         let report = play_game_with_resignation(
             Position::new(1.0 / 6.0, Vec::new(), Color::Black),
             40,
@@ -459,11 +476,38 @@ mod tests {
     }
 
     #[test]
+    fn a_ply_floor_holds_off_an_early_concession() {
+        // The window counts a seat's own turns, so window 5 fires at ply 8 --
+        // five stones each on a board that holds thirty-five. In production
+        // that ended 17 of 28 games at ply 8 with White conceding 26 of 28,
+        // while the same seed with resignation off ran every game to a hundred
+        // plies. The floor forbids acting on the confidence test that early.
+        let rule = ResignRule {
+            threshold: 0.9,
+            window: 3,
+            disable_fraction: 0.0,
+            minimum_ply: 20,
+        };
+        let report = play_game_with_resignation(
+            Position::new(1.0 / 6.0, Vec::new(), Color::Black),
+            12,
+            rule,
+            |position, ply| Ok::<_, Infallible>(placing_value(position, ply, -1.0)),
+            |_| {},
+        )
+        .unwrap();
+        assert!(
+            !report.resigned,
+            "a game shorter than the floor must not concede"
+        );
+    }
+
+    #[test]
     fn resignation_is_relative_to_the_side_to_move() {
         // The root value is Black-relative. A strongly positive value means
         // Black is winning, so Black must never concede on it however long it
         // persists -- only the side actually losing may resign.
-        let rule = ResignRule { threshold: 0.9, window: 3, disable_fraction: 0.0 };
+        let rule = ResignRule { threshold: 0.9, window: 3, disable_fraction: 0.0, minimum_ply: 0 };
         let report = play_game_with_resignation(
             Position::new(1.0 / 6.0, Vec::new(), Color::Black),
             8,
