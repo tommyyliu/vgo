@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-use vgo_core::{Point, Position, SettledRegion, legal_set_vertices};
+use vgo_core::{Color, Point, Position, SettledRegion, legal_set_vertices};
 
-pub const CHANNEL_COUNT: usize = 11;
+pub const CHANNEL_COUNT: usize = 12;
 
 /// Channels written by [`rasterize_rgb_into`]: red, green, blue.
 pub const RGB_CHANNEL_COUNT: usize = 3;
@@ -65,6 +65,10 @@ pub const CHANNELS: [ChannelSpec; CHANNEL_COUNT] = [
     ChannelSpec {
         name: "settled",
         scale: ChannelScale::Unit,
+    },
+    ChannelSpec {
+        name: "komi",
+        scale: ChannelScale::Signed,
     },
 ];
 
@@ -271,6 +275,20 @@ pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32
     // stone. At 96x96 with 30 stones that is 276k transcendental calls traded for
     // 37k -- this loop was measured at 66% of all self-play CPU time.
     let to_move = position.to_move();
+    // What the side to move must win by, from its own seat. Every other channel
+    // is mover-relative and komi has to be too: the same position is a win for
+    // one seat and a loss for the other at the same komi, so feeding Black's
+    // komi alongside White's stones states the wrong target. KataGo signs it
+    // the same way -- `selfKomi` in nninputs.cpp is relative to the player to
+    // move.
+    //
+    // Scoring is `black - white - komi > 0` for a Black win, so a positive komi
+    // is a margin Black must overcome and one White may fall short by. Voronoi
+    // area totals 1.0, so this is already order one and needs no scaling.
+    let mover_komi = match to_move {
+        Color::Black => position.komi() as f32,
+        Color::White => -position.komi() as f32,
+    };
     let stones = position.stones();
     // Splitting by colour once hoists the per-stone colour comparison out of the
     // pixel loop entirely.
@@ -427,6 +445,7 @@ pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32
             // side owns the nearest stone -- the same ownership rule the
             // voronoi channels use.
             set(data, pixels, 10, pixel, f32::from(settled_mask[pixel]));
+            set(data, pixels, 11, pixel, mover_komi);
 
             let board_clearance = (x - radius)
                 .min(1.0 - radius - x)
@@ -742,6 +761,10 @@ mod tests {
                     .iter()
                     .any(|s| (x - s.x).hypot(y - s.y) <= free);
                 data[10 * pixels + pixel] = f32::from(settled);
+                data[11 * pixels + pixel] = match position.to_move() {
+                    Color::Black => position.komi() as f32,
+                    Color::White => -position.komi() as f32,
+                };
             }
         }
         data
@@ -859,6 +882,43 @@ mod tests {
                 "  {stones:2} stones: {:.3} ms per 128x128 raster",
                 started.elapsed().as_secs_f64() / f64::from(runs) * 1000.0
             );
+        }
+    }
+
+    /// The komi channel states what the side to move must win by.
+    ///
+    /// The sign is silent if wrong -- a net simply learns the opposite of the
+    /// truth -- so it is pinned against the scoring rule rather than described.
+    #[test]
+    fn komi_channel_is_relative_to_the_side_to_move() {
+        let komi = 0.18;
+        let stones = vec![
+            Stone::new(0.25, 0.25, Color::Black),
+            Stone::new(0.75, 0.75, Color::White),
+        ];
+        let config = RasterConfig::square(16);
+        let pixels = config.pixels();
+
+        let black = Position::new(0.1, stones.clone(), Color::Black).with_komi(komi);
+        let white = Position::new(0.1, stones, Color::White).with_komi(komi);
+        let from_black = rasterize(&black, config);
+        let from_white = rasterize(&white, config);
+
+        // Scoring is `black - white - komi > 0`, so komi is a margin Black must
+        // overcome and one White may fall short by.
+        assert!(
+            (from_black.data()[11 * pixels] - komi as f32).abs() < 1.0e-6,
+            "Black must see the komi it has to overcome, got {}",
+            from_black.data()[11 * pixels]
+        );
+        assert!(
+            (from_white.data()[11 * pixels] + komi as f32).abs() < 1.0e-6,
+            "White must see the komi it receives, got {}",
+            from_white.data()[11 * pixels]
+        );
+        // Constant over the board, like radius.
+        for pixel in 0..pixels {
+            assert_eq!(from_black.data()[11 * pixels + pixel], from_black.data()[11 * pixels]);
         }
     }
 
