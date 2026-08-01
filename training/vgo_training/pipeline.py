@@ -921,10 +921,10 @@ class Pipeline:
             str(config.resign_window),
             "--resign-minimum-ply",
             str(config.resign_minimum_ply),
-            "--komi-low",
-            str(config.komi_low),
-            "--komi-high",
-            str(config.komi_high),
+            # `=` form: a negative komi otherwise parses as a flag, since clap
+            # cannot tell `-0.1` from a short option.
+            f"--komi-low={config.komi_low}",
+            f"--komi-high={config.komi_high}",
             "--raster-kind",
             str(config.raster_kind),
             "--resign-disable-fraction",
