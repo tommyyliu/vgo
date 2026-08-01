@@ -6,6 +6,15 @@ pub const CHANNEL_COUNT: usize = 12;
 
 /// Channels written by [`rasterize_rgb_into`]: red, green, blue.
 pub const RGB_CHANNEL_COUNT: usize = 3;
+
+/// Indices into [`CHANNELS`] that [`RasterKind::Compact`] keeps.
+pub const COMPACT_CHANNELS: [usize; 5] = [
+    0,  // current_stones
+    1,  // opponent_stones
+    6,  // voronoi_ridge
+    10, // settled
+    11, // komi
+];
 pub const DATASET_MAGIC: [u8; 8] = *b"VGODATA1";
 pub const DATASET_VERSION: u32 = 2;
 
@@ -83,6 +92,19 @@ pub enum RasterKind {
     #[default]
     Semantic,
     Rgb,
+    /// The four channels an ablation preferred, plus komi.
+    ///
+    /// Measured over 24 epochs on 30720 samples: current_stones,
+    /// opponent_stones, voronoi_ridge and settled reached policy CE 2.8177 and
+    /// 35.2% argmax agreement against all eleven channels' 2.8308 and 34.4%,
+    /// and the ten-channel set's 2.8425 and 32.2%. The spread is under a
+    /// percent and one seed, so this is a preference rather than a finding --
+    /// but fewer channels is also less memory, and the replay window is what
+    /// the run is short of.
+    ///
+    /// Komi joins them because a net that cannot see what it must win by
+    /// cannot evaluate a position.
+    Compact,
 }
 
 impl RasterKind {
@@ -91,6 +113,7 @@ impl RasterKind {
         match self {
             Self::Semantic => CHANNEL_COUNT,
             Self::Rgb => RGB_CHANNEL_COUNT,
+            Self::Compact => COMPACT_CHANNELS.len(),
         }
     }
 
@@ -99,6 +122,7 @@ impl RasterKind {
         match self {
             Self::Semantic => "semantic",
             Self::Rgb => "rgb",
+            Self::Compact => "compact",
         }
     }
 }
@@ -110,6 +134,7 @@ impl std::str::FromStr for RasterKind {
         match value {
             "semantic" => Ok(Self::Semantic),
             "rgb" => Ok(Self::Rgb),
+            "compact" => Ok(Self::Compact),
             _ => Err(format!("unsupported raster kind: {value}")),
         }
     }
@@ -253,6 +278,33 @@ pub fn rasterize_any_into(position: &Position, config: RasterConfig, data: &mut 
     match config.kind {
         RasterKind::Semantic => rasterize_into(position, config, data),
         RasterKind::Rgb => rasterize_rgb_into(position, config, data),
+        RasterKind::Compact => rasterize_compact_into(position, config, data),
+    }
+}
+
+/// Writes the [`RasterKind::Compact`] subset.
+///
+/// Renders the full semantic set and keeps the planes `COMPACT_CHANNELS` names,
+/// rather than a second rasterizer that would have to stay in step with the
+/// first. The cost is the planes that are discarded, which is the same work the
+/// full raster does anyway -- and the settled contour, by far the most
+/// expensive channel, is one of the ones kept.
+pub fn rasterize_compact_into(
+    position: &Position,
+    config: RasterConfig,
+    data: &mut [f32],
+) {
+    let pixels = config.pixels();
+    assert_eq!(data.len(), COMPACT_CHANNELS.len() * pixels);
+    let full = RasterConfig {
+        kind: RasterKind::Semantic,
+        ..config
+    };
+    let mut everything = vec![0.0_f32; CHANNEL_COUNT * pixels];
+    rasterize_into(position, full, &mut everything);
+    for (slot, &channel) in COMPACT_CHANNELS.iter().enumerate() {
+        data[slot * pixels..(slot + 1) * pixels]
+            .copy_from_slice(&everything[channel * pixels..(channel + 1) * pixels]);
     }
 }
 
@@ -690,8 +742,8 @@ mod tests {
     use vgo_core::{Color, Position, Stone};
 
     use super::{
-        BOARD_BACKGROUND, CHANNEL_COUNT, RGB_CHANNEL_COUNT, RasterConfig, RasterKind,
-        action_pixel, rasterize, rasterize_into, rasterize_rgb,
+        BOARD_BACKGROUND, CHANNEL_COUNT, CHANNELS, COMPACT_CHANNELS, RGB_CHANNEL_COUNT,
+        RasterConfig, RasterKind, action_pixel, rasterize, rasterize_into, rasterize_rgb,
     };
 
     /// The pre-optimization formulation: one `hypot` per (pixel, stone) pair.
@@ -919,6 +971,27 @@ mod tests {
         // Constant over the board, like radius.
         for pixel in 0..pixels {
             assert_eq!(from_black.data()[11 * pixels + pixel], from_black.data()[11 * pixels]);
+        }
+    }
+
+    /// Compact must be exactly the planes it names, not a re-derivation.
+    #[test]
+    fn compact_is_a_subset_of_the_semantic_raster() {
+        let position = scattered_position(12).with_komi(0.15);
+        let full = RasterConfig::square(48);
+        let compact = RasterConfig::square_of(48, RasterKind::Compact);
+        assert_eq!(compact.channels(), COMPACT_CHANNELS.len());
+
+        let whole = rasterize(&position, full);
+        let subset = rasterize(&position, compact);
+        let pixels = full.pixels();
+        for (slot, &channel) in COMPACT_CHANNELS.iter().enumerate() {
+            assert_eq!(
+                &subset.data()[slot * pixels..(slot + 1) * pixels],
+                &whole.data()[channel * pixels..(channel + 1) * pixels],
+                "compact plane {slot} must equal semantic channel {channel} ({})",
+                CHANNELS[channel].name
+            );
         }
     }
 

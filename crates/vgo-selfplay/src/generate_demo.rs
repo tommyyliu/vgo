@@ -1158,6 +1158,10 @@ fn write_manifest(
     let names: Vec<&str> = match config.raster_kind {
         RasterKind::Semantic => CHANNELS.iter().map(|channel| channel.name).collect(),
         RasterKind::Rgb => vec!["red", "green", "blue"],
+        RasterKind::Compact => vgo_raster::COMPACT_CHANNELS
+            .iter()
+            .map(|&channel| CHANNELS[channel].name)
+            .collect(),
     };
     for (index, name) in names.iter().enumerate() {
         let comma = if index + 1 == names.len() { "" } else { "," };
