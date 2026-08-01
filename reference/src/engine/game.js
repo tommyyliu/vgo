@@ -53,7 +53,20 @@
       if (selfRemoval.count) nextAnalysis = analysis.analyze(next);
     }
 
-    next = model.update(next, { toMove: model.other(mover), passes: 0, phase: "playing" });
+    // A placement that leaves the board exactly as it was is a pass, not a
+    // move: a lone stone with no liberties, self-captured on arrival, taking
+    // nothing with it. Resetting the pass counter for it made it a *better*
+    // stall than passing -- two passes end the game and score it, two no-op
+    // suicides end nothing -- and both sides learned to abuse that. Must match
+    // after_placement in crates/vgo-core/src/model.rs.
+    const changed = next.stones.length !== position.stones.length;
+    const passes = changed ? 0 : position.passes + 1;
+    const finished = activeRules.ending === "two-passes" && passes >= 2;
+    next = model.update(next, {
+      toMove: finished ? mover : model.other(mover),
+      passes: passes,
+      phase: finished ? "finished" : "playing",
+    });
     nextAnalysis = analysis.analyze(next);
     const events = [];
     if (enemyRemoval.count) events.push({ type: "capture", color: model.other(mover), count: enemyRemoval.count });

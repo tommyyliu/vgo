@@ -146,13 +146,45 @@ impl Position {
         next
     }
 
-    pub(crate) fn after_placement(&self, stones: Vec<Stone>) -> Self {
+    /// The position after a placement.
+    ///
+    /// `changed` is false when the move left the board exactly as it was: a
+    /// stone placed with no liberties, self-captured in the same move, taking
+    /// nothing with it. That is a pass in every respect except that it used to
+    /// reset the pass counter, which made it a *better* stall than passing --
+    /// two passes end the game and score it, while two no-op suicides end
+    /// nothing.
+    ///
+    /// Both sides learned to abuse that. In arena games between two close
+    /// models, half the game could be one side suiciding while the other
+    /// passed, neither able to end it. In self-play 3.8% of all transitions
+    /// were no-ops -- twice the pass rate -- and the games containing a run of
+    /// four or more reached the ply cap 88% of the time against 0% for games
+    /// without one, with a median of 34 wasted plies out of 100.
+    ///
+    /// Counting a no-op as a pass closes it: two in a row now end the game and
+    /// score it, so stalling loses to whoever is ahead on the board.
+    pub(crate) fn after_placement(&self, stones: Vec<Stone>, changed: bool) -> Self {
+        let passes = if changed {
+            0
+        } else {
+            self.consecutive_passes + 1
+        };
+        let finished = passes >= 2;
         Self {
             radius: self.radius,
             stones,
-            to_move: self.to_move.other(),
-            consecutive_passes: 0,
-            phase: Phase::Playing,
+            to_move: if finished {
+                self.to_move
+            } else {
+                self.to_move.other()
+            },
+            consecutive_passes: passes,
+            phase: if finished {
+                Phase::Finished
+            } else {
+                Phase::Playing
+            },
             // Carried, not reset: komi belongs to the game, not the ply.
             komi: self.komi,
         }

@@ -12,13 +12,13 @@ use std::{
 };
 
 use clap::{ArgAction, Parser};
-use vgo_core::{Color, Outcome, Position};
+use vgo_core::{Color, Outcome, Point, Position};
 use vgo_inference::{
     BatchedEvaluator, BrokerConfig, BrokerMetrics, OnnxBatchService, OnnxProvider,
     OnnxServiceConfig,
 };
 use vgo_raster::{RasterConfig, RasterKind};
-use vgo_search::{EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, search_with_evaluator};
+use vgo_search::{Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, search_with_evaluator};
 use vgo_selfplay::{
     ADJUDICATION_MARGIN, ADJUDICATION_PLIES, adjudicate_positions,
     play_game as run_playout,
@@ -82,14 +82,25 @@ struct Arguments {
     fp16: bool,
     #[arg(long, default_value = "artifacts/onnx-cache")]
     cache_directory: PathBuf,
+    /// Write each game as SGF here. Off by default; a rating pass is cheap
+    /// enough to record and its games are the evidence behind the number.
+    #[arg(long)]
+    sgf_directory: Option<PathBuf>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct GameResult {
     completed: bool,
     outcome: Option<Outcome>,
     candidate_color: Color,
     plies: u32,
+    /// The moves played, kept only when `--sgf-directory` asks for them.
+    ///
+    /// Arena games are few -- a rating pass is hundreds where self-play is
+    /// hundreds of thousands -- and they are the ones worth reading, because
+    /// they are what a rating is computed from. An undecided rate has no
+    /// explanation without them.
+    moves: Vec<(Color, Option<Point>)>,
 }
 
 fn load_model(
@@ -144,6 +155,40 @@ fn validate_arguments(arguments: &Arguments) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// One game as SGF, in the dialect `reference/src/io/vgo-sgf.js` reads.
+///
+/// Coordinates print with `{}` rather than a fixed precision: placements come
+/// from a continuous space and a snapped move can sit within 1e-6 of a
+/// constraint, so a rounded file would not reload as the position that was
+/// played. Rust's float Display is already the shortest round-tripping form.
+fn game_sgf(result: &GameResult, radius: f64, komi: f64) -> String {
+    let mut text = format!(
+        "(;FF[4]GM[VGO]SZ[1]RA[{radius}]KM[{komi}]PL[B]"
+    );
+    for (colour, action) in &result.moves {
+        let tag = match colour {
+            Color::Black => "B",
+            Color::White => "W",
+        };
+        match action {
+            Some(point) => {
+                text.push_str(&format!(";{tag}[{},{}]", point.x, point.y));
+            }
+            None => text.push_str(&format!(";{tag}[]")),
+        }
+    }
+    // Result in SGF's own vocabulary, so a reader knows how the game ended
+    // rather than inferring it from the move count.
+    let outcome = match result.outcome.and_then(|outcome| outcome.winner) {
+        Some(Color::Black) => "B+",
+        Some(Color::White) => "W+",
+        None if result.completed => "0",
+        None => "Void",
+    };
+    text.push_str(&format!("RE[{outcome}])"));
+    text
+}
+
 fn play_game(
     candidate: &BatchedEvaluator,
     opponent: Option<&BatchedEvaluator>,
@@ -156,6 +201,8 @@ fn play_game(
     // Only the last ADJUDICATION_PLIES are needed, so this stays bounded rather
     // than retaining the whole game.
     let mut closing: VecDeque<Position> = VecDeque::with_capacity(ADJUDICATION_PLIES);
+    let record_moves = arguments.sgf_directory.is_some();
+    let mut moves: Vec<(Color, Option<Point>)> = Vec::new();
     let playout = run_playout(
         Position::new(arguments.radius, Vec::new(), Color::Black),
         arguments.maximum_plies,
@@ -183,6 +230,15 @@ fn play_game(
                 closing.pop_front();
             }
             closing.push_back(step.transition.position.clone());
+            if record_moves {
+                moves.push((
+                    step.position.to_move(),
+                    match step.action {
+                        Action::Place(point) => Some(point),
+                        Action::Pass => None,
+                    },
+                ));
+            }
         },
     )?;
     // A game that runs out of plies is awarded by area, the same rule self-play
@@ -198,6 +254,7 @@ fn play_game(
         outcome,
         candidate_color,
         plies: playout.stats.plies,
+        moves,
     })
 }
 
@@ -309,6 +366,27 @@ fn run_match(
         .flatten()
         .collect::<Vec<_>>();
     let elapsed = started.elapsed().as_secs_f64();
+    if let Some(directory) = arguments.sgf_directory.as_ref() {
+        std::fs::create_dir_all(directory)?;
+        // The opponent names the match; no path is the naive player.
+        let label = opponent_path
+            .and_then(|path| path.parent())
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("naive")
+            .to_owned();
+        for (index, result) in results.iter().enumerate() {
+            let seat = match result.candidate_color {
+                Color::Black => "B",
+                Color::White => "W",
+            };
+            let status = if result.completed { "decided" } else { "undecided" };
+            let path = directory.join(format!(
+                "{label}-game{index:03}-cand{seat}-{status}.sgf"
+            ));
+            std::fs::write(path, game_sgf(result, arguments.radius, 0.0))?;
+        }
+    }
     let mut wins = 0_usize;
     let mut losses = 0_usize;
     let mut draws = 0_usize;
