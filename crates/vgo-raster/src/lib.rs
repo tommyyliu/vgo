@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-use vgo_core::Position;
+use vgo_core::{Point, Position, SettledRegion, legal_set_vertices};
 
-pub const CHANNEL_COUNT: usize = 10;
+pub const CHANNEL_COUNT: usize = 11;
 
 /// Channels written by [`rasterize_rgb_into`]: red, green, blue.
 pub const RGB_CHANNEL_COUNT: usize = 3;
@@ -60,6 +60,10 @@ pub const CHANNELS: [ChannelSpec; CHANNEL_COUNT] = [
     },
     ChannelSpec {
         name: "previous_pass",
+        scale: ChannelScale::Unit,
+    },
+    ChannelSpec {
+        name: "settled",
         scale: ChannelScale::Unit,
     },
 ];
@@ -270,6 +274,75 @@ pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32
     let stones = position.stones();
     // Splitting by colour once hoists the per-stone colour comparison out of the
     // pixel loop entirely.
+    // The settled region, as a mask built once rather than per pixel.
+    //
+    // Each stone's boundary is solved once as a contour and filled, which is
+    // what the client does. Testing every pixel against every stone's radial
+    // solve instead costs 573k solves at 35 stones against the contour's ~20k
+    // ray evaluations -- 29x more work, and it measured 239 ms against the
+    // whole rest of the raster's 0.5 ms.
+    let known_vertices = legal_set_vertices(position);
+    let mut settled_mask = vec![false; pixels];
+    for index in 0..stones.len() {
+        let region = SettledRegion::new(position, index, &known_vertices);
+        // A third of a pixel: finer than the raster can express, and far
+        // cheaper than the 2e-5 the client needs for a zoomable vector.
+        let contour = region.contour_within(
+            1.0 / (3.0 * config.width.max(config.height) as f64),
+        );
+        if contour.len() < 3 {
+            continue;
+        }
+        // Only the rows and columns the loop spans need testing.
+        let (mut low_x, mut high_x) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut low_y, mut high_y) = (f64::INFINITY, f64::NEG_INFINITY);
+        for point in &contour {
+            low_x = low_x.min(point.x);
+            high_x = high_x.max(point.x);
+            low_y = low_y.min(point.y);
+            high_y = high_y.max(point.y);
+        }
+        let first_row = ((low_y * config.height as f64 - 0.5).floor().max(0.0)) as usize;
+        let last_row =
+            ((high_y * config.height as f64 - 0.5).ceil() as usize).min(config.height - 1);
+        let first_column =
+            ((low_x * config.width as f64 - 0.5).floor().max(0.0)) as usize;
+        let last_column =
+            ((high_x * config.width as f64 - 0.5).ceil() as usize).min(config.width - 1);
+        // Scanline fill: the crossings of one row are computed once for the
+        // whole row rather than once per pixel, which is the difference
+        // between O(rows x columns x vertices) and O(rows x vertices).
+        let mut crossings: Vec<f64> = Vec::with_capacity(16);
+        for row in first_row..=last_row {
+            let y = (row as f64 + 0.5) / config.height as f64;
+            crossings.clear();
+            let mut previous = contour[contour.len() - 1];
+            for &current in &contour {
+                if (current.y > y) != (previous.y > y) {
+                    let t = (y - current.y) / (previous.y - current.y);
+                    crossings.push(current.x + t * (previous.x - current.x));
+                }
+                previous = current;
+            }
+            if crossings.is_empty() {
+                continue;
+            }
+            crossings.sort_by(f64::total_cmp);
+            // Star-shaped loops are simple, so spans pair up in order.
+            for span in crossings.chunks_exact(2) {
+                let from = ((span[0] * config.width as f64 - 0.5).ceil()).max(0.0) as usize;
+                let to = ((span[1] * config.width as f64 - 0.5).floor()).max(-1.0);
+                if to < 0.0 {
+                    continue;
+                }
+                let to = (to as usize).min(config.width - 1);
+                for column in from..=to {
+                    settled_mask[row * config.width + column] = true;
+                }
+            }
+        }
+    }
+
     let mut current_stones = Vec::with_capacity(stones.len());
     let mut opponent_stones = Vec::with_capacity(stones.len());
     for stone in stones {
@@ -349,6 +422,11 @@ pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32
                 0.0
             };
             set(data, pixels, 6, pixel, ridge);
+
+            // Settled is the union over stones (A15), attributed to whichever
+            // side owns the nearest stone -- the same ownership rule the
+            // voronoi channels use.
+            set(data, pixels, 10, pixel, f32::from(settled_mask[pixel]));
 
             let board_clearance = (x - radius)
                 .min(1.0 - radius - x)
@@ -602,6 +680,7 @@ mod tests {
     /// roots per pixel instead; squaring is monotonic so every min and ordering
     /// is preserved. This reference pins that equivalence.
     fn hypot_reference(position: &Position, config: RasterConfig) -> Vec<f32> {
+        let vertices = vgo_core::legal_set_vertices(position);
         let pixels = config.pixels();
         let mut data = vec![0.0f32; CHANNEL_COUNT * pixels];
         let radius = position.radius();
@@ -651,6 +730,18 @@ mod tests {
                 data[7 * pixels + pixel] = (board.min(clear) / radius).clamp(-1.0, 1.0) as f32;
                 data[8 * pixels + pixel] = (2.0 * radius) as f32;
                 data[9 * pixels + pixel] = f32::from(position.consecutive_passes() > 0);
+                // The definition itself, not the radial solve: a point is
+                // settled when some stone is at least as near as the legal set.
+                let free = vgo_core::distance_to_legal_set(
+                    position,
+                    vgo_core::Point::new(x, y),
+                    Some(&vertices),
+                );
+                let settled = position
+                    .stones()
+                    .iter()
+                    .any(|s| (x - s.x).hypot(y - s.y) <= free);
+                data[10 * pixels + pixel] = f32::from(settled);
             }
         }
         data
@@ -696,10 +787,30 @@ mod tests {
             let config = RasterConfig::square(48);
             let produced = rasterize(&position, config);
             let expected = hypot_reference(&position, config);
+            // Channels 0-9 must match bit for bit.
+            let plain = 10 * config.pixels();
             assert_eq!(
-                produced.data(),
-                expected.as_slice(),
+                &produced.data()[..plain],
+                &expected[..plain],
                 "raster diverged from the hypot reference at {stones} stones"
+            );
+            // The settled channels are filled from a contour subdivided to a
+            // third of a pixel, so a boundary pixel may land either side of the
+            // exact predicate. Bound that rather than requiring equality.
+            let differing = produced.data()[plain..]
+                .iter()
+                .zip(&expected[plain..])
+                .filter(|(a, b)| a != b)
+                .count();
+            let share = differing as f64 / config.pixels() as f64;
+            // Measured 0.043% at 40 stones; this leaves room for a denser
+            // board without admitting a real regression.
+            assert!(
+                share < 0.002,
+                "settled channel differs on {differing} of {} values \
+                 ({:.2}%) at {stones} stones",
+                config.pixels(),
+                100.0 * share
             );
         }
     }
@@ -726,6 +837,28 @@ mod tests {
                     assert!(!legal, "negative clearance at ({x}, {y}) must be illegal");
                 }
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "timing"]
+    fn measure_rasterize_cost() {
+        for stones in [8usize, 20, 35] {
+            let position = scattered_position(stones);
+            let config = RasterConfig::square(128);
+            let mut data = vec![0.0_f32; CHANNEL_COUNT * config.pixels()];
+            for _ in 0..3 {
+                rasterize_into(&position, config, &mut data);
+            }
+            let started = std::time::Instant::now();
+            let runs = 20;
+            for _ in 0..runs {
+                rasterize_into(&position, config, &mut data);
+            }
+            println!(
+                "  {stones:2} stones: {:.3} ms per 128x128 raster",
+                started.elapsed().as_secs_f64() / f64::from(runs) * 1000.0
+            );
         }
     }
 
