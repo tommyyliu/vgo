@@ -2,7 +2,7 @@
 
 use vgo_core::{Point, Position, SettledRegion, legal_set_vertices};
 
-pub const CHANNEL_COUNT: usize = 12;
+pub const CHANNEL_COUNT: usize = 11;
 
 /// Channels written by [`rasterize_rgb_into`]: red, green, blue.
 pub const RGB_CHANNEL_COUNT: usize = 3;
@@ -63,11 +63,7 @@ pub const CHANNELS: [ChannelSpec; CHANNEL_COUNT] = [
         scale: ChannelScale::Unit,
     },
     ChannelSpec {
-        name: "current_settled",
-        scale: ChannelScale::Unit,
-    },
-    ChannelSpec {
-        name: "opponent_settled",
+        name: "settled",
         scale: ChannelScale::Unit,
     },
 ];
@@ -430,17 +426,7 @@ pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32
             // Settled is the union over stones (A15), attributed to whichever
             // side owns the nearest stone -- the same ownership rule the
             // voronoi channels use.
-            let (current_settled, opponent_settled) = if settled_mask[pixel] {
-                if current_distance <= opponent_distance {
-                    (1.0_f32, 0.0_f32)
-                } else {
-                    (0.0_f32, 1.0_f32)
-                }
-            } else {
-                (0.0_f32, 0.0_f32)
-            };
-            set(data, pixels, 10, pixel, current_settled);
-            set(data, pixels, 11, pixel, opponent_settled);
+            set(data, pixels, 10, pixel, f32::from(settled_mask[pixel]));
 
             let board_clearance = (x - radius)
                 .min(1.0 - radius - x)
@@ -755,8 +741,7 @@ mod tests {
                     .stones()
                     .iter()
                     .any(|s| (x - s.x).hypot(y - s.y) <= free);
-                data[10 * pixels + pixel] = f32::from(settled && current <= opponent);
-                data[11 * pixels + pixel] = f32::from(settled && opponent < current);
+                data[10 * pixels + pixel] = f32::from(settled);
             }
         }
         data
@@ -817,14 +802,14 @@ mod tests {
                 .zip(&expected[plain..])
                 .filter(|(a, b)| a != b)
                 .count();
-            let share = differing as f64 / (2.0 * config.pixels() as f64);
+            let share = differing as f64 / config.pixels() as f64;
             // Measured 0.043% at 40 stones; this leaves room for a denser
             // board without admitting a real regression.
             assert!(
                 share < 0.002,
-                "settled channels differ on {differing} of {} values \
+                "settled channel differs on {differing} of {} values \
                  ({:.2}%) at {stones} stones",
-                2 * config.pixels(),
+                config.pixels(),
                 100.0 * share
             );
         }
