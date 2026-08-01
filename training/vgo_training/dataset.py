@@ -35,6 +35,10 @@ V4_POLICY_CAPACITY = 64
 CHANNEL_COUNT = 10
 
 # Built by `cargo build --release -p vgo-raster --example render_shard`.
+# Channel count -> the raster kind that produces it. The shard header records
+# the count, so the kind never has to be configured separately.
+_RASTER_KINDS = {3: "rgb", 5: "compact", 12: "semantic"}
+
 _RUST_RENDERER = (
     Path(__file__).resolve().parents[2] / "target/release/examples/render_shard"
 )
@@ -226,7 +230,13 @@ def _render_states(
     with tempfile.TemporaryDirectory() as directory:
         destination = Path(directory) / "rasters.bin"
         completed = subprocess.run(
-            [str(binary), str(path), str(destination), str(width)],
+            [
+                str(binary),
+                str(path),
+                str(destination),
+                str(width),
+                _RASTER_KINDS[channels],
+            ],
             check=True,
             capture_output=True,
             text=True,

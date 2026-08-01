@@ -5,12 +5,12 @@
 //! implementation that has to agree exactly, which is the drift the v4 format
 //! exists to remove.
 //!
-//!     render_shard <shard.vgo> <out.bin> [resolution]
+//!     render_shard <shard.vgo> <out.bin> [resolution] [kind]
 
 use std::fs;
 
 use vgo_core::{Color, Position, Stone};
-use vgo_raster::{CHANNEL_COUNT, RasterConfig, rasterize_into};
+use vgo_raster::{RasterConfig, RasterKind, rasterize_any_into};
 
 const HEADER: usize = 32;
 const STONE: usize = 8 + 8 + 1;
@@ -29,6 +29,12 @@ fn main() {
     let source = args.next().expect("shard path");
     let destination = args.next().expect("output path");
     let resolution: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(128);
+    // The shard header records how many channels it was written with, and the
+    // kind follows from that -- a caller should not have to repeat it.
+    let kind: RasterKind = args
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(RasterKind::Semantic);
 
     let blob = fs::read(&source).expect("read shard");
     let version = read_u32(&blob, 8);
@@ -55,10 +61,11 @@ fn main() {
          version {version}; the layout changed and this example needs updating"
     );
 
-    let config = RasterConfig::square(resolution);
+    let config = RasterConfig::square_of(resolution, kind);
+    let channels = config.channels();
     let pixels = config.pixels();
-    let mut out = Vec::with_capacity(samples * CHANNEL_COUNT * pixels * 4);
-    let mut data = vec![0.0_f32; CHANNEL_COUNT * pixels];
+    let mut out = Vec::with_capacity(samples * channels * pixels * 4);
+    let mut data = vec![0.0_f32; channels * pixels];
 
     for index in 0..samples {
         let base = HEADER + index * stride;
@@ -77,11 +84,11 @@ fn main() {
             stones.push(Stone::new(read_f64(&blob, at), read_f64(&blob, at + 8), colour));
         }
         let position = Position::new(radius, stones, to_move).with_komi(komi);
-        rasterize_into(&position, config, &mut data);
+        rasterize_any_into(&position, config, &mut data);
         for value in &data {
             out.extend_from_slice(&value.to_le_bytes());
         }
     }
     fs::write(&destination, &out).expect("write rasters");
-    println!("{samples} {CHANNEL_COUNT} {resolution}");
+    println!("{samples} {channels} {resolution}");
 }
