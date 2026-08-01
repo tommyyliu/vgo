@@ -317,6 +317,11 @@ class PipelineConfig:
     resign_threshold: float = 0.0
     resign_window: int = 5
     resign_minimum_ply: int = 0
+    # Uniform per game, in [komi_low, komi_high]. Positive favours White:
+    # scoring is `black - white - komi > 0`.
+    komi_low: float = 0.0
+    komi_high: float = 0.0
+    raster_kind: str = "semantic"
     resign_disable_fraction: float = 0.1
     arena_pairs: int = 16
     arena_simulations: int = 256
@@ -916,6 +921,12 @@ class Pipeline:
             str(config.resign_window),
             "--resign-minimum-ply",
             str(config.resign_minimum_ply),
+            "--komi-low",
+            str(config.komi_low),
+            "--komi-high",
+            str(config.komi_high),
+            "--raster-kind",
+            str(config.raster_kind),
             "--resign-disable-fraction",
             str(config.resign_disable_fraction),
             "--radius",
@@ -2181,6 +2192,27 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
             "concede a game once the side to move has been losing by this much "
             "for --resign-window consecutive plies; 0 disables resignation"
         ),
+    )
+    parser.add_argument(
+        "--komi-low",
+        type=float,
+        default=0.0,
+        help="lowest komi a game may draw; positive favours White",
+    )
+    parser.add_argument(
+        "--komi-high",
+        type=float,
+        default=0.0,
+        help=(
+            "highest komi a game may draw. A range teaches the relationship "
+            "between komi and the position; one value teaches one balance point"
+        ),
+    )
+    parser.add_argument(
+        "--raster-kind",
+        choices=("semantic", "compact", "rgb"),
+        default="semantic",
+        help="channel layout; compact is four channels plus komi",
     )
     parser.add_argument("--resign-window", type=int, default=5)
     parser.add_argument(
