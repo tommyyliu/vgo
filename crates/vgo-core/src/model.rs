@@ -43,6 +43,18 @@ pub struct Position {
     to_move: Color,
     consecutive_passes: u32,
     phase: Phase,
+    /// Area subtracted from Black's lead when the game is scored.
+    ///
+    /// Voronoi area is a fraction of the board, so komi is one too rather than
+    /// a stone count: 0.18 means White is spotted eighteen percent of the
+    /// board. Measured on games played to the ply cap, Black led by a median
+    /// of 0.181 and won twelve of thirteen, so an unbalanced game is close to
+    /// decided before either side moves.
+    ///
+    /// Part of the position because it changes who won: the same stones under
+    /// different komi score differently, so a search, a shard, and a model
+    /// that disagree about it are not playing the same game.
+    komi: f64,
 }
 
 impl Position {
@@ -54,7 +66,20 @@ impl Position {
             to_move,
             consecutive_passes: 0,
             phase: Phase::Playing,
+            komi: 0.0,
         }
+    }
+
+    /// The same position scored with `komi` subtracted from Black's lead.
+    #[must_use]
+    pub fn with_komi(mut self, komi: f64) -> Self {
+        self.komi = komi;
+        self
+    }
+
+    #[must_use]
+    pub const fn komi(&self) -> f64 {
+        self.komi
     }
 
     #[must_use]
@@ -128,6 +153,8 @@ impl Position {
             to_move: self.to_move.other(),
             consecutive_passes: 0,
             phase: Phase::Playing,
+            // Carried, not reset: komi belongs to the game, not the ply.
+            komi: self.komi,
         }
     }
 
@@ -148,6 +175,7 @@ impl Position {
             } else {
                 Phase::Playing
             },
+            komi: self.komi,
         }
     }
 }
