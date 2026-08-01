@@ -586,7 +586,11 @@ class BatchStager:
         host = (
             torch.empty(
                 (batch, channels, height, width),
-                dtype=torch.float32,
+                # Matches the dataset, which stores rasters half. index_select
+                # writes straight into this buffer and requires the same scalar
+                # type; keeping it half also halves the pinned staging and the
+                # host-to-device copy.
+                dtype=torch.float16,
                 pin_memory=pin,
             ),
             torch.empty((batch, policy_size), dtype=torch.float32, pin_memory=pin),
