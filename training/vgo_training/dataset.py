@@ -7,6 +7,9 @@ import hashlib
 import json
 import struct
 
+import subprocess
+import tempfile
+
 import numpy as np
 import torch
 
@@ -30,6 +33,11 @@ REPLAY_VERSIONS = (1, 2, 3, 4, 5)
 V4_STONE_CAPACITY = 128
 V4_POLICY_CAPACITY = 64
 CHANNEL_COUNT = 10
+
+# Built by `cargo build --release -p vgo-raster --example render_shard`.
+_RUST_RENDERER = (
+    Path(__file__).resolve().parents[2] / "target/release/examples/render_shard"
+)
 HEADER = struct.Struct("<8s6I")
 
 
@@ -184,6 +192,54 @@ def _load_legacy(
         zeros.copy(),
         zeros.copy(),
     )
+
+
+def _render_states(
+    path: Path,
+    records: np.ndarray,
+    channels: int,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """Renders a shard's positions, preferring the Rust rasterizer.
+
+    `rasterize_records` below is a hand-kept NumPy port of `rasterize_into`.
+    That was affordable while every channel was a closed-form function of
+    stone distances. It stopped being so once `settled` arrived: it is a
+    radial contour solve over the legal set, and a second implementation of
+    that geometry would have to agree exactly, which is the drift the position
+    format exists to remove.
+
+    So when the Rust renderer is available and the caller wants channels the
+    port does not implement, shell out to it. The port still serves the ten
+    channels it was written for, which keeps older runs loading unchanged.
+    """
+    if channels == CHANNEL_COUNT:
+        return rasterize_records(records, channels, height, width)
+    binary = _RUST_RENDERER
+    if not binary.exists():
+        raise ValueError(
+            f"{channels} channels needs the Rust rasterizer at {binary}; "
+            "build it with "
+            "`cargo build --release -p vgo-raster --example render_shard`"
+        )
+    with tempfile.TemporaryDirectory() as directory:
+        destination = Path(directory) / "rasters.bin"
+        completed = subprocess.run(
+            [str(binary), str(path), str(destination), str(width)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        produced = completed.stdout.split()
+        if len(produced) != 3 or int(produced[1]) != channels:
+            raise ValueError(
+                f"renderer produced {completed.stdout.strip()!r}, expected "
+                f"{len(records)} {channels} {width}"
+            )
+        return np.fromfile(destination, dtype="<f4").reshape(
+            len(records), channels, height, width
+        )
 
 
 def rasterize_records(
@@ -418,7 +474,7 @@ def _load_replay_v4(
     if int(np.asarray(records["stone_count"]).max(initial=0)) > V4_STONE_CAPACITY:
         raise ValueError("replay record claims more stones than the capacity")
 
-    states = rasterize_records(records, channels, height, width)
+    states = _render_states(path, records, channels, height, width)
     policies, masks, visits, beta, proposal_counts = _expand_sparse_policy(
         records, samples, policy_size
     )
