@@ -15,7 +15,7 @@ use std::{
 
 use clap::{ArgAction, Parser};
 use sha2::{Digest, Sha256};
-use vgo_core::{Color, Position};
+use vgo_core::{Analysis, Color, Position};
 use vgo_inference::{
     BatchedEvaluator, BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, OnnxBatchService,
     OnnxProvider, OnnxServiceConfig,
@@ -645,7 +645,18 @@ fn generate_game(
             passes: playout.stats.passes,
             self_captures: playout.stats.self_captures,
             black_utility: black_value,
-            margin: outcome.margin,
+            // The board margin, not `outcome.margin`: a resignation reports a
+            // real winner but leaves the margin at zero, since no area was
+            // scored. Recomputing it from the final position is what makes a
+            // resigned game reviewable -- it says how far behind the conceding
+            // side actually was, which is the only way to judge the rule.
+            margin: {
+                let analysis = Analysis::new(&playout.final_position);
+                (analysis.score.black
+                    - analysis.score.white
+                    - playout.final_position.komi())
+                .abs()
+            },
             reached_ply_cap: playout.outcome.is_none(),
             resigned: playout.resigned,
             // Filled by the writer, which owns the shard-relative offset.

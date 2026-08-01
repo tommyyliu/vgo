@@ -1581,7 +1581,64 @@ class Pipeline:
             int(report["through_shard"]),
         )
         self._save_state()
+        self._report_resign_calibration()
         return model if accepted else None
+
+    def _report_resign_calibration(self) -> None:
+        """Pool the resignation counterfactual over the active replay window.
+
+        Each shard measures the rule on the ~10% of games exempt from it -- the
+        only games whose true result is known independently of the rule, since a
+        conceded game's outcome was assigned by the thing under test. But a
+        shard holds ~25 exempt games of which ~13 fire, so a single shard's
+        false-positive rate is nearly meaningless: measured across 30 shards it
+        ranged 0% to 33% with a median of 8%, while the pooled rate was 9.7%.
+
+        Pooling over the window is what makes it readable, and printing it each
+        update is what makes it noticed -- the per-shard blocks have been
+        written since the run began and nothing ever read them.
+        """
+
+        totals: dict[float, list[int]] = {}
+        for replay in self.state.replay[-self.config.replay_window :]:
+            if int(replay.get("sequence", -1)) < 0:
+                continue
+            try:
+                manifest = json.loads(
+                    Path(str(replay["manifest"])).read_text(encoding="utf-8")
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            for entry in manifest.get("resign_calibration", ()):
+                try:
+                    bucket = totals.setdefault(float(entry["threshold"]), [0, 0, 0])
+                    bucket[0] += int(entry["games"])
+                    bucket[1] += int(entry["fired"])
+                    bucket[2] += int(entry["wrong"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+        if not totals:
+            return
+
+        live = float(self.config.resign_threshold)
+        parts = []
+        for threshold in sorted(totals):
+            games, fired, wrong = totals[threshold]
+            if not fired:
+                continue
+            marker = "*" if abs(threshold - live) < 1e-9 else ""
+            parts.append(
+                f"{marker}{threshold:g}:{100 * wrong / fired:.0f}%({wrong}/{fired})"
+            )
+        if not parts:
+            return
+        exempt = max(entry[0] for entry in totals.values())
+        print(
+            f"[resign] window of {len(self.state.replay[-self.config.replay_window :])} "
+            f"shards, {exempt} exempt games; false positives by threshold "
+            f"({' '.join(parts)}); * is live",
+            flush=True,
+        )
 
     async def _learn_and_publish(
         self,
