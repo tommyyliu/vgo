@@ -25,7 +25,10 @@ pub(crate) const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
 // both variable-length parts carry a capacity and a live count. Measured on
 // ddrnet-pipe generations: at most 88 stones (bounded by --max-plies) and at
 // most 47 of 16385 policy cells nonzero, mean 31.6.
-pub(crate) const REPLAY_VERSION: u32 = 4;
+// v5 adds komi to each record. It is part of the position -- the same stones
+// under different komi have different winners -- so a shard that omits it
+// cannot reconstruct the game it stored.
+pub(crate) const REPLAY_VERSION: u32 = 5;
 
 /// Stones a v4 record can hold. One stone per ply at most, and the longest
 /// observed game was 88 plies.
@@ -339,6 +342,7 @@ fn write_sample(writer: &mut impl Write, sample: &LabeledSample) -> io::Result<(
         ));
     }
     write_f64(writer, position.radius())?;
+    write_f64(writer, position.komi())?;
     writer.write_all(&[color_code(position.to_move())])?;
     writer.write_all(&position.consecutive_passes().to_le_bytes())?;
     writer.write_all(&[phase_code(position)])?;
@@ -477,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn streams_exactly_the_advertised_v4_records_and_hashes_them() {
+    fn streams_exactly_the_advertised_v5_records_and_hashes_them() {
         let directory = TestDirectory::create();
         let path = directory.0.join("dataset.vgo");
         let raster = RasterConfig::square(2);
@@ -506,10 +510,11 @@ mod tests {
         assert!(!temporary_path(&path).exists());
 
         let bytes = fs::read(&path).expect("read replay");
-        // A v4 record is the position at STONE_CAPACITY, the sparse policy at
+        // A v5 record is the position at STONE_CAPACITY, the sparse policy at
         // POLICY_CAPACITY, and the trailing scalars -- fixed size regardless of
-        // how many stones or cells are actually live.
-        let position_bytes = 8 + 1 + 4 + 1 + 4 + STONE_CAPACITY * (8 + 8 + 1);
+        // how many stones or cells are actually live. The leading f64s are
+        // radius and komi.
+        let position_bytes = 8 + 8 + 1 + 4 + 1 + 4 + STONE_CAPACITY * (8 + 8 + 1);
         let policy_bytes = 4 + POLICY_CAPACITY * (4 * 4 + 4);
         let record_bytes = position_bytes + policy_bytes + 28;
         assert_eq!(bytes.len(), 32 + 3 * record_bytes);

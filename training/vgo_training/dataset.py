@@ -20,8 +20,8 @@ REPLAY_MAGIC = b"VGORPLY1"
 #
 # Older records synthesize unavailable fields so replay windows can span schema
 # versions. REPLAY_VERSION is the version the current generator writes.
-REPLAY_VERSION = 4
-REPLAY_VERSIONS = (1, 2, 3, 4)
+REPLAY_VERSION = 5
+REPLAY_VERSIONS = (1, 2, 3, 4, 5)
 
 # v4 stores the position and a sparse policy instead of a rendered raster.
 # These capacities are the writer's, in crates/vgo-selfplay/src/replay_stream.rs,
@@ -306,7 +306,7 @@ def rasterize_records(
     return out.reshape(samples, CHANNEL_COUNT * height * width)
 
 
-def _v4_record_dtype(policy_size: int) -> np.dtype:
+def _v4_record_dtype(policy_size: int, version: int = REPLAY_VERSION) -> np.dtype:
     """Fixed-size v4 record: position, sparse policy, scalars.
 
     Both variable-length parts pad to a capacity so records stay memory-mappable;
@@ -316,6 +316,12 @@ def _v4_record_dtype(policy_size: int) -> np.dtype:
     return np.dtype(
         [
             ("radius", "<f8"),
+            *(
+                # v5 onward. Part of the position: the same stones under
+                # different komi have different winners, so a v4 shard read
+                # with this field would misparse every record after it.
+                [("komi", "<f8")] if version >= 5 else []
+            ),
             ("to_move", "u1"),
             ("consecutive_passes", "<u4"),
             ("phase", "u1"),
@@ -392,6 +398,7 @@ def _load_replay_v4(
     height: int,
     width: int,
     policy_size: int,
+    version: int = REPLAY_VERSION,
 ) -> tuple[np.ndarray, ...]:
     """Loads a position shard, rendering each state at load time.
 
@@ -399,7 +406,7 @@ def _load_replay_v4(
     produced here and the layout is a training-time choice rather than a
     property of the data -- see docs/POSITION_SHARDS.md.
     """
-    record_dtype = _v4_record_dtype(policy_size)
+    record_dtype = _v4_record_dtype(policy_size, version)
     expected_bytes = HEADER.size + samples * record_dtype.itemsize
     if path.stat().st_size != expected_bytes:
         raise ValueError(
@@ -508,7 +515,7 @@ def load_dataset(path: str | Path) -> RasterDataset:
         _validate_manifest(path)
         if version >= 4:
             arrays = _load_replay_v4(
-                path, samples, channels, height, width, policy_size
+                path, samples, channels, height, width, policy_size, version
             )
         else:
             arrays = _load_replay(

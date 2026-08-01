@@ -158,6 +158,15 @@ struct Config {
     /// have been wrong, so a run that resigns should always keep some.
     #[arg(long, default_value_t = 0.1)]
     resign_disable_fraction: f64,
+    /// Lowest komi a game may be given. Komi is a fraction of the board, and
+    /// positive favours White: scoring is `black - white - komi > 0`.
+    #[arg(long, default_value_t = 0.0)]
+    komi_low: f64,
+    /// Highest komi a game may be given; each game draws uniformly from the
+    /// range. A single value teaches one balance point, a range teaches the
+    /// relationship, which is what lets one model play at any komi.
+    #[arg(long, default_value_t = 0.0)]
+    komi_high: f64,
     #[arg(long, default_value_t = 1.0 / 6.0)]
     radius: f64,
     #[arg(long, default_value_t = 50_001)]
@@ -312,6 +321,34 @@ fn resign_exempt(game_seed: u64, fraction: f64) -> bool {
     (value >> 11) as f64 / (1_u64 << 53) as f64 <= fraction
 }
 
+/// A uniform draw in `[0, 1)` from a game seed.
+///
+/// Shares `resign_exempt`'s SplitMix64 finalizer but with a different constant,
+/// so a game's komi and its exemption are independent -- reusing the stream
+/// would correlate the two and make every exempt game share a komi.
+fn seeded_unit(game_seed: u64) -> f64 {
+    let mut value = game_seed ^ 0x2545_f491_4f6c_dd1d;
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    (value >> 11) as f64 / (1_u64 << 53) as f64
+}
+
+/// Komi for one game, drawn uniformly from `[low, high]`.
+///
+/// Varying it across games is what lets one model play at any komi: a net shown
+/// a single value learns that value's balance rather than the relationship. It
+/// also spreads the training distribution over positions that are close under
+/// *some* komi, which a fixed value cannot do.
+fn sampled_komi(game_seed: u64, low: f64, high: f64) -> f64 {
+    if !(low.is_finite() && high.is_finite()) || high <= low {
+        return low.max(0.0).min(high.max(0.0));
+    }
+    low + seeded_unit(game_seed) * (high - low)
+}
+
 fn policy_target(result: &SearchResult, config: RasterConfig) -> PolicyTarget {
     let size = config.pixels() + 1;
     let mut policy = vec![0.0_f32; size];
@@ -445,7 +482,8 @@ fn generate_game(
         ResignRule::disabled()
     };
     let playout = run_playout_with_resignation(
-        Position::new(config.radius, Vec::new(), Color::Black),
+        Position::new(config.radius, Vec::new(), Color::Black)
+            .with_komi(sampled_komi(game_seed, config.komi_low, config.komi_high)),
         config.maximum_plies,
         resign,
         |position, ply| {
@@ -510,10 +548,15 @@ fn generate_game(
         }
     };
     let black_value = outcome.black_utility() as f32;
-    // Measured before `pending` is consumed below. Only exempt games can
-    // calibrate: a game the rule already ended cannot say whether ending it was
-    // right, and a resigned game's outcome was assigned by the rule under test.
-    let calibration = if exempt_from_resignation && !playout.resigned {
+    // Measured before `pending` is consumed below. Only a game the rule did
+    // not end can calibrate it: a resigned game's outcome was assigned by the
+    // rule under test, so asking whether resigning was right is circular.
+    //
+    // With resignation disabled entirely every game qualifies, which is how to
+    // measure the false-positive rate on the whole population rather than on
+    // the 10% held out -- the held-out sample is what the threshold is normally
+    // tuned from, but it is small and it is not the games that actually resign.
+    let calibration = if !playout.resigned {
         calibration_trials(&pending, config.resign_window, black_value > 0.0)
     } else {
         Vec::new()
