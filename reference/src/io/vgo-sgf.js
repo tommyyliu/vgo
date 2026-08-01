@@ -3,8 +3,20 @@
 
   const model = root.VGO.model;
 
+  // Shortest string that parses back to the identical double, which is what
+  // `String` on a number gives. Not a fixed decimal count: legality here turns
+  // on differences of 1e-6 (SNAP_MARGIN) and 1e-7 (coordinateEpsilon), and
+  // `toFixed(5)` moves a stone by up to 7.1e-6 -- enough to turn a legal
+  // position into an overlapping one on reload, and enough that a saved game
+  // could not be used to diagnose one.
+  //
+  // Two stalled games were undiagnosable for exactly this reason: every
+  // apparent overlap in the saved position was smaller than the rounding that
+  // produced it, so the file could not distinguish a real defect from its own
+  // artefact. Ordinary coordinates stay short -- 0.5 prints as "0.5" -- and
+  // only values that genuinely need the digits get them.
   function format(value) {
-    return Number(value).toFixed(5);
+    return String(Number(value));
   }
 
   function serialize(position) {
