@@ -150,6 +150,7 @@ class ReplayCacheTests(unittest.TestCase):
                 width=window.width,
                 policy_size=window.policy_size,
                 device=torch.device("cpu"),
+                state_dtype=window.shards[0].dataset.states.dtype,
             )
             pointers = []
             samples = 0

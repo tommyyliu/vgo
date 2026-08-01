@@ -556,8 +556,13 @@ class BatchStager:
         width: int,
         policy_size: int,
         device: torch.device,
+        state_dtype: torch.dtype,
     ) -> None:
         self.batch_size = batch_size
+        # index_select writes straight into the staging buffer and requires the
+        # same scalar type, so this follows the dataset rather than assuming
+        # one. Shards load half; a caller holding float32 states says so.
+        self.state_dtype = state_dtype
         self.shape = (channels, height, width, policy_size)
         self.device_name = str(device)
         self.device = device
@@ -586,11 +591,7 @@ class BatchStager:
         host = (
             torch.empty(
                 (batch, channels, height, width),
-                # Matches the dataset, which stores rasters half. index_select
-                # writes straight into this buffer and requires the same scalar
-                # type; keeping it half also halves the pinned staging and the
-                # host-to-device copy.
-                dtype=torch.float16,
+                dtype=self.state_dtype,
                 pin_memory=pin,
             ),
             torch.empty((batch, policy_size), dtype=torch.float32, pin_memory=pin),
@@ -613,11 +614,15 @@ class BatchStager:
         width: int,
         policy_size: int,
         device: torch.device,
+        state_dtype: torch.dtype,
     ) -> bool:
         return (
             self.batch_size == batch_size
             and self.shape == (channels, height, width, policy_size)
             and self.device_name == str(device)
+            # A cached stager whose buffers are the wrong scalar type would
+            # fail on the first index_select rather than be rebuilt.
+            and self.state_dtype == state_dtype
             and not self._closed
         )
 
@@ -1082,6 +1087,9 @@ class PersistentLearner:
             "width": window.width,
             "policy_size": window.policy_size,
             "device": self._device,
+            # The window is a set of shards, not one tensor; every shard is
+            # rendered the same way, so the first one's dtype speaks for all.
+            "state_dtype": window.shards[0].dataset.states.dtype,
         }
         if self._stager is not None and self._stager.compatible(**arguments):
             return self._stager, True
