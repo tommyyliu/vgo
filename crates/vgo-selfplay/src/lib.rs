@@ -75,6 +75,39 @@ pub fn adjudicate_positions(
         margin: 0.0,
     })
 }
+/// Awards a truncated game on its final position alone.
+///
+/// [`adjudicate_positions`] can refuse -- on a margin, or on the lead changing
+/// inside its window -- and a refused game is discarded. That is the right
+/// trade for self-play, where a mislabelled game teaches the wrong thing and
+/// throwing one away costs only its samples.
+///
+/// It is the wrong trade for rating. A refused arena game is not a discarded
+/// sample, it is a missing result: twelve games between two close models
+/// produced three usable outcomes, because nine ended inside the 0.10 margin.
+/// Rating two similar models is exactly the case where the margin rejects
+/// everything, and a run whose komi balances the game makes that the norm
+/// rather than the exception.
+///
+/// Voronoi area is continuous and totals 1.0, so an exact tie is measure-zero.
+/// The final position is enough to name a winner, and a hundred-odd plies is
+/// far past the point where the board is decided.
+#[must_use]
+pub fn award_by_area(position: &Position) -> Outcome {
+    let analysis = Analysis::new(position);
+    let delta = analysis.score.black - analysis.score.white - position.komi();
+    Outcome {
+        winner: if delta.abs() <= f64::EPSILON {
+            None
+        } else if delta > 0.0 {
+            Some(Color::Black)
+        } else {
+            Some(Color::White)
+        },
+        margin: delta.abs(),
+    }
+}
+
 use vgo_search::{Action, SearchResult, SearchStats};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

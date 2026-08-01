@@ -55,6 +55,8 @@ pub(crate) struct LabeledSample {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GameWrite {
+    /// Shard-relative offset of this game's first record.
+    pub(crate) first_sample: usize,
     pub(crate) samples_written: usize,
     pub(crate) samples_truncated: usize,
 }
@@ -176,6 +178,10 @@ impl ReplayStream {
     }
 
     pub(crate) fn write_game(&mut self, samples: Vec<LabeledSample>) -> io::Result<GameWrite> {
+        // The offset this game's records start at, captured before any are
+        // written. This is the join key back into the dataset, and it is the
+        // one thing the writer knows that the caller cannot.
+        let first_sample = self.samples_written;
         let remaining = self.target_samples - self.samples_written;
         let to_write = remaining.min(samples.len());
         let truncated = samples.len() - to_write;
@@ -199,6 +205,7 @@ impl ReplayStream {
         }
         self.write_time += started.elapsed();
         Ok(GameWrite {
+            first_sample,
             samples_written: to_write,
             samples_truncated: truncated,
         })

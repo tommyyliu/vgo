@@ -19,10 +19,7 @@ use vgo_inference::{
 };
 use vgo_raster::{RasterConfig, RasterKind};
 use vgo_search::{Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, search_with_evaluator};
-use vgo_selfplay::{
-    ADJUDICATION_MARGIN, ADJUDICATION_PLIES, adjudicate_positions,
-    play_game as run_playout,
-};
+use vgo_selfplay::{ADJUDICATION_PLIES, award_by_area, play_game as run_playout};
 
 #[derive(Debug, Parser)]
 #[command(about = "Run a color-swapped held-out arena for an ONNX candidate")]
@@ -179,11 +176,13 @@ fn game_sgf(result: &GameResult, radius: f64, komi: f64) -> String {
     }
     // Result in SGF's own vocabulary, so a reader knows how the game ended
     // rather than inferring it from the move count.
-    let outcome = match result.outcome.and_then(|outcome| outcome.winner) {
-        Some(Color::Black) => "B+",
-        Some(Color::White) => "W+",
-        None if result.completed => "0",
-        None => "Void",
+    let outcome = match result.outcome {
+        Some(outcome) => match outcome.winner {
+            Some(Color::Black) => format!("B+{:.3}", outcome.margin),
+            Some(Color::White) => format!("W+{:.3}", outcome.margin),
+            None => "0".to_owned(),
+        },
+        None => "Void".to_owned(),
     };
     text.push_str(&format!("RE[{outcome}])"));
     text
@@ -245,10 +244,12 @@ fn play_game(
     // uses. Discarding it instead is not neutral: at a 100-ply cap 69% of arena
     // games went undecided, and the ones that survive are those that resolve
     // quickly, which reflects playing style rather than strength.
-    let outcome = playout.outcome.or_else(|| {
-        let positions: Vec<_> = closing.iter().cloned().collect();
-        adjudicate_positions(&positions, ADJUDICATION_PLIES, ADJUDICATION_MARGIN)
-    });
+    // A rating pass cannot afford to refuse: a discarded arena game is a
+    // missing result, not a lost sample, and the games it refuses are exactly
+    // the close ones between similar models that a rating most needs.
+    let outcome = playout
+        .outcome
+        .or_else(|| closing.back().map(award_by_area));
     Ok(GameResult {
         completed: outcome.is_some(),
         outcome,
@@ -380,7 +381,14 @@ fn run_match(
                 Color::Black => "B",
                 Color::White => "W",
             };
-            let status = if result.completed { "decided" } else { "undecided" };
+            // Every game is decided now, so "decided" says nothing. What is
+            // worth finding in a directory listing is which games stalled to
+            // the cap rather than ending on their own.
+            let status = if result.plies >= arguments.maximum_plies {
+                "capped"
+            } else {
+                "natural"
+            };
             let path = directory.join(format!(
                 "{label}-game{index:03}-cand{seat}-{status}.sgf"
             ));
@@ -393,8 +401,15 @@ fn run_match(
     let mut completed = 0_usize;
     let mut points = 0.0;
     let mut plies = 0_u64;
+    // Games that ran out of plies rather than ending on their own. A hundred
+    // plies is far past where the board settles, so a high share means the
+    // sides are stalling rather than that the game is long.
+    let mut capped = 0_usize;
     for result in &results {
         plies += u64::from(result.plies);
+        if result.plies >= arguments.maximum_plies {
+            capped += 1;
+        }
         if !result.completed {
             continue;
         }
@@ -451,6 +466,7 @@ fn run_match(
             "  \"games\": {},\n",
             "  \"completed\": {},\n",
             "  \"truncated\": {},\n",
+            "  \"reached_ply_cap\": {},\n",
             "  \"candidate_wins\": {},\n",
             "  \"candidate_losses\": {},\n",
             "  \"draws\": {},\n",
@@ -474,6 +490,7 @@ fn run_match(
         games,
         completed,
         games - completed,
+        capped,
         wins,
         losses,
         draws,

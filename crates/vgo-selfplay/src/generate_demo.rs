@@ -20,12 +20,15 @@ use vgo_inference::{
     BatchedEvaluator, BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, OnnxBatchService,
     OnnxProvider, OnnxServiceConfig,
 };
-use vgo_raster::{CHANNELS, RasterConfig, RasterKind, SemanticRaster, action_pixel};
+use vgo_raster::{
+    CHANNELS, COMPACT_CHANNELS, ChannelSpec, RasterConfig, RasterKind, SemanticRaster,
+    action_pixel,
+};
 use vgo_search::{
     Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, SearchResult, search_at_ply,
 };
 use vgo_selfplay::{
-    ADJUDICATION_MARGIN, ADJUDICATION_PLIES, ResignRule, adjudicate_positions,
+    ResignRule, award_by_area,
     play_game_with_resignation as run_playout_with_resignation,
 };
 
@@ -62,6 +65,10 @@ impl std::str::FromStr for GenerationRuntime {
     }
 }
 
+/// Buckets spanning the configured komi range. Eight over [-0.1, 0.2] gives
+/// 0.0375-wide buckets and ~170 games each per sixteen-shard window.
+const KOMI_BUCKETS: usize = 8;
+
 struct PendingSample {
     position: Position,
     root_black_value: f64,
@@ -77,9 +84,48 @@ struct PendingSample {
     seed: u64,
 }
 
+/// One game's outcome, written to a sidecar rather than into the replay.
+///
+/// The replay record is a training tensor: position, policy, value, and nothing
+/// that identifies which game it came from. Game-level facts -- the komi it was
+/// played at, how it ended, by how much -- have no place there, and replicating
+/// them across every position of a game would pay 72x for one number.
+///
+/// `first_sample` and `sample_count` are the join back: they name the record
+/// range this game produced, which is what lets a later question condition
+/// position-level data on a game-level outcome. They cannot be reconstructed
+/// after the fact, so they are written even though nothing reads them yet.
+#[derive(Clone, Copy, Debug)]
+struct GameRecord {
+    game: u64,
+    komi: f64,
+    plies: u32,
+    /// Passes and no-op self-captures, which are how a stalled game passes the
+    /// time. A capped game with many of either is stalling, not playing long.
+    passes: u64,
+    self_captures: u64,
+    /// Black-relative: +1 Black, -1 White, 0 tie.
+    black_utility: f32,
+    /// Area margin, always non-negative.
+    margin: f64,
+    reached_ply_cap: bool,
+    resigned: bool,
+    first_sample: usize,
+    sample_count: usize,
+}
+
 struct GameSamples {
     samples: Vec<LabeledSample>,
+    /// This game's outcome, absent only when it produced no samples.
+    record: Option<GameRecord>,
     completed: bool,
+    /// The game ran out of plies rather than ending on its own.
+    ///
+    /// Worth tracking on its own: a hundred plies is far past where the board
+    /// settles, so a high share means the sides are stalling rather than that
+    /// the game is genuinely long. It was 88% among games containing a run of
+    /// no-op self-captures and 0% among games without one.
+    reached_ply_cap: bool,
     /// Counterfactual resignation outcomes for this game, one entry per
     /// candidate threshold. Only produced for games exempt from resignation,
     /// which are the only ones whose true result is known independently of the
@@ -537,16 +583,19 @@ fn generate_game(
                 .iter()
                 .map(|sample| sample.position.clone())
                 .collect();
-            match adjudicate_positions(
-                &closing,
-                ADJUDICATION_PLIES,
-                ADJUDICATION_MARGIN,
-            ) {
-                Some(outcome) => outcome,
+            // A game at the ply cap is decided on its final position rather
+            // than discarded. A hundred plies is far past where the board
+            // settles, and the margin was rejecting close games -- which are
+            // the ones a balanced komi produces, so refusing them threw away
+            // exactly the positions the run is trying to learn from.
+            match closing.last() {
+                Some(position) => award_by_area(position),
                 None => {
                     return Ok(GameSamples {
                         samples: Vec::new(),
+                        record: None,
                         completed: false,
+                        reached_ply_cap: true,
                         calibration: Vec::new(),
                     });
                 }
@@ -587,9 +636,25 @@ fn generate_game(
             seed: sample.seed,
         })
         .collect();
+    let samples: Vec<LabeledSample> = samples;
     Ok(GameSamples {
+        record: Some(GameRecord {
+            game: game_index,
+            komi: playout.final_position.komi(),
+            plies: playout.stats.plies,
+            passes: playout.stats.passes,
+            self_captures: playout.stats.self_captures,
+            black_utility: black_value,
+            margin: outcome.margin,
+            reached_ply_cap: playout.outcome.is_none(),
+            resigned: playout.resigned,
+            // Filled by the writer, which owns the shard-relative offset.
+            first_sample: 0,
+            sample_count: samples.len(),
+        }),
         samples,
         completed: true,
+        reached_ply_cap: playout.outcome.is_none(),
         calibration,
     })
 }
@@ -676,6 +741,10 @@ impl Drop for ActorPool {
 }
 
 struct GenerationReport {
+    /// Games that ran out of plies rather than ending on their own.
+    capped_games: usize,
+    /// One row per game that reached the dataset, written to a sidecar.
+    game_records: Vec<GameRecord>,
     replay: PublishedReplay,
     completed_games: usize,
     discarded_games: usize,
@@ -803,6 +872,8 @@ fn generate_to_dataset(
 
     let mut completed_games = 0_usize;
     let mut discarded_games = 0_usize;
+    let mut capped_games = 0_usize;
+    let mut game_records: Vec<GameRecord> = Vec::new();
     // threshold bits -> (games measured, would have fired, would have been
     // wrong, plies that would have been saved)
     let mut calibration_totals: std::collections::BTreeMap<u64, (u32, u32, u32, u64)> =
@@ -837,6 +908,9 @@ fn generate_to_dataset(
             entry.2 += u32::from(trial.wrong);
             entry.3 += u64::from(trial.plies_saved);
         }
+        if game.reached_ply_cap {
+            capped_games += 1;
+        }
         if game.completed {
             completed_games += 1;
             samples_generated_by_received_games =
@@ -844,6 +918,14 @@ fn generate_to_dataset(
             let written = replay.write_game(game.samples)?;
             serialization_truncated_samples =
                 serialization_truncated_samples.saturating_add(written.samples_truncated);
+            // Only games that reached the dataset get a row, and the row
+            // describes what was actually written: a game cut at the sample
+            // boundary contributed fewer records than it played.
+            if let Some(mut record) = game.record {
+                record.first_sample = written.first_sample;
+                record.sample_count = written.samples_written;
+                game_records.push(record);
+            }
         } else {
             discarded_games += 1;
         }
@@ -871,6 +953,8 @@ fn generate_to_dataset(
         replay: published,
         completed_games,
         discarded_games,
+        capped_games,
+        game_records,
         calibration: calibration_totals
             .into_iter()
             .map(|(bits, (measured, fired, wrong, saved))| {
@@ -894,6 +978,101 @@ fn generate_to_dataset(
         summed_game_time,
         wall_time: started.elapsed(),
     })
+}
+
+/// Writes one JSON object per game to `games.jsonl`.
+///
+/// JSONL rather than a field on the replay record: ~85 games against 6144
+/// positions, so the file is a rounding error next to the dataset, and new
+/// fields can be added later without a `replay_version` bump or a dtype change
+/// on the training path.
+fn write_game_records(path: &Path, records: &[GameRecord]) -> std::io::Result<()> {
+    let temporary = path.with_extension("jsonl.tmp");
+    let mut writer = BufWriter::new(File::create(&temporary)?);
+    for record in records {
+        writeln!(
+            writer,
+            concat!(
+                r#"{{"game":{},"komi":{:.6},"plies":{},"passes":{},"#,
+                r#""self_captures":{},"black_utility":{},"margin":{:.6},"#,
+                r#""reached_ply_cap":{},"resigned":{},"#,
+                r#""first_sample":{},"sample_count":{}}}"#
+            ),
+            record.game,
+            record.komi,
+            record.plies,
+            record.passes,
+            record.self_captures,
+            record.black_utility,
+            record.margin,
+            record.reached_ply_cap,
+            record.resigned,
+            record.first_sample,
+            record.sample_count,
+        )?;
+    }
+    writer.flush()?;
+    drop(writer);
+    std::fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+/// Black's results bucketed over the configured komi range.
+///
+/// Fixed edges from the configuration rather than from the observed data, so
+/// buckets line up across shards and can be summed over a replay window. That
+/// pooling is not optional: a shard holds ~85 games, so a single shard's
+/// buckets hold ~10 games each and the binomial interval on 5/10 spans roughly
+/// [19%, 81%] -- noise. A window of sixteen shards is the smallest honest unit.
+fn komi_buckets(records: &[GameRecord], low: f64, high: f64, count: usize) -> Vec<String> {
+    let width = (high - low) / count as f64;
+    (0..count)
+        .map(|index| {
+            let start = low + width * index as f64;
+            let end = if index + 1 == count { high } else { start + width };
+            let mut games = 0_usize;
+            let mut black = 0_usize;
+            let mut ties = 0_usize;
+            let mut margins: Vec<f64> = Vec::new();
+            for record in records {
+                // Half-open, with the top bucket closed so `high` itself lands.
+                let inside = record.komi >= start
+                    && (record.komi < end || (index + 1 == count && record.komi <= end));
+                if !inside {
+                    continue;
+                }
+                games += 1;
+                if record.black_utility > 0.0 {
+                    black += 1;
+                } else if record.black_utility == 0.0 {
+                    ties += 1;
+                }
+                // Signed toward Black, so the median crosses zero at the same
+                // komi the winrate crosses 50% -- a gap between those two
+                // crossings is the model's seat asymmetry, not the game's.
+                margins.push(if record.black_utility >= 0.0 {
+                    record.margin
+                } else {
+                    -record.margin
+                });
+            }
+            margins.sort_by(|a, b| a.partial_cmp(b).expect("finite margins"));
+            let median = if margins.is_empty() {
+                0.0
+            } else if margins.len() % 2 == 1 {
+                margins[margins.len() / 2]
+            } else {
+                (margins[margins.len() / 2 - 1] + margins[margins.len() / 2]) / 2.0
+            };
+            format!(
+                concat!(
+                    r#"{{"low": {:.4}, "high": {:.4}, "games": {}, "#,
+                    r#""black_wins": {}, "ties": {}, "black_margin_median": {:.6}}}"#
+                ),
+                start, end, games, black, ties, median
+            )
+        })
+        .collect()
 }
 
 fn write_manifest(
@@ -930,6 +1109,20 @@ fn write_manifest(
     writeln!(writer, "  \"samples\": {},", report.replay.samples)?;
     writeln!(writer, "  \"completed_games\": {},", report.completed_games)?;
     writeln!(writer, "  \"discarded_games\": {},", report.discarded_games)?;
+    writeln!(writer, "  \"capped_games\": {},", report.capped_games)?;
+    writeln!(writer, "  \"games\": \"games.jsonl\",")?;
+    let buckets = komi_buckets(
+        &report.game_records,
+        config.komi_low,
+        config.komi_high,
+        KOMI_BUCKETS,
+    );
+    writeln!(writer, "  \"komi_calibration\": [")?;
+    for (index, bucket) in buckets.iter().enumerate() {
+        let comma = if index + 1 == buckets.len() { "" } else { "," };
+        writeln!(writer, "    {bucket}{comma}")?;
+    }
+    writeln!(writer, "  ],")?;
     writeln!(writer, "  \"resign_calibration\": [")?;
     for (index, (threshold, measured, fired, wrong, saved)) in
         report.calibration.iter().enumerate()
@@ -1247,14 +1440,36 @@ fn write_examples(
     fs::create_dir_all(directory)?;
     for (sample_index, raster) in rasters.iter().take(count).enumerate() {
         let config = raster.config();
-        write_bmp(
-            &directory.join(format!("sample-{sample_index:03}-overview.bmp")),
-            config.width,
-            config.height,
-            &raster.overview_rgb(),
-            6,
-        )?;
-        for (channel_index, channel) in CHANNELS.iter().enumerate() {
+        // Previews are a diagnostic, and the channel table describes the
+        // semantic layout. A shard written in another layout carries fewer
+        // channels under different meanings, so only the channels this raster
+        // actually holds can be dumped -- and the overview, which reads fixed
+        // semantic indices, only applies to the layout it was written for.
+        let channels = config.channels();
+        if channels == CHANNELS.len() {
+            write_bmp(
+                &directory.join(format!("sample-{sample_index:03}-overview.bmp")),
+                config.width,
+                config.height,
+                &raster.overview_rgb(),
+                6,
+            )?;
+        }
+        // A compact plane is not the semantic plane at the same index -- plane
+        // 2 is voronoi_ridge, which the table lists at 6 -- so the name has to
+        // come through the layout's own index map or the file would lie about
+        // what it shows.
+        let named: Vec<(usize, &ChannelSpec)> = if channels == CHANNELS.len() {
+            CHANNELS.iter().enumerate().collect()
+        } else {
+            COMPACT_CHANNELS
+                .iter()
+                .take(channels)
+                .enumerate()
+                .map(|(plane, &semantic)| (plane, &CHANNELS[semantic]))
+                .collect()
+        };
+        for (channel_index, channel) in named {
             write_bmp(
                 &directory.join(format!(
                     "sample-{sample_index:03}-{channel_index:02}-{}.bmp",
@@ -1371,6 +1586,7 @@ fn main() -> std::io::Result<()> {
         &report.replay.examples,
         config.examples,
     )?;
+    write_game_records(&config.output.join("games.jsonl"), &report.game_records)?;
     write_manifest(
         &config.output.join("manifest.json"),
         &config,
@@ -1386,6 +1602,7 @@ fn main() -> std::io::Result<()> {
     writeln!(output, ",\n  \"samples\": {},", report.replay.samples)?;
     writeln!(output, "  \"completed_games\": {},", report.completed_games)?;
     writeln!(output, "  \"discarded_games\": {},", report.discarded_games)?;
+    writeln!(output, "  \"capped_games\": {},", report.capped_games)?;
     writeln!(
         output,
         "  \"dataset_sha256\": \"{}\",",
@@ -1579,8 +1796,9 @@ mod tests {
     use vgo_search::{Action, CandidateSource, ChildSummary, SearchResult, SearchStats};
 
     use super::{
-        ActorPool, Config, GameEnvelope, GameSamples, PendingSample,
-        calibration_trials, policy_target, resign_exempt, search_config, validate_config,
+        ActorPool, Config, GameEnvelope, GameRecord, GameSamples, PendingSample,
+        calibration_trials, komi_buckets, policy_target, resign_exempt, search_config,
+        validate_config,
     };
     use vgo_core::{Color, Position, Stone};
 
@@ -1607,6 +1825,70 @@ mod tests {
         );
     }
 
+    fn game_at(komi: f64, black_wins: bool, margin: f64) -> GameRecord {
+        GameRecord {
+            game: 0,
+            komi,
+            plies: 60,
+            passes: 0,
+            self_captures: 0,
+            black_utility: if black_wins { 1.0 } else { -1.0 },
+            margin,
+            reached_ply_cap: false,
+            resigned: false,
+            first_sample: 0,
+            sample_count: 1,
+        }
+    }
+
+    /// Every game lands in exactly one bucket, including the range endpoints.
+    ///
+    /// The top bucket is closed and the rest are half-open, so `high` itself
+    /// has a home; without that a game drawn at exactly the range maximum would
+    /// vanish from the calibration while still being counted as played.
+    #[test]
+    fn komi_buckets_place_every_game_including_the_endpoints() {
+        let records = vec![
+            game_at(-0.1, true, 0.5),  // exactly `low`
+            game_at(0.2, false, 0.5),  // exactly `high`
+            game_at(0.05, true, 0.5),  // interior
+        ];
+        let buckets = komi_buckets(&records, -0.1, 0.2, 4);
+        let counted: usize = buckets
+            .iter()
+            .map(|bucket| {
+                let marker = "\"games\": ";
+                let start = bucket.find(marker).expect("games field") + marker.len();
+                let rest = &bucket[start..];
+                let end = rest.find(',').expect("field terminator");
+                rest[..end].parse::<usize>().expect("integer count")
+            })
+            .sum();
+        assert_eq!(counted, records.len(), "every game lands in exactly one bucket");
+    }
+
+    /// The median margin is signed toward Black.
+    ///
+    /// It has to be, for the margin curve to cross zero where the winrate
+    /// crosses 50%. Taking the median of unsigned margins would report a
+    /// positive lead for a bucket White dominates.
+    #[test]
+    fn komi_bucket_margin_is_signed_toward_black() {
+        // One bucket, White winning both games by a clear margin.
+        let records = vec![game_at(0.0, false, 0.30), game_at(0.05, false, 0.40)];
+        let buckets = komi_buckets(&records, 0.0, 0.1, 1);
+        let marker = "\"black_margin_median\": ";
+        let start = buckets[0].find(marker).expect("median field") + marker.len();
+        let rest = &buckets[0][start..];
+        let end = rest.find('}').expect("object terminator");
+        let median: f64 = rest[..end].trim().parse().expect("finite median");
+        assert!(
+            median < 0.0,
+            "White winning both games must give Black a negative median, got {median}"
+        );
+        assert!((median + 0.35).abs() < 1.0e-9, "median of -0.30 and -0.40, got {median}");
+    }
+
     #[test]
     fn actor_pool_closes_a_full_queue_before_joining() {
         let stopped = Arc::new(AtomicBool::new(false));
@@ -1615,7 +1897,9 @@ mod tests {
             .send(GameEnvelope {
                 result: Ok(GameSamples {
                     samples: Vec::new(),
+                    record: None,
                     completed: false,
+                    reached_ply_cap: false,
                     calibration: Vec::new(),
                 }),
                 ready_at: Instant::now(),
@@ -1629,7 +1913,9 @@ mod tests {
             let _ = sender.send(GameEnvelope {
                 result: Ok(GameSamples {
                     samples: Vec::new(),
+                    record: None,
                     completed: false,
+                    reached_ply_cap: false,
                     calibration: Vec::new(),
                 }),
                 ready_at: Instant::now(),
