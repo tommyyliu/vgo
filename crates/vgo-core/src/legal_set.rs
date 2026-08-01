@@ -305,10 +305,61 @@ pub fn nearest_with(
             snapped: false,
         },
         Some((_, found)) => Nearest {
-            point: found,
+            point: clear_by_margin(position, found),
             legal: true,
             snapped: true,
         },
+    }
+}
+
+/// Pushes a chosen placement off whatever constraint it is resting on.
+///
+/// The stone-tangent candidates already carry `SNAP_MARGIN`, but the vertex set
+/// does not: `vertices` is the exact vertex set of the legal region, and
+/// `distance` and `escape_witness` need it that way. `nearest` draws from the
+/// same list, so it could still return a point sitting exactly on a constraint
+/// -- which is what the margin exists to prevent. A browser game stalled on a
+/// vertex 1.1e-16 from a stone, legal to the search and illegal to the page.
+///
+/// Nudging the winner rather than the candidates keeps the two uses separate:
+/// the geometry stays exact, and only the point that becomes a move is moved.
+fn clear_by_margin(position: &Position, point: Point) -> Point {
+    let radius = position.radius();
+    let target = 2.0 * radius + numeric::SNAP_MARGIN;
+    let mut moved = point;
+    // One pass per stone, nearest first: pushing off one constraint can bring a
+    // point nearer another, and the margin is small enough that a fixed number
+    // of passes settles it.
+    for _ in 0..4 {
+        let mut worst: Option<(f64, &crate::Stone)> = None;
+        for stone in position.stones() {
+            let distance = (moved.x - stone.x).hypot(moved.y - stone.y);
+            if distance < target && worst.is_none_or(|(seen, _)| distance < seen) {
+                worst = Some((distance, stone));
+            }
+        }
+        let Some((distance, stone)) = worst else {
+            break;
+        };
+        if distance < numeric::EDGE_EPSILON {
+            // Concentric with a stone: no ray to push along, and the candidate
+            // generator already covers this case by trying the four axes.
+            break;
+        }
+        let scale = target / distance;
+        moved = Point::new(
+            stone.x + (moved.x - stone.x) * scale,
+            stone.y + (moved.y - stone.y) * scale,
+        );
+    }
+    // Never push a point off the board to gain clearance from a stone.
+    let inset = (radius + numeric::SNAP_MARGIN).min(0.5);
+    let (low, high) = (inset.min(1.0 - inset), inset.max(1.0 - inset));
+    let clamped = Point::new(moved.x.clamp(low, high), moved.y.clamp(low, high));
+    if contains(position, clamped.x, clamped.y) {
+        clamped
+    } else {
+        point
     }
 }
 
@@ -433,6 +484,48 @@ mod tests {
         let found = nearest(&position, Point::new(coarse, 0.5));
         assert!(found.legal && found.snapped);
         assert!(contains(&position, found.point.x, found.point.y));
+    }
+
+    #[test]
+    fn a_snap_that_lands_on_a_vertex_still_clears_the_margin() {
+        // `nearest` chooses from the stone-tangent candidates *and* the vertex
+        // set. The tangents carry SNAP_MARGIN; the vertices deliberately do
+        // not, because `distance` and `escape_witness` need the exact vertex
+        // set of the legal region. So a snap could still return a point resting
+        // exactly on a constraint whenever a vertex was the closest candidate.
+        //
+        // A browser game stalled on one: a click snapped to a vertex 1.1e-16
+        // from a stone, which the page accepted and the model server's own
+        // legality check then refused, leaving the model unable to answer.
+        let radius = 0.055714285714285716;
+        let position = Position::new(
+            radius,
+            vec![
+                Stone::new(0.70703125, 0.57421875, Color::Black),
+                Stone::new(0.449219, 0.425781, Color::White),
+                Stone::new(0.32421875, 0.69921875, Color::Black),
+                Stone::new(0.370426, 0.504574, Color::White),
+                Stone::new(0.72265625, 0.23046875, Color::Black),
+                Stone::new(0.245426, 0.620426, Color::White),
+                Stone::new(0.55859375, 0.80078125, Color::Black),
+                Stone::new(0.560365, 0.417842, Color::White),
+                Stone::new(0.77734375, 0.40234375, Color::Black),
+                Stone::new(0.550655, 0.689635, Color::White),
+            ],
+            Color::Black,
+        );
+        // The click that produced the stalling stone.
+        let found = nearest(&position, Point::new(0.66, 0.675));
+        assert!(found.legal);
+        for stone in position.stones() {
+            let distance = (found.point.x - stone.x).hypot(found.point.y - stone.y);
+            assert!(
+                distance >= 2.0 * radius,
+                "a snapped placement must not rest on a constraint; this one \
+                 sits {:.3e} inside a stone",
+                2.0 * radius - distance
+            );
+        }
     }
 
     #[test]

@@ -173,9 +173,49 @@
         best = candidate;
       }
     }
-    return best
-      ? { x: best[0], y: best[1], legal: true, snapped: true }
-      : { x: x, y: y, legal: false, snapped: false };
+    if (!best) return { x: x, y: y, legal: false, snapped: false };
+    const cleared = clearByMargin(position, best[0], best[1]);
+    return { x: cleared[0], y: cleared[1], legal: true, snapped: true };
+  }
+
+  // Pushes a chosen placement off whatever constraint it is resting on.
+  //
+  // The stone-tangent candidates carry snapMargin, but the vertex set does not:
+  // `vertices` is the exact vertex set of the legal region and is used as such
+  // elsewhere. `nearest` draws from the same list, so it could still return a
+  // point sitting exactly on a constraint whenever a vertex was closest -- a
+  // game stalled on a click that snapped to a vertex 1.1e-16 from a stone,
+  // which this page accepted and the model server then refused, leaving the
+  // model unable to reply. Must match clear_by_margin in
+  // crates/vgo-core/src/legal_set.rs.
+  function clearByMargin(position, x, y) {
+    const r = position.radius;
+    const target = 2 * r + N.snapMargin;
+    let px = x, py = y;
+    // Nearest constraint first; pushing off one can bring a point nearer
+    // another, and the margin is small enough that a few passes settle it.
+    for (let pass = 0; pass < 4; pass++) {
+      let worst = null, worstDistance = Infinity;
+      for (const stone of position.stones) {
+        const distance = Math.hypot(px - stone.x, py - stone.y);
+        if (distance < target && distance < worstDistance) {
+          worstDistance = distance;
+          worst = stone;
+        }
+      }
+      if (!worst) break;
+      // Concentric with a stone: no ray to push along, and the candidate
+      // generator already covers that case with its four axes.
+      if (worstDistance < N.edgeEpsilon) break;
+      const scale = target / worstDistance;
+      px = worst.x + (px - worst.x) * scale;
+      py = worst.y + (py - worst.y) * scale;
+    }
+    // Never push a point off the board to gain clearance from a stone.
+    const inset = Math.min(r + N.snapMargin, 0.5);
+    const lo = Math.min(inset, 1 - inset), hi = Math.max(inset, 1 - inset);
+    const cx = Math.min(hi, Math.max(lo, px)), cy = Math.min(hi, Math.max(lo, py));
+    return contains(position, cx, cy) ? [cx, cy] : [x, y];
   }
 
   root.VGO.legalSet = Object.freeze({
