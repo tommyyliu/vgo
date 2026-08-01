@@ -3,6 +3,7 @@
 mod analysis;
 mod game;
 mod legal_set;
+mod settled;
 mod model;
 mod numeric;
 mod voronoi;
@@ -15,5 +16,6 @@ pub use legal_set::{
     nearest_with as nearest_legal_placement_with, vertices as legal_set_vertices,
 };
 pub use model::{Color, Phase, Position, Stone, Validation, ValidationIssue};
+pub use settled::SettledRegion;
 pub use numeric::COORDINATE_EPSILON;
 pub use voronoi::{Cell, Edge, EdgeSource, Geometry, Point};

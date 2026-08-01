@@ -259,7 +259,10 @@ mod tests {
         assert_eq!(&frame[..8], b"VGOIFR01");
         assert_eq!(u32::from_le_bytes(frame[8..12].try_into().unwrap()), 1);
         assert_eq!(u32::from_le_bytes(frame[12..16].try_into().unwrap()), 2);
-        assert_eq!(frame.len(), 28 + 2 * (8 + 10 * 2 * 2 * 4));
+        // Derived, not literal: this asserts the framing, and hardcoding the
+        // channel count made it fail when a channel was added.
+        let channels = vgo_raster::CHANNEL_COUNT;
+        assert_eq!(frame.len(), 28 + 2 * (8 + channels * 2 * 2 * 4));
     }
 
     #[test]
