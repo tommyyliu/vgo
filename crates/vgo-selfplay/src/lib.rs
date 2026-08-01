@@ -1,7 +1,5 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
-
 pub mod render_svg;
 
 use vgo_core::{Analysis, Color, GameEvent, Outcome, Phase, Position};
@@ -85,8 +83,6 @@ pub struct PlayoutStats {
     pub captures: u64,
     pub self_captures: u64,
     pub passes: u64,
-    pub repetitions: u64,
-    pub repetition_avoids: u64,
     pub search: SearchStats,
 }
 
@@ -154,7 +150,6 @@ pub struct PlayoutStep<'a> {
     pub search: &'a SearchResult,
     pub action: Action,
     pub transition: &'a vgo_core::MoveResult,
-    pub repetition_avoids: u32,
 }
 
 pub fn play_game<E>(
@@ -178,9 +173,7 @@ pub fn play_game_with_resignation<E>(
     assert_eq!(initial.phase(), Phase::Playing, "game must start playable");
 
     let mut position = initial;
-    let mut seen = HashSet::new();
     let mut stats = PlayoutStats::default();
-    seen.insert(position_fingerprint(&position));
     // Consecutive *own* turns whose root value has stayed past the threshold,
     // counted per seat. Reset by any of that seat's turns that does not, so the
     // window measures the least confident evaluation in a run rather than the
@@ -233,29 +226,26 @@ pub fn play_game_with_resignation<E>(
                 });
             }
         }
-        let mut selected = None;
-        let mut repetition_avoids = 0_u32;
-        for action in result.actions_by_preference(position.to_move()) {
-            let transition = action.apply(&position);
-            if transition.position.phase() == Phase::Finished
-                || !seen.contains(&position_fingerprint(&transition.position))
-            {
-                selected = Some((action, transition));
-                break;
-            }
-            repetition_avoids += 1;
-        }
-        let (action, transition) = selected.unwrap_or_else(|| {
-            let action = Action::Pass;
-            (action, action.apply(&position))
-        });
+        let (action, transition) = result
+            .actions_by_preference(position.to_move())
+            .into_iter()
+            .next()
+            .map_or_else(
+                || {
+                    let action = Action::Pass;
+                    (action, action.apply(&position))
+                },
+                |action| {
+                    let transition = action.apply(&position);
+                    (action, transition)
+                },
+            );
         observe(PlayoutStep {
             ply,
             position: &position,
             search: &result,
             action,
             transition: &transition,
-            repetition_avoids,
         });
 
         stats.plies = ply + 1;
@@ -269,7 +259,6 @@ pub fn play_game_with_resignation<E>(
             })
             .sum::<u64>();
         stats.passes += u64::from(action == Action::Pass);
-        stats.repetition_avoids += u64::from(repetition_avoids);
 
         position = transition.position;
         if position.phase() == Phase::Finished {
@@ -280,8 +269,6 @@ pub fn play_game_with_resignation<E>(
                 resigned: false,
             });
         }
-        let inserted = seen.insert(position_fingerprint(&position));
-        stats.repetitions += u64::from(!inserted);
     }
 
     Ok(PlayoutReport {
@@ -292,39 +279,6 @@ pub fn play_game_with_resignation<E>(
     })
 }
 
-#[must_use]
-pub fn position_fingerprint(position: &Position) -> u64 {
-    let mut hash = hash_word(0xcbf2_9ce4_8422_2325, position.radius().to_bits());
-    hash = hash_word(hash, u64::from(position.consecutive_passes()));
-    hash = hash_word(hash, u64::from(position.to_move() == Color::White));
-    hash = hash_word(hash, u64::from(position.phase() == Phase::Finished));
-    let mut stones = position
-        .stones()
-        .iter()
-        .map(|stone| {
-            (
-                stone.x.to_bits(),
-                stone.y.to_bits(),
-                u64::from(stone.color == Color::White),
-            )
-        })
-        .collect::<Vec<_>>();
-    stones.sort_unstable();
-    for (x, y, color) in stones {
-        hash = hash_word(hash, x);
-        hash = hash_word(hash, y);
-        hash = hash_word(hash, color);
-    }
-    hash
-}
-
-fn hash_word(mut hash: u64, word: u64) -> u64 {
-    for byte in word.to_le_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
 
 pub fn accumulate_search_stats(total: &mut SearchStats, next: SearchStats) {
     total.simulations += next.simulations;
@@ -340,7 +294,7 @@ pub fn accumulate_search_stats(total: &mut SearchStats, next: SearchStats) {
 mod tests {
     use std::convert::Infallible;
 
-    use super::{ResignRule, play_game, play_game_with_resignation, position_fingerprint};
+    use super::{ResignRule, play_game, play_game_with_resignation};
     use vgo_core::{Color, Position, Stone};
     use vgo_search::{SearchConfig, search};
 
@@ -357,31 +311,6 @@ mod tests {
         assert_eq!(report.stats.search.simulations, report.stats.plies * 2);
     }
 
-    #[test]
-    fn fingerprint_is_order_independent_but_color_absolute() {
-        let stones = vec![
-            Stone::new(0.25, 0.25, Color::Black),
-            Stone::new(0.75, 0.75, Color::White),
-        ];
-        let mut reversed = stones.clone();
-        reversed.reverse();
-        let swapped = stones
-            .iter()
-            .map(|stone| Stone::new(stone.x, stone.y, stone.color.other()))
-            .collect();
-        let first = Position::new(0.1, stones, Color::Black);
-        let reordered = Position::new(0.1, reversed, Color::Black);
-        let color_swapped = Position::new(0.1, swapped, Color::White);
-
-        assert_eq!(
-            position_fingerprint(&first),
-            position_fingerprint(&reordered)
-        );
-        assert_ne!(
-            position_fingerprint(&first),
-            position_fingerprint(&color_swapped)
-        );
-    }
 
     /// A search result whose root value is fixed, for driving the resign rule.
     fn fixed_value(position: &vgo_core::Position, black_value: f64) -> vgo_search::SearchResult {

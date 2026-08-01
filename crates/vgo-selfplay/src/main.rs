@@ -53,8 +53,6 @@ struct GameReport {
     captures: u64,
     self_captures: u64,
     passes: u64,
-    repetitions: u64,
-    repetition_avoids: u64,
     search: SearchStats,
     elapsed: Duration,
 }
@@ -71,8 +69,6 @@ struct MatchReport {
     captures: u64,
     self_captures: u64,
     passes: u64,
-    repetitions: u64,
-    repetition_avoids: u64,
     search: SearchStats,
     game_time: Duration,
 }
@@ -84,8 +80,6 @@ impl MatchReport {
         self.captures += game.captures;
         self.self_captures += game.self_captures;
         self.passes += game.passes;
-        self.repetitions += game.repetitions;
-        self.repetition_avoids += game.repetition_avoids;
         self.game_time += game.elapsed;
         accumulate_search_stats(&mut self.search, game.search);
         if game.completed {
@@ -127,8 +121,6 @@ impl MatchReport {
                 "  \"captures\": {},\n",
                 "  \"self_captures\": {},\n",
                 "  \"passes\": {},\n",
-                "  \"repetitions\": {},\n",
-                "  \"repetition_avoids\": {},\n",
                 "  \"search_simulations\": {},\n",
                 "  \"evaluations\": {},\n",
                 "  \"expanded_nodes\": {},\n",
@@ -157,8 +149,6 @@ impl MatchReport {
             self.captures,
             self.self_captures,
             self.passes,
-            self.repetitions,
-            self.repetition_avoids,
             self.search.simulations,
             self.search.evaluations,
             self.search.expanded_nodes,
@@ -205,8 +195,6 @@ fn play_game(config: MatchConfig, first_color: Color, pair_seed: u64) -> GameRep
         captures: playout.stats.captures,
         self_captures: playout.stats.self_captures,
         passes: playout.stats.passes,
-        repetitions: playout.stats.repetitions,
-        repetition_avoids: playout.stats.repetition_avoids,
         search: playout.stats.search,
         elapsed: started.elapsed(),
     }

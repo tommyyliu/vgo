@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use vgo_core::{Point, Position, SettledRegion, legal_set_vertices};
+use vgo_core::{Position, SettledRegion, legal_set_vertices};
 
 pub const CHANNEL_COUNT: usize = 11;
 
@@ -294,21 +294,16 @@ pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32
             continue;
         }
         // Only the rows and columns the loop spans need testing.
-        let (mut low_x, mut high_x) = (f64::INFINITY, f64::NEG_INFINITY);
+        // Only the rows the loop spans need scanning; the scanline derives its
+        // own column span from that row's crossings.
         let (mut low_y, mut high_y) = (f64::INFINITY, f64::NEG_INFINITY);
         for point in &contour {
-            low_x = low_x.min(point.x);
-            high_x = high_x.max(point.x);
             low_y = low_y.min(point.y);
             high_y = high_y.max(point.y);
         }
         let first_row = ((low_y * config.height as f64 - 0.5).floor().max(0.0)) as usize;
         let last_row =
             ((high_y * config.height as f64 - 0.5).ceil() as usize).min(config.height - 1);
-        let first_column =
-            ((low_x * config.width as f64 - 0.5).floor().max(0.0)) as usize;
-        let last_column =
-            ((high_x * config.width as f64 - 0.5).ceil() as usize).min(config.width - 1);
         // Scanline fill: the crossings of one row are computed once for the
         // whole row rather than once per pixel, which is the difference
         // between O(rows x columns x vertices) and O(rows x vertices).

@@ -92,9 +92,9 @@ pub struct SearchResult {
     pub stats: SearchStats,
     /// Child indices in the order the caller should try them. Under deterministic
     /// selection this is visit-count order; under a positive temperature the head
-    /// of the list is drawn from `visits^(1 / temperature)` instead. Held so that
-    /// a caller rejecting the first action (repetition avoidance) falls back
-    /// through the same order the selection policy produced.
+    /// of the list is drawn from `visits^(1 / temperature)` instead. Held as an
+    /// order rather than a single choice so a caller that cannot play the first
+    /// action falls back through the same ranking the selection policy produced.
     order: Vec<usize>,
 }
 
@@ -524,8 +524,8 @@ fn preferred_child_indices(children: &[ChildSummary], to_move: Color) -> Vec<usi
 ///
 /// Only children with visits participate in the draw; unvisited children keep
 /// their deterministic ordering at the tail, so a caller falling back through the
-/// list for repetition avoidance still degrades to visit order rather than to
-/// noise. `temperature <= 0` never reaches here.
+/// list still degrades to visit order rather than to noise. `temperature <= 0`
+/// never reaches here.
 fn sampled_child_indices(
     children: &[ChildSummary],
     to_move: Color,
@@ -1028,8 +1028,8 @@ mod tests {
         assert!(leader >= 195, "2:1 visits at t=0.1 should be near-certain");
     }
 
-    /// Unvisited children must stay behind every visited one so that repetition
-    /// fallback degrades to visit order rather than to noise.
+    /// Unvisited children must stay behind every visited one so that any
+    /// fallback through the order degrades to visit order rather than to noise.
     #[test]
     fn unvisited_children_sort_last() {
         let children = vec![
