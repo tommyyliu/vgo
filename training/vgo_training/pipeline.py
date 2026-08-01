@@ -1373,6 +1373,8 @@ class Pipeline:
             str(self.config.resolution),
             "--policy-resolution",
             str(self.config.policy_resolution),
+            "--raster-kind",
+            str(self.config.raster_kind),
             "--batch",
             str(self.config.inference_batch),
             "--fp16",

@@ -60,6 +60,7 @@ struct Arguments {
     provider: OnnxProvider,
     resolution: usize,
     policy_resolution: usize,
+    raster_kind: vgo_raster::RasterKind,
     batch: usize,
     warmup: usize,
     iterations: usize,
@@ -95,6 +96,14 @@ fn parse_arguments(arguments: &[String], root: &Path) -> Result<Arguments, Strin
     let provider = value_argument(arguments, "--provider", OnnxProvider::Cuda)?;
     let resolution = value_argument(arguments, "--resolution", 128_usize)?;
     let policy_resolution = value_argument(arguments, "--policy-resolution", resolution)?;
+    // A model exported under a non-default layout declares its own channel
+    // count, and loading validates against the raster it is handed -- so the
+    // bench has to be told which layout, or a compact model fails warmup.
+    let raster_kind = value_argument(
+        arguments,
+        "--raster-kind",
+        vgo_raster::RasterKind::Semantic,
+    )?;
     let batch = value_argument(arguments, "--batch", 8_usize)?;
     let warmup = value_argument(arguments, "--warmup", 10_usize)?;
     let iterations = value_argument(arguments, "--iterations", 200_usize)?;
@@ -115,6 +124,7 @@ fn parse_arguments(arguments: &[String], root: &Path) -> Result<Arguments, Strin
         model,
         checkpoint,
         python,
+        raster_kind,
         training,
         cache_directory,
         provider,
@@ -214,8 +224,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         compare_python,
         python_device,
         python_compile,
+        raster_kind,
     } = parse_arguments(&env::args().collect::<Vec<_>>(), &root)?;
-    let raster_config = RasterConfig::square(resolution);
+    let raster_config = RasterConfig::square_of(resolution, raster_kind);
     let policy_config = RasterConfig::square(policy_resolution);
     let positions = fixture_positions();
     let inputs = (0..batch)
