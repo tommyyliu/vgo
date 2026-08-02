@@ -43,6 +43,12 @@ PROTOCOL_SCHEMA = "vgo.learner.protocol.v1"
 # the remainder trains the unnormalized heads that inference actually uses.
 NORMED_HEAD_WEIGHT = 0.8
 
+# Ownership loss weight, relative to policy at 1.0. KataGo uses 1.5 against a
+# value weight of 1.2 -- comparable magnitude, because ownership is dense
+# supervision worth about as much as the outcome itself, unlike its score
+# belief head at 0.0015. Ours is scaled the same way against our value weight.
+OWNERSHIP_WEIGHT = 1.5
+
 
 @dataclass(frozen=True)
 class LearnerConfig:
@@ -542,6 +548,26 @@ class _StagingSlot:
     device: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
     copy_complete: torch.cuda.Event | None = None
     consumed: torch.cuda.Event | None = None
+
+
+def ownership_loss(
+    predicted: torch.Tensor, targets: torch.Tensor, present: torch.Tensor
+) -> torch.Tensor:
+    """Mean squared error of the predicted ownership map.
+
+    MSE rather than cross-entropy: unlike the outcome, a cell's ownership is
+    genuinely continuous near a boundary, and the head emits a raw map through
+    tanh only at the output, so there is no saturating layer between the
+    parameters and this loss.
+
+    `present` masks samples whose game has no stored final board -- shards
+    written before the field existed -- so a mixed window trains on the ones
+    that have it rather than on zeros pretending to be a target.
+    """
+    if not bool(present.any()):
+        return predicted.sum() * 0.0
+    error = (predicted[present] - targets[present]).square().mean()
+    return error
 
 
 def value_cross_entropy(
@@ -1208,7 +1234,19 @@ class PersistentLearner:
         assert self._device is not None
 
         generator = torch.Generator().manual_seed(config.seed)
+        # The schedule advances per optimizer step, not per epoch. With ten
+        # epochs the difference was cosmetic; at one epoch a per-epoch schedule
+        # never moves at all -- warmup would consume the whole update and the
+        # decay phase would never run. Expressing the horizon in steps keeps
+        # the same curve shape whatever the epoch count is.
+        steps_per_epoch = max(
+            1, len(split.training.batches(config.batch_size, shuffle=False))
+        )
         scheduler_arguments = argparse.Namespace(**asdict(config))
+        scheduler_arguments.epochs = config.epochs * steps_per_epoch
+        scheduler_arguments.warmup_epochs = round(
+            config.warmup_epochs * steps_per_epoch
+        )
         scheduler = build_scheduler(self.optimizer, scheduler_arguments)
         initial_training = evaluate(
             self.model,
@@ -1290,7 +1328,7 @@ class PersistentLearner:
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 self.optimizer.step()
-            scheduler.step()
+                scheduler.step()
             if (
                 epoch == 1
                 or epoch % config.report_every == 0
