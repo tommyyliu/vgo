@@ -556,7 +556,14 @@ def value_cross_entropy(
     saw 0.0004 of the gradient a non-saturating loss would give.
 
     Accepts the scalar target the shards already store, so no replay version
-    changes: +1 means the mover won, -1 that it lost.
+    changes: +1 means the mover won, -1 that it lost, 0 a tie.
+
+    A tie becomes 0.5/0.5 rather than a third class. Ties need
+    black - white - komi inside f64::EPSILON on continuous areas and there were
+    zero in 1400 games, so a draw logit would be a class that never fires --
+    but a hard `target <= 0` would have trained the rare tie as an outright
+    loss, which is a full-strength wrong gradient on a position that was even.
+    Soft targets cost nothing and say what actually happened.
     """
     if logits.dim() == 1:
         # A checkpoint from before the head became categorical.
@@ -564,7 +571,10 @@ def value_cross_entropy(
             "value head emitted a scalar; this checkpoint predates the "
             "win/loss head and its value semantics are incompatible"
         )
-    return nn.functional.cross_entropy(logits, (targets <= 0).long())
+    win = (targets.to(logits.dtype) + 1.0) / 2.0
+    return nn.functional.cross_entropy(
+        logits, torch.stack((win, 1.0 - win), dim=1)
+    )
 
 
 class BatchStager:
