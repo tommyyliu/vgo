@@ -38,7 +38,7 @@ use vgo_core::{Color, Phase, Position, Stone};
 use vgo_inference::{
     BatchedEvaluator, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
 };
-use vgo_raster::RasterConfig;
+use vgo_raster::{RasterConfig, RasterKind};
 use vgo_search::{Action, SearchConfig, search_with_evaluator};
 
 #[derive(Debug, Parser)]
@@ -55,6 +55,11 @@ struct Arguments {
     resolution: usize,
     #[arg(long, default_value_t = 32)]
     policy_resolution: usize,
+    /// Channel layout the model reads, fixed at its export. A model trained on
+    /// `compact` fed the twelve semantic channels sees a different input than
+    /// it learned from, so this must match the export or the net plays blind.
+    #[arg(long, default_value = "semantic")]
+    raster_kind: RasterKind,
     /// Fine cells per coarse sampling region. Must match how the model was
     /// trained, or its policy head is read through the wrong sampler.
     #[arg(long, default_value_t = 4)]
@@ -272,7 +277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = OnnxBatchService::load(&OnnxServiceConfig {
         policy: Some(RasterConfig::square(arguments.policy_resolution)),
         model: arguments.model.clone(),
-        raster: RasterConfig::square(arguments.resolution),
+        raster: RasterConfig::square_of(arguments.resolution, arguments.raster_kind),
         maximum_batch: arguments.leaf_batch.max(1),
         provider: arguments.provider,
         device_id: 0,
