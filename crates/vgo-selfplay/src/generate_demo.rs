@@ -452,11 +452,31 @@ fn seeded_unit(game_seed: u64) -> f64 {
 /// a single value learns that value's balance rather than the relationship. It
 /// also spreads the training distribution over positions that are close under
 /// *some* komi, which a fixed value cannot do.
+/// Komi for one game: a normal centred on the range, truncated to it.
+///
+/// Uniform spends as much mass at the ends of the range as at the middle, and
+/// the ends are where komi decides the game rather than shading it. Measured on
+/// ddrnet-resign64 with the range at [-0.037, 0.363]: Black took 77% of the
+/// bottom bucket and 3.2% of the top, so a game drawn near either end is
+/// settled before a stone is placed and teaches the value head only which end
+/// it came from.
+///
+/// A normal concentrates games where the position is genuinely contested while
+/// still reaching the ends often enough to teach the relationship. Sigma is a
+/// quarter of the width, so the range spans +/-2 sigma and about 95% of draws
+/// land inside it before truncation.
 fn sampled_komi(game_seed: u64, low: f64, high: f64) -> f64 {
     if !(low.is_finite() && high.is_finite()) || high <= low {
         return low.max(0.0).min(high.max(0.0));
     }
-    low + seeded_unit(game_seed) * (high - low)
+    let centre = 0.5 * (low + high);
+    let sigma = 0.25 * (high - low);
+    // Box-Muller from two independent uniforms off the same seed. The second
+    // stream uses a different constant so the pair is not degenerate.
+    let u1 = seeded_unit(game_seed).max(f64::MIN_POSITIVE);
+    let u2 = seeded_unit(game_seed ^ 0x51ed_2701_a3f5_9c7b);
+    let normal = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+    (centre + sigma * normal).clamp(low, high)
 }
 
 fn policy_target(result: &SearchResult, config: RasterConfig) -> PolicyTarget {
@@ -1942,7 +1962,8 @@ mod tests {
 
     use super::{
         ActorPool, Config, GameEnvelope, GameRecord, GameSamples, PendingSample,
-        calibration_trials, komi_buckets, policy_target, resign_exempt, search_config,
+        calibration_trials, komi_buckets, policy_target, resign_exempt, sampled_komi,
+        search_config,
         validate_config,
     };
     use vgo_core::{Color, Position, Stone};
@@ -1993,6 +2014,46 @@ mod tests {
     /// The top bucket is closed and the rest are half-open, so `high` itself
     /// has a home; without that a game drawn at exactly the range maximum would
     /// vanish from the calibration while still being counted as played.
+    /// Komi concentrates near the middle of its range and stays inside it.
+    ///
+    /// Uniform spent as much mass on the ends as the middle, and the ends are
+    /// where komi decides the game outright: measured at range
+    /// [-0.037, 0.363], Black took 77% of the bottom bucket and 3.2% of the
+    /// top. Those games teach the value head which end they came from and
+    /// little else.
+    #[test]
+    fn komi_is_drawn_from_a_truncated_normal() {
+        let (low, high) = (-0.166, 0.234);
+        let centre = 0.5 * (low + high);
+        let draws: Vec<f64> = (0..20_000)
+            .map(|index| sampled_komi(index as u64 * 2_654_435_761, low, high))
+            .collect();
+
+        assert!(
+            draws.iter().all(|&k| (low..=high).contains(&k)),
+            "every draw must stay inside the range"
+        );
+        let mean = draws.iter().sum::<f64>() / draws.len() as f64;
+        assert!(
+            (mean - centre).abs() < 0.01,
+            "should centre on {centre}, got {mean}"
+        );
+
+        // Concentrated, not uniform: the middle fifth should hold well over
+        // the 20% a uniform draw would put there.
+        let width = high - low;
+        let middle = draws
+            .iter()
+            .filter(|&&k| (k - centre).abs() < width * 0.1)
+            .count();
+        let share = middle as f64 / draws.len() as f64;
+        assert!(
+            share > 0.30,
+            "middle fifth should hold far more than uniform's 20%, got {:.1}%",
+            100.0 * share
+        );
+    }
+
     #[test]
     fn komi_buckets_place_every_game_including_the_endpoints() {
         let records = vec![
