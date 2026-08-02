@@ -78,6 +78,11 @@ def arena_environment() -> dict[str, str]:
     return environment
 
 
+# Version number standing for the naive (no-model) evaluator. Negative so it
+# sorts before every checkpoint and can never collide with one.
+NAIVE = -1
+
+
 def ancestor_of(run: Path) -> tuple[Path, int] | None:
     """The run this one warm-started from, and the version it started at.
 
@@ -157,6 +162,33 @@ def discover_lineage(run: Path) -> tuple[dict[int, Path], dict[int, str]]:
     return found, origin
 
 
+def group_pairings(pairings: list[tuple[int, int]]) -> list[tuple[int, list[int]]]:
+    """Pairings as arena invocations: one process per candidate.
+
+    The arena loads a candidate once and emits a record per opponent, and a
+    model load costs ~21s against ~0.93s per additional pair, so batching a
+    candidate's opponents into one process is most of the wall time.
+
+    Naive is the exception. It has no model to load, so it is always the
+    opponent rather than the candidate, and the arena selects it by the
+    *absence* of --opponent -- which cannot be combined with real ones. Those
+    matches get a process each.
+    """
+    grouped: list[tuple[int, list[int]]] = []
+    batched: dict[int, list[int]] = {}
+    for candidate, opponent in pairings:
+        if NAIVE in (candidate, opponent):
+            grouped.append((opponent if candidate == NAIVE else candidate, [NAIVE]))
+            continue
+        batched.setdefault(candidate, []).append(opponent)
+    grouped.extend(sorted(batched.items()))
+    return grouped
+
+
+def describe(version: int) -> str:
+    return "naive" if version == NAIVE else f"v{version}"
+
+
 def evenly_spaced(versions: list[int], count: int) -> list[int]:
     """`count` versions spread across the run, always including first and last.
 
@@ -233,7 +265,10 @@ def build_command(
         "--cache-directory", str(root / "artifacts/onnx-cache"),
     ]
     for opponent in opponents:
-        command += ["--opponent", str(opponent)]
+        # None is the naive evaluator: the arena plays it when no --opponent is
+        # given, so it can only be the sole opponent of a match.
+        if opponent is not None:
+            command += ["--opponent", str(opponent)]
     return command
 
 
@@ -273,11 +308,26 @@ def main() -> None:
         help="version every other plays against; defaults to the earliest rated",
     )
     parser.add_argument(
-        "--round-robin", action="store_true",
+        "--round-robin", action=argparse.BooleanOptionalAction, default=True,
         help=(
             "play every chosen checkpoint against every other, not just the "
-            "anchor; keeps late ratings pinned by close games instead of by "
-            "the prior once the field beats the anchor outright"
+            "anchor. The default, because rating against one anchor stops "
+            "discriminating as soon as the field beats it outright: an "
+            "undefeated record has no finite Elo, so the fit falls back on the "
+            "prior rather than on evidence. Measured on this lineage, v4 "
+            "through v20 all scored 0.94-1.00 against v0 and were "
+            "indistinguishable. --no-round-robin restores anchor-only, which "
+            "is n-1 matches rather than n(n-1)/2."
+        ),
+    )
+    parser.add_argument(
+        "--naive", action=argparse.BooleanOptionalAction, default=True,
+        help=(
+            "include the naive evaluator in the field. It is the one opponent "
+            "whose strength never changes, so it is what makes ratings "
+            "comparable across runs and across lineages -- a checkpoint's Elo "
+            "against other checkpoints only says where it sits in its own "
+            "field"
         ),
     )
     parser.add_argument("--pairs", type=int, default=16)
@@ -315,6 +365,12 @@ def main() -> None:
     else:
         chosen = evenly_spaced(sorted(available), arguments.count)
 
+    if arguments.naive:
+        # A model path of None makes the arena fall back to its naive
+        # evaluator, which is how the pipeline's own telemetry rates against it.
+        available[NAIVE] = None
+        chosen = [NAIVE] + chosen
+
     anchor = arguments.anchor if arguments.anchor is not None else chosen[0]
     if anchor not in available:
         raise SystemExit(f"no checkpoint for anchor version {anchor}")
@@ -342,18 +398,16 @@ def main() -> None:
     print(f"matches   : {len(pairings)} pairing(s) x {arguments.pairs} pairs")
 
     if arguments.dry_run:
-        preview: dict[int, list[int]] = {}
-        for candidate, opponent in pairings:
-            preview.setdefault(candidate, []).append(opponent)
+        preview = group_pairings(pairings)
         print(f"\nwould run {len(preview)} arena process(es):")
-        for candidate, opponents in sorted(preview.items()):
-            listed = ", ".join(f"v{version}" for version in opponents)
-            print(f"  v{candidate} vs {listed}")
-        sample = sorted(preview)[0]
+        for candidate, opponents in preview:
+            listed = ", ".join(describe(version) for version in opponents)
+            print(f"  {describe(candidate)} vs {listed}")
+        candidate, opponents = preview[0]
         print("\nfirst command:")
         print("  " + " ".join(build_command(
-            root, config, available[sample],
-            [available[version] for version in preview[sample]],
+            root, config, available[candidate],
+            [available[version] for version in opponents],
             arguments.seed, arguments.pairs,
         )))
         return
@@ -386,14 +440,12 @@ def main() -> None:
     # arena loads the candidate once and emits a record per opponent, and model
     # load is ~21s against ~0.93s per additional pair -- so grouping turns 10
     # processes into 4 here.
-    grouped: dict[int, list[int]] = {}
-    for candidate, opponent in todo:
-        grouped.setdefault(candidate, []).append(opponent)
+    grouped = group_pairings(todo)
 
     environment = arena_environment()
     started = time.perf_counter()
 
-    for index, (candidate, opponents) in enumerate(sorted(grouped.items()), start=1):
+    for index, (candidate, opponents) in enumerate(grouped, start=1):
         command = build_command(
             root, config, available[candidate],
             [available[version] for version in opponents],
