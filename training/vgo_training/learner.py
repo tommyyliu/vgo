@@ -1230,7 +1230,11 @@ class PersistentLearner:
                     # inference heads above learn the same targets without
                     # normalization. Architectures that emit only two outputs
                     # are unaffected.
-                    if len(outputs) == 4:
+                    # Dispatch on presence, not on tuple length: this was
+                    # `len(outputs) == 4` and stopped matching the moment the
+                    # ownership head made it six, which silently dropped the
+                    # 80% of the loss that shapes the trunk.
+                    if len(outputs) >= 4:
                         normed_logits, normed_values = outputs[2], outputs[3]
                         normed_loss = policy_cross_entropy(
                             normed_logits, policy_targets, policy_masks
