@@ -315,6 +315,20 @@ class PipelineConfig:
     # consecutive plies. Zero disables it. This belongs to run identity: it
     # changes which positions reach the shard.
     resign_threshold: float = 0.0
+    # Target false-positive rate for the resignation rule. When positive the
+    # threshold is chosen per update from the trailing calibration rather than
+    # fixed: the lowest threshold whose measured error stays under this bound.
+    #
+    # A fixed threshold cannot follow a model that is still learning. On
+    # ddrnet-wl a 0.95 threshold fired on 15 of 1625 games early and 440 of
+    # 1686 late -- the same setting was useless and then useful. Simulated over
+    # that run, a 5% target would have grown throughput from 0.4 to 24.9 plies
+    # saved per game while holding measured error at 3.6-4.9%.
+    resign_target_false_positive: float = 0.0
+    # Simulations for the remainder of a conceded game, 0 to stop at the
+    # concession. Non-zero makes a false positive self-correcting, which is what
+    # makes an aggressive target safe.
+    resign_soft_simulations: int = 0
     resign_window: int = 5
     resign_minimum_ply: int = 0
     # Uniform per game, in [komi_low, komi_high]. Positive favours White:
@@ -890,6 +904,52 @@ class Pipeline:
             "--",
         ]
 
+    def _adaptive_resign_threshold(self) -> float:
+        """Lowest threshold whose measured error stays under the target.
+
+        Lower fires more often and saves more search, so the cheapest setting
+        that clears the error bound is the right one. Returns the configured
+        threshold when adaptation is off, when no shard has calibration yet, or
+        when nothing clears the bound -- in the last case the configured value
+        is the conservative fallback rather than the most aggressive candidate.
+
+        Only the trailing window counts. Calibration describes the model that
+        generated those games, and a model still learning invalidates its own
+        history: on ddrnet-wl a 0.95 threshold fired on 15 of 1625 games over
+        the first fifteen shards and 440 of 1686 over the next sixteen.
+        """
+        target = float(self.config.resign_target_false_positive)
+        if target <= 0.0:
+            return float(self.config.resign_threshold)
+
+        totals: dict[float, list[int]] = {}
+        for replay in self.state.replay[-self.config.replay_window :]:
+            if int(replay.get("sequence", -1)) < 0:
+                continue
+            try:
+                manifest = json.loads(
+                    Path(str(replay["manifest"])).read_text(encoding="utf-8")
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            for entry in manifest.get("resign_calibration", ()):
+                # Only the live window: a threshold measured at another window
+                # says nothing about how this one behaves.
+                if int(entry.get("window", 0)) != int(self.config.resign_window):
+                    continue
+                bucket = totals.setdefault(float(entry["threshold"]), [0, 0])
+                bucket[0] += int(entry["fired"])
+                bucket[1] += int(entry["wrong"])
+
+        # A handful of firings can read 0% by luck, so require enough to mean
+        # something before trusting a threshold.
+        minimum_fires = 30
+        for threshold in sorted(totals):
+            fired, wrong = totals[threshold]
+            if fired >= minimum_fires and wrong / fired <= target:
+                return threshold
+        return float(self.config.resign_threshold)
+
     def generation_command(
         self,
         *,
@@ -898,6 +958,13 @@ class Pipeline:
         model: ModelArtifact | None,
     ) -> list[str]:
         config = self.config
+        threshold = self._adaptive_resign_threshold()
+        if threshold != config.resign_threshold:
+            print(
+                f"[resign] threshold {threshold} chosen for shard {sequence} "
+                f"(target FP {100 * config.resign_target_false_positive:.0f}%)",
+                flush=True,
+            )
         command = self._rust_command("vgo-generate-demo") + [
             "--samples",
             str(config.samples_per_shard),
@@ -916,11 +983,13 @@ class Pipeline:
             "--max-plies",
             str(config.maximum_plies),
             "--resign-threshold",
-            str(config.resign_threshold),
+            str(threshold),
             "--resign-window",
             str(config.resign_window),
             "--resign-minimum-ply",
             str(config.resign_minimum_ply),
+            "--resign-soft-simulations",
+            str(config.resign_soft_simulations),
             # `=` form: a negative komi otherwise parses as a flag, since clap
             # cannot tell `-0.1` from a short option.
             f"--komi-low={config.komi_low}",
@@ -2296,6 +2365,28 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
             "earliest ply a game may be conceded at. The window counts a "
             "seat's own turns and a seat moves every other ply, so window 5 "
             "concedes at ply 8 -- five stones each on a board holding 35"
+        ),
+    )
+    parser.add_argument(
+        "--resign-target-false-positive",
+        type=float,
+        default=0.0,
+        help=(
+            "choose the resign threshold per shard from trailing calibration "
+            "instead of fixing it: the lowest threshold whose measured error "
+            "stays under this rate. A fixed threshold cannot follow a model "
+            "that is still learning -- 0.95 fired on 1%% of games early in "
+            "ddrnet-wl and 26%% late. Zero keeps --resign-threshold fixed"
+        ),
+    )
+    parser.add_argument(
+        "--resign-soft-simulations",
+        type=int,
+        default=0,
+        help=(
+            "play a conceded game out at this many simulations instead of "
+            "stopping, so a false positive corrects itself rather than writing "
+            "the wrong label; measured at 10.7%% of concessions on a real shard"
         ),
     )
     parser.add_argument(
