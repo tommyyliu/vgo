@@ -110,6 +110,10 @@ struct GameRecord {
     margin: f64,
     reached_ply_cap: bool,
     resigned: bool,
+    /// Ply a soft concession fired at, if one did. The game played on from
+    /// there at reduced search, so `resigned` stays false and the outcome is a
+    /// real one -- this is what lets the rule be scored after the fact.
+    soft_resign_ply: Option<u32>,
     first_sample: usize,
     sample_count: usize,
     /// The board as the game ended, for the ownership target.
@@ -213,6 +217,16 @@ struct Config {
     /// acting on it while the board is still an opening.
     #[arg(long, default_value_t = 0)]
     resign_minimum_ply: u32,
+    /// Simulations for the remainder of a conceded game, or 0 to stop at the
+    /// concession.
+    ///
+    /// A hard resignation asserts the winner and a false positive writes the
+    /// wrong label. Playing on cheaply lets the game reach a real terminal
+    /// state, so a mistaken concession corrects itself. Measured on this run's
+    /// recent shards, a 0.7 threshold fires on 66% of games at a 4.8% error
+    /// rate -- errors worth recovering rather than tolerating.
+    #[arg(long, default_value_t = 0)]
+    resign_soft_simulations: u32,
     /// Fraction of games played to a real finish regardless of the threshold.
     /// These are the only games that can measure how often resignation would
     /// have been wrong, so a run that resigns should always keep some.
@@ -573,10 +587,16 @@ fn generate_game(
             window: config.resign_window,
             disable_fraction: config.resign_disable_fraction,
             minimum_ply: config.resign_minimum_ply,
+            soft_simulations: config.resign_soft_simulations,
         }
     } else {
         ResignRule::disabled()
     };
+    // Set by the playout the ply a soft concession fires at, read by the search
+    // closure below so the rest of the game runs cheaply. A Cell rather than a
+    // parameter because the playout owns the loop and the closure is its
+    // argument -- neither can see the other's locals.
+    let soft_from = std::cell::Cell::new(u32::MAX);
     let playout = run_playout_with_resignation(
         Position::new(config.radius, Vec::new(), Color::Black)
             .with_komi(sampled_komi(game_seed, config.komi_low, config.komi_high)),
@@ -586,9 +606,18 @@ fn generate_game(
             if stopped.load(Ordering::Acquire) {
                 return Err(EvaluationError::new("replay generation cancelled"));
             }
-            search_at_ply(position, search_config, game_seed, evaluator, ply)
+            // Past a soft concession the game is only being played out to reach
+            // a real terminal state, so it does not need full search.
+            let mut config_for_ply = search_config;
+            if ply >= soft_from.get() {
+                config_for_ply.simulations = config.resign_soft_simulations;
+            }
+            search_at_ply(position, config_for_ply, game_seed, evaluator, ply)
         },
         |step| {
+            if let Some(ply) = step.soft_resign_ply {
+                soft_from.set(ply);
+            }
             let target = policy_target(step.search, policy_config);
             pending.push(PendingSample {
                 // Store the position; rendering is a training-time choice now,
@@ -703,6 +732,7 @@ fn generate_game(
             },
             reached_ply_cap: playout.outcome.is_none(),
             resigned: playout.resigned,
+            soft_resign_ply: playout.stats.soft_resign_ply,
             // Filled by the writer, which owns the shard-relative offset.
             first_sample: 0,
             sample_count: samples.len(),
@@ -1081,7 +1111,7 @@ fn write_game_records(path: &Path, records: &[GameRecord]) -> std::io::Result<()
             concat!(
                 r#"{{"game":{},"komi":{:.6},"plies":{},"passes":{},"#,
                 r#""self_captures":{},"black_utility":{},"margin":{:.6},"#,
-                r#""reached_ply_cap":{},"resigned":{},"#,
+                r#""reached_ply_cap":{},"resigned":{},"soft_resign_ply":{},"#,
                 r#""first_sample":{},"sample_count":{},"final_stones":[{}]}}"#
             ),
             record.game,
@@ -1093,6 +1123,9 @@ fn write_game_records(path: &Path, records: &[GameRecord]) -> std::io::Result<()
             record.margin,
             record.reached_ply_cap,
             record.resigned,
+            record
+                .soft_resign_ply
+                .map_or_else(|| "null".to_owned(), |ply| ply.to_string()),
             record.first_sample,
             record.sample_count,
             record
@@ -1943,6 +1976,7 @@ mod tests {
             resigned: false,
             first_sample: 0,
             sample_count: 1,
+            soft_resign_ply: None,
             final_stones: Vec::new(),
         }
     }

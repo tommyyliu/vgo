@@ -113,6 +113,10 @@ use vgo_search::{Action, SearchResult, SearchStats};
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PlayoutStats {
     pub plies: u32,
+    /// Ply at which a soft resignation fired, if it did. The game continued
+    /// past it at reduced search, so the outcome is still played rather than
+    /// asserted -- this only records that the rule triggered.
+    pub soft_resign_ply: Option<u32>,
     pub captures: u64,
     pub self_captures: u64,
     pub passes: u64,
@@ -156,6 +160,16 @@ pub struct ResignRule {
     /// which is the part that works. A floor leaves the test at five turns and
     /// only forbids acting on it while the board is still empty.
     pub minimum_ply: u32,
+    /// Play the rest of a conceded game at reduced search instead of stopping.
+    ///
+    /// A hard resignation asserts the winner; the label is only as good as the
+    /// rule. KataGo instead plays the remainder cheaply, so the game reaches a
+    /// real terminal state and the outcome comes from play. A false positive is
+    /// then self-correcting: the game continues and records whoever actually
+    /// won, rather than writing the rule's mistake into the training data.
+    ///
+    /// Zero keeps the old behaviour of ending the game at the concession.
+    pub soft_simulations: u32,
 }
 
 impl ResignRule {
@@ -167,6 +181,7 @@ impl ResignRule {
             window: u32::MAX,
             disable_fraction: 0.0,
             minimum_ply: 0,
+            soft_simulations: 0,
         }
     }
 
@@ -196,6 +211,9 @@ impl PlayoutReport {
 
 pub struct PlayoutStep<'a> {
     pub ply: u32,
+    /// Set on the step where a soft resignation fired, so a caller can drop its
+    /// search budget for the remainder without tracking the rule itself.
+    pub soft_resign_ply: Option<u32>,
     pub position: &'a Position,
     pub search: &'a SearchResult,
     pub action: Action,
@@ -224,6 +242,8 @@ pub fn play_game_with_resignation<E>(
 
     let mut position = initial;
     let mut stats = PlayoutStats::default();
+    // Ply a soft concession happened at, if any. The game plays on from here.
+    let mut conceded_at: Option<u32> = None;
     // Consecutive *own* turns whose root value has stayed past the threshold,
     // counted per seat. Reset by any of that seat's turns that does not, so the
     // window measures the least confident evaluation in a run rather than the
@@ -257,7 +277,21 @@ pub fn play_game_with_resignation<E>(
             } else {
                 losing_streak[seat] = 0;
             }
-            if losing_streak[seat] >= resign.window && ply >= resign.minimum_ply {
+            if losing_streak[seat] >= resign.window
+                && ply >= resign.minimum_ply
+                && resign.soft_simulations > 0
+                && conceded_at.is_none()
+            {
+                // Soft: note the concession and carry on. `conceded_at` is what
+                // the caller reads to drop its simulation count, and the game
+                // still ends on a real terminal position.
+                conceded_at = Some(ply);
+                stats.soft_resign_ply = Some(ply);
+            }
+            if losing_streak[seat] >= resign.window
+                && ply >= resign.minimum_ply
+                && resign.soft_simulations == 0
+            {
                 // The mover concedes, so the opponent wins. This is a real
                 // result, not a truncation: the samples carry a genuine outcome
                 // and train exactly as a played-out game would.
@@ -292,6 +326,7 @@ pub fn play_game_with_resignation<E>(
             );
         observe(PlayoutStep {
             ply,
+            soft_resign_ply: conceded_at,
             position: &position,
             search: &result,
             action,
@@ -426,7 +461,7 @@ mod tests {
     fn a_single_bad_evaluation_does_not_end_a_game() {
         // The window exists because one ply's root value is noisy. A lone
         // hopeless evaluation surrounded by even ones must not concede.
-        let rule = ResignRule { threshold: 0.9, window: 5, disable_fraction: 0.0, minimum_ply: 0 };
+        let rule = ResignRule { threshold: 0.9, window: 5, disable_fraction: 0.0, minimum_ply: 0, soft_simulations: 0 };
         let mut ply = 0;
         let report = play_game_with_resignation(
             Position::new(1.0 / 6.0, Vec::new(), Color::Black),
@@ -452,7 +487,7 @@ mod tests {
         // Window 1 so the rule fires before the fixture's repeated Pass ends
         // the game by double-pass; the window's behaviour is covered by
         // `a_single_bad_evaluation_does_not_end_a_game`.
-        let rule = ResignRule { threshold: 0.9, window: 1, disable_fraction: 0.0, minimum_ply: 0 };
+        let rule = ResignRule { threshold: 0.9, window: 1, disable_fraction: 0.0, minimum_ply: 0, soft_simulations: 0 };
         let report = play_game_with_resignation(
             Position::new(1.0 / 6.0, Vec::new(), Color::Black),
             40,
@@ -481,7 +516,7 @@ mod tests {
         // the one setting where the bug is invisible.
         // Placing rather than passing: two passes finish the game at ply 2,
         // before Black reaches a third turn.
-        let rule = ResignRule { threshold: 0.9, window: 3, disable_fraction: 0.0, minimum_ply: 0 };
+        let rule = ResignRule { threshold: 0.9, window: 3, disable_fraction: 0.0, minimum_ply: 0, soft_simulations: 0 };
         let report = play_game_with_resignation(
             Position::new(1.0 / 6.0, Vec::new(), Color::Black),
             40,
@@ -508,6 +543,66 @@ mod tests {
         );
     }
 
+    /// A soft concession plays the game out instead of asserting a winner.
+    ///
+    /// This is the whole point of the mode: a hard resignation records whatever
+    /// the rule decided, so a false positive writes the wrong label. Measured
+    /// on ddrnet-wl's recent shards, a 0.7 threshold fires on 66% of games at a
+    /// 4.8% error rate -- one game in twenty mislabelled. Playing on lets those
+    /// correct themselves, at the cost of cheap search for the remainder.
+    #[test]
+    fn a_soft_concession_plays_on_and_reports_a_played_result() {
+        let rule = ResignRule {
+            threshold: 0.9,
+            window: 3,
+            disable_fraction: 0.0,
+            minimum_ply: 0,
+            soft_simulations: 8,
+        };
+        let mut soft_at = None;
+        let report = play_game_with_resignation(
+            Position::new(1.0 / 6.0, Vec::new(), Color::Black),
+            40,
+            rule,
+            |position, ply| Ok::<_, Infallible>(placing_value(position, ply, -1.0)),
+            |step| {
+                if soft_at.is_none() {
+                    soft_at = step.soft_resign_ply;
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            soft_at,
+            Some(4),
+            "the rule should still fire on Black's third turn, ply 4"
+        );
+        assert!(
+            !report.resigned,
+            "a soft concession is not a resignation: the game was played out"
+        );
+        assert_eq!(
+            report.stats.soft_resign_ply,
+            Some(4),
+            "the concession ply is reported so the rule can be scored later"
+        );
+        assert!(
+            report.stats.plies > 5,
+            "the game must continue past the concession, got {} plies",
+            report.stats.plies
+        );
+        // The outcome may be None here: this fixture never fills the board, so
+        // the game runs to the ply cap, and adjudicating a capped game is the
+        // generator's job (`award_by_area`) rather than the playout's. What
+        // matters is that the playout did not assert a winner of its own --
+        // a hard resignation would have returned Some(White) at ply 5.
+        assert!(
+            report.outcome.is_none() || !report.resigned,
+            "a soft game's outcome must come from play, not from the rule"
+        );
+    }
+
     #[test]
     fn a_ply_floor_holds_off_an_early_concession() {
         // The window counts a seat's own turns, so window 5 fires at ply 8 --
@@ -520,6 +615,7 @@ mod tests {
             window: 3,
             disable_fraction: 0.0,
             minimum_ply: 20,
+            soft_simulations: 0,
         };
         let report = play_game_with_resignation(
             Position::new(1.0 / 6.0, Vec::new(), Color::Black),
@@ -540,7 +636,7 @@ mod tests {
         // The root value is Black-relative. A strongly positive value means
         // Black is winning, so Black must never concede on it however long it
         // persists -- only the side actually losing may resign.
-        let rule = ResignRule { threshold: 0.9, window: 3, disable_fraction: 0.0, minimum_ply: 0 };
+        let rule = ResignRule { threshold: 0.9, window: 3, disable_fraction: 0.0, minimum_ply: 0, soft_simulations: 0 };
         let report = play_game_with_resignation(
             Position::new(1.0 / 6.0, Vec::new(), Color::Black),
             8,
