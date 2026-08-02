@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 from pathlib import Path
 import subprocess
@@ -77,6 +78,33 @@ def arena_environment() -> dict[str, str]:
     return environment
 
 
+def ancestor_of(run: Path) -> tuple[Path, int] | None:
+    """The run this one warm-started from, and the version it started at.
+
+    A warm-started run's version 0 continues its parent's last checkpoint, so
+    rating the child alone shows only the tail of the training history. The
+    parent is read out of the launch script rather than the pipeline state
+    because `--initial-checkpoint` is what actually determined the lineage.
+    """
+    launch = run / "launch.sh"
+    if not launch.exists():
+        return None
+    match = re.search(
+        r'--initial-checkpoint\s+"?\$?\{?root\}?/?([^"\s]+)', launch.read_text()
+    )
+    if not match:
+        return None
+    checkpoint = Path(str(match.group(1)).lstrip("/"))
+    parts = checkpoint.parts
+    if "updates" not in parts:
+        return None
+    index = parts.index("updates")
+    parent = run.parent.parent / Path(*parts[: index]) if not checkpoint.is_absolute() else None
+    parent = (run.parent / Path(*parts[1:index])) if parent is None else parent
+    version = int(parts[index + 1].split("-")[1])
+    return (parent, version) if (parent / "updates").is_dir() else None
+
+
 def discover_checkpoints(run: Path) -> dict[int, Path]:
     """Every published checkpoint, by version."""
     found: dict[int, Path] = {}
@@ -91,6 +119,42 @@ def discover_checkpoints(run: Path) -> dict[int, Path]:
         if onnx.exists():
             found.setdefault(int(directory.name.split("-")[1]), onnx)
     return found
+
+
+def discover_lineage(run: Path) -> tuple[dict[int, Path], dict[int, str]]:
+    """Checkpoints of this run and its ancestors on one version timeline.
+
+    A warm start makes the child's version 0 the successor of the parent's
+    checkpoint, so the child's versions are shifted past the parent's to read as
+    a single history. Rating them together is what shows whether achange
+    helped: the child alone starts from whatever the parent had already reached.
+    """
+    chain: list[tuple[Path, int]] = []
+    current, cut = run, None
+    seen: set[Path] = set()
+    while current not in seen:
+        seen.add(current)
+        chain.append((current, cut))
+        parent = ancestor_of(current)
+        if parent is None:
+            break
+        current, cut = parent[0], parent[1]
+
+    found: dict[int, Path] = {}
+    origin: dict[int, str] = {}
+    offset = 0
+    # Oldest first, so each run's versions land after its parent's.
+    for run_path, inherited in reversed(chain):
+        versions = discover_checkpoints(run_path)
+        # The parent only contributes up to the checkpoint the child forked at.
+        limit = inherited if inherited is not None else max(versions, default=-1)
+        for version in sorted(versions):
+            if version > limit:
+                continue
+            found[offset + version] = versions[version]
+            origin[offset + version] = f"{run_path.name}:v{version}"
+        offset += limit + 1
+    return found, origin
 
 
 def evenly_spaced(versions: list[int], count: int) -> list[int]:
@@ -222,13 +286,24 @@ def main() -> None:
         "--prior-games", type=float, default=0.25,
         help="virtual even games regularizing a lopsided record",
     )
+    parser.add_argument(
+        "--lineage",
+        action="store_true",
+        help="include the runs this one warm-started from, on one version "
+        "timeline; a warm-started run's v0 continues its parent's last "
+        "checkpoint, so rating it alone shows only the tail of the history",
+    )
     parser.add_argument("--dry-run", action="store_true")
     arguments = parser.parse_args()
 
     run = arguments.run.resolve()
     root = Path(__file__).resolve().parents[1]
     config = run_config(run)
-    available = discover_checkpoints(run)
+    origin: dict[int, str] = {}
+    if arguments.lineage:
+        available, origin = discover_lineage(run)
+    else:
+        available = discover_checkpoints(run)
     if not available:
         raise SystemExit(f"no checkpoints under {run}")
 
@@ -397,7 +472,8 @@ def main() -> None:
         played[a] = played.get(a, 0) + int(match["games"])
         played[b] = played.get(b, 0) + int(match["games"])
 
-    print(f"\n{'version':>9}{'elo':>9}{'score':>9}{'games':>8}")
+    label = "  source" if origin else ""
+    print(f"\n{'version':>9}{'elo':>9}{'score':>9}{'games':>8}{label}")
     for version in sorted(ratings):
         total = played.get(version, 0)
         score = wins.get(version, 0.0) / total if total else float("nan")
@@ -407,8 +483,9 @@ def main() -> None:
         # rather than letting the number be read as a measurement.
         if total and (score >= 1.0 or score <= 0.0):
             flag = "  <- no finite Elo; rating pinned by the prior"
+        source = f"  {origin[version]}" if version in origin else ""
         print(
-            f"{version:>9}{ratings[version]:>9.0f}{score:>9.3f}{total:>8}{flag}"
+            f"{version:>9}{ratings[version]:>9.0f}{score:>9.3f}{total:>8}{source}{flag}"
         )
     print(f"\n{time.perf_counter() - started:.0f}s total -> {output}/ratings.json")
 
