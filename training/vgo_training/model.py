@@ -68,6 +68,19 @@ def apply_he_initialization(module: nn.Module) -> None:
                 nn.init.zeros_(child.bias)
 
 
+def value_utility(logits: torch.Tensor) -> torch.Tensor:
+    """Mover-relative utility in [-1, 1] from win/loss logits.
+
+    P(win) - P(loss) over the two-class softmax, which for two classes is
+    tanh(z_win - z_loss) / 1 -- bounded by construction rather than by a
+    squashing layer, so the bound costs no gradient. This is what the search
+    consumes and what the exported graph emits, so the ONNX contract and every
+    Rust caller are unchanged by the head becoming categorical.
+    """
+    probabilities = torch.softmax(logits, dim=1)
+    return probabilities[:, 0] - probabilities[:, 1]
+
+
 class ResidualBlock(nn.Module):
     """Residual block, optionally variance-scaled or normalized.
 
@@ -154,8 +167,23 @@ class RasterPolicyValueNet(nn.Module):
         self.value_head = nn.Sequential(
             nn.Linear(width, width),
             nn.ReLU(),
-            nn.Linear(width, 1),
-            nn.Tanh(),
+            # Two logits -- P(mover wins), P(mover loses) -- rather than a
+            # scalar through tanh. The outcome is categorical, so a
+            # distribution over categories is what the data actually is.
+            #
+            # tanh + MSE has gradient 2*(v - target)*(1 - v^2), and that last
+            # factor is what killed learning: measured on 512 real positions
+            # from update 11, the median damping was 0.0004 -- a 2500x weaker
+            # gradient -- with 65% of positions under 0.01. A confidently wrong
+            # evaluation produced almost no signal to correct it. Softmax
+            # cross-entropy has gradient (p - target) in logit space, with no
+            # such factor, so being wrong and certain is exactly the case that
+            # learns fastest.
+            #
+            # Two classes rather than KataGo's three: it carries a no-result
+            # class for ko and timeout, and our ties need black - white - komi
+            # inside f64::EPSILON on continuous areas. Zero ties in 1400 games.
+            nn.Linear(width, 2),
         )
 
     def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -168,7 +196,7 @@ class RasterPolicyValueNet(nn.Module):
         placement_logits = self.policy_map(features).flatten(start_dim=1)
         pass_logit = self.pass_head(pooled)
         policy_logits = torch.cat((placement_logits, pass_logit), dim=1)
-        values = self.value_head(pooled).squeeze(1)
+        values = value_utility(self.value_head(pooled))
         return policy_logits, values
 
 
@@ -256,8 +284,23 @@ class UNetPolicyValueNet(nn.Module):
         self.value_head = nn.Sequential(
             nn.Linear(bottleneck, bottleneck),
             nn.ReLU(),
-            nn.Linear(bottleneck, 1),
-            nn.Tanh(),
+            # Two logits -- P(mover wins), P(mover loses) -- rather than a
+            # scalar through tanh. The outcome is categorical, so a
+            # distribution over categories is what the data actually is.
+            #
+            # tanh + MSE has gradient 2*(v - target)*(1 - v^2), and that last
+            # factor is what killed learning: measured on 512 real positions
+            # from update 11, the median damping was 0.0004 -- a 2500x weaker
+            # gradient -- with 65% of positions under 0.01. A confidently wrong
+            # evaluation produced almost no signal to correct it. Softmax
+            # cross-entropy has gradient (p - target) in logit space, with no
+            # such factor, so being wrong and certain is exactly the case that
+            # learns fastest.
+            #
+            # Two classes rather than KataGo's three: it carries a no-result
+            # class for ko and timeout, and our ties need black - white - komi
+            # inside f64::EPSILON on continuous areas. Zero ties in 1400 games.
+            nn.Linear(bottleneck, 2),
         )
 
     def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -276,7 +319,7 @@ class UNetPolicyValueNet(nn.Module):
         pooled = bottleneck.mean(dim=(-2, -1))
         pass_logit = self.pass_head(pooled)
         policy_logits = torch.cat((placement_logits, pass_logit), dim=1)
-        values = self.value_head(pooled).squeeze(1)
+        values = value_utility(self.value_head(pooled))
         return policy_logits, values
 
 
@@ -530,8 +573,23 @@ class DDRNetPolicyValueNet(nn.Module):
         self.value_head = nn.Sequential(
             nn.Linear(context_channels, context_channels),
             nn.ReLU(),
-            nn.Linear(context_channels, 1),
-            nn.Tanh(),
+            # Two logits -- P(mover wins), P(mover loses) -- rather than a
+            # scalar through tanh. The outcome is categorical, so a
+            # distribution over categories is what the data actually is.
+            #
+            # tanh + MSE has gradient 2*(v - target)*(1 - v^2), and that last
+            # factor is what killed learning: measured on 512 real positions
+            # from update 11, the median damping was 0.0004 -- a 2500x weaker
+            # gradient -- with 65% of positions under 0.01. A confidently wrong
+            # evaluation produced almost no signal to correct it. Softmax
+            # cross-entropy has gradient (p - target) in logit space, with no
+            # such factor, so being wrong and certain is exactly the case that
+            # learns fastest.
+            #
+            # Two classes rather than KataGo's three: it carries a no-result
+            # class for ko and timeout, and our ties need black - white - komi
+            # inside f64::EPSILON on continuous areas. Zero ties in 1400 games.
+            nn.Linear(context_channels, 2),
         )
 
         # The normalized twins. These see batch-normalized features and take the
@@ -553,8 +611,23 @@ class DDRNetPolicyValueNet(nn.Module):
         self.value_head_normed = nn.Sequential(
             nn.Linear(context_channels, context_channels),
             nn.ReLU(),
-            nn.Linear(context_channels, 1),
-            nn.Tanh(),
+            # Two logits -- P(mover wins), P(mover loses) -- rather than a
+            # scalar through tanh. The outcome is categorical, so a
+            # distribution over categories is what the data actually is.
+            #
+            # tanh + MSE has gradient 2*(v - target)*(1 - v^2), and that last
+            # factor is what killed learning: measured on 512 real positions
+            # from update 11, the median damping was 0.0004 -- a 2500x weaker
+            # gradient -- with 65% of positions under 0.01. A confidently wrong
+            # evaluation produced almost no signal to correct it. Softmax
+            # cross-entropy has gradient (p - target) in logit space, with no
+            # such factor, so being wrong and certain is exactly the case that
+            # learns fastest.
+            #
+            # Two classes rather than KataGo's three: it carries a no-result
+            # class for ko and timeout, and our ties need black - white - komi
+            # inside f64::EPSILON on continuous areas. Zero ties in 1400 games.
+            nn.Linear(context_channels, 2),
         )
 
         # He scale is what both schemes assume: the fixed constants are derived
@@ -640,7 +713,7 @@ class DDRNetPolicyValueNet(nn.Module):
             )
             pooled = semantic_features.mean(dim=(-2, -1))
             logits = torch.cat((placement, pass_head(pooled)), dim=1)
-            values = value_head(pooled).squeeze(1)
+            values = value_head(pooled)
             if ownership_features is None:
                 return logits, values
             # Same resize as the policy so the map lands on the policy grid,
@@ -661,8 +734,10 @@ class DDRNetPolicyValueNet(nn.Module):
         )
         if not self.training:
             # Ownership is an auxiliary target, not something the search reads,
-            # so it stays out of the exported graph entirely.
-            return policy_logits, values
+            # so it stays out of the exported graph entirely. The value logits
+            # collapse to the scalar utility here, so the exported graph keeps
+            # emitting exactly what the search always consumed.
+            return policy_logits, value_utility(values)
 
         # Training only. The normalized heads carry most of the loss and so are
         # what actually shapes the trunk; returning them lets the learner add

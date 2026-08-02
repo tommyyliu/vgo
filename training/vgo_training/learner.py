@@ -544,6 +544,29 @@ class _StagingSlot:
     consumed: torch.cuda.Event | None = None
 
 
+def value_cross_entropy(
+    logits: torch.Tensor, targets: torch.Tensor
+) -> torch.Tensor:
+    """Cross-entropy of win/loss logits against a +/-1 outcome.
+
+    The head is categorical now, so the loss is too. tanh + MSE carried a
+    (1 - v^2) factor that vanished exactly where the model was most wrong: on a
+    confidently mistaken prediction the gradient was 1.9e-6 against 1.0 here, a
+    factor of half a million. Measured on the trained model, the median position
+    saw 0.0004 of the gradient a non-saturating loss would give.
+
+    Accepts the scalar target the shards already store, so no replay version
+    changes: +1 means the mover won, -1 that it lost.
+    """
+    if logits.dim() == 1:
+        # A checkpoint from before the head became categorical.
+        raise ValueError(
+            "value head emitted a scalar; this checkpoint predates the "
+            "win/loss head and its value semantics are incompatible"
+        )
+    return nn.functional.cross_entropy(logits, (targets <= 0).long())
+
+
 class BatchStager:
     """Double-buffered shard gather and asynchronous host-to-device pipeline."""
 
@@ -767,6 +790,12 @@ def evaluate(
                 targets * targets.clamp_min(1e-12).log()
             ).sum(dim=1)
             squared_error = (predictions - values).square()
+            # Sign agreement: for a categorical head this is the metric that
+            # matters -- did it pick the right outcome -- where MAE mixes
+            # correctness with confidence.
+            value_correct = (
+                (predictions.sign() == values.sign()) | (values == 0)
+            ).to(dtype=logits.dtype)
             top1 = (
                 masked_logits.argmax(dim=1) == targets.argmax(dim=1)
             ).to(dtype=logits.dtype)
@@ -778,6 +807,7 @@ def evaluate(
                 squared_error.sum(),
                 top1.sum(),
                 absolute_error.sum(),
+                value_correct.sum(),
             )
         ).to(dtype=torch.float64)
 
@@ -794,6 +824,10 @@ def evaluate(
         "policy_kl": cross_entropy - target_entropy,
         "policy_top1": totals[3] / view.samples,
         "value_mae": totals[4] / view.samples,
+        # The head predicts a category now, so report how often it picks the
+        # right one. 0.5 is chance; value_mae can look respectable while sign
+        # accuracy sits at chance, which is what memorisation looks like.
+        "value_sign_accuracy": totals[5] / view.samples,
     }
 
 
@@ -1221,9 +1255,7 @@ class PersistentLearner:
                     policy_loss = policy_cross_entropy(
                         logits, policy_targets, policy_masks
                     )
-                    value_loss = nn.functional.mse_loss(
-                        values, value_targets
-                    )
+                    value_loss = value_cross_entropy(values, value_targets)
                     loss = policy_loss + config.value_weight * value_loss
                     # KataGo's one-batch-norm split: the normalized heads take
                     # most of the weight so they drive the trunk, while the
@@ -1238,7 +1270,7 @@ class PersistentLearner:
                         normed_logits, normed_values = outputs[2], outputs[3]
                         normed_loss = policy_cross_entropy(
                             normed_logits, policy_targets, policy_masks
-                        ) + config.value_weight * nn.functional.mse_loss(
+                        ) + config.value_weight * value_cross_entropy(
                             normed_values, value_targets
                         )
                         loss = (

@@ -54,7 +54,31 @@ def load_model(checkpoint_path: Path) -> tuple[nn.Module, dict[str, object]]:
     # and present-but-unused in a training checkpoint. Either way they must not
     # fail the load -- but everything inference *does* read still has to be
     # there, so a genuinely truncated checkpoint is not quietly accepted.
-    missing, _ = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    # A checkpoint from before the value head became categorical has a
+    # single-output final projection where this model has two. PyTorch raises on
+    # the shape mismatch rather than loading it quietly, which is the right
+    # default -- the two heads mean different things. Drop those tensors so the
+    # trunk and policy still transfer and the value head starts fresh, which is
+    # what a migration wants anyway: the old weights encode pre-tanh margins
+    # reaching 17, all of which a logit head would have to unlearn.
+    state = dict(checkpoint["state_dict"])
+    reinitialized_value_head = False
+    for name, parameter in list(state.items()):
+        current = model.state_dict().get(name)
+        if current is not None and current.shape != parameter.shape:
+            if "value_head" not in name:
+                raise RuntimeError(
+                    f"checkpoint tensor {name} has shape {tuple(parameter.shape)}, "
+                    f"model expects {tuple(current.shape)}"
+                )
+            del state[name]
+            reinitialized_value_head = True
+    if reinitialized_value_head:
+        print(
+            "value head reinitialized: checkpoint predates the win/loss head",
+            flush=True,
+        )
+    missing, _ = model.load_state_dict(state, strict=False)
     required = [
         name
         for name in missing
@@ -67,6 +91,8 @@ def load_model(checkpoint_path: Path) -> tuple[nn.Module, dict[str, object]]:
             # exported graph, so a checkpoint predating the head is complete
             # for inference and must still load.
             or name.startswith("ownership_")
+            # Dropped just above when the checkpoint predates the win/loss head.
+            or (reinitialized_value_head and "value_head" in name)
         )
     ]
     if required:
