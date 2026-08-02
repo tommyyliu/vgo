@@ -515,6 +515,17 @@ class DDRNetPolicyValueNet(nn.Module):
             nn.ReLU(),
         )
         self.policy_map = nn.Conv2d(detail_channels, 1, kernel_size=1)
+        # Ownership: who holds each cell when the game ends, in [-1, 1] from the
+        # mover's view. Spatial rather than scalar on purpose -- a game's ~58
+        # positions all share one value label, which a net of this capacity
+        # memorises by trajectory (training MAE 0.040 against validation 0.467).
+        # Ownership varies within a game, so the same trajectory cannot collapse
+        # to one number.
+        self.ownership_features = nn.Sequential(
+            nn.Conv2d(context_channels, detail_channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.ownership_map = nn.Conv2d(detail_channels, 1, kernel_size=1)
         self.pass_head = nn.Linear(context_channels, 1)
         self.value_head = nn.Sequential(
             nn.Linear(context_channels, context_channels),
@@ -533,6 +544,11 @@ class DDRNetPolicyValueNet(nn.Module):
             nn.ReLU(),
         )
         self.policy_map_normed = nn.Conv2d(detail_channels, 1, kernel_size=1)
+        self.ownership_features_normed = nn.Sequential(
+            nn.Conv2d(context_channels, detail_channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.ownership_map_normed = nn.Conv2d(detail_channels, 1, kernel_size=1)
         self.pass_head_normed = nn.Linear(context_channels, 1)
         self.value_head_normed = nn.Sequential(
             nn.Linear(context_channels, context_channels),
@@ -615,14 +631,25 @@ class DDRNetPolicyValueNet(nn.Module):
             policy_map: nn.Module,
             pass_head: nn.Module,
             value_head: nn.Module,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+            ownership_features: nn.Module | None = None,
+            ownership_map: nn.Module | None = None,
+        ) -> tuple[torch.Tensor, ...]:
             placement = policy_map(policy_features(fused_features))
             placement = self._resize_policy(placement, target_size).flatten(
                 start_dim=1
             )
             pooled = semantic_features.mean(dim=(-2, -1))
             logits = torch.cat((placement, pass_head(pooled)), dim=1)
-            return logits, value_head(pooled).squeeze(1)
+            values = value_head(pooled).squeeze(1)
+            if ownership_features is None:
+                return logits, values
+            # Same resize as the policy so the map lands on the policy grid,
+            # which is the resolution the target is rendered at.
+            ownership = ownership_map(ownership_features(fused_features))
+            ownership = torch.tanh(
+                self._resize_policy(ownership, target_size)
+            ).flatten(start_dim=1)
+            return logits, values, ownership
 
         policy_logits, values = heads(
             semantic,
@@ -633,20 +660,41 @@ class DDRNetPolicyValueNet(nn.Module):
             self.value_head,
         )
         if not self.training:
+            # Ownership is an auxiliary target, not something the search reads,
+            # so it stays out of the exported graph entirely.
             return policy_logits, values
 
         # Training only. The normalized heads carry most of the loss and so are
         # what actually shapes the trunk; returning them lets the learner add
         # their loss without the exported graph ever seeing a BatchNorm.
-        normed_logits, normed_values = heads(
+        ownership = heads(
+            semantic,
+            fused,
+            self.policy_features,
+            self.policy_map,
+            self.pass_head,
+            self.value_head,
+            self.ownership_features,
+            self.ownership_map,
+        )[2]
+        normed_logits, normed_values, normed_ownership = heads(
             self.semantic_norm(semantic),
             self.fused_norm(fused),
             self.policy_features_normed,
             self.policy_map_normed,
             self.pass_head_normed,
             self.value_head_normed,
+            self.ownership_features_normed,
+            self.ownership_map_normed,
         )
-        return policy_logits, values, normed_logits, normed_values
+        return (
+            policy_logits,
+            values,
+            normed_logits,
+            normed_values,
+            ownership,
+            normed_ownership,
+        )
 
 
 def build_model(

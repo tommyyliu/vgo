@@ -848,6 +848,42 @@ def load_datasets(paths: Iterable[str | Path]) -> RasterDataset:
     )
 
 
+def ownership_targets(
+    final_stones: list[tuple[float, float, int]],
+    mover_is_black: np.ndarray,
+    resolution: int,
+) -> np.ndarray:
+    """Per-cell ownership of the final board, from each sample's mover's view.
+
+    Ownership at a point is the colour of the nearest stone -- the same rule the
+    rasteriser uses for the voronoi channels, so the target cannot drift from
+    the inputs the net reads. Rendered from the stored final position rather
+    than stored as a map: 26x smaller, and it stays correct if the resolution
+    changes.
+
+    Returns +1 where the sample's mover owns the cell and -1 where the opponent
+    does, so the target is mover-relative exactly as the value target is.
+    """
+    cells = resolution * resolution
+    if not final_stones:
+        return np.zeros((mover_is_black.shape[0], cells), dtype=np.float32)
+
+    step = 1.0 / resolution
+    axis = (np.arange(resolution, dtype=np.float64) + 0.5) * step
+    grid_y, grid_x = np.meshgrid(axis, axis, indexing="ij")
+    points = np.stack((grid_x.ravel(), grid_y.ravel()), axis=1)
+
+    stones = np.asarray(final_stones, dtype=np.float64)
+    deltas = points[:, None, :] - stones[None, :, :2]
+    nearest = np.argmin(np.einsum("ijk,ijk->ij", deltas, deltas), axis=1)
+    # Stored colour is 0 for Black and 1 for White.
+    black_owns = stones[nearest, 2] == 0.0
+
+    # Mover-relative: flip the sign for samples where White is to move.
+    view = np.where(mover_is_black[:, None], 1.0, -1.0)
+    return (np.where(black_owns, 1.0, -1.0)[None, :] * view).astype(np.float32)
+
+
 def replay_diagnostics(dataset: RasterDataset, *, maximum_pairs: int = 400) -> dict[str, object]:
     """Health metrics for a replay shard, keyed on whether the policy target is
     learnable at all.
