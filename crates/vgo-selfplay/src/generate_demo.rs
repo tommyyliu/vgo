@@ -677,13 +677,20 @@ fn generate_game(
     };
     let black_value = outcome.black_utility() as f32;
     // Measured before `pending` is consumed below. Only a game the rule did
-    // not end can calibrate it: a resigned game's outcome was assigned by the
-    // rule under test, so asking whether resigning was right is circular.
+    // not end can calibrate it: a hard-resigned game's outcome was assigned by
+    // the rule under test, so asking whether resigning was right is circular.
     //
-    // With resignation disabled entirely every game qualifies, which is how to
-    // measure the false-positive rate on the whole population rather than on
-    // the 10% held out -- the held-out sample is what the threshold is normally
-    // tuned from, but it is small and it is not the games that actually resign.
+    // A *soft* resignation is not circular, and reports `resigned: false` for
+    // exactly that reason -- the game played on to a real terminal state, so
+    // the outcome is independent of the rule that fired. Under soft resign
+    // every game therefore calibrates, and `--resign-disable-fraction` is no
+    // longer needed to hold out a clean sample: it exists to keep the rule from
+    // deciding the label, which soft resign already prevents. That is a ten-fold
+    // larger calibration sample at no cost, since the counterfactual only
+    // replays root values every game already stores.
+    //
+    // The exemption still matters with hard resignation, where a fired game's
+    // label really is the rule's own assertion.
     let calibration = if !playout.resigned {
         calibration_trials(&pending, config.resign_window, black_value > 0.0)
     } else {
