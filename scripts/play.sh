@@ -18,7 +18,15 @@ venv="$root/training/.venv/lib/python3.14/site-packages"
 
 model="${1:-}"
 if [[ -z "$model" ]]; then
-  model="$(ls -1 "$root"/artifacts/ddrnet-vs/updates/update-*/model/candidate.onnx 2>/dev/null | sort | tail -1)"
+  # Newest checkpoint of the newest run that has one, rather than a run named
+  # here: a hardcoded path goes stale every time a run is superseded, and this
+  # one had been pointing at a directory with no models in it.
+  # Both layouts, newest first. Run separately and concatenated because an
+  # unmatched glob is passed through literally, `ls` then exits 2, and under
+  # `set -o pipefail` that kills the script before it prints anything.
+  model="$( { ls -1t "$root"/artifacts/*/updates/update-*/candidate.onnx 2>/dev/null || true
+              ls -1t "$root"/artifacts/*/updates/update-*/model/candidate.onnx 2>/dev/null || true
+            } | head -1 )"
 fi
 if [[ -z "$model" || ! -f "$model" ]]; then
   echo "no model found; pass one explicitly: ./artifacts/play.sh <candidate.onnx>" >&2
