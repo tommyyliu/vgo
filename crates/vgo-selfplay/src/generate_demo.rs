@@ -280,10 +280,22 @@ struct PolicyTarget {
 /// acceptable -- lower concedes earlier and saves more.
 const CALIBRATION_THRESHOLDS: [f64; 6] = [0.70, 0.80, 0.85, 0.90, 0.95, 0.98];
 
+/// Windows swept alongside the thresholds.
+///
+/// The window is the other half of the rule and the untested half: raising the
+/// threshold from 0.95 to 0.98 barely moved the false-positive rate, which says
+/// the head is confidently wrong rather than marginally over the line. Demanding
+/// more consecutive plies of agreement is a different lever -- it asks the
+/// losing seat to keep conceding across more of its own turns, which noise
+/// clears far less easily than one confident evaluation.
+const CALIBRATION_WINDOWS: [u32; 4] = [5, 8, 12, 16];
+
 /// What resignation would have done to one exempt game at one threshold.
 #[derive(Clone, Copy, Debug)]
 struct ResignTrial {
     threshold: f64,
+    /// Consecutive own-turn agreements required before conceding.
+    window: u32,
     /// The rule would have conceded this game.
     fired: bool,
     /// It would have conceded for the side that actually won: a false positive,
@@ -291,6 +303,17 @@ struct ResignTrial {
     wrong: bool,
     /// Plies that would have been skipped had it fired.
     plies_saved: u32,
+    /// The *least* confident evaluation in the window that triggered the
+    /// concession, as a magnitude in [threshold, 1].
+    ///
+    /// This is the quantity the rule actually tests, and the question it
+    /// answers is whether false positives are less extreme than true ones. If
+    /// they are, confidence separates the two and a higher bar is worth
+    /// raising. If the distributions overlap, no threshold can filter them and
+    /// only a different signal -- a longer window, or not resigning -- will.
+    /// The root values are discarded after a playout, so this cannot be
+    /// recovered later; it has to be measured here.
+    fired_confidence: f64,
 }
 
 /// Replays the resign rule over a finished game at each candidate threshold.
@@ -301,15 +324,22 @@ struct ResignTrial {
 /// ended.
 fn calibration_trials(
     pending: &[PendingSample],
-    window: u32,
+    _window: u32,
     black_won: bool,
 ) -> Vec<ResignTrial> {
     CALIBRATION_THRESHOLDS
         .iter()
-        .map(|&threshold| {
+        .flat_map(|&threshold| {
+            CALIBRATION_WINDOWS.iter().map(move |&window| (threshold, window))
+        })
+        .map(|(threshold, window)| {
             // Per seat, matching the live rule: a shared counter is reset by the
             // winning side's ply and can never reach the window.
             let mut streak = [0_u32; 2];
+            // The weakest evaluation in the current streak, per seat: the rule
+            // requires every ply in the window to clear the bar, so the streak
+            // is only as confident as its least confident member.
+            let mut weakest = [1.0_f64; 2];
             let mut fired_at = None;
             for (index, sample) in pending.iter().enumerate() {
                 let mover_value = if sample.to_move == Color::Black {
@@ -320,29 +350,35 @@ fn calibration_trials(
                 let seat = usize::from(sample.to_move == Color::White);
                 if mover_value <= -threshold {
                     streak[seat] += 1;
+                    weakest[seat] = weakest[seat].min(mover_value.abs());
                 } else {
                     streak[seat] = 0;
+                    weakest[seat] = 1.0;
                 }
                 if streak[seat] >= window {
-                    fired_at = Some((index, sample.to_move));
+                    fired_at = Some((index, sample.to_move, weakest[seat]));
                     break;
                 }
             }
             match fired_at {
                 None => ResignTrial {
                     threshold,
+                    window,
                     fired: false,
                     wrong: false,
                     plies_saved: 0,
+                    fired_confidence: 0.0,
                 },
-                Some((index, conceding)) => {
+                Some((index, conceding, confidence)) => {
                     let conceding_won =
                         (conceding == Color::Black) == black_won;
                     ResignTrial {
                         threshold,
+                        window,
                         fired: true,
                         wrong: conceding_won,
                         plies_saved: (pending.len() - index - 1) as u32,
+                        fired_confidence: confidence,
                     }
                 }
             }
@@ -764,7 +800,7 @@ struct GenerationReport {
     /// wrong, plies saved). The pipeline reads these to pick the next shard's
     /// threshold, so it tracks the value head as it changes rather than being
     /// fixed once.
-    calibration: Vec<(f64, u32, u32, u32, u64)>,
+    calibration: Vec<(f64, u32, u32, u32, u32, u64, f64, f64)>,
     samples_generated_by_received_games: usize,
     serialization_truncated_samples: usize,
     games_started: u64,
@@ -885,10 +921,15 @@ fn generate_to_dataset(
     let mut discarded_games = 0_usize;
     let mut capped_games = 0_usize;
     let mut game_records: Vec<GameRecord> = Vec::new();
-    // threshold bits -> (games measured, would have fired, would have been
-    // wrong, plies that would have been saved)
-    let mut calibration_totals: std::collections::BTreeMap<u64, (u32, u32, u32, u64)> =
-        std::collections::BTreeMap::new();
+    // (threshold bits, window) -> (games measured, would have fired, would have
+    // been wrong, plies that would have been saved). Keyed on both, or the four
+    // windows would sum into one another and report a single blended rate.
+    // Trailing two sums split the triggering confidence by correctness, which
+    // is what says whether a false positive is distinguishable from a true one.
+    let mut calibration_totals: std::collections::BTreeMap<
+        (u64, u32),
+        (u32, u32, u32, u64, f64, f64),
+    > = std::collections::BTreeMap::new();
     let mut samples_generated_by_received_games = 0_usize;
     let mut serialization_truncated_samples = 0_usize;
     let mut writer_backpressure = Duration::ZERO;
@@ -912,12 +953,19 @@ fn generate_to_dataset(
         })?;
         for trial in &game.calibration {
             let entry = calibration_totals
-                .entry(trial.threshold.to_bits())
-                .or_insert((0_u32, 0_u32, 0_u32, 0_u64));
+                .entry((trial.threshold.to_bits(), trial.window))
+                .or_insert((0_u32, 0_u32, 0_u32, 0_u64, 0.0_f64, 0.0_f64));
             entry.0 += 1;
             entry.1 += u32::from(trial.fired);
             entry.2 += u32::from(trial.wrong);
             entry.3 += u64::from(trial.plies_saved);
+            if trial.fired {
+                if trial.wrong {
+                    entry.5 += trial.fired_confidence;
+                } else {
+                    entry.4 += trial.fired_confidence;
+                }
+            }
         }
         if game.reached_ply_cap {
             capped_games += 1;
@@ -968,9 +1016,20 @@ fn generate_to_dataset(
         game_records,
         calibration: calibration_totals
             .into_iter()
-            .map(|(bits, (measured, fired, wrong, saved))| {
-                (f64::from_bits(bits), measured, fired, wrong, saved)
-            })
+            .map(
+                |((bits, window), (measured, fired, wrong, saved, right_sum, wrong_sum))| {
+                    (
+                        f64::from_bits(bits),
+                        window,
+                        measured,
+                        fired,
+                        wrong,
+                        saved,
+                        right_sum,
+                        wrong_sum,
+                    )
+                },
+            )
             .collect(),
         samples_generated_by_received_games,
         serialization_truncated_samples,
@@ -1135,13 +1194,26 @@ fn write_manifest(
     }
     writeln!(writer, "  ],")?;
     writeln!(writer, "  \"resign_calibration\": [")?;
-    for (index, (threshold, measured, fired, wrong, saved)) in
+    for (index, (threshold, window, measured, fired, wrong, saved, right_sum, wrong_sum)) in
         report.calibration.iter().enumerate()
     {
         let comma = if index + 1 == report.calibration.len() { "" } else { "," };
+        // Mean confidence at the moment of firing, split by whether the
+        // concession turned out right. Emitted as means rather than sums so a
+        // reader does not have to divide, and null when nothing fired.
+        let right_mean = if fired > wrong {
+            format!("{:.4}", right_sum / f64::from(fired - wrong))
+        } else {
+            "null".to_owned()
+        };
+        let wrong_mean = if *wrong > 0 {
+            format!("{:.4}", wrong_sum / f64::from(*wrong))
+        } else {
+            "null".to_owned()
+        };
         writeln!(
             writer,
-            "    {{\"threshold\": {threshold}, \"games\": {measured}, \"fired\": {fired}, \"wrong\": {wrong}, \"plies_saved\": {saved}}}{comma}"
+            "    {{\"threshold\": {threshold}, \"window\": {window}, \"games\": {measured}, \"fired\": {fired}, \"wrong\": {wrong}, \"plies_saved\": {saved}, \"confidence_right\": {right_mean}, \"confidence_wrong\": {wrong_mean}}}{comma}"
         )?;
     }
     writeln!(writer, "  ],")?;

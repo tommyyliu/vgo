@@ -1599,7 +1599,7 @@ class Pipeline:
         written since the run began and nothing ever read them.
         """
 
-        totals: dict[float, list[int]] = {}
+        totals: dict[tuple[float, int], list[int]] = {}
         for replay in self.state.replay[-self.config.replay_window :]:
             if int(replay.get("sequence", -1)) < 0:
                 continue
@@ -1611,7 +1611,10 @@ class Pipeline:
                 continue
             for entry in manifest.get("resign_calibration", ()):
                 try:
-                    bucket = totals.setdefault(float(entry["threshold"]), [0, 0, 0])
+                    bucket = totals.setdefault(
+                        (float(entry["threshold"]), int(entry.get("window", 0))),
+                        [0, 0, 0],
+                    )
                     bucket[0] += int(entry["games"])
                     bucket[1] += int(entry["fired"])
                     bucket[2] += int(entry["wrong"])
@@ -1620,25 +1623,31 @@ class Pipeline:
         if not totals:
             return
 
-        live = float(self.config.resign_threshold)
-        parts = []
-        for threshold in sorted(totals):
-            games, fired, wrong = totals[threshold]
-            if not fired:
-                continue
-            marker = "*" if abs(threshold - live) < 1e-9 else ""
-            parts.append(
-                f"{marker}{threshold:g}:{100 * wrong / fired:.0f}%({wrong}/{fired})"
-            )
-        if not parts:
-            return
+        live_threshold = float(self.config.resign_threshold)
+        live_window = int(self.config.resign_window)
         exempt = max(entry[0] for entry in totals.values())
+        shards = len(self.state.replay[-self.config.replay_window :])
         print(
-            f"[resign] window of {len(self.state.replay[-self.config.replay_window :])} "
-            f"shards, {exempt} exempt games; false positives by threshold "
-            f"({' '.join(parts)}); * is live",
+            f"[resign] {shards} shards, {exempt} exempt games; "
+            f"false positives as threshold x window (* is live)",
             flush=True,
         )
+        windows = sorted({window for _, window in totals})
+        header = "  ".join(f"w{window:<10}" for window in windows)
+        print(f"[resign]   thresh  {header}", flush=True)
+        for threshold in sorted({value for value, _ in totals}):
+            cells = []
+            for window in windows:
+                games, fired, wrong = totals.get((threshold, window), [0, 0, 0])
+                if not fired:
+                    cells.append(f"{'-':<12}")
+                    continue
+                live = (
+                    abs(threshold - live_threshold) < 1e-9 and window == live_window
+                )
+                cell = f"{100 * wrong / fired:.0f}%({wrong}/{fired})"
+                cells.append(f"{'*' if live else ' '}{cell:<11}")
+            print(f"[resign]   {threshold:<6g}  {''.join(cells)}", flush=True)
 
     async def _learn_and_publish(
         self,
