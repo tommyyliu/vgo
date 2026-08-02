@@ -806,7 +806,9 @@ def evaluate(
     if view.samples <= 0:
         raise ValueError("cannot compute metrics over an empty dataset")
     model.eval()
-    accumulator = torch.zeros(5, dtype=torch.float64, device=stager.device)
+    # One slot per metric summed below; keep in step with the torch.stack call
+    # and with the totals[...] indices after it.
+    accumulator = torch.zeros(6, dtype=torch.float64, device=stager.device)
     for states, targets, masks, values in stager.batches(
         view.batches(batch_size, shuffle=False)
     ):
