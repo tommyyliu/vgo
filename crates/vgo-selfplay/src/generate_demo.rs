@@ -95,7 +95,7 @@ struct PendingSample {
 /// range this game produced, which is what lets a later question condition
 /// position-level data on a game-level outcome. They cannot be reconstructed
 /// after the fact, so they are written even though nothing reads them yet.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GameRecord {
     game: u64,
     komi: f64,
@@ -112,6 +112,14 @@ struct GameRecord {
     resigned: bool,
     first_sample: usize,
     sample_count: usize,
+    /// The board as the game ended, for the ownership target.
+    ///
+    /// Stored as stones rather than as a rendered map: ownership at a point is
+    /// the colour of the nearest stone, which is what the rasterizer already
+    /// computes for the voronoi channels, so re-rendering from the position
+    /// cannot drift from the inputs the net reads. It is also 26x smaller --
+    /// ~600 bytes against a 16 KB int8 map at 128x128.
+    final_stones: Vec<(f64, f64, u8)>,
 }
 
 struct GameSamples {
@@ -698,6 +706,14 @@ fn generate_game(
             // Filled by the writer, which owns the shard-relative offset.
             first_sample: 0,
             sample_count: samples.len(),
+            final_stones: playout
+                .final_position
+                .stones()
+                .iter()
+                .map(|stone| {
+                    (stone.x, stone.y, u8::from(stone.color == Color::White))
+                })
+                .collect(),
         }),
         samples,
         completed: true,
@@ -1066,7 +1082,7 @@ fn write_game_records(path: &Path, records: &[GameRecord]) -> std::io::Result<()
                 r#"{{"game":{},"komi":{:.6},"plies":{},"passes":{},"#,
                 r#""self_captures":{},"black_utility":{},"margin":{:.6},"#,
                 r#""reached_ply_cap":{},"resigned":{},"#,
-                r#""first_sample":{},"sample_count":{}}}"#
+                r#""first_sample":{},"sample_count":{},"final_stones":[{}]}}"#
             ),
             record.game,
             record.komi,
@@ -1079,6 +1095,12 @@ fn write_game_records(path: &Path, records: &[GameRecord]) -> std::io::Result<()
             record.resigned,
             record.first_sample,
             record.sample_count,
+            record
+                .final_stones
+                .iter()
+                .map(|(x, y, colour)| format!("[{x:.6},{y:.6},{colour}]"))
+                .collect::<Vec<_>>()
+                .join(","),
         )?;
     }
     writer.flush()?;
@@ -1921,6 +1943,7 @@ mod tests {
             resigned: false,
             first_sample: 0,
             sample_count: 1,
+            final_stones: Vec::new(),
         }
     }
 
