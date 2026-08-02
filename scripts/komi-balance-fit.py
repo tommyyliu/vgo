@@ -31,9 +31,19 @@ import statistics
 import sys
 
 
-def load(root: pathlib.Path) -> list[dict]:
+def load(root: pathlib.Path, last: int | None = None) -> list[dict]:
+    """Games from every shard, or only the most recent `last` of them.
+
+    Pooling the whole run is wrong once the net's play changes character. In
+    ddrnet-komi2 the net began conditioning on komi partway through, and Black
+    fell 67% -> 47% between two shards; pooling across that point averages two
+    different games and reports a balance point belonging to neither.
+    """
+    paths = sorted(glob.glob(str(root / "replay" / "shard-*" / "games.jsonl")))
+    if last is not None:
+        paths = paths[-last:]
     rows: list[dict] = []
-    for path in sorted(glob.glob(str(root / "replay" / "shard-*" / "games.jsonl"))):
+    for path in paths:
         rows += [json.loads(line) for line in open(path) if line.strip()]
     return rows
 
@@ -112,9 +122,15 @@ def main() -> int:
     parser.add_argument("--buckets", type=int, default=6)
     parser.add_argument("--komi-low", type=float, default=-0.1)
     parser.add_argument("--komi-high", type=float, default=0.2)
+    parser.add_argument(
+        "--last",
+        type=int,
+        help="use only the most recent N shards, so a change in how the net "
+        "plays is not averaged against the run's history",
+    )
     arguments = parser.parse_args()
 
-    rows = load(arguments.root)
+    rows = load(arguments.root, arguments.last)
     if not rows:
         print(f"no games.jsonl under {arguments.root}", file=sys.stderr)
         return 1
