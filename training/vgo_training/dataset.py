@@ -46,6 +46,55 @@ HEADER = struct.Struct("<8s6I")
 
 
 @dataclass(frozen=True)
+class SparsePolicy:
+    """Touched cells only, in the shard's own layout.
+
+    A record stores at most `V4_POLICY_CAPACITY` (64) cells, but the dense
+    tensor is `policy_size` wide -- 16385 at policy resolution 128. Expanding at
+    load time costs 24 GB of a 39 GB replay window, all of it zeros, which is
+    what caps the window and therefore how many independent game outcomes
+    training can see at once. Held sparse here and expanded per batch instead.
+    """
+
+    indices: torch.Tensor      # (samples, capacity) int64, valid where < counts
+    policies: torch.Tensor     # (samples, capacity) float32
+    visits: torch.Tensor
+    betas: torch.Tensor
+    proposal_counts: torch.Tensor
+    counts: torch.Tensor       # (samples,) int64: live cells per sample
+    policy_size: int
+
+    def expand(self, rows: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Dense policy, mask, visits, beta and proposals for `rows`."""
+        picked = self.counts[rows]
+        slot = torch.arange(self.indices.shape[1]).unsqueeze(0)
+        live = slot < picked.unsqueeze(1)
+        size = (rows.numel(), self.policy_size)
+        columns = self.indices[rows]
+        # Park dead slots on a scratch column so one scatter handles the whole
+        # batch; the column is dropped before returning.
+        scratch = torch.where(live, columns, torch.full_like(columns, self.policy_size))
+        dense = []
+        for source in (self.policies, self.visits, self.betas):
+            out = torch.zeros(size[0], size[1] + 1, dtype=torch.float32)
+            out.scatter_(1, scratch, torch.where(live, source[rows], torch.zeros(())))
+            dense.append(out[:, : self.policy_size])
+        mask = torch.zeros(size[0], size[1] + 1, dtype=torch.float32)
+        mask.scatter_(1, scratch, live.float())
+        counts_dense = torch.zeros(size[0], size[1] + 1, dtype=torch.float32)
+        counts_dense.scatter_(
+            1, scratch, torch.where(live, self.proposal_counts[rows], torch.zeros(()))
+        )
+        return (
+            dense[0],
+            mask[:, : self.policy_size],
+            dense[1],
+            dense[2],
+            counts_dense[:, : self.policy_size],
+        )
+
+
+@dataclass(frozen=True)
 class RasterDataset:
     states: torch.Tensor
     policies: torch.Tensor
@@ -64,6 +113,10 @@ class RasterDataset:
     height: int
     width: int
     sources: tuple[str, ...]
+    # The same policy targets in the shard's own sparse layout. The dense
+    # tensors above stay for callers that want a whole shard at once; the
+    # replay window holds only this, which is 254x smaller.
+    sparse: "SparsePolicy | None" = None
 
     @property
     def samples(self) -> int:
@@ -185,6 +238,10 @@ def _load_legacy(
     proposal_counts = np.zeros_like(policies, dtype=np.uint32)
     return (
         states,
+        # Legacy shards have no sparse cell list; the window falls back to the
+        # dense tensors for them.
+        None,
+        None,
         policies,
         masks,
         visits,
@@ -488,8 +545,14 @@ def _load_replay_v4(
     policies, masks, visits, beta, proposal_counts = _expand_sparse_policy(
         records, samples, policy_size
     )
+    # The sparse cells as stored, copied off the memmap so the dataset does not
+    # pin the file. This is what the replay window keeps.
+    sparse_cells = np.array(records["cells"], copy=True)
+    sparse_counts = np.array(records["touched"], copy=True)
     return (
         states,
+        sparse_cells,
+        sparse_counts,
         policies,
         masks,
         visits,
@@ -561,6 +624,8 @@ def _load_replay(
         proposal_counts = np.zeros_like(policies, dtype=np.uint32)
     return (
         np.array(records["state"], copy=True),
+        None,
+        None,
         policies,
         masks,
         visits,
@@ -591,6 +656,8 @@ def load_dataset(path: str | Path) -> RasterDataset:
         arrays = _load_legacy(path, samples, channels, height, width, policy_size)
     (
         states,
+        sparse_cells,
+        sparse_counts,
         policies,
         policy_masks,
         visits,
@@ -679,6 +746,17 @@ def load_dataset(path: str | Path) -> RasterDataset:
         height=height,
         width=width,
         sources=(str(path),),
+        sparse=None if sparse_cells is None else SparsePolicy(
+            indices=torch.from_numpy(sparse_cells["index"].astype(np.int64)),
+            policies=torch.from_numpy(sparse_cells["policy"].astype(np.float32)),
+            visits=torch.from_numpy(sparse_cells["visits"].astype(np.float32)),
+            betas=torch.from_numpy(sparse_cells["beta"].astype(np.float32)),
+            proposal_counts=torch.from_numpy(
+                sparse_cells["proposal_counts"].astype(np.float32)
+            ),
+            counts=torch.from_numpy(sparse_counts.astype(np.int64)),
+            policy_size=policy_size,
+        ),
     )
 
 
@@ -722,6 +800,8 @@ def load_datasets(paths: Iterable[str | Path]) -> RasterDataset:
 
     output: dict[str, torch.Tensor] = {}
     sources: list[str] = []
+    # The sparse cells concatenate too, at 1/254 the size of the dense form.
+    sparse_parts: list[SparsePolicy] = []
     offset = 0
     for path in paths:
         shard = load_dataset(path)
@@ -735,6 +815,8 @@ def load_datasets(paths: Iterable[str | Path]) -> RasterDataset:
         for field in _CONCATENATED_FIELDS:
             output[field][offset:stop].copy_(getattr(shard, field))
         sources.extend(shard.sources)
+        if shard.sparse is not None:
+            sparse_parts.append(shard.sparse)
         offset = stop
         # Drop the shard before loading the next one; without this the peak is
         # the window plus every shard already consumed.
@@ -743,11 +825,26 @@ def load_datasets(paths: Iterable[str | Path]) -> RasterDataset:
     if offset != total:
         raise ValueError(f"expected {total} concatenated samples, wrote {offset}")
 
+    sparse = None
+    if len(sparse_parts) == len(paths) and sparse_parts:
+        sparse = SparsePolicy(
+            indices=torch.cat([part.indices for part in sparse_parts]),
+            policies=torch.cat([part.policies for part in sparse_parts]),
+            visits=torch.cat([part.visits for part in sparse_parts]),
+            betas=torch.cat([part.betas for part in sparse_parts]),
+            proposal_counts=torch.cat(
+                [part.proposal_counts for part in sparse_parts]
+            ),
+            counts=torch.cat([part.counts for part in sparse_parts]),
+            policy_size=sparse_parts[0].policy_size,
+        )
+
     return RasterDataset(
         **output,
         height=first_shape[1],
         width=first_shape[2],
         sources=tuple(sources),
+        sparse=sparse,
     )
 
 
