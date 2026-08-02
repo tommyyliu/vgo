@@ -134,6 +134,10 @@ def build_command(
     simulations = int(
         config.get("arena_simulations", config.get("generation_simulations", 512))
     )
+    # Midpoint of the run's komi range. Zero is outside what generation drew.
+    komi = (
+        float(config.get("komi_low", 0.0)) + float(config.get("komi_high", 0.0))
+    ) / 2.0
     command = [
         str(root / "target/release/vgo-arena"),
         "--candidate", str(candidate),
@@ -151,6 +155,12 @@ def build_command(
         "--resolution", str(int(config.get("resolution", 128))),
         "--policy-resolution", str(int(config.get("policy_resolution", 128))),
         "--radius", str(config.get("radius", 0.05555555555555555)),
+        # The midpoint of the run's komi range, not zero. Generation draws komi
+        # per game, so a model rated at zero is judged on a game it never
+        # trained for -- Black takes ~85% at the bottom of the range. Fixed
+        # across the match so both halves of a colour-swapped pair face the
+        # same game.
+        "--komi", str(komi),
         "--seed", str(seed),
         "--maximum-batch", str(int(config.get("maximum_batch", 64))),
         "--delay-ms", str(int(config.get("inference_delay_ms", config.get("delay_ms", 1)))),

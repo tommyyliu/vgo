@@ -58,7 +58,16 @@ def load_model(checkpoint_path: Path) -> tuple[nn.Module, dict[str, object]]:
     required = [
         name
         for name in missing
-        if not (name.endswith("_normed") or "_normed." in name or name.endswith("_norm.num_batches_tracked") or "_norm." in name)
+        if not (
+            name.endswith("_normed")
+            or "_normed." in name
+            or name.endswith("_norm.num_batches_tracked")
+            or "_norm." in name
+            # Ownership is an auxiliary training target and never enters the
+            # exported graph, so a checkpoint predating the head is complete
+            # for inference and must still load.
+            or name.startswith("ownership_")
+        )
     ]
     if required:
         raise RuntimeError(

@@ -65,6 +65,15 @@ struct Arguments {
     resolution: usize,
     #[arg(long, default_value_t = 1.0 / 6.0)]
     radius: f64,
+    /// Komi every arena game is played at.
+    ///
+    /// Rating at komi 0 measures a model outside the distribution it trained
+    /// on: generation draws komi per game, and at 0 the game is not close to
+    /// balanced -- Black took 85% of the lowest bucket in the run this was
+    /// built for. Fixed rather than drawn so both seats of a colour-swapped
+    /// pair face the same game.
+    #[arg(long, default_value_t = 0.0)]
+    komi: f64,
     #[arg(long, default_value_t = 900_001)]
     seed: u64,
     #[arg(long, default_value_t = 8)]
@@ -203,7 +212,7 @@ fn play_game(
     let record_moves = arguments.sgf_directory.is_some();
     let mut moves: Vec<(Color, Option<Point>)> = Vec::new();
     let playout = run_playout(
-        Position::new(arguments.radius, Vec::new(), Color::Black),
+        Position::new(arguments.radius, Vec::new(), Color::Black).with_komi(arguments.komi),
         arguments.maximum_plies,
         |position, _| {
             let evaluator: &dyn Evaluator = if position.to_move() == candidate_color {
@@ -392,7 +401,7 @@ fn run_match(
             let path = directory.join(format!(
                 "{label}-game{index:03}-cand{seat}-{status}.sgf"
             ));
-            std::fs::write(path, game_sgf(result, arguments.radius, 0.0))?;
+            std::fs::write(path, game_sgf(result, arguments.radius, arguments.komi))?;
         }
     }
     let mut wins = 0_usize;
