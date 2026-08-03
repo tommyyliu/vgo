@@ -56,6 +56,24 @@ actor utilization, and complete games per second.
 The Rust self-play canary is implemented by `vgo-canary`. Geometry conformance
 fixtures and cross-language throughput harnesses remain future work.
 
+## CPU generation microbenchmarks
+
+`vgo-generation-bench` times deterministic, model-free slices of the self-play
+generation path: position analysis, settled geometry, semantic and compact
+rasterization, dense-policy setup and sampling, legacy candidates, move
+application, and a small MCTS search with an in-process spatial evaluator.
+Fixture construction and GPU/model execution are outside the timed regions.
+
+Run the release benchmark from the repository root:
+
+```text
+cargo run --release -p vgo-selfplay --bin vgo-generation-bench
+```
+
+Use `--samples`, `--sample-millis`, and `--warmup` to control runtime,
+`--filter <text>` to isolate matching stages, and `--json` when retaining
+results for comparison.
+
 ## Self-play canary
 
 Before introducing a learned model, use the same deterministic spread-out
