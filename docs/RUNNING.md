@@ -395,12 +395,40 @@ w48/b16 net OOM during backward. Batch 128 peaks at 7.4 and 8.6 GB. The failure
 arrives as `CUDA out of memory` deep in `_engine_run_backward`, which reads like
 a leak rather than a sizing problem.
 
-**TensorRT libraries are not on `PATH`.** They ship inside the `uv` virtual
-environment. `rl_loop.runtime_environment()` prepends `tensorrt_libs` and
-`torch/lib` for every child process it spawns. Invoking `vgo-arena` or
-`vgo-generate-demo` yourself without that environment fails with
-`Error loading onnxruntime_providers_tensorrt.dll ... nvinfer_10.dll is
-missing`. Import the helper rather than reimplementing the path logic.
+**TensorRT libraries are not on `LD_LIBRARY_PATH`.** They ship inside the `uv`
+virtual environment, not on the system. `rl_loop.runtime_environment()` prepends
+`onnxruntime_trt`, `tensorrt_libs`, `nvidia/cu13/lib`, `nvidia/cudnn/lib`, and
+`torch/lib`, and sets `ORT_DYLIB_PATH`, for every child process it spawns.
+Anything launched through the loop is already correct. Invoking `vgo-arena` or
+`vgo-generate-demo` yourself from a bare shell fails to load
+`libonnxruntime_providers_tensorrt.so` because `libnvinfer.so.10` is not
+resolvable. Import the helper rather than reimplementing the path logic.
+
+Two ONNX Runtime builds are installed: `onnxruntime_trt` and
+`onnxruntime_blackwell`. The helper prefers `onnxruntime_trt` and only falls
+back to the other if it is absent, which matters when reading a stack trace and
+wondering which one is loaded.
+
+Provider registration is not silent about failure. `OnnxService` calls
+`.error_on_failure()` on the TensorRT provider, so a missing library aborts
+rather than quietly degrading to the CUDA provider listed after it. A run that
+starts is a run that got the provider it asked for.
+
+**Do not delete `artifacts/onnx-cache` between iterations.** It holds two caches
+with different lifetimes. The engine cache is keyed on the model digest, so every
+trained model rebuilds it -- that is expected. The timing cache is deliberately
+hoisted one directory level above it: it records how fast each kernel tactic runs
+for a given layer shape on this device, which does not change across RL
+iterations because only the weights change. Sharing those measurements is the
+difference between roughly 10.9 s and 0.3 s per model load. Clearing the
+directory is only correct after a driver or TensorRT upgrade, when the recorded
+tactic timings no longer describe the hardware.
+
+Both cache paths are keyed on provider, precision, raster width and height, and
+`maximum_batch`; only the engine cache adds the model digest. So changing
+`--fp16`, the raster size, or `--maximum-batch` mints a fresh engine *and* a
+fresh timing cache, and re-pays the cold build once. That one-time stall is the
+cache working, not a regression.
 
 **`maximum_batch` is frozen into each ONNX at export time.** A model exported at
 16 cannot be driven at 64, and the error is
