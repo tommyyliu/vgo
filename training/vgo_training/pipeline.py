@@ -948,7 +948,18 @@ class Pipeline:
             fired, wrong = totals[threshold]
             if fired >= minimum_fires and wrong / fired <= target:
                 return threshold
-        return float(self.config.resign_threshold)
+        # Nothing clears the target, so resignation is switched off for this
+        # shard rather than falling back to the configured threshold.
+        #
+        # The old fallback was backwards: it returned `resign_threshold`, a
+        # mid-range constant, which is *more* permissive than the strictest
+        # candidate that just failed. On ddrnet-komi3 that silently ran at 4-7%
+        # against a 2% target for ten shards, and printed nothing, because the
+        # log line only fires when the choice differs from the configured value.
+        #
+        # A threshold of 1.0 can never be reached -- the head's output is
+        # bounded -- so this concedes nothing while the calibration recovers.
+        return 1.0
 
     def generation_command(
         self,
@@ -959,12 +970,23 @@ class Pipeline:
     ) -> list[str]:
         config = self.config
         threshold = self._adaptive_resign_threshold()
-        if threshold != config.resign_threshold:
-            print(
-                f"[resign] threshold {threshold} chosen for shard {sequence} "
-                f"(target FP {100 * config.resign_target_false_positive:.0f}%)",
-                flush=True,
-            )
+        if config.resign_target_false_positive > 0.0:
+            # Always log under adaptation: "chose 0.95 because it qualified" and
+            # "chose 0.95 because nothing did" were previously indistinguishable,
+            # and the second printed nothing at all.
+            target = 100 * config.resign_target_false_positive
+            if threshold >= 1.0:
+                print(
+                    f"[resign] shard {sequence}: no threshold met {target:.0f}% "
+                    "false positives; resignation disabled for this shard",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[resign] threshold {threshold} chosen for shard {sequence} "
+                    f"(target FP {target:.0f}%)",
+                    flush=True,
+                )
         command = self._rust_command("vgo-generate-demo") + [
             "--samples",
             str(config.samples_per_shard),

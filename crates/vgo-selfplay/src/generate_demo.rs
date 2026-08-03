@@ -300,7 +300,15 @@ struct PolicyTarget {
 /// Spanning the range where a value head this saturated might plausibly be
 /// trusted. The pipeline picks the lowest whose measured error rate is
 /// acceptable -- lower concedes earlier and saves more.
-const CALIBRATION_THRESHOLDS: [f64; 6] = [0.70, 0.80, 0.85, 0.90, 0.95, 0.98];
+/// Thresholds the counterfactual sweeps.
+///
+/// Extends past 0.98 because the head saturates: measured on ddrnet-komi3
+/// update 34, 51% of positions read |v| > 0.95 and 30% read |v| > 0.99, so a
+/// sweep stopping at 0.98 cannot tell a confident call from a certain one. The
+/// tail matters -- 0.70 to 0.98 moved the false-positive rate only 9.0% to
+/// 6.2% while still firing on 504 of ~660 games.
+const CALIBRATION_THRESHOLDS: [f64; 9] =
+    [0.70, 0.80, 0.85, 0.90, 0.95, 0.98, 0.99, 0.995, 0.999];
 
 /// Windows swept alongside the thresholds.
 ///
