@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use vgo_core::{Color, Point, Position, SettledRegion, legal_set_vertices};
+use vgo_core::{Color, Position, SettledRegion, legal_set_vertices};
 
 pub const CHANNEL_COUNT: usize = 12;
 
@@ -284,27 +284,51 @@ pub fn rasterize_any_into(position: &Position, config: RasterConfig, data: &mut 
 
 /// Writes the [`RasterKind::Compact`] subset.
 ///
-/// Renders the full semantic set and keeps the planes `COMPACT_CHANNELS` names,
-/// rather than a second rasterizer that would have to stay in step with the
-/// first. The cost is the planes that are discarded, which is the same work the
-/// full raster does anyway -- and the settled contour, by far the most
-/// expensive channel, is one of the ones kept.
+/// This shares the semantic raster's geometry helpers but writes only the five
+/// requested planes. In particular, it does not allocate, render, and copy a
+/// twelve-plane temporary for every inference position.
 pub fn rasterize_compact_into(
     position: &Position,
     config: RasterConfig,
     data: &mut [f32],
 ) {
+    assert!(config.width > 0 && config.height > 0);
+    assert!(position.validate().is_playable());
     let pixels = config.pixels();
     assert_eq!(data.len(), COMPACT_CHANNELS.len() * pixels);
-    let full = RasterConfig {
-        kind: RasterKind::Semantic,
-        ..config
+    let radius = position.radius();
+    let to_move = position.to_move();
+    let mover_komi = match to_move {
+        Color::Black => position.komi() as f32,
+        Color::White => -position.komi() as f32,
     };
-    let mut everything = vec![0.0_f32; CHANNEL_COUNT * pixels];
-    rasterize_into(position, full, &mut everything);
-    for (slot, &channel) in COMPACT_CHANNELS.iter().enumerate() {
-        data[slot * pixels..(slot + 1) * pixels]
-            .copy_from_slice(&everything[channel * pixels..(channel + 1) * pixels]);
+    let settled = settled_mask(position, config);
+    let (current_stones, opponent_stones) = relative_stones(position, to_move);
+
+    // Komi is constant over the board, so write its plane once rather than in
+    // the pixel loop below.
+    data[4 * pixels..5 * pixels].fill(mover_komi);
+    for row in 0..config.height {
+        let y = (row as f64 + 0.5) / config.height as f64;
+        for column in 0..config.width {
+            let x = (column as f64 + 0.5) / config.width as f64;
+            let pixel = row * config.width + column;
+            let (current_square, opponent_square, nearest_square, second_square) =
+                squared_distances(x, y, &current_stones, &opponent_stones);
+            let current_distance = current_square.sqrt();
+            let opponent_distance = opponent_square.sqrt();
+            let nearest = nearest_square.sqrt();
+            let second = second_square.sqrt();
+
+            data[pixel] = inside(current_distance, radius);
+            data[pixels + pixel] = inside(opponent_distance, radius);
+            data[2 * pixels + pixel] = if second.is_finite() {
+                (1.0 - (second - nearest) / radius).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            data[3 * pixels + pixel] = f32::from(settled[pixel]);
+        }
     }
 }
 
@@ -341,7 +365,6 @@ pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32
         Color::Black => position.komi() as f32,
         Color::White => -position.komi() as f32,
     };
-    let stones = position.stones();
     // Splitting by colour once hoists the per-stone colour comparison out of the
     // pixel loop entirely.
     // The settled region, as a mask built once rather than per pixel.
@@ -351,116 +374,16 @@ pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32
     // solve instead costs 573k solves at 35 stones against the contour's ~20k
     // ray evaluations -- 29x more work, and it measured 239 ms against the
     // whole rest of the raster's 0.5 ms.
-    let known_vertices = legal_set_vertices(position);
-    let mut settled_mask = vec![false; pixels];
-    for index in 0..stones.len() {
-        let region = SettledRegion::new(position, index, &known_vertices);
-        // A third of a pixel: finer than the raster can express, and far
-        // cheaper than the 2e-5 the client needs for a zoomable vector.
-        let contour = region.contour_within(
-            1.0 / (3.0 * config.width.max(config.height) as f64),
-        );
-        if contour.len() < 3 {
-            continue;
-        }
-        // Only the rows and columns the loop spans need testing.
-        let (mut low_x, mut high_x) = (f64::INFINITY, f64::NEG_INFINITY);
-        let (mut low_y, mut high_y) = (f64::INFINITY, f64::NEG_INFINITY);
-        for point in &contour {
-            low_x = low_x.min(point.x);
-            high_x = high_x.max(point.x);
-            low_y = low_y.min(point.y);
-            high_y = high_y.max(point.y);
-        }
-        let first_row = ((low_y * config.height as f64 - 0.5).floor().max(0.0)) as usize;
-        let last_row =
-            ((high_y * config.height as f64 - 0.5).ceil() as usize).min(config.height - 1);
-        let first_column =
-            ((low_x * config.width as f64 - 0.5).floor().max(0.0)) as usize;
-        let last_column =
-            ((high_x * config.width as f64 - 0.5).ceil() as usize).min(config.width - 1);
-        // Scanline fill: the crossings of one row are computed once for the
-        // whole row rather than once per pixel, which is the difference
-        // between O(rows x columns x vertices) and O(rows x vertices).
-        let mut crossings: Vec<f64> = Vec::with_capacity(16);
-        for row in first_row..=last_row {
-            let y = (row as f64 + 0.5) / config.height as f64;
-            crossings.clear();
-            let mut previous = contour[contour.len() - 1];
-            for &current in &contour {
-                if (current.y > y) != (previous.y > y) {
-                    let t = (y - current.y) / (previous.y - current.y);
-                    crossings.push(current.x + t * (previous.x - current.x));
-                }
-                previous = current;
-            }
-            if crossings.is_empty() {
-                continue;
-            }
-            crossings.sort_by(f64::total_cmp);
-            // Star-shaped loops are simple, so spans pair up in order.
-            for span in crossings.chunks_exact(2) {
-                let from = ((span[0] * config.width as f64 - 0.5).ceil()).max(0.0) as usize;
-                let to = ((span[1] * config.width as f64 - 0.5).floor()).max(-1.0);
-                if to < 0.0 {
-                    continue;
-                }
-                let to = (to as usize).min(config.width - 1);
-                for column in from..=to {
-                    settled_mask[row * config.width + column] = true;
-                }
-            }
-        }
-    }
-
-    let mut current_stones = Vec::with_capacity(stones.len());
-    let mut opponent_stones = Vec::with_capacity(stones.len());
-    for stone in stones {
-        if stone.color == to_move {
-            current_stones.push((stone.x, stone.y));
-        } else {
-            opponent_stones.push((stone.x, stone.y));
-        }
-    }
+    let settled_mask = settled_mask(position, config);
+    let (current_stones, opponent_stones) = relative_stones(position, to_move);
 
     for row in 0..config.height {
         let y = (row as f64 + 0.5) / config.height as f64;
         for column in 0..config.width {
             let x = (column as f64 + 0.5) / config.width as f64;
             let pixel = row * config.width + column;
-            let mut current_square = f64::INFINITY;
-            let mut opponent_square = f64::INFINITY;
-            let mut nearest_square = f64::INFINITY;
-            let mut second_square = f64::INFINITY;
-
-            for &(sx, sy) in &current_stones {
-                let dx = x - sx;
-                let dy = y - sy;
-                let square = dx * dx + dy * dy;
-                if square < current_square {
-                    current_square = square;
-                }
-                if square < nearest_square {
-                    second_square = nearest_square;
-                    nearest_square = square;
-                } else if square < second_square {
-                    second_square = square;
-                }
-            }
-            for &(sx, sy) in &opponent_stones {
-                let dx = x - sx;
-                let dy = y - sy;
-                let square = dx * dx + dy * dy;
-                if square < opponent_square {
-                    opponent_square = square;
-                }
-                if square < nearest_square {
-                    second_square = nearest_square;
-                    nearest_square = square;
-                } else if square < second_square {
-                    second_square = square;
-                }
-            }
+            let (current_square, opponent_square, nearest_square, second_square) =
+                squared_distances(x, y, &current_stones, &opponent_stones);
 
             let current_distance = current_square.sqrt();
             let opponent_distance = opponent_square.sqrt();
@@ -526,6 +449,129 @@ pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32
             );
         }
     }
+}
+
+fn settled_mask(position: &Position, config: RasterConfig) -> Vec<bool> {
+    let pixels = config.pixels();
+    let stones = position.stones();
+    let known_vertices = legal_set_vertices(position);
+    let mut settled = vec![false; pixels];
+    let mut contour = Vec::new();
+    let mut crossings: Vec<f64> = Vec::with_capacity(16);
+    for index in 0..stones.len() {
+        let region = SettledRegion::new(position, index, &known_vertices);
+        // A third of a pixel: finer than the raster can express, and far
+        // cheaper than the 2e-5 the client needs for a zoomable vector.
+        region.contour_within_into(
+            1.0 / (3.0 * config.width.max(config.height) as f64),
+            &mut contour,
+        );
+        if contour.len() < 3 {
+            continue;
+        }
+        // Only the rows the contour spans need testing.
+        let (mut low_y, mut high_y) = (f64::INFINITY, f64::NEG_INFINITY);
+        for point in &contour {
+            low_y = low_y.min(point.y);
+            high_y = high_y.max(point.y);
+        }
+        let first_row = ((low_y * config.height as f64 - 0.5).floor().max(0.0)) as usize;
+        let last_row =
+            ((high_y * config.height as f64 - 0.5).ceil() as usize).min(config.height - 1);
+        // Scanline fill computes a row's crossings once instead of once per
+        // pixel. The same buffer is reused for every row and every stone.
+        for row in first_row..=last_row {
+            let y = (row as f64 + 0.5) / config.height as f64;
+            crossings.clear();
+            let mut previous = contour[contour.len() - 1];
+            for &current in &contour {
+                if (current.y > y) != (previous.y > y) {
+                    let t = (y - current.y) / (previous.y - current.y);
+                    crossings.push(current.x + t * (previous.x - current.x));
+                }
+                previous = current;
+            }
+            if crossings.is_empty() {
+                continue;
+            }
+            crossings.sort_by(f64::total_cmp);
+            // Star-shaped loops are simple, so spans pair up in order.
+            for span in crossings.chunks_exact(2) {
+                let from = ((span[0] * config.width as f64 - 0.5).ceil()).max(0.0) as usize;
+                let to = ((span[1] * config.width as f64 - 0.5).floor()).max(-1.0);
+                if to < 0.0 {
+                    continue;
+                }
+                let to = (to as usize).min(config.width - 1);
+                for column in from..=to {
+                    settled[row * config.width + column] = true;
+                }
+            }
+        }
+    }
+    settled
+}
+
+fn relative_stones(position: &Position, to_move: Color) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+    let stones = position.stones();
+    let mut current = Vec::with_capacity(stones.len());
+    let mut opponent = Vec::with_capacity(stones.len());
+    for stone in stones {
+        if stone.color == to_move {
+            current.push((stone.x, stone.y));
+        } else {
+            opponent.push((stone.x, stone.y));
+        }
+    }
+    (current, opponent)
+}
+
+#[inline]
+fn squared_distances(
+    x: f64,
+    y: f64,
+    current_stones: &[(f64, f64)],
+    opponent_stones: &[(f64, f64)],
+) -> (f64, f64, f64, f64) {
+    let mut current_square = f64::INFINITY;
+    let mut opponent_square = f64::INFINITY;
+    let mut nearest_square = f64::INFINITY;
+    let mut second_square = f64::INFINITY;
+
+    for &(sx, sy) in current_stones {
+        let dx = x - sx;
+        let dy = y - sy;
+        let square = dx * dx + dy * dy;
+        if square < current_square {
+            current_square = square;
+        }
+        if square < nearest_square {
+            second_square = nearest_square;
+            nearest_square = square;
+        } else if square < second_square {
+            second_square = square;
+        }
+    }
+    for &(sx, sy) in opponent_stones {
+        let dx = x - sx;
+        let dy = y - sy;
+        let square = dx * dx + dy * dy;
+        if square < opponent_square {
+            opponent_square = square;
+        }
+        if square < nearest_square {
+            second_square = nearest_square;
+            nearest_square = square;
+        } else if square < second_square {
+            second_square = square;
+        }
+    }
+    (
+        current_square,
+        opponent_square,
+        nearest_square,
+        second_square,
+    )
 }
 
 #[must_use]
@@ -742,8 +788,8 @@ mod tests {
     use vgo_core::{Color, Position, Stone};
 
     use super::{
-        BOARD_BACKGROUND, CHANNEL_COUNT, CHANNELS, COMPACT_CHANNELS, RGB_CHANNEL_COUNT,
-        RasterConfig, RasterKind, action_pixel, rasterize, rasterize_into, rasterize_rgb,
+        CHANNEL_COUNT, CHANNELS, COMPACT_CHANNELS, RGB_CHANNEL_COUNT, RasterConfig, RasterKind,
+        action_pixel, rasterize, rasterize_into, rasterize_rgb,
     };
 
     /// The pre-optimization formulation: one `hypot` per (pixel, stone) pair.
@@ -974,24 +1020,32 @@ mod tests {
         }
     }
 
-    /// Compact must be exactly the planes it names, not a re-derivation.
+    /// The direct compact writer must stay bit-for-bit identical to the
+    /// semantic planes it names across sparse and dense positions.
     #[test]
     fn compact_is_a_subset_of_the_semantic_raster() {
-        let position = scattered_position(12).with_komi(0.15);
         let full = RasterConfig::square(48);
         let compact = RasterConfig::square_of(48, RasterKind::Compact);
         assert_eq!(compact.channels(), COMPACT_CHANNELS.len());
-
-        let whole = rasterize(&position, full);
-        let subset = rasterize(&position, compact);
         let pixels = full.pixels();
-        for (slot, &channel) in COMPACT_CHANNELS.iter().enumerate() {
-            assert_eq!(
-                &subset.data()[slot * pixels..(slot + 1) * pixels],
-                &whole.data()[channel * pixels..(channel + 1) * pixels],
-                "compact plane {slot} must equal semantic channel {channel} ({})",
-                CHANNELS[channel].name
-            );
+
+        for stones in [0, 1, 12, 40] {
+            let fixture = scattered_position(stones);
+            for to_move in [Color::Black, Color::White] {
+                let position = Position::new(fixture.radius(), fixture.stones().to_vec(), to_move)
+                    .with_komi(0.15);
+                let whole = rasterize(&position, full);
+                let subset = rasterize(&position, compact);
+                for (slot, &channel) in COMPACT_CHANNELS.iter().enumerate() {
+                    assert_eq!(
+                        &subset.data()[slot * pixels..(slot + 1) * pixels],
+                        &whole.data()[channel * pixels..(channel + 1) * pixels],
+                        "compact plane {slot} must equal semantic channel {channel} ({}) at \
+                         {stones} stones with {to_move:?} to move",
+                        CHANNELS[channel].name
+                    );
+                }
+            }
         }
     }
 

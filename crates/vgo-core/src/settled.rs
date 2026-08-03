@@ -260,18 +260,31 @@ impl<'a> SettledRegion<'a> {
     /// earlier, and subdivision is most of the cost.
     #[must_use]
     pub fn contour_within(&self, tolerance: f64) -> Vec<Point> {
+        let mut points = Vec::new();
+        self.contour_within_into(tolerance, &mut points);
+        points
+    }
+
+    /// [`contour_within`](Self::contour_within), writing into reusable storage.
+    ///
+    /// Rasterization traces one region per stone, so retaining the largest
+    /// contour's capacity avoids allocating and growing another vector for
+    /// every stone at every encoded search leaf.
+    pub fn contour_within_into(&self, tolerance: f64, points: &mut Vec<Point>) {
         const BASE_RAYS: usize = 16;
         const MAX_DEPTH: u32 = 9;
         let tolerance = tolerance.max(0.0);
+        points.clear();
 
         if self.unbounded {
             // Every point is settled; the caller wants the whole board.
-            return vec![
+            points.extend([
                 Point::new(-0.02, -0.02),
                 Point::new(1.02, -0.02),
                 Point::new(1.02, 1.02),
                 Point::new(-0.02, 1.02),
-            ];
+            ]);
+            return;
         }
 
         let ray = |angle: f64| {
@@ -330,24 +343,23 @@ impl<'a> SettledRegion<'a> {
             );
         }
 
-        let mut rays = Vec::with_capacity(BASE_RAYS + 1);
+        let mut rays = [(0.0, 0.0, 0.0, 0.0); BASE_RAYS + 1];
         for k in 0..=BASE_RAYS {
             let angle = std::f64::consts::TAU * k as f64 / BASE_RAYS as f64;
             let (ux, uy, t) = ray(angle);
-            rays.push((angle, t, ux, uy));
+            rays[k] = (angle, t, ux, uy);
         }
 
-        let mut points = vec![at(rays[0].1, rays[0].2, rays[0].3)];
+        points.push(at(rays[0].1, rays[0].2, rays[0].3));
         for k in 0..BASE_RAYS {
             let (angle_a, ta, ax, ay) = rays[k];
             let (angle_b, tb, bx, by) = rays[k + 1];
             flatten(
-                self, &mut points, angle_a, ta, ax, ay, angle_b, tb, bx, by, 0,
+                self, points, angle_a, ta, ax, ay, angle_b, tb, bx, by, 0,
                 tolerance, MAX_DEPTH,
             );
         }
         points.pop(); // the closing point repeats the first
-        points
     }
 
     fn exit_distance(&self, ux: f64, uy: f64) -> f64 {
