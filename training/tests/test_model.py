@@ -26,12 +26,24 @@ from vgo_training.train_demo import (
 
 class ModelTests(unittest.TestCase):
     def test_policy_and_value_shapes(self) -> None:
+        """Value is two logits while training, one bounded scalar at inference.
+
+        The exported graph and the search read the scalar, so eval mode must
+        keep emitting it; the loss reads the logits. Collapsing in both modes
+        hands cross-entropy a scalar, which fails far from here.
+        """
         model = RasterPolicyValueNet(channels=10, width=8, blocks=1)
+
+        model.eval()
         policy, value = model(torch.zeros(2, 10, 8, 8))
         self.assertEqual(tuple(policy.shape), (2, 65))
         self.assertEqual(tuple(value.shape), (2,))
         self.assertTrue(torch.all(value >= -1.0))
         self.assertTrue(torch.all(value <= 1.0))
+
+        model.train()
+        _, logits = model(torch.zeros(2, 10, 8, 8))
+        self.assertEqual(tuple(logits.shape), (2, 2))
 
     def test_ddrnet_handles_odd_rasters_and_backpropagates_both_fusions(self) -> None:
         model = DDRNetPolicyValueNet(channels=10, width=16, blocks=2)
@@ -55,16 +67,21 @@ class ModelTests(unittest.TestCase):
             self.assertTrue(bool(torch.isfinite(parameter.grad).all()))
 
     def test_ddrnet_training_mode_emits_normalized_twin_heads(self) -> None:
-        """Training returns four outputs; inference returns the usual two.
+        """Training returns six outputs; inference returns the usual two.
 
         The normalized heads carry most of the loss so they shape the trunk,
         but inference reads the unnormalized pair, which is what gets exported.
+        Ownership is an auxiliary training target and never enters the exported
+        graph, so it appears only in the training tuple.
         """
         model = DDRNetPolicyValueNet(channels=10, width=16, blocks=2)
         model.train()
         outputs = model(torch.randn(2, 10, 19, 23))
-        self.assertEqual(len(outputs), 4)
-        policy, value, normed_policy, normed_value = outputs
+        self.assertEqual(len(outputs), 6)
+        policy, value, normed_policy, normed_value, ownership, normed_ownership = outputs
+        # Ownership covers the placement grid without the pass slot.
+        self.assertEqual(ownership.shape, normed_ownership.shape)
+        self.assertEqual(ownership.shape[1], policy.shape[1] - 1)
         self.assertEqual(policy.shape, normed_policy.shape)
         self.assertEqual(value.shape, normed_value.shape)
 

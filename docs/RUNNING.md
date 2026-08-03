@@ -19,42 +19,80 @@ lives.
 
 ## Tests
 
-There are four suites and no single command that runs them all.
+There are three suites and no single command that runs them all. Run the first
+two before any change lands; they are fast.
 
-```powershell
-cargo test --workspace                 # Rust rules engine, search, self-play
-.\reference\tests\run-tests.ps1        # engine, game tree, and UI fixtures in Chrome
+```bash
+cargo test --release --workspace          # 21 suites: rules, search, self-play
+cd training && .venv/bin/python3 -m unittest discover -s tests   # 88 tests
 ```
 
-```powershell
-cd training
-uv run python -m unittest discover -s tests -v
+```bash
+reference/tests/run-tests.ps1             # engine, game tree, UI fixtures in Chrome
 ```
 
-`run-tests.ps1` drives headless Chrome and fails the run if any fixture reports
-a status other than `pass`, so it is safe in a pipeline.
+The browser suite needs Chrome and PowerShell; it is the only part of the tree
+that assumes Windows. The Rust and Python suites are what catch the failures
+that actually happen -- a shape or tuple-arity change in the learner shows up
+there rather than at runtime, and one such change would otherwise have crashed a
+run at its first validation pass.
 
 ## The reinforcement-learning loop
 
 [`RL_LOOP.md`](RL_LOOP.md) describes the queue, artifact, and recovery
-contracts. A representative run is:
+contracts.
 
-```powershell
-cd training
-uv run python -m vgo_training.rl_loop `
-  --output ../artifacts/rl-run-NAME `
-  --updates 20 --samples-per-shard 1024 `
-  --shards-per-update 1 --replay-window 8 --maximum-prefetch-shards 1 `
-  --resolution 96 --policy-resolution 32 --coarse-pool 4 `
-  --generation-simulations 256 --arena-simulations 256 `
-  --maximum-plies 256 `
-  --training-epochs 10 --training-batch 64 `
-  --warm-learning-rate 5e-4 --value-weight 1.0 `
-  --training-device cuda --training-precision bfloat16 --actors 64 `
-  --inference-batch 16 --inference-slots 2 `
-  --provider tensorrt --inference-device-id 0 `
-  --warm-inference
+Every run this project has kept is launched from a committed `launch.sh` beside
+its output, not from a command typed at a prompt. That file is the record of
+what a run *was* -- its settings are learning identity, so a run cannot be
+resumed with different ones, and the header comment explains why each value was
+chosen. Copy the most recent one and edit it:
+
+```bash
+cp artifacts/ddrnet-own/launch.sh artifacts/my-run/launch.sh
+$EDITOR artifacts/my-run/launch.sh          # --output, --seed, and the change under test
+./artifacts/my-run/launch.sh > artifacts/my-run/logs/run.log 2>&1
 ```
+
+Run it detached if you want it to survive the shell:
+
+```bash
+setsid nohup ./artifacts/my-run/launch.sh > artifacts/my-run/logs/run.log 2>&1 &
+```
+
+The current shape of a run, as of `ddrnet-own`:
+
+```bash
+.venv/bin/python3 -m vgo_training.rl_loop \
+  --output "$root/artifacts/NAME" \
+  --updates 60 --samples-per-shard 6144 --shards-per-update 1 --replay-window 6 \
+  --resolution 128 --policy-resolution 128 --radius 0.055714285714285716 \
+  --raster-kind compact --komi-low=-0.166 --komi-high=0.234 \
+  --coarse-pool 16 --generation-simulations 512 \
+  --temperature 1.0 --temperature-plies 30 --maximum-plies 70 \
+  --resign-target-false-positive 0.02 --resign-soft-simulations 64 \
+  --resign-window 5 --resign-minimum-ply 20 --resign-disable-fraction 0.0 \
+  --training-epochs 1 --training-batch 256 \
+  --learning-rate 0.001 --warm-learning-rate 0.001 --value-weight 2.0 \
+  --schedule wsd --warmup-epochs 1 --compile --restore-optimizer \
+  --architecture ddrnet --norm-groups 8 --model-width 96 --blocks 16 \
+  --training-device cuda --report-every 1 --validation-fraction 0.1 \
+  --actors 64 --arena-actors 64 --leaf-batch 4 \
+  --inference-batch 64 --inference-delay-ms 1 --inference-slots 1 \
+  --provider tensorrt --fp16 --warm-inference \
+  --overlap-actor-learner --retire-shards \
+  --seed 8900001 --arena-seed 8905001
+```
+
+Note `--komi-low=-0.1` uses the `=` form: clap reads a bare `-0.1` as a flag.
+
+**One epoch, not ten.** A shard is seen once per update and survives
+`--replay-window` updates, so each sample is seen six times, by six different
+models. That is far from memorisation: measured over 35 updates the training MAE
+never fell below 0.109, where ten epochs on fixed shards reached 0.018. Ten
+epochs also spent 62% of the cycle on training; one spends about 6%, which
+leaves the GPU to self-play. The learning-rate schedule advances per optimizer
+step so the full warmup-stable-decay curve still fits inside a single epoch.
 
 Self-play and the persistent learner overlap by default. If same-GPU kernel or
 context contention hurts cadence, pass `--no-overlap-actor-learner`. That flag
@@ -74,9 +112,9 @@ engine cache while the current actor tail finishes. Pass
 Continue from a published model by passing both halves, and optionally seed the
 replay window:
 
-```powershell
-  --initial-checkpoint ../artifacts/PREV/updates/update-000019/candidate.pt `
-  --initial-onnx ../artifacts/PREV/updates/update-000019/candidate.onnx `
+```bash
+  --initial-checkpoint ../artifacts/PREV/updates/update-000019/candidate.pt \
+  --initial-onnx ../artifacts/PREV/updates/update-000019/candidate.onnx \
   --initial-replay ../artifacts/PREV/replay/shard-000019/dataset.vgo
 ```
 
@@ -117,8 +155,8 @@ changes are recorded in `pipeline-config-history.json`.
 
 Elo jobs do not block the next learner update. Drain them independently:
 
-```powershell
-uv run python -m vgo_training.rl_loop `
+```bash
+training/.venv/bin/python3 -m vgo_training.rl_loop \
   --output ../artifacts/rl-run-NAME --telemetry-only
 ```
 
@@ -148,14 +186,15 @@ Queued telemetry compares accepted generations and fits common Bradley–Terry
 ratings without blocking publication. For an ad hoc head-to-head, run the arena
 yourself:
 
-```powershell
-cargo run --release -p vgo-selfplay --bin vgo-arena -- `
-  --candidate artifacts/A/updates/update-000019/candidate.onnx `
-  --opponent  artifacts/B/updates/update-000019/candidate.onnx `
-  --pairs 75 --simulations 256 --max-plies 256 --threads 32 `
-  --resolution 96 --policy-resolution 32 --coarse-pool 4 `
-  --radius 0.05555555555555555 `
-  --maximum-batch 16 --provider tensorrt --device-id 0 `
+```bash
+cargo run --release -p vgo-selfplay --bin vgo-arena -- \
+  --candidate artifacts/A/updates/update-000034/candidate.onnx \
+  --opponent  artifacts/B/updates/update-000034/candidate.onnx \
+  --candidate-raster-kind compact \
+  --pairs 16 --simulations 512 --max-plies 120 --threads 32 \
+  --resolution 128 --policy-resolution 128 --coarse-pool 16 \
+  --radius 0.055714285714285716 --komi 0.034 \
+  --maximum-batch 64 --provider tensorrt --device-id 0 \
   --cache-directory artifacts/onnx-cache
 ```
 
@@ -168,6 +207,96 @@ parallel arenas are promotion-grade; see the note in `docs/RL_LOOP.md`.
 Run it through `runtime_environment()` if you invoke it from Python, or from a
 shell where the TensorRT libraries are already on `PATH`. See the traps below.
 
+### Rating a lineage
+
+`scripts/rate-checkpoints.py` plays checkpoints against each other and fits
+Bradley-Terry ratings. It runs outside the pipeline -- no state file, no queue
+-- so it works on a finished run, an abandoned one, or one that is merely idle.
+
+```bash
+./scripts/rate-checkpoints.py artifacts/ddrnet-komi3 --lineage \
+  --versions 0,14,28,35,41,47 --pairs 8
+```
+
+`--lineage` follows `--initial-checkpoint` back through launch scripts and puts
+every ancestor on one version timeline. A warm-started run's version 0 is
+already the product of its parent's training, so rating it alone reads the tail
+of a history as though it were the whole thing.
+
+Round robin is the default, and matters more than it sounds. Rating everything
+against one anchor stops discriminating the moment the field beats it: measured
+on one lineage, four checkpoints scored 0.938 to 1.000 against the anchor and
+were indistinguishable, and an undefeated record has no finite Elo at all -- the
+fit falls back on the prior. Cross-play keeps every rating pinned by games that
+were actually close. `--no-round-robin` restores anchor-only, which is `n-1`
+matches rather than `n(n-1)/2`.
+
+The naive evaluator joins the field by default. It is the only opponent whose
+strength never changes, so it is what makes ratings comparable across runs; an
+Elo measured only against siblings says where a model sits in its own field and
+nothing more.
+
+Matches are played at the midpoint of the run's own komi range, read from its
+config. Rating at komi 0 measures a model on a game it never trained for.
+
+### Where does komi balance the game?
+
+```bash
+training/.venv/bin/python3 scripts/komi-balance-fit.py artifacts/ddrnet-komi3 \
+  --komi-low=-0.166 --komi-high=0.234 --last 6
+```
+
+Fits `P(Black wins) = sigmoid(a + b*komi)` over played-out games and reports the
+crossing with a bootstrap interval. **This does not stay put.** On one lineage
+the balance point moved from +0.163 to +0.034 over about forty updates as the
+model strengthened, and nothing in the loop measures it -- the drift was found
+only while investigating something else. Refit every ten updates or so.
+
+`--last N` restricts the fit to recent shards, which is necessary once a run's
+play changes character. Resigned games are excluded automatically: under
+resignation the mover concedes, so the winner is fixed by ply parity and carries
+no information about balance. Pooling them in once produced an apparent 86%
+Black where the played-out subset said 62%.
+
+The symptom to watch for between fits is Black's share per shard. Anything
+outside 40-60% means the range has drifted, and a one-sided share makes
+`value_sign_accuracy` meaningless -- predicting the majority class scores
+whatever that class holds. At 18% Black an accuracy of 0.970 was worth +0.15
+over that baseline; at 49% Black, 0.911 was worth +0.40.
+
+### Reading a specific position
+
+Two diagnostics answer questions the aggregate metrics cannot.
+
+```bash
+# Was the refutation in the tree, or did the value head just miss it?
+cargo run --release -p vgo-selfplay --example probe_capture -- \
+  position.json 0.371 0.074 artifacts/RUN/updates/update-000030/candidate.onnx 2048
+
+# Does the raster the net reads match the position the engine computes?
+cargo run --release -p vgo-selfplay --example raster_fidelity -- game.sgf 128
+```
+
+`probe_capture` distinguishes a candidate-generation failure from a value-head
+failure, which call for opposite fixes. On the game that prompted it the
+refutation *was* proposed -- it drew 1 visit of 2339 and was evaluated at
++1.0000 while capturing 21 stones -- which is what identified the head rather
+than the search.
+
+`raster_fidelity` checks the settled channel against its closed-form region and
+reports how far stones land from the policy lattice. Snapping pushes placements
+off the lattice by design, including moves the engine plays itself, so off-grid
+is normal; what matters is that the offset stays under half a cell.
+
+```bash
+# Were the resignations right?
+cargo run --release -p vgo-selfplay --example review_resignations -- \
+  artifacts/RUN/replay/shard-000020 20
+```
+
+Writes SGFs to `diagnostics/resignation-review/`, named by whether the conceding
+side was ahead or behind on the board.
+
 ### Is search working at all?
 
 `vgo-arena` drives both seats at one `--simulations`, so it cannot tell you
@@ -175,12 +304,12 @@ whether search depth is buying anything. `vgo-playout-duel` holds the model
 fixed and varies only the playout budget, which isolates the search path from
 policy quality:
 
-```powershell
-cargo run --release -p vgo-selfplay --bin vgo-playout-duel -- `
-  --model artifacts/A/updates/update-000019/candidate.onnx `
-  --high 128 --low 16 --pairs 40 --coarse-pool 8 `
-  --max-plies 160 --threads 32 --resolution 96 --policy-resolution 32 `
-  --radius 0.05555555555555555 --maximum-batch 64 `
+```bash
+cargo run --release -p vgo-selfplay --bin vgo-playout-duel -- \
+  --model artifacts/A/updates/update-000019/candidate.onnx \
+  --high 128 --low 16 --pairs 40 --coarse-pool 8 \
+  --max-plies 160 --threads 32 --resolution 96 --policy-resolution 32 \
+  --radius 0.05555555555555555 --maximum-batch 64 \
   --provider tensorrt --cache-directory artifacts/onnx-cache
 ```
 
@@ -193,20 +322,20 @@ the net sees out-of-distribution rasters and inference returns NaN.
 
 ## Benchmarks
 
-```powershell
-cargo run --release -p vgo-selfplay --bin vgo-canary -- `
+```bash
+cargo run --release -p vgo-selfplay --bin vgo-canary -- \
   --pairs 100 --first 1000 --second 10 --max-plies 48 --threads 4 --seed 10001
 
-cargo run --release -p vgo-selfplay --bin vgo-model-smoke -- `
+cargo run --release -p vgo-selfplay --bin vgo-model-smoke -- \
   --resolution 128 --policy-resolution 32
 ```
 
-```powershell
+```bash
 cd training
-uv run python -m vgo_training.benchmark_model `
+.venv/bin/python3 -m vgo_training.benchmark_model \
   --checkpoint ../artifacts/raster-demo/model.pt --batches 1,8,16,32,64
-uv run python -m vgo_training.benchmark_precision `
-  --dataset ../artifacts/raster-demo/dataset.vgo `
+training/.venv/bin/python3 -m vgo_training.benchmark_precision \
+  --dataset ../artifacts/raster-demo/dataset.vgo \
   --checkpoint ../artifacts/raster-demo/model.pt
 ```
 
@@ -220,6 +349,52 @@ or a game record into the VGO-SGF box and press Load.
 
 These are all things that fail confusingly rather than obviously.
 
+**Do not wait on a process with `pgrep -f`.** A monitor or launcher whose own
+command line contains the pattern matches itself, and two of them match each
+other. That cost a full night: an A/B finished at 02:20, the launcher waiting on
+`pgrep -f ownership_effect.py` never saw it exit because two monitors containing
+that string were still alive, and the machine sat idle until morning. The same
+class of mistake makes `pkill -f rl_loop` kill the shell issuing it. Match on a
+PID file, or on something no tool of yours will ever contain.
+
+**Alert thresholds need calibrating against both a healthy and a failing run.**
+An absolute train/val gap threshold tightens silently as a model improves --
+`gap > 0.06` is nothing at a validation MAE of 1.0 and everything at 0.15, and
+it fired on four of six healthy updates. Relative thresholds need the same care:
+45% sits *inside* the healthy band, which measured 8-48% with a median of 31%,
+where genuine memorisation ran at 90-92%. Put the threshold between the two
+regimes, not where it feels strict.
+
+**A shard is ~105 games, so per-shard rates swing several points by chance.**
+Three or four consecutive points are not a trend. In one session that produced
+three false alarms -- a "doubling" capped rate that reversed, a "monotone" ply
+increase that reversed, and a stalling signal that came from a field counting
+captured *stones* rather than no-op *moves*. Compute the interval, or pool
+shards, before reporting movement.
+
+**Game ids restart in every shard.** Across twenty shards, 2198 games carry only
+148 distinct ids. Any analysis that groups by `game_id` alone silently merges
+unrelated games; key on `(shard, game)`. The learner's own split avoids this by
+salting its hash with the shard digest.
+
+**`load_datasets` expands policy targets to full width.** A record stores 64
+touched cells; the loader materialises four tensors of `policy_size` (16385),
+which for twenty shards is 30 GB of ~99.6% zeros against 18.8 GB of rasters. Use
+`dataset.sparse.expand(rows)` per batch and drop the dense copies if you are
+loading many shards outside the pipeline.
+
+**A saturating activation in front of a squared error stops learning.** This has
+now bitten three times: `tanh` + MSE on the value head, `tanh` on the ownership
+head (which read -1.0000 to -0.9993 at initialisation, gradients 1e-6), and MSE
+against bounded +/-1 targets, which keeps pulling correct cells long after their
+sign is settled. Before adding any head, check its output range and gradient
+magnitude at initialisation rather than after a run disappoints.
+
+**Batch 256 does not fit a 15.5 GiB card at 128x128.** Both a w96/b32 and a
+w48/b16 net OOM during backward. Batch 128 peaks at 7.4 and 8.6 GB. The failure
+arrives as `CUDA out of memory` deep in `_engine_run_backward`, which reads like
+a leak rather than a sizing problem.
+
 **TensorRT libraries are not on `PATH`.** They ship inside the `uv` virtual
 environment. `rl_loop.runtime_environment()` prepends `tensorrt_libs` and
 `torch/lib` for every child process it spawns. Invoking `vgo-arena` or
@@ -232,7 +407,7 @@ missing`. Import the helper rather than reimplementing the path logic.
 `configured batch 64 exceeds ONNX maximum 16`. Two models can only meet at the
 smaller of their two ceilings, which silently limits both generation throughput
 and cross-generation comparison. Re-export with
-`uv run python -m vgo_training.export_onnx --checkpoint X --output Y
+`training/.venv/bin/python3 -m vgo_training.export_onnx --checkpoint X --output Y
 --maximum-batch 64`.
 
 **The ply-limit flag is spelled differently in each layer.** The driver takes

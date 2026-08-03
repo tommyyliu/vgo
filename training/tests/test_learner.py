@@ -155,7 +155,7 @@ class ReplayCacheTests(unittest.TestCase):
             pointers = []
             samples = 0
             try:
-                for states, policies, masks, values in stager.batches(
+                for states, policies, masks, values, _ownership in stager.batches(
                     view.batches(2, shuffle=False)
                 ):
                     pointers.append(states.untyped_storage().data_ptr())

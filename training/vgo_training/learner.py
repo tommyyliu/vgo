@@ -859,7 +859,10 @@ def evaluate(
     # One slot per metric summed below; keep in step with the torch.stack call
     # and with the totals[...] indices after it.
     accumulator = torch.zeros(6, dtype=torch.float64, device=stager.device)
-    for states, targets, masks, values in stager.batches(
+    # Five, not four: the stager carries ownership alongside the rest. Metrics
+    # do not use it -- the ownership head is training-only -- but the tuple
+    # still has to be unpacked.
+    for states, targets, masks, values, _ownership in stager.batches(
         view.batches(batch_size, shuffle=False)
     ):
         with torch.autocast(

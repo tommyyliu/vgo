@@ -196,8 +196,14 @@ class RasterPolicyValueNet(nn.Module):
         placement_logits = self.policy_map(features).flatten(start_dim=1)
         pass_logit = self.pass_head(pooled)
         policy_logits = torch.cat((placement_logits, pass_logit), dim=1)
-        values = value_utility(self.value_head(pooled))
-        return policy_logits, values
+        # Logits while training, the scalar utility at inference -- the same
+        # contract DDRNet follows. Collapsing unconditionally would hand the
+        # loss a scalar where it expects two classes, which fails as
+        # "value head emitted a scalar" rather than as a shape error.
+        values = self.value_head(pooled)
+        if self.training:
+            return policy_logits, values
+        return policy_logits, value_utility(values)
 
 
 class _Down(nn.Module):
@@ -319,8 +325,14 @@ class UNetPolicyValueNet(nn.Module):
         pooled = bottleneck.mean(dim=(-2, -1))
         pass_logit = self.pass_head(pooled)
         policy_logits = torch.cat((placement_logits, pass_logit), dim=1)
-        values = value_utility(self.value_head(pooled))
-        return policy_logits, values
+        # Logits while training, the scalar utility at inference -- the same
+        # contract DDRNet follows. Collapsing unconditionally would hand the
+        # loss a scalar where it expects two classes, which fails as
+        # "value head emitted a scalar" rather than as a shape error.
+        values = self.value_head(pooled)
+        if self.training:
+            return policy_logits, values
+        return policy_logits, value_utility(values)
 
 
 class _DDRContext(nn.Module):

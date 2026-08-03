@@ -142,6 +142,10 @@ class PreparedRasterDataset:
     height: int
     width: int
     sources: tuple[str, ...]
+    # Carried from the raw dataset. None when no shard in the window had a
+    # `final_stones` sidecar, which the ownership loss masks rather than
+    # training on as "nobody owns anything".
+    ownerships: "torch.Tensor | None" = None
 
     @property
     def samples(self) -> int:

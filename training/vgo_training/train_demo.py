@@ -307,6 +307,7 @@ def prepare_policy_supervision(
         height=dataset.height,
         width=dataset.width,
         sources=dataset.sources,
+        ownerships=getattr(dataset, "ownerships", None),
     )
 
 
