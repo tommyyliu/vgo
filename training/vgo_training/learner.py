@@ -656,6 +656,10 @@ class BatchStager:
             torch.empty((batch, policy_size), dtype=torch.float32, pin_memory=pin),
             torch.empty((batch, policy_size), dtype=torch.bool, pin_memory=pin),
             torch.empty((batch,), dtype=torch.float32, pin_memory=pin),
+            # Ownership: policy_size - 1 cells, the placement block without the
+            # pass slot. Always allocated; shards lacking `final_stones` leave
+            # it zero and the loss masks those rows.
+            torch.empty((batch, policy_size - 1), dtype=torch.float32, pin_memory=pin),
         )
         device_buffers = None
         if self.device.type == "cuda":
@@ -705,7 +709,7 @@ class BatchStager:
                     dataset.values,
                 ),
                 slot.host,
-                strict=True,
+                strict=False,
             ):
                 torch.index_select(
                     source,
@@ -713,6 +717,14 @@ class BatchStager:
                     part.rows,
                     out=target[offset : offset + part_count],
                 )
+            # Ownership separately: a shard predating `final_stones` has none,
+            # and zeroing the destination slice is far cheaper than materialising
+            # a zero source of `samples x policy_size` to index into.
+            destination = slot.host[4][offset : offset + part_count]
+            if dataset.ownerships is None:
+                destination.zero_()
+            else:
+                torch.index_select(dataset.ownerships, 0, part.rows, out=destination)
             offset += part_count
         if spec.transform:
             dataset = spec.parts[0].shard.dataset
@@ -729,11 +741,34 @@ class BatchStager:
             slot.host[0][:count].copy_(states)
             slot.host[1][:count].copy_(policies)
             slot.host[2][:count].copy_(masks)
+            # Ownership is a spatial field over the same grid as the policy's
+            # placement block, so it needs the identical reindexing -- without
+            # this an augmented batch pairs a rotated board with an unrotated
+            # target. `apply_dihedral` takes policy vectors, which carry a
+            # trailing pass slot, so a dummy one is padded on and dropped again.
+            # Verified equivalent to rotating the map as an image for transforms
+            # 1, 3 and 5.
+            side = int(round((dataset.policies.shape[1] - 1) ** 0.5))
+            owned = slot.host[4][:count]
+            padded = torch.cat(
+                (owned, torch.zeros((count, 1), dtype=owned.dtype)), dim=1
+            )
+            _, rotated, _ = apply_dihedral(
+                slot.host[0][:count],
+                padded,
+                slot.host[2][:count],
+                spec.transform,
+                dataset.height,
+                dataset.width,
+                side,
+                side,
+            )
+            owned.copy_(rotated[:, :-1])
         return count
 
     def _transfer(
         self, slot: _StagingSlot, count: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         if self.device.type != "cuda":
             return tuple(tensor[:count] for tensor in slot.host)  # type: ignore[return-value]
         assert self._copy_stream is not None
@@ -1288,7 +1323,13 @@ class PersistentLearner:
                 generator=generator,
                 augment=config.augment,
             )
-            for states, policy_targets, policy_masks, value_targets in stager.batches(specs):
+            for (
+                states,
+                policy_targets,
+                policy_masks,
+                value_targets,
+                ownership_targets,
+            ) in stager.batches(specs):
                 with torch.autocast(
                     device_type=self._device.type,
                     dtype=torch.bfloat16,
@@ -1307,6 +1348,16 @@ class PersistentLearner:
                     )
                     value_loss = value_cross_entropy(values, value_targets)
                     loss = policy_loss + config.value_weight * value_loss
+                    # Ownership is dense spatial supervision: one target per
+                    # cell rather than one scalar per position, which is what
+                    # forces the trunk to represent *where* a group lives
+                    # instead of only who won. Absent for shards written before
+                    # `final_stones`, whose rows arrive zeroed and are masked.
+                    if len(outputs) >= 5:
+                        present = ownership_targets.abs().sum(dim=1) > 0
+                        loss = loss + OWNERSHIP_WEIGHT * ownership_loss(
+                            outputs[4], ownership_targets, present
+                        )
                     # KataGo's one-batch-norm split: the normalized heads take
                     # most of the weight so they drive the trunk, while the
                     # inference heads above learn the same targets without
@@ -1323,6 +1374,10 @@ class PersistentLearner:
                         ) + config.value_weight * value_cross_entropy(
                             normed_values, value_targets
                         )
+                        if len(outputs) >= 6:
+                            normed_loss = normed_loss + OWNERSHIP_WEIGHT * ownership_loss(
+                                outputs[5], ownership_targets, present
+                            )
                         loss = (
                             NORMED_HEAD_WEIGHT * normed_loss
                             + (1.0 - NORMED_HEAD_WEIGHT) * loss

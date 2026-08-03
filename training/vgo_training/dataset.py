@@ -117,6 +117,10 @@ class RasterDataset:
     # tensors above stay for callers that want a whole shard at once; the
     # replay window holds only this, which is 254x smaller.
     sparse: "SparsePolicy | None" = None
+    # Final-board ownership per sample, mover-relative, flattened to
+    # policy_resolution**2. None for shards written before `final_stones`
+    # existed, which the loss masks rather than treating as "nobody owns it".
+    ownerships: "torch.Tensor | None" = None
 
     @property
     def samples(self) -> int:
@@ -746,6 +750,12 @@ def load_dataset(path: str | Path) -> RasterDataset:
         height=height,
         width=width,
         sources=(str(path),),
+        ownerships=(
+            None
+            if (own := shard_ownership(path, samples, int(round((policy_size - 1) ** 0.5))))
+            is None
+            else torch.from_numpy(own)
+        ),
         sparse=None if sparse_cells is None else SparsePolicy(
             indices=torch.from_numpy(sparse_cells["index"].astype(np.int64)),
             policies=torch.from_numpy(sparse_cells["policy"].astype(np.float32)),
@@ -802,6 +812,7 @@ def load_datasets(paths: Iterable[str | Path]) -> RasterDataset:
     sources: list[str] = []
     # The sparse cells concatenate too, at 1/254 the size of the dense form.
     sparse_parts: list[SparsePolicy] = []
+    ownership_parts: list[torch.Tensor] = []
     offset = 0
     for path in paths:
         shard = load_dataset(path)
@@ -817,6 +828,8 @@ def load_datasets(paths: Iterable[str | Path]) -> RasterDataset:
         sources.extend(shard.sources)
         if shard.sparse is not None:
             sparse_parts.append(shard.sparse)
+        if shard.ownerships is not None:
+            ownership_parts.append(shard.ownerships)
         offset = stop
         # Drop the shard before loading the next one; without this the peak is
         # the window plus every shard already consumed.
@@ -839,12 +852,20 @@ def load_datasets(paths: Iterable[str | Path]) -> RasterDataset:
             policy_size=sparse_parts[0].policy_size,
         )
 
+    # Only when every shard has it: a partial stack would silently misalign
+    # rows against the other tensors.
+    ownerships = (
+        torch.cat(ownership_parts)
+        if len(ownership_parts) == len(paths) and ownership_parts
+        else None
+    )
     return RasterDataset(
         **output,
         height=first_shape[1],
         width=first_shape[2],
         sources=tuple(sources),
         sparse=sparse,
+        ownerships=ownerships,
     )
 
 

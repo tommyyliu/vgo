@@ -718,9 +718,14 @@ class DDRNetPolicyValueNet(nn.Module):
                 return logits, values
             # Same resize as the policy so the map lands on the policy grid,
             # which is the resolution the target is rendered at.
-            ownership = ownership_map(ownership_features(fused_features))
-            ownership = torch.tanh(
-                self._resize_policy(ownership, target_size)
+            # Raw, not through tanh. A tanh here saturates at initialisation --
+            # measured -1.0000 to -0.9993 on a fresh model, with gradients of
+            # 1e-6 -- because the (1 - v^2) factor vanishes exactly where the
+            # output is pinned. That is the same trap the scalar value head was
+            # in before it became categorical. MSE against +/-1 targets does not
+            # need a bounded output; the head learns the bound from the data.
+            ownership = self._resize_policy(
+                ownership_map(ownership_features(fused_features)), target_size
             ).flatten(start_dim=1)
             return logits, values, ownership
 
