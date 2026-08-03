@@ -1,2 +1,10 @@
 [env]
 ORT_CUDA_VERSION = { value = "13", force = false }
+
+[build]
+# The raster's per-pixel distance sweep is the largest CPU cost in generation,
+# and the default baseline-x86-64 target leaves the machine's AVX-512 unused.
+# Enabling the host's own features cuts the 128^2 compact raster from 2.26 ms to
+# 1.70 ms with bit-identical output. Binaries built this way only run on a CPU
+# with the build host's feature set; drop this if artifacts need to be portable.
+rustflags = ["-C", "target-cpu=native"]
