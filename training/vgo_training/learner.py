@@ -553,12 +553,25 @@ class _StagingSlot:
 def ownership_loss(
     predicted: torch.Tensor, targets: torch.Tensor, present: torch.Tensor
 ) -> torch.Tensor:
-    """Mean squared error of the predicted ownership map.
+    """Binary cross-entropy of the predicted ownership map.
 
-    MSE rather than cross-entropy: unlike the outcome, a cell's ownership is
-    genuinely continuous near a boundary, and the head emits a raw map through
-    tanh only at the output, so there is no saturating layer between the
-    parameters and this loss.
+    Each cell's output is read as a logit for "the mover owns this cell", which
+    is exactly a two-class softmax with the redundant second logit dropped --
+    softmax over two classes depends only on their difference, so one logit
+    carries it. Verified identical to `cross_entropy` on the two-logit form.
+
+    BCE rather than MSE because MSE has no finite optimum per cell. Targets are
+    exactly +/-1, so MSE keeps pulling the raw value toward the target even once
+    the sign is long settled: at logit +8 on a correct cell it still applies a
+    gradient of 14, against BCE's 0.0003. That wasted pull is what drove 16.6%
+    of cells past +/-1, a magnitude that means nothing since ownership is
+    bounded. BCE spends gradient only where the model is wrong or unsure, and
+    `sigmoid(logit)` then reads as a per-cell confidence.
+
+    MSE does give a larger gradient on a confidently wrong cell (18 against 1),
+    but that was the same argument that favoured MSE for the value head and it
+    was the wrong frame there too: what drives learning is the ratio between
+    wrong and settled cells, not the absolute magnitude.
 
     `present` masks samples whose game has no stored final board -- shards
     written before the field existed -- so a mixed window trains on the ones
@@ -566,8 +579,10 @@ def ownership_loss(
     """
     if not bool(present.any()):
         return predicted.sum() * 0.0
-    error = (predicted[present] - targets[present]).square().mean()
-    return error
+    # Targets arrive as +/-1 from the mover's view; BCE wants 0/1.
+    return nn.functional.binary_cross_entropy_with_logits(
+        predicted[present], (targets[present] > 0).to(predicted.dtype)
+    )
 
 
 def value_cross_entropy(
