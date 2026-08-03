@@ -848,6 +848,41 @@ def load_datasets(paths: Iterable[str | Path]) -> RasterDataset:
     )
 
 
+def shard_ownership(path: Path, samples: int, resolution: int) -> "np.ndarray | None":
+    """Per-sample ownership targets for a shard, or None if it has no sidecar.
+
+    One map is rendered per *game* and broadcast across that game's sample
+    range: the target is the final board, which every position in a game shares.
+    Rendering per position would be ~55x the work for identical rows.
+
+    `first_sample` and `sample_count` in games.jsonl are the join, which is what
+    they were written for. Games missing `final_stones` -- shards from before
+    that field existed -- leave their rows zero, and the caller masks them.
+    """
+    sidecar = path.parent / "games.jsonl"
+    if not sidecar.exists():
+        return None
+    rows = [json.loads(line) for line in sidecar.read_text().splitlines() if line.strip()]
+    if not rows or "final_stones" not in rows[0]:
+        return None
+
+    cells = resolution * resolution
+    out = np.zeros((samples, cells), dtype=np.float32)
+    for row in rows:
+        stones = row.get("final_stones") or []
+        start, count = int(row["first_sample"]), int(row["sample_count"])
+        if not stones or count <= 0 or start + count > samples:
+            continue
+        # Mover-relative, so the sign follows whose turn it is. Ply parity gives
+        # the mover: even plies are Black's.
+        plies = np.arange(count)
+        mover_is_black = (plies % 2) == 0
+        out[start : start + count] = ownership_targets(
+            [tuple(stone) for stone in stones], mover_is_black, resolution
+        )
+    return out
+
+
 def ownership_targets(
     final_stones: list[tuple[float, float, int]],
     mover_is_black: np.ndarray,
