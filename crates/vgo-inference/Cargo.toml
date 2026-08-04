@@ -26,3 +26,7 @@ path = "src/bin/stage_bench.rs"
 [[bin]]
 name = "vgo-onnx-bench"
 path = "src/bin/onnx_bench.rs"
+
+[[bin]]
+name = "vgo-lane-bench"
+path = "src/bin/lane_bench.rs"
