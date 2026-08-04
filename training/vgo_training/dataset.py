@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 import hashlib
 import json
 import struct
 
 import subprocess
+
+if TYPE_CHECKING:
+    from .packed_states import PackedStates
 import tempfile
 
 import numpy as np
@@ -146,13 +149,23 @@ class PreparedRasterDataset:
     # `final_stones` sidecar, which the ownership loss masks rather than
     # training on as "nobody owns anything".
     ownerships: "torch.Tensor | None" = None
+    # The same states in packed form, set by the replay cache when the layout
+    # allows it. A cached shard stays resident for every update its window
+    # spans, so packing here is what bounds the window's memory. `states` then
+    # holds an empty view kept for its dtype and channel count, and callers
+    # wanting rows expand this instead. See vgo_training/packed_states.py.
+    packed_states: "PackedStates | None" = None
 
     @property
     def samples(self) -> int:
+        if self.packed_states is not None:
+            return self.packed_states.samples
         return self.states.shape[0]
 
     @property
     def channels(self) -> int:
+        if self.packed_states is not None:
+            return self.packed_states.channels
         return self.states.shape[1]
 
 

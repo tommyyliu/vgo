@@ -298,6 +298,9 @@ class PipelineConfig:
     learning_rate: float = 2e-3
     warm_learning_rate: float = 5e-4
     value_weight: float = 1.0
+    # Weight on the auxiliary ownership loss. Zero disables it and releases its
+    # targets from the replay window; see LearnerConfig.ownership_weight.
+    ownership_weight: float = 1.5
     training_threads: int = 4
     training_device: str = "cuda"
     training_precision: str = "bfloat16"
@@ -419,6 +422,8 @@ class PipelineConfig:
             raise ValueError("temperature must be nonnegative")
         if self.learning_rate <= 0.0 or self.warm_learning_rate <= 0.0:
             raise ValueError("learning rates must be positive")
+        if self.ownership_weight < 0.0:
+            raise ValueError("ownership weight must be nonnegative")
         if self.value_weight < 0.0:
             raise ValueError("value weight must be nonnegative")
         if not 0.0 <= self.validation_fraction < 1.0:
@@ -1338,6 +1343,7 @@ class Pipeline:
                 else self.config.warm_learning_rate
             ),
             "value_weight": self.config.value_weight,
+            "ownership_weight": self.config.ownership_weight,
             "model_width": self.config.model_width,
             "blocks": self.config.blocks,
             "architecture": self.config.architecture,
@@ -2317,6 +2323,15 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--learning-rate", type=float, default=2e-3)
     parser.add_argument("--warm-learning-rate", type=float, default=5e-4)
     parser.add_argument("--value-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--ownership-weight",
+        type=float,
+        default=1.5,
+        help=(
+            "weight on the auxiliary ownership loss; 0 disables it and frees "
+            "its targets from the replay window"
+        ),
+    )
     parser.add_argument("--training-threads", type=int, default=4)
     parser.add_argument("--training-device", default="cuda")
     parser.add_argument(

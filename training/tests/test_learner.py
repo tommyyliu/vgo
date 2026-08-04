@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import StringIO
+import inspect
 import json
 from pathlib import Path
 import tempfile
@@ -9,7 +10,7 @@ from unittest.mock import patch
 
 import torch
 
-from vgo_training.dataset import RasterDataset
+from vgo_training.dataset import PreparedRasterDataset, RasterDataset
 from vgo_training.dataset import file_sha256
 from vgo_training.learner import (
     BatchStager,
@@ -467,6 +468,52 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("unknown learner command", errors.getvalue())
         self.assertTrue(messages[3]["ok"])
         self.assertEqual(messages[3]["result"], {"closed": True})
+
+
+class OwnershipWeightTests(unittest.TestCase):
+    """Zero ownership weight must skip both head sets, not just the first.
+
+    The normed head's ownership term read a `present` mask that only the plain
+    head's branch assigned, so disabling ownership raised UnboundLocalError one
+    update into a live run rather than at import or in a unit test.
+    """
+
+    def test_zero_weight_skips_both_ownership_terms(self) -> None:
+        from vgo_training.learner import LearnerConfig
+
+        source = inspect.getsource(PersistentLearner._update_once)
+        guarded = [
+            line
+            for line in source.splitlines()
+            if "ownership_loss(" in line
+        ]
+        self.assertEqual(len(guarded), 2, "expected a plain and a normed term")
+        # Both must sit under the same flag; a branch that computes `present`
+        # for one and not the other is the bug this covers.
+        self.assertEqual(source.count("train_ownership"), 4)
+        self.assertEqual(LearnerConfig().ownership_weight, 1.5)
+        LearnerConfig(ownership_weight=0.0).validate()
+        with self.assertRaises(ValueError):
+            LearnerConfig(ownership_weight=-1.0).validate()
+
+    def test_dropping_ownership_releases_the_targets(self) -> None:
+        from vgo_training.learner import _drop_ownership
+
+        dataset = PreparedRasterDataset(
+            states=torch.zeros((2, 5, 4, 4), dtype=torch.float16),
+            policies=torch.zeros((2, 17)),
+            policy_masks=torch.ones((2, 17)),
+            values=torch.zeros((2,)),
+            height=4,
+            width=4,
+            sources=("test",),
+            ownerships=torch.zeros((2, 16)),
+        )
+        self.assertIsNone(_drop_ownership(dataset).ownerships)
+        # Idempotent: a shard already without targets is returned unchanged.
+        self.assertIs(
+            _drop_ownership(_drop_ownership(dataset)).ownerships, None
+        )
 
 
 if __name__ == "__main__":

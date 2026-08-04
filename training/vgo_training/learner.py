@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 import json
 import math
 import os
@@ -23,6 +23,7 @@ from .dataset import (
     load_dataset,
 )
 from .model import MODEL_ARCHITECTURES, build_model
+from .packed_states import is_packable, pack as pack_states
 from .serve import load_model
 from .train_demo import (
     DIHEDRAL_TRANSFORMS,
@@ -75,6 +76,12 @@ class LearnerConfig:
     # GroupNorm groups per residual block; None leaves the block unnormalized.
     # Supersedes variance_scaled, which stands in the same place.
     norm_groups: int | None = None
+    # Weight on the auxiliary ownership loss, relative to policy at 1.0. Zero
+    # disables the head's supervision *and* stops the window holding its
+    # targets, which is 0.063 MB per sample -- a fifth of a packed sample. The
+    # head still exists and still exports as nothing, so this is reversible
+    # without touching model identity.
+    ownership_weight: float = OWNERSHIP_WEIGHT
     threads: int = 4
     device: str = "cuda"
     precision: str = "float32"
@@ -118,6 +125,8 @@ class LearnerConfig:
             raise ValueError("report interval must be positive")
         if not 0.0 <= self.validation_fraction < 1.0:
             raise ValueError("validation fraction must be in [0, 1)")
+        if not math.isfinite(self.ownership_weight) or self.ownership_weight < 0.0:
+            raise ValueError("ownership weight must be finite and nonnegative")
 
     @classmethod
     def from_mapping(
@@ -252,6 +261,38 @@ def _stable_game_hashes(dataset: RasterDataset, digest: str) -> torch.Tensor:
     return torch.from_numpy((values >> np.uint64(1)).astype(np.int64, copy=False))
 
 
+def _drop_ownership(dataset: PreparedRasterDataset) -> PreparedRasterDataset:
+    """Release ownership targets a zero-weighted loss will never read.
+
+    Dense over the policy grid at float32, so they are 0.063 MB per sample --
+    a third of a packed sample, resident for every update the shard's window
+    spans. The stager already zero-fills the ownership slot for shards that
+    have none, so dropping them here takes the same path a pre-`final_stones`
+    shard does.
+    """
+    if dataset.ownerships is None:
+        return dataset
+    return replace(dataset, ownerships=None)
+
+
+def _pack_states(dataset: RasterDataset) -> RasterDataset:
+    """Replace a shard's dense states with the packed planes, when it can.
+
+    `states` is left in place as a zero-sample view so anything reading its
+    dtype or channel count still works; the rows themselves come from
+    `packed_states`. A layout the packer does not recognise -- a different
+    channel count, a komi plane that varies, a channel that stopped being
+    binary -- is returned untouched and keeps its dense states.
+    """
+    if dataset.packed_states is not None or not is_packable(dataset.states):
+        return dataset
+    return replace(
+        dataset,
+        states=dataset.states[:0].clone(),
+        packed_states=pack_states(dataset.states),
+    )
+
+
 class ReplayCache:
     """In-memory cache of validated, prepared immutable replay shards."""
 
@@ -285,6 +326,12 @@ class ReplayCache:
             preparation_batch_size,
             validate_targets=False,
         )
+        # A cached shard stays resident for every update its window spans, so
+        # its states are the term that scales. Three of the five compact
+        # channels are binary and komi is one value per sample, which packs to
+        # 4.2x less; the stager expands only the rows a batch needs, at 0.04%
+        # of a training step. Layouts without that structure keep dense states.
+        prepared = _pack_states(prepared)
         entry = PreparedReplayShard(
             path=resolved,
             digest=digest,
@@ -716,14 +763,29 @@ class BatchStager:
         for part in spec.parts:
             part_count = int(part.rows.numel())
             dataset = part.shard.dataset
+            # States may be held packed: three of the five compact channels are
+            # binary and komi is one value per sample, so the window keeps 4.2x
+            # less and expands the rows this batch actually needs. See
+            # vgo_training/packed_states.py.
+            packed = getattr(dataset, "packed_states", None)
+            if packed is None:
+                torch.index_select(
+                    dataset.states,
+                    0,
+                    part.rows,
+                    out=slot.host[0][offset : offset + part_count],
+                )
+            else:
+                packed.expand(
+                    part.rows, out=slot.host[0][offset : offset + part_count]
+                )
             for source, target in zip(
                 (
-                    dataset.states,
                     dataset.policies,
                     dataset.policy_masks,
                     dataset.values,
                 ),
-                slot.host,
+                slot.host[1:],
                 strict=False,
             ):
                 torch.index_select(
@@ -1276,6 +1338,14 @@ class PersistentLearner:
         hits_before = self.replay_cache.hits
         misses_before = self.replay_cache.misses
         window = self.replay_cache.window(request.datasets, config.batch_size)
+        if config.ownership_weight == 0.0:
+            # Release the targets the loss will not read. Done here rather than
+            # in the cache because only the config knows the weight, and a
+            # cached shard may outlive a run that changes it.
+            for shard in window.shards:
+                object.__setattr__(
+                    shard, "dataset", _drop_ownership(shard.dataset)
+                )
         split = window.split(config.validation_fraction)
         (
             optimizer_restored,
@@ -1371,9 +1441,18 @@ class PersistentLearner:
                     # forces the trunk to represent *where* a group lives
                     # instead of only who won. Absent for shards written before
                     # `final_stones`, whose rows arrive zeroed and are masked.
-                    if len(outputs) >= 5:
-                        present = ownership_targets.abs().sum(dim=1) > 0
-                        loss = loss + OWNERSHIP_WEIGHT * ownership_loss(
+                    # Zero weight drops the targets from the window too, so
+                    # `present` would be all-false; compute it once here and
+                    # let both head sets read it rather than deriving it inside
+                    # one branch that the other silently depends on.
+                    train_ownership = config.ownership_weight > 0.0
+                    present = (
+                        ownership_targets.abs().sum(dim=1) > 0
+                        if train_ownership
+                        else None
+                    )
+                    if len(outputs) >= 5 and train_ownership:
+                        loss = loss + config.ownership_weight * ownership_loss(
                             outputs[4], ownership_targets, present
                         )
                     # KataGo's one-batch-norm split: the normalized heads take
@@ -1392,8 +1471,8 @@ class PersistentLearner:
                         ) + config.value_weight * value_cross_entropy(
                             normed_values, value_targets
                         )
-                        if len(outputs) >= 6:
-                            normed_loss = normed_loss + OWNERSHIP_WEIGHT * ownership_loss(
+                        if len(outputs) >= 6 and train_ownership:
+                            normed_loss = normed_loss + config.ownership_weight * ownership_loss(
                                 outputs[5], ownership_targets, present
                             )
                         loss = (
