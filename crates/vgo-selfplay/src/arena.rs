@@ -45,6 +45,15 @@ struct Arguments {
     pairs: usize,
     #[arg(long, default_value_t = 16)]
     simulations: u32,
+    /// Simulations for the opponent seat, when it should differ from the
+    /// candidate's. Ratings need both seats equal, so this is not for measuring
+    /// strength -- it is for asking what search itself is worth: play a model
+    /// against *itself* at two budgets and the score is how much the extra
+    /// search buys on top of the network's own priors. A plateau where doubling
+    /// search changes nothing says the targets can no longer improve on the
+    /// policy that generated them. Defaults to `--simulations`.
+    #[arg(long)]
+    opponent_simulations: Option<u32>,
     /// Fine cells per coarse sampling region; zero uses legacy candidates.
     #[arg(long, default_value_t = 0)]
     coarse_pool: usize,
@@ -152,6 +161,9 @@ fn validate_arguments(arguments: &Arguments) -> Result<(), &'static str> {
     {
         return Err("arena counts, simulations, and dimensions must be positive");
     }
+    if arguments.opponent_simulations == Some(0) {
+        return Err("--opponent-simulations must be positive");
+    }
     if arguments.coarse_pool > arguments.policy_resolution {
         return Err("--coarse-pool must not exceed --policy-resolution");
     }
@@ -215,20 +227,24 @@ fn play_game(
         Position::new(arguments.radius, Vec::new(), Color::Black).with_komi(arguments.komi),
         arguments.maximum_plies,
         |position, _| {
-            let evaluator: &dyn Evaluator = if position.to_move() == candidate_color {
+            let is_candidate = position.to_move() == candidate_color;
+            let evaluator: &dyn Evaluator = if is_candidate {
                 candidate
             } else if let Some(opponent) = opponent {
                 opponent
             } else {
                 &naive
             };
+            let simulations = if is_candidate {
+                arguments.simulations
+            } else {
+                arguments
+                    .opponent_simulations
+                    .unwrap_or(arguments.simulations)
+            };
             search_with_evaluator(
                 position,
-                search_config(
-                    arguments.simulations,
-                    arguments.coarse_pool,
-                    arguments.leaf_batch,
-                ),
+                search_config(simulations, arguments.coarse_pool, arguments.leaf_batch),
                 seed,
                 evaluator,
             )
@@ -482,6 +498,7 @@ fn run_match(
             "  \"candidate_score\": {:.6},\n",
             "  \"score_ci95\": [{:.6}, {:.6}],\n",
             "  \"simulations_per_move\": {},\n",
+            "  \"opponent_simulations_per_move\": {},\n",
             "  \"coarse_pool\": {},\n",
             "  \"average_plies\": {:.3},\n",
             "  \"wall_seconds\": {:.6},\n",
@@ -507,6 +524,9 @@ fn run_match(
         interval.0,
         interval.1,
         arguments.simulations,
+        arguments
+            .opponent_simulations
+            .unwrap_or(arguments.simulations),
         arguments.coarse_pool,
         plies as f64 / games as f64,
         elapsed,
