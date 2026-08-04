@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from .attention import BoardTransformerBlock
+
 
 MODEL_ARCHITECTURES = ("flat", "unet", "ddrnet")
 
@@ -207,7 +209,14 @@ class RasterPolicyValueNet(nn.Module):
 
 
 class _Down(nn.Module):
-    """Stride-2 conv downsample followed by residual blocks at the smaller scale."""
+    """Stride-2 conv downsample followed by residual blocks at the smaller scale.
+
+    `attention_blocks` replaces that many trailing residual blocks with
+    transformer blocks, which relate every cell to every other one directly
+    rather than through stacked local receptive fields. It needs `board` -- the
+    (height, width) reaching this stage -- because rotary position tables are
+    precomputed per resolution.
+    """
 
     def __init__(
         self,
@@ -217,18 +226,40 @@ class _Down(nn.Module):
         variance_scaled: bool = False,
         start: int = 1,
         groups: int | None = None,
+        attention_blocks: int = 0,
+        attention_heads: int = 8,
+        board: tuple[int, int] | None = None,
     ) -> None:
         super().__init__()
+        if attention_blocks and board is None:
+            raise ValueError("attention blocks need the board size at this stage")
+        if attention_blocks > blocks:
+            raise ValueError(
+                f"cannot replace {attention_blocks} of {blocks} residual blocks"
+            )
         self.reduce = nn.Sequential(
             nn.Conv2d(channels_in, channels_out, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
         )
+        kept = blocks - attention_blocks
         self.body = nn.Sequential(
-            *residual_stack(channels_out, blocks, variance_scaled, start, groups)
+            *residual_stack(channels_out, kept, variance_scaled, start, groups)
+        )
+        # Held apart from `body` because a transformer block takes an optional
+        # mask that nn.Sequential cannot thread through.
+        self.attention = nn.ModuleList(
+            BoardTransformerBlock(
+                channels_out, attention_heads, board[0], board[1],
+                rope_theta=max(100.0, 4.0 * max(board)),
+            )
+            for _ in range(attention_blocks)
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.body(self.reduce(inputs))
+        features = self.body(self.reduce(inputs))
+        for block in self.attention:
+            features = block(features)
+        return features
 
 
 class _Up(nn.Module):
@@ -420,12 +451,29 @@ class DDRNetPolicyValueNet(nn.Module):
         stem_stride: int = 4,
         variance_scaled: bool = False,
         norm_groups: int | None = None,
+        context_attention_blocks: int = 0,
+        attention_heads: int = 8,
+        raster_resolution: int | None = None,
     ) -> None:
         super().__init__()
         if stem_stride not in (1, 2, 4):
             raise ValueError("stem stride must be 1, 2, or 4")
+        # Attention is the only part of this net that is not resolution-agnostic:
+        # rotary position tables are built per board size, so a model with
+        # attention is fixed to the raster it was constructed for.
+        if context_attention_blocks and raster_resolution is None:
+            raise ValueError(
+                "context attention needs raster_resolution to size its position tables"
+            )
         self.policy_resolution = policy_resolution
         self.stem_stride = stem_stride
+        self.context_attention_blocks = context_attention_blocks
+        self.attention_heads = attention_heads
+        self.raster_resolution = raster_resolution
+        # Stem divides by stem_stride; each context stage halves again.
+        trunk = None if raster_resolution is None else raster_resolution // stem_stride
+        context1_board = None if trunk is None else (trunk // 2, trunk // 2)
+        context2_board = None if trunk is None else (trunk // 4, trunk // 4)
         # Normalization supersedes the fixed scaling: both stand where a norm
         # would go, and a block takes one or the other.
         self.variance_scaled = variance_scaled and norm_groups is None
@@ -483,6 +531,9 @@ class DDRNetPolicyValueNet(nn.Module):
             stage_blocks,
             variance_scaled,
             groups=norm_groups,
+            attention_blocks=context_attention_blocks,
+            attention_heads=attention_heads,
+            board=context1_board,
         )
         self.context_to_detail1 = nn.Conv2d(
             context_channels, detail_channels, kernel_size=1
@@ -511,6 +562,9 @@ class DDRNetPolicyValueNet(nn.Module):
             variance_scaled,
             start=1 + stage_blocks,
             groups=norm_groups,
+            attention_blocks=context_attention_blocks,
+            attention_heads=attention_heads,
+            board=context2_board,
         )
         self.context_to_detail2 = nn.Conv2d(
             deep_channels, detail_channels, kernel_size=1
@@ -798,6 +852,9 @@ def build_model(
     stem_stride: int = 4,
     variance_scaled: bool = False,
     norm_groups: int | None = None,
+    context_attention_blocks: int = 0,
+    attention_heads: int = 8,
+    raster_resolution: int | None = None,
 ) -> nn.Module:
     """Construct a policy-value net by architecture name. Older checkpoints without
     an architecture field are the flat residual tower.
@@ -828,5 +885,8 @@ def build_model(
             stem_stride=stem_stride,
             variance_scaled=variance_scaled,
             norm_groups=norm_groups,
+            context_attention_blocks=context_attention_blocks,
+            attention_heads=attention_heads,
+            raster_resolution=raster_resolution,
         )
     raise ValueError(f"unknown model architecture: {architecture!r}")
