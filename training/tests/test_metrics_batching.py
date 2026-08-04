@@ -132,10 +132,14 @@ class MetricsBatchingTests(unittest.TestCase):
                 dataset.values,
             )
         )
-        for field in ("visits", "betas", "proposal_counts"):
+        # Betas are deliberately retained now: they are the behaviour policy
+        # policy surprise weighting measures divergence from. Visits and
+        # proposal counts are still released.
+        for field in ("visits", "proposal_counts"):
             self.assertFalse(hasattr(dataset, field))
+        self.assertIsNotNone(dataset.betas)
         prepared_subset = subset(dataset, torch.tensor([0, 2, 4]))
-        for field in ("visits", "betas", "proposal_counts"):
+        for field in ("visits", "proposal_counts"):
             self.assertFalse(hasattr(prepared_subset, field))
 
         expected = metrics(

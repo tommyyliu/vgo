@@ -155,6 +155,11 @@ class PreparedRasterDataset:
     # holds an empty view kept for its dtype and channel count, and callers
     # wanting rows expand this instead. See vgo_training/packed_states.py.
     packed_states: "PackedStates | None" = None
+    # Coarse-to-fine sampling probability per cell, carried through preparation
+    # rather than released with the other raw fields. It is the behaviour policy
+    # the proposals were drawn from, so it is the prior that policy surprise
+    # weighting measures divergence from. See vgo_training/surprise.py.
+    betas: "torch.Tensor | None" = None
 
     @property
     def samples(self) -> int:

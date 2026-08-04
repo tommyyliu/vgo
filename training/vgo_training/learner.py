@@ -24,6 +24,7 @@ from .dataset import (
 )
 from .model import MODEL_ARCHITECTURES, build_model
 from .packed_states import is_packable, pack as pack_states
+from .surprise import policy_kl_from_prior, surprise_weights, weighted_row_index
 from .serve import load_model
 from .train_demo import (
     DIHEDRAL_TRANSFORMS,
@@ -82,6 +83,11 @@ class LearnerConfig:
     # head still exists and still exports as nothing, so this is reversible
     # without touching model identity.
     ownership_weight: float = OWNERSHIP_WEIGHT
+    # Share of the sampling budget spread uniformly; the rest follows how much
+    # the search target diverged from the behaviour policy. 1.0 is plain
+    # uniform sampling. See vgo_training/surprise.py.
+    surprise_uniform_share: float = 1.0
+    surprise_maximum_weight: float = 8.0
     threads: int = 4
     device: str = "cuda"
     precision: str = "float32"
@@ -127,6 +133,10 @@ class LearnerConfig:
             raise ValueError("validation fraction must be in [0, 1)")
         if not math.isfinite(self.ownership_weight) or self.ownership_weight < 0.0:
             raise ValueError("ownership weight must be finite and nonnegative")
+        if not 0.0 <= self.surprise_uniform_share <= 1.0:
+            raise ValueError("surprise uniform share must be in [0, 1]")
+        if self.surprise_maximum_weight <= 0.0:
+            raise ValueError("surprise maximum weight must be positive")
 
     @classmethod
     def from_mapping(
@@ -259,6 +269,35 @@ def _stable_game_hashes(dataset: RasterDataset, digest: str) -> torch.Tensor:
     # Signed int64 comparisons are portable across PyTorch CPU builds. Dropping
     # one bit leaves a uniform value in [0, 2**63).
     return torch.from_numpy((values >> np.uint64(1)).astype(np.int64, copy=False))
+
+
+def _training_surprise(
+    view, *, uniform_share: float, maximum: float
+) -> torch.Tensor | None:
+    """Frequency weights for every row of `view`, or None if beta is missing.
+
+    Shards written before beta was retained through preparation have no prior to
+    diverge from; those fall back to uniform sampling rather than failing, so a
+    mixed window still trains.
+    """
+    divergences = []
+    for selection in view.selections:
+        dataset = selection.shard.dataset
+        if dataset.betas is None:
+            return None
+        rows = selection.rows
+        divergences.append(
+            policy_kl_from_prior(
+                dataset.policies[rows],
+                dataset.betas[rows],
+                dataset.policy_masks[rows],
+            )
+        )
+    if not divergences:
+        return None
+    return surprise_weights(
+        torch.cat(divergences), uniform_share=uniform_share, maximum=maximum
+    )
 
 
 def _drop_ownership(dataset: PreparedRasterDataset) -> PreparedRasterDataset:
@@ -431,7 +470,16 @@ class ReplayView:
         shuffle: bool,
         generator: torch.Generator | None = None,
         augment: bool = False,
+        surprise: torch.Tensor | None = None,
     ) -> list[BatchSpec]:
+        """Batch specs over this view.
+
+        `surprise` is one frequency weight per row of the concatenated view,
+        averaging 1.0. Rows are repeated by those weights before shuffling, so a
+        position the search disagreed with the prior on appears more often. The
+        epoch keeps its length in expectation because the weights average one.
+        See vgo_training/surprise.py.
+        """
         if batch_size <= 0:
             raise ValueError("batch size must be positive")
         shard_ids = torch.cat(
@@ -445,6 +493,15 @@ class ReplayView:
             ]
         )
         rows = torch.cat([selection.rows for selection in self.selections])
+        if surprise is not None:
+            if surprise.numel() != rows.numel():
+                raise ValueError(
+                    f"surprise weights cover {surprise.numel()} rows, "
+                    f"view has {rows.numel()}"
+                )
+            repeat = weighted_row_index(surprise, generator)
+            shard_ids = shard_ids[repeat]
+            rows = rows[repeat]
         if shuffle and rows.numel() > 1:
             order = torch.randperm(rows.numel(), generator=generator)
             shard_ids = shard_ids[order]
@@ -1403,6 +1460,16 @@ class PersistentLearner:
         best_optimizer_state = _cpu_clone(self.optimizer.state_dict())
         optimization_started = time.perf_counter()
 
+        # One weight per training row, reused across epochs: the divergence is a
+        # property of the data, not of the model's current state.
+        training_surprise = None
+        if config.surprise_uniform_share < 1.0:
+            training_surprise = _training_surprise(
+                split.training,
+                uniform_share=config.surprise_uniform_share,
+                maximum=config.surprise_maximum_weight,
+            )
+
         self.model.train()
         for epoch in range(1, config.epochs + 1):
             specs = split.training.batches(
@@ -1410,6 +1477,7 @@ class PersistentLearner:
                 shuffle=True,
                 generator=generator,
                 augment=config.augment,
+                surprise=training_surprise,
             )
             for (
                 states,

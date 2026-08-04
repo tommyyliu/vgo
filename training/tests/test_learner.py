@@ -89,8 +89,10 @@ class ReplayCacheTests(unittest.TestCase):
         self.assertEqual(cache.hits, 1)
         self.assertEqual(cache.misses, 1)
         self.assertEqual(first.shards[0].digest, "ab" * 32)
-        for field in ("visits", "betas", "proposal_counts"):
+        # Betas survive preparation on purpose -- see prepare_policy_supervision.
+        for field in ("visits", "proposal_counts"):
             self.assertFalse(hasattr(first.shards[0].dataset, field))
+        self.assertIsNotNone(first.shards[0].dataset.betas)
 
     def test_validation_split_keeps_every_game_together(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

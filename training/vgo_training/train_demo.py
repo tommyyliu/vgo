@@ -266,8 +266,10 @@ def prepare_policy_supervision(
     """Consume raw replay supervision into cached targets in bounded CPU batches.
 
     The normalized policy and explored-mask buffers are overwritten in place.
-    The returned lightweight dataset deliberately omits visits, betas, proposal
-    counts, and replay metadata so those tensors can be released before training.
+    The returned lightweight dataset deliberately omits visits, proposal counts,
+    and replay metadata so those tensors can be released before training. Betas
+    are kept: they record the behaviour policy each proposal was drawn from,
+    which policy surprise weighting needs as its prior.
     """
     if batch_size <= 0:
         raise ValueError("policy preparation batch size must be positive")
@@ -308,6 +310,7 @@ def prepare_policy_supervision(
         width=dataset.width,
         sources=dataset.sources,
         ownerships=getattr(dataset, "ownerships", None),
+        betas=dataset.betas.clone(),
     )
 
 
