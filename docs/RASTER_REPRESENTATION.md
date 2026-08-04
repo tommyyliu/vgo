@@ -1,5 +1,12 @@
 # Semantic Raster Representation
 
+> **Channel count is out of date.** This document describes 10 channels; the
+> semantic layout is now **12** (`CHANNEL_COUNT` in `crates/vgo-raster/src/lib.rs`,
+> which adds `settled` and `komi`), and production runs the **5-channel compact**
+> layout (`COMPACT_CHANNELS`): `current_stones`, `opponent_stones`,
+> `voronoi_ridge`, `settled`, `komi`. The channel *semantics* and the sampling
+> contract below are still correct. See [`OVERVIEW.md`](OVERVIEW.md) §4.
+
 ## Contract
 
 `vgo-raster` converts an exact `Position` into a player-relative contiguous

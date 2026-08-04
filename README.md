@@ -3,6 +3,12 @@
 This repository is being prepared for search and machine-learning experiments
 over the continuous-action game defined in [`reference/RULES.md`](reference/RULES.md).
 
+**New here? Read [`docs/OVERVIEW.md`](docs/OVERVIEW.md).** It maps the whole
+system top-down — the RL loop, the language split, the board representation, the
+model, and the serving path — and records the load-bearing decisions with the
+measurements behind them, so you do not have to reconstruct them from a dozen
+files.
+
 ## Repository areas
 
 - [`reference/`](reference/README.md) contains the clean, working JavaScript
