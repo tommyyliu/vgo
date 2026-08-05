@@ -48,6 +48,14 @@ def load_model(checkpoint_path: Path) -> tuple[nn.Module, dict[str, object]]:
         policy_resolution=policy_resolution,
         variance_scaled=bool(checkpoint.get("variance_scaled", False)),
         norm_groups=checkpoint.get("norm_groups"),
+        context_attention_blocks=int(
+            checkpoint.get("context_attention_blocks", 0) or 0
+        ),
+        attention_heads=int(checkpoint.get("attention_heads", 8) or 8),
+        # Attention sizes its rotary tables per board, so rebuilding needs the
+        # raster the checkpoint was trained at. Checkpoints without attention
+        # ignore this.
+        raster_resolution=int(checkpoint["width"]),
     )
     # The batch-normalized twin heads exist only while training; inference runs
     # the unnormalized heads, so their weights are absent from an exported model

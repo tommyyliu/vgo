@@ -82,6 +82,11 @@ class LearnerConfig:
     # head still exists and still exports as nothing, so this is reversible
     # without touching model identity.
     ownership_weight: float = OWNERSHIP_WEIGHT
+    # Transformer blocks replacing trailing residual blocks in each context
+    # stage. Changes the computed function, so it is checkpoint metadata and
+    # cannot be toggled on a warm start. See vgo_training/attention.py.
+    context_attention_blocks: int = 0
+    attention_heads: int = 8
     threads: int = 4
     device: str = "cuda"
     precision: str = "float32"
@@ -127,6 +132,10 @@ class LearnerConfig:
             raise ValueError("validation fraction must be in [0, 1)")
         if not math.isfinite(self.ownership_weight) or self.ownership_weight < 0.0:
             raise ValueError("ownership weight must be finite and nonnegative")
+        if self.context_attention_blocks < 0:
+            raise ValueError("context attention blocks must be nonnegative")
+        if self.attention_heads <= 0:
+            raise ValueError("attention heads must be positive")
 
     @classmethod
     def from_mapping(
@@ -1199,6 +1208,10 @@ class PersistentLearner:
                         checkpoint.get("variance_scaled", False)
                     ),
                     "norm_groups": checkpoint.get("norm_groups"),
+                    "context_attention_blocks": checkpoint.get(
+                        "context_attention_blocks", 0
+                    ),
+                    "attention_heads": checkpoint.get("attention_heads", 8),
                 }
             else:
                 model = build_model(
@@ -1209,6 +1222,11 @@ class PersistentLearner:
                     policy_resolution=decoupled,
                     variance_scaled=config.variance_scaled,
                     norm_groups=config.norm_groups,
+                    context_attention_blocks=config.context_attention_blocks,
+                    attention_heads=config.attention_heads,
+                    # Rotary tables are sized per board, so an attention model
+                    # is tied to the raster it was built for.
+                    raster_resolution=window.width,
                 )
                 checkpoint = {}
                 metadata = {
@@ -1221,6 +1239,8 @@ class PersistentLearner:
                     "architecture": config.architecture,
                     "variance_scaled": config.variance_scaled,
                     "norm_groups": config.norm_groups,
+                    "context_attention_blocks": config.context_attention_blocks,
+                    "attention_heads": config.attention_heads,
                 }
             model = model.to(device)
             compiled = bool(config.compile and device.type == "cuda")

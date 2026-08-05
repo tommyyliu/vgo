@@ -301,6 +301,10 @@ class PipelineConfig:
     # Weight on the auxiliary ownership loss. Zero disables it and releases its
     # targets from the replay window; see LearnerConfig.ownership_weight.
     ownership_weight: float = 1.5
+    # Transformer blocks in each context stage; see LearnerConfig. Identity
+    # config, since it changes the function the weights represent.
+    context_attention_blocks: int = 0
+    attention_heads: int = 8
     training_threads: int = 4
     training_device: str = "cuda"
     training_precision: str = "bfloat16"
@@ -424,6 +428,8 @@ class PipelineConfig:
             raise ValueError("learning rates must be positive")
         if self.ownership_weight < 0.0:
             raise ValueError("ownership weight must be nonnegative")
+        if self.context_attention_blocks < 0:
+            raise ValueError("context attention blocks must be nonnegative")
         if self.value_weight < 0.0:
             raise ValueError("value weight must be nonnegative")
         if not 0.0 <= self.validation_fraction < 1.0:
@@ -1344,6 +1350,8 @@ class Pipeline:
             ),
             "value_weight": self.config.value_weight,
             "ownership_weight": self.config.ownership_weight,
+            "context_attention_blocks": self.config.context_attention_blocks,
+            "attention_heads": self.config.attention_heads,
             "model_width": self.config.model_width,
             "blocks": self.config.blocks,
             "architecture": self.config.architecture,
@@ -2323,6 +2331,16 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--learning-rate", type=float, default=2e-3)
     parser.add_argument("--warm-learning-rate", type=float, default=5e-4)
     parser.add_argument("--value-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--context-attention-blocks",
+        type=int,
+        default=0,
+        help=(
+            "transformer blocks replacing trailing residual blocks in each "
+            "DDRNet context stage"
+        ),
+    )
+    parser.add_argument("--attention-heads", type=int, default=8)
     parser.add_argument(
         "--ownership-weight",
         type=float,
