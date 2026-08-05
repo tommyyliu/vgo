@@ -1733,8 +1733,11 @@ class Pipeline:
 
         totals: dict[tuple[float, int], list[int]] = {}
         for replay in self.state.replay[-self.config.replay_window :]:
-            if int(replay.get("sequence", -1)) < 0:
-                continue
+            # Seeded shards count here for the same reason they count in
+            # _adaptive_resign_threshold: they are real games from this
+            # lineage. Excluding them pooled a seeded run's table over its own
+            # shards alone -- 41 exempt games on the first update, which is the
+            # single-shard noise this function exists to average away.
             try:
                 manifest = json.loads(
                     Path(str(replay["manifest"])).read_text(encoding="utf-8")
