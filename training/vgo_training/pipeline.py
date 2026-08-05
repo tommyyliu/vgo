@@ -301,6 +301,12 @@ class PipelineConfig:
     # Weight on the auxiliary ownership loss. Zero disables it and releases its
     # targets from the replay window; see LearnerConfig.ownership_weight.
     ownership_weight: float = 1.5
+    # Share of the sampling budget spread uniformly; the rest follows how far
+    # the search target diverged from the behaviour policy. 1.0 is plain
+    # uniform sampling. Identity config: it changes what the model is trained
+    # on. See vgo_training/surprise.py.
+    surprise_uniform_share: float = 1.0
+    surprise_maximum_weight: float = 8.0
     training_threads: int = 4
     training_device: str = "cuda"
     training_precision: str = "bfloat16"
@@ -424,6 +430,10 @@ class PipelineConfig:
             raise ValueError("learning rates must be positive")
         if self.ownership_weight < 0.0:
             raise ValueError("ownership weight must be nonnegative")
+        if not 0.0 <= self.surprise_uniform_share <= 1.0:
+            raise ValueError("surprise uniform share must be in [0, 1]")
+        if self.surprise_maximum_weight <= 0.0:
+            raise ValueError("surprise maximum weight must be positive")
         if self.value_weight < 0.0:
             raise ValueError("value weight must be nonnegative")
         if not 0.0 <= self.validation_fraction < 1.0:
@@ -1344,6 +1354,8 @@ class Pipeline:
             ),
             "value_weight": self.config.value_weight,
             "ownership_weight": self.config.ownership_weight,
+            "surprise_uniform_share": self.config.surprise_uniform_share,
+            "surprise_maximum_weight": self.config.surprise_maximum_weight,
             "model_width": self.config.model_width,
             "blocks": self.config.blocks,
             "architecture": self.config.architecture,
@@ -2323,6 +2335,16 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--learning-rate", type=float, default=2e-3)
     parser.add_argument("--warm-learning-rate", type=float, default=5e-4)
     parser.add_argument("--value-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--surprise-uniform-share",
+        type=float,
+        default=1.0,
+        help=(
+            "share of the sampling budget spread uniformly; the rest follows "
+            "policy surprise. 1.0 is uniform sampling"
+        ),
+    )
+    parser.add_argument("--surprise-maximum-weight", type=float, default=8.0)
     parser.add_argument(
         "--ownership-weight",
         type=float,
