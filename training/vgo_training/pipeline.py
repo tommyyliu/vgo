@@ -321,7 +321,8 @@ class PipelineConfig:
     schedule: str = "wsd"
     compile: bool = True
     restore_optimizer: bool = True
-    warmup_epochs: int = 1
+    # Fractional values allowed; see LearnerConfig.warmup_epochs.
+    warmup_epochs: float = 1
     report_every: int = 5
     validation_fraction: float = 0.1
     overlap_actor_learner: bool = True
@@ -2433,7 +2434,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument("--warmup-epochs", type=int, default=1)
+    parser.add_argument("--warmup-epochs", type=float, default=1)
     parser.add_argument("--report-every", type=int, default=5)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument(

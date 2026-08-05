@@ -95,7 +95,11 @@ class LearnerConfig:
     compile: bool = True
     restore_optimizer: bool = True
     schedule: str = "wsd"
-    warmup_epochs: int = 5
+    # Fractional values are meaningful and sometimes necessary: warmup is
+    # converted to steps as warmup_epochs * steps_per_epoch, so with a short
+    # epoch count an integer floor of 1 makes warmup consume the whole update
+    # and the decay phase never runs.
+    warmup_epochs: float = 5
     decay_fraction: float = 0.2
     final_learning_rate_fraction: float = 0.01
     report_every: int = 20
