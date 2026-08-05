@@ -7,3 +7,4 @@
 Screenshot*.png
 __pycache__/
 *.py[cod]
+.worktree/

@@ -179,6 +179,16 @@ struct Config {
     /// inference batches without needing more concurrent games.
     #[arg(long, default_value_t = 1)]
     leaf_batch: usize,
+    /// Finish in-flight games when the sample target is reached rather than
+    /// cancelling them.
+    ///
+    /// Every actor has a game running when a shard fills, so cutting there
+    /// discards roughly one partial game per actor. That is ~29% of the work at
+    /// 16888 samples and 60-70% at 4000, because the tail is a fixed cost that
+    /// does not shrink with the shard. Draining writes those games instead, so
+    /// the shard overshoots its target by whatever the tail carried.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    drain_tail: bool,
     /// Fine cells per coarse sampling region; zero uses legacy candidates.
     #[arg(long, default_value_t = 0)]
     coarse_pool: usize,
@@ -928,6 +938,9 @@ fn generate_to_dataset(
     )?;
     let next_game = Arc::new(AtomicU64::new(0));
     let stopped = Arc::new(AtomicBool::new(false));
+    // Set when the shard reaches its target: actors stop taking new games but
+    // finish the one they are playing. See the collector loop below.
+    let draining = Arc::new(AtomicBool::new(false));
     let metrics = Arc::new(AtomicGenerationMetrics::default());
     let (sender, receiver) = mpsc::sync_channel(config.writer_queue_games);
     let mut actors = ActorPool::new(Arc::clone(&stopped), receiver);
@@ -937,6 +950,7 @@ fn generate_to_dataset(
         let evaluator = Arc::clone(&evaluator);
         let next_game = Arc::clone(&next_game);
         let stopped = Arc::clone(&stopped);
+        let draining = Arc::clone(&draining);
         let metrics = Arc::clone(&metrics);
         let sender = sender.clone();
         actors.push(
@@ -944,6 +958,14 @@ fn generate_to_dataset(
                 .name(format!("vgo-replay-actor-{actor:03}"))
                 .spawn(move || {
                     while !stopped.load(Ordering::Acquire) {
+                        // Two flags, deliberately. `draining` stops new games
+                        // from starting; `stopped` cancels one already running.
+                        // Checking draining here and stopped inside the playout
+                        // is what lets a shard finish its tail instead of
+                        // throwing away one partial game per actor.
+                        if draining.load(Ordering::Acquire) {
+                            break;
+                        }
                         let index = next_game.fetch_add(1, Ordering::Relaxed);
                         if index >= maximum_games {
                             break;
@@ -975,8 +997,8 @@ fn generate_to_dataset(
                                 metrics.failed_games.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        // The collector has already reached the exact record
-                        // boundary. Do not enqueue a just-finished tail game.
+                        // A cancelled run drops its tail; a draining one keeps
+                        // it, which is the whole point of draining.
                         if stopped.load(Ordering::Acquire) {
                             break;
                         }
@@ -1014,12 +1036,32 @@ fn generate_to_dataset(
     let mut samples_generated_by_received_games = 0_usize;
     let mut serialization_truncated_samples = 0_usize;
     let mut writer_backpressure = Duration::ZERO;
-    while !replay.is_full() {
+    // Phase one fills the shard; phase two drains whatever was already in
+    // flight when it filled. `drain_tail` false keeps the old exact-count
+    // behaviour for callers that need a fixed shard size.
+    let mut draining_started = false;
+    loop {
+        if replay.is_full() && !draining_started {
+            draining_started = true;
+            if !config.drain_tail {
+                break;
+            }
+            // Stop handing out new games, then keep collecting. Actors already
+            // playing run to completion.
+            draining.store(true, Ordering::Release);
+            replay.allow_overshoot();
+        }
+        if draining_started && metrics.active_games.load(Ordering::Relaxed) == 0
+            && metrics.writer_backlog.load(Ordering::Relaxed) == 0
+        {
+            break;
+        }
         let envelope = match actors.recv() {
             Ok(envelope) => {
                 metrics.writer_backlog.fetch_sub(1, Ordering::Relaxed);
                 envelope
             }
+            Err(_) if draining_started => break,
             Err(_) => {
                 actors.shutdown()?;
                 return Err(std::io::Error::other(format!(

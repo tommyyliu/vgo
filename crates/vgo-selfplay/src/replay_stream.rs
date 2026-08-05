@@ -28,7 +28,7 @@ pub(crate) const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
 // v5 adds komi to each record. It is part of the position -- the same stones
 // under different komi have different winners -- so a shard that omits it
 // cannot reconstruct the game it stored.
-pub(crate) const REPLAY_VERSION: u32 = 5;
+pub(crate) const REPLAY_VERSION: u32 = 6;
 
 /// Stones a v4 record can hold. One stone per ply at most, and the longest
 /// observed game was 88 plies.
@@ -36,7 +36,12 @@ pub(crate) const STONE_CAPACITY: usize = 128;
 
 /// Policy cells a v4 record can hold. Progressive widening surfaces a few dozen
 /// candidates from a 512-simulation search; 47 was the observed maximum.
-pub(crate) const POLICY_CAPACITY: usize = 64;
+// v6 widened this from 64. Search at 1600 simulations touches more distinct
+// cells per position than 64 -- measured 81 before the writer rejected the
+// record -- and each record pads to a fixed capacity, so deeper search needs
+// more slots. Readers derive capacity from the shard version, so v4 and v5
+// shards still load. Must match `policy_capacity` in training/vgo_training/dataset.py.
+pub(crate) const POLICY_CAPACITY: usize = 128;
 
 pub(crate) struct LabeledSample {
     /// The position itself. A shard records state, not a picture of it.
@@ -94,6 +99,8 @@ pub(crate) struct ReplayStream {
     last_game_id: Option<u64>,
     write_time: Duration,
     published: bool,
+    /// Set by `allow_overshoot`: write whole games past the target.
+    overshoot: bool,
 }
 
 impl ReplayStream {
@@ -170,11 +177,26 @@ impl ReplayStream {
             last_game_id: None,
             write_time: Duration::ZERO,
             published: false,
+            overshoot: false,
         })
     }
 
     pub(crate) const fn is_full(&self) -> bool {
-        self.samples_written == self.target_samples
+        self.samples_written >= self.target_samples
+    }
+
+    /// Accept games past the target instead of truncating them.
+    ///
+    /// A shard's actors all have a game in flight when the target is reached.
+    /// Cutting there discards that work -- roughly one partial game per actor,
+    /// which at small shard sizes costs more than the shard contains. Draining
+    /// instead lets those games finish and writes them, so the shard overshoots
+    /// its target by however much the tail carried.
+    ///
+    /// `target_samples` stays where it was so `publish` still rejects a shard
+    /// that never reached it; only the per-game truncation is lifted.
+    pub(crate) fn allow_overshoot(&mut self) {
+        self.overshoot = true;
     }
 
     pub(crate) fn write_game(&mut self, samples: Vec<LabeledSample>) -> io::Result<GameWrite> {
@@ -182,8 +204,13 @@ impl ReplayStream {
         // written. This is the join key back into the dataset, and it is the
         // one thing the writer knows that the caller cannot.
         let first_sample = self.samples_written;
-        let remaining = self.target_samples - self.samples_written;
-        let to_write = remaining.min(samples.len());
+        let to_write = if self.overshoot {
+            samples.len()
+        } else {
+            self.target_samples
+                .saturating_sub(self.samples_written)
+                .min(samples.len())
+        };
         let truncated = samples.len() - to_write;
         let started = Instant::now();
         for sample in samples.into_iter().take(to_write) {
@@ -225,7 +252,40 @@ impl ReplayStream {
         let mut writer = self.writer.take().expect("writer exists until publication");
         writer.flush()?;
         let hashing = writer.into_inner().map_err(|error| error.into_error())?;
-        let (file, digest, bytes) = hashing.into_parts();
+        let (mut file, digest, bytes) = hashing.into_parts();
+
+        // A drained shard wrote more samples than the header claimed, because
+        // the header goes down before the target is known to be exceeded. Fix
+        // the count in place; readers size the record array from it and would
+        // otherwise reject the file as truncated.
+        let (digest, bytes) = if self.samples_written == self.target_samples {
+            (format!("{:x}", digest.finalize()), bytes)
+        } else {
+            use std::io::{Seek, SeekFrom, Write as _};
+            let count = u32::try_from(self.samples_written).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "sample count exceeds u32")
+            })?;
+            file.seek(SeekFrom::Start(REPLAY_MAGIC.len() as u64 + 4))?;
+            file.write_all(&count.to_le_bytes())?;
+            file.sync_all()?;
+            // The streaming digest covered the stale header, so rehash the file
+            // as it now stands. The write handle is write-only, so read through
+            // a fresh one rather than widening the permissions it was opened
+            // with.
+            let mut source = OpenOptions::new().read(true).open(&self.temporary_path)?;
+            let mut hasher = Sha256::new();
+            let mut buffer = vec![0_u8; 1024 * 1024];
+            let mut total = 0_u64;
+            loop {
+                let read = std::io::Read::read(&mut source, &mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                total += read as u64;
+            }
+            (format!("{:x}", hasher.finalize()), total)
+        };
         file.sync_all()?;
         drop(file);
         if self.final_path.exists() {
@@ -242,7 +302,7 @@ impl ReplayStream {
         self.published = true;
         Ok(PublishedReplay {
             samples: self.samples_written,
-            sha256: format!("{:x}", digest.finalize()),
+            sha256: digest,
             bytes,
             examples: std::mem::take(&mut self.examples),
             first_game_id: self.first_game_id,

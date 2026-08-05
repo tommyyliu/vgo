@@ -47,3 +47,7 @@ path = "src/serve_move.rs"
 [[bin]]
 name = "vgo-generation-bench"
 path = "src/generation_bench.rs"
+
+[[bin]]
+name = "vgo-feed-bench"
+path = "src/feed_bench.rs"

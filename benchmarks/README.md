@@ -74,6 +74,23 @@ Use `--samples`, `--sample-millis`, and `--warmup` to control runtime,
 `--filter <text>` to isolate matching stages, and `--json` when retaining
 results for comparison.
 
+`vgo-feed-bench` measures aggregate CPU input capacity with synchronized
+producer threads over real positions loaded from a replay-v5 dataset. It
+reports the raw allocating compact-raster ceiling separately from the complete
+production evaluator/broker/response path with an ONNX-style contiguous input
+gather and an instantaneous model:
+
+```text
+cargo run --release -p vgo-selfplay --bin vgo-feed-bench -- \
+  --dataset artifacts/RUN/replay/shard-NNNNNN/dataset.vgo
+```
+
+The host-pipeline result includes input encoding, grouping, queueing, batching,
+and staging. It deliberately excludes MCTS work, model execution and transfers,
+production-sized policy outputs, and replay writing. Because its fake model
+returns immediately, this is a closed-loop host ceiling; a real model's service
+time lets more requests accumulate and usually produces fuller batches.
+
 ## Self-play canary
 
 Before introducing a learned model, use the same deterministic spread-out

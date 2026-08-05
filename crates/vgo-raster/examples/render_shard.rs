@@ -15,7 +15,20 @@ use vgo_raster::{RasterConfig, RasterKind, rasterize_any_into};
 const HEADER: usize = 32;
 const STONE: usize = 8 + 8 + 1;
 const STONE_CAPACITY: usize = 128;
-const POLICY_CAPACITY: usize = 64;
+// Slots per record, which v6 widened from 64 so deeper search can record every
+// cell it touched. Must match `POLICY_CAPACITY` in
+// crates/vgo-selfplay/src/replay_stream.rs and `policy_capacity` in
+// training/vgo_training/dataset.py.
+const POLICY_CAPACITY_V4: usize = 64;
+const POLICY_CAPACITY_V6: usize = 128;
+
+const fn policy_capacity(version: u32) -> usize {
+    if version >= 6 {
+        POLICY_CAPACITY_V6
+    } else {
+        POLICY_CAPACITY_V4
+    }
+}
 
 fn read_u32(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
@@ -39,8 +52,8 @@ fn main() {
     let blob = fs::read(&source).expect("read shard");
     let version = read_u32(&blob, 8);
     assert!(
-        version == 4 || version == 5,
-        "expected replay version 4 or 5, found {version}"
+        (4..=6).contains(&version),
+        "expected replay version 4, 5 or 6, found {version}"
     );
     let samples = read_u32(&blob, 12) as usize;
 
@@ -53,7 +66,7 @@ fn main() {
     let expected = stones_at
         + STONE_CAPACITY * STONE
         + 4
-        + POLICY_CAPACITY * (4 + 4 + 4 + 4 + 4)
+        + policy_capacity(version) * (4 + 4 + 4 + 4 + 4)
         + 4 + 4 + 8 + 4 + 8;
     assert_eq!(
         stride, expected,

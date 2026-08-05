@@ -26,8 +26,8 @@ REPLAY_MAGIC = b"VGORPLY1"
 #
 # Older records synthesize unavailable fields so replay windows can span schema
 # versions. REPLAY_VERSION is the version the current generator writes.
-REPLAY_VERSION = 5
-REPLAY_VERSIONS = (1, 2, 3, 4, 5)
+REPLAY_VERSION = 6
+REPLAY_VERSIONS = (1, 2, 3, 4, 5, 6)
 
 # v4 stores the position and a sparse policy instead of a rendered raster.
 # These capacities are the writer's, in crates/vgo-selfplay/src/replay_stream.rs,
@@ -35,6 +35,18 @@ REPLAY_VERSIONS = (1, 2, 3, 4, 5)
 # _load_replay_v4 is what catches it.
 V4_STONE_CAPACITY = 128
 V4_POLICY_CAPACITY = 64
+# v6 doubles the policy slots. Search at 1600 simulations touches more distinct
+# cells per position than 64 -- measured 81 -- and the record pads to a fixed
+# capacity, so deeper search needs a wider one. Reading stays version-dependent
+# so v4 and v5 shards keep loading unchanged.
+V6_POLICY_CAPACITY = 128
+
+
+def policy_capacity(version: int) -> int:
+    """Policy slots per record for a replay version."""
+    return V6_POLICY_CAPACITY if version >= 6 else V4_POLICY_CAPACITY
+
+
 CHANNEL_COUNT = 10
 
 # Built by `cargo build --release -p vgo-raster --example render_shard`.
@@ -487,7 +499,7 @@ def _v4_record_dtype(policy_size: int, version: int = REPLAY_VERSION) -> np.dtyp
                         ("proposal_counts", "<u4"),
                     ]
                 ),
-                (V4_POLICY_CAPACITY,),
+                (policy_capacity(version),),
             ),
             ("value", "<f4"),
             ("selected_action", "<u4"),
@@ -514,12 +526,15 @@ def _expand_sparse_policy(
     proposal_counts = np.zeros((samples, policy_size), dtype=np.uint32)
 
     counts = np.asarray(records["touched"], dtype=np.int64)
-    if int(counts.max(initial=0)) > V4_POLICY_CAPACITY:
-        raise ValueError("replay record claims more touched cells than the capacity")
     cells = records["cells"]
+    # The dtype was built for this shard's version, so its width is the
+    # capacity -- v4/v5 hold 64 cells and v6 holds 128.
+    capacity = cells.shape[1]
+    if int(counts.max(initial=0)) > capacity:
+        raise ValueError("replay record claims more touched cells than the capacity")
     # One flat scatter rather than a per-sample loop: build the row index for
     # every live cell, then index once.
-    slot = np.arange(V4_POLICY_CAPACITY, dtype=np.int64)[None, :]
+    slot = np.arange(capacity, dtype=np.int64)[None, :]
     live = slot < counts[:, None]
     rows = np.broadcast_to(
         np.arange(samples, dtype=np.int64)[:, None], live.shape

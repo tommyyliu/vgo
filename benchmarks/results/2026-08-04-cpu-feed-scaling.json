@@ -1,0 +1,67 @@
+{
+  "schema": "vgo.cpu-feed-scaling.v1",
+  "date": "2026-08-04",
+  "base_revision": "f5619dd6a9f0d57481ced418bec45447c10cf1aa",
+  "build": {
+    "profile": "release",
+    "rustc": "1.97.1",
+    "target_cpu": "native"
+  },
+  "hardware": {
+    "processor": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_processors": 32,
+    "accelerator": null
+  },
+  "dataset": "artifacts/ddrnet-komi3/replay/shard-000035/dataset.vgo",
+  "positions": 6144,
+  "stones": {
+    "minimum": 0,
+    "mean": 26.249,
+    "median": 28,
+    "maximum": 52
+  },
+  "raster": {
+    "kind": "compact",
+    "channels": 5,
+    "height": 128,
+    "width": 128
+  },
+  "host_pipeline": {
+    "group": 4,
+    "maximum_batch": 64,
+    "lanes": 2,
+    "delay_ms": 1,
+    "service": "contiguous input gather with an immediate valid 1x1 policy response"
+  },
+  "timing": {
+    "samples": 3,
+    "sample_millis": 1500,
+    "summary": "median throughput; timing counters pooled across samples"
+  },
+  "results": [
+    {"threads": 1, "raster_positions_per_second": 531.096, "host_positions_per_second": 450.042, "host_average_batch": 4.000, "host_encoding_milliseconds_per_position": 1.947601, "host_queue_milliseconds_per_position": 1.059272, "host_service_milliseconds_per_batch": 0.037256},
+    {"threads": 2, "raster_positions_per_second": 1071.016, "host_positions_per_second": 913.714, "host_average_batch": 4.136, "host_encoding_milliseconds_per_position": 1.913083, "host_queue_milliseconds_per_position": 1.038437, "host_service_milliseconds_per_batch": 0.031906},
+    {"threads": 4, "raster_positions_per_second": 2107.675, "host_positions_per_second": 1835.105, "host_average_batch": 4.627, "host_encoding_milliseconds_per_position": 1.915380, "host_queue_milliseconds_per_position": 0.985370, "host_service_milliseconds_per_batch": 0.030068},
+    {"threads": 8, "raster_positions_per_second": 4115.594, "host_positions_per_second": 3600.439, "host_average_batch": 5.673, "host_encoding_milliseconds_per_position": 1.972082, "host_queue_milliseconds_per_position": 0.895127, "host_service_milliseconds_per_batch": 0.035671},
+    {"threads": 16, "raster_positions_per_second": 7844.741, "host_positions_per_second": 6919.687, "host_average_batch": 7.515, "host_encoding_milliseconds_per_position": 2.070949, "host_queue_milliseconds_per_position": 0.807329, "host_service_milliseconds_per_batch": 0.061235},
+    {"threads": 24, "raster_positions_per_second": 9895.699, "host_positions_per_second": 9159.430, "host_average_batch": 8.875, "host_encoding_milliseconds_per_position": 2.378992, "host_queue_milliseconds_per_position": 0.771156, "host_service_milliseconds_per_batch": 0.080754},
+    {"threads": 32, "raster_positions_per_second": 11768.593, "host_positions_per_second": 10890.042, "host_average_batch": 10.868, "host_encoding_milliseconds_per_position": 2.617559, "host_queue_milliseconds_per_position": 0.896970, "host_service_milliseconds_per_batch": 0.131095},
+    {"threads": 48, "raster_positions_per_second": 11703.582, "host_positions_per_second": 11357.884, "host_average_batch": 13.549, "host_encoding_milliseconds_per_position": 3.492803, "host_queue_milliseconds_per_position": 1.715730, "host_service_milliseconds_per_batch": 0.211207},
+    {"threads": 64, "raster_positions_per_second": 11779.496, "host_positions_per_second": 11465.783, "host_average_batch": 14.362, "host_encoding_milliseconds_per_position": 4.606422, "host_queue_milliseconds_per_position": 2.085643, "host_service_milliseconds_per_batch": 0.233119}
+  ],
+  "scope": {
+    "included": [
+      "compact raster allocation and rendering",
+      "production evaluator request and response paths",
+      "production broker queueing and batching",
+      "contiguous backend input gather"
+    ],
+    "excluded": [
+      "MCTS and game logic",
+      "model execution and device transfers",
+      "policy output allocation and transfer",
+      "replay writing"
+    ]
+  }
+}
