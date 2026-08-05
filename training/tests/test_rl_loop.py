@@ -363,15 +363,16 @@ class PipelineSchedulingTests(unittest.TestCase):
     def test_one_generator_is_the_serial_path(self) -> None:
         # The default must behave exactly as before, or every existing run
         # changes shape when this lands.
-        pipeline = Pipeline(
-            PipelineConfig(output="/tmp/x", updates=3, telemetry_opponents=0)
-        )
-        self.assertEqual(pipeline.config.concurrent_generators, 1)
-        self.assertFalse(
-            pipeline._should_start_generation(
-                [], learning_through=None, generation_active=True
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(
+                PipelineConfig(output=directory, updates=3, telemetry_opponents=0)
             )
-        )
+            self.assertEqual(pipeline.config.concurrent_generators, 1)
+            self.assertFalse(
+                pipeline._should_start_generation(
+                    [], learning_through=None, generation_active=True
+                )
+            )
 
     def test_async_state_machine_overlaps_both_completion_orders(self) -> None:
         class FakeLearner:
