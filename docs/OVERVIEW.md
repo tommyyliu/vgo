@@ -141,6 +141,9 @@ graph.
 **Normalization: GroupNorm, 8 groups, two per residual block.** See §8 for the
 measurements behind this and what is known about changing it.
 
+Exact shapes, the parameter and time budget per stage, and the experimental
+options are in [`MODEL_ARCHITECTURE.md`](MODEL_ARCHITECTURE.md).
+
 ## 7. Serving
 
 The exported graph takes `states` and emits `policy_logits` and `values`. Rust
@@ -227,7 +230,8 @@ Measured results that are not in the code:
 - **Running it:** [`RUNNING.md`](RUNNING.md).
 - **Changing the loop:** [`RL_LOOP.md`](RL_LOOP.md), then
   [`SELFPLAY_ARCHITECTURE.md`](SELFPLAY_ARCHITECTURE.md).
-- **Changing the model:** §6 above, then `model.py`, then
+- **Changing the model:** §6 above, then
+  [`MODEL_ARCHITECTURE.md`](MODEL_ARCHITECTURE.md), then `model.py`, then
   [`POLICY_REDESIGN.md`](POLICY_REDESIGN.md) for why the policy is shaped as it
   is.
 - **Changing inference:** §7 above, then
