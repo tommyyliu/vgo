@@ -947,8 +947,12 @@ class Pipeline:
 
         totals: dict[float, list[int]] = {}
         for replay in self.state.replay[-self.config.replay_window :]:
-            if int(replay.get("sequence", -1)) < 0:
-                continue
+            # Seeded shards carry negative sequences, and they calibrate as well
+            # as any other: they are real games from this lineage, which is the
+            # whole reason for seeding with them. Filtering on the sign left the
+            # first shards of a seeded run with no calibration at all, so
+            # resignation stayed off exactly when the seed could have paid for
+            # it. A shard without a readable manifest is skipped below instead.
             try:
                 manifest = json.loads(
                     Path(str(replay["manifest"])).read_text(encoding="utf-8")

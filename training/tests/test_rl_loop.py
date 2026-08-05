@@ -851,6 +851,83 @@ class ShardRetirementTests(unittest.TestCase):
             self.assertFalse(pipeline._retirements)
 
 
+class AdaptiveResignThresholdTests(unittest.TestCase):
+    def _shard(
+        self, directory: str, sequence: int, fired: int, wrong: int
+    ) -> dict[str, object]:
+        shard = Path(directory) / f"shard-{sequence:+03d}"
+        shard.mkdir(parents=True, exist_ok=True)
+        manifest = shard / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "resign_calibration": [
+                        {"threshold": 0.95, "window": 5, "fired": fired, "wrong": wrong}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {"sequence": sequence, "manifest": str(manifest)}
+
+    def _pipeline(self, directory: str) -> Pipeline:
+        return Pipeline(
+            PipelineConfig(
+                output=directory,
+                resign_target_false_positive=0.05,
+                resign_window=5,
+                replay_window=12,
+            )
+        )
+
+    def test_seeded_shards_calibrate_the_threshold(self) -> None:
+        # Seeded shards carry negative sequences. They are real games from the
+        # run's own lineage, so excluding them left a seeded run with no
+        # calibration and resignation switched off for its first shards --
+        # precisely when the seed should have been carrying it.
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = self._pipeline(directory)
+            pipeline.state.replay = [
+                self._shard(directory, -2, fired=100, wrong=2),
+                self._shard(directory, -1, fired=100, wrong=2),
+            ]
+            self.assertEqual(pipeline._adaptive_resign_threshold(), 0.95)
+
+    def test_resignation_stays_off_when_the_error_is_too_high(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = self._pipeline(directory)
+            pipeline.state.replay = [
+                self._shard(directory, -1, fired=100, wrong=20),
+            ]
+            self.assertEqual(
+                pipeline._adaptive_resign_threshold(),
+                1.0,
+                "an unreachable threshold must disable rather than fall back",
+            )
+
+    def test_a_thin_sample_is_not_trusted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = self._pipeline(directory)
+            pipeline.state.replay = [
+                self._shard(directory, -1, fired=5, wrong=0),
+            ]
+            self.assertEqual(
+                pipeline._adaptive_resign_threshold(),
+                1.0,
+                "a clean 0% over five firings says nothing",
+            )
+
+    def test_an_unreadable_manifest_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = self._pipeline(directory)
+            good = self._shard(directory, -1, fired=100, wrong=2)
+            pipeline.state.replay = [
+                {"sequence": -2, "manifest": str(Path(directory) / "absent.json")},
+                good,
+            ]
+            self.assertEqual(pipeline._adaptive_resign_threshold(), 0.95)
+
+
 class TelemetrySubsetTests(unittest.TestCase):
     def _model(self, version: int) -> ModelArtifact:
         return ModelArtifact(
