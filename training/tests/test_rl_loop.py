@@ -301,6 +301,78 @@ class PipelineSchedulingTests(unittest.TestCase):
                 )
             )
 
+    def test_concurrent_generators_run_at_once_with_distinct_sequences(self) -> None:
+        """Two generators must overlap, and must not claim the same shard.
+
+        `state.next_shard` only advances on commit, so a second task reading it
+        while the first is still running would take the same number and race for
+        the same staging directory. The scheduler assigns sequences instead.
+        """
+
+        class FakeLearner:
+            async def close(self, *, force: bool = False) -> None:
+                del force
+
+        async def exercise(directory: str) -> tuple[int, list[int]]:
+            pipeline = Pipeline(
+                PipelineConfig(
+                    output=directory,
+                    updates=4,
+                    maximum_prefetch_shards=4,
+                    concurrent_generators=2,
+                    telemetry_opponents=0,
+                )
+            )
+            claimed: list[int] = []
+            active = 0
+            maximum_active = 0
+
+            async def generate(
+                _model: ModelArtifact | None, sequence: int | None = None
+            ) -> ReplayArtifact:
+                nonlocal active, maximum_active
+                if sequence is None:
+                    sequence = pipeline.state.next_shard
+                claimed.append(sequence)
+                active += 1
+                maximum_active = max(maximum_active, active)
+                try:
+                    await asyncio.sleep(0.01)
+                    return replay(sequence)
+                finally:
+                    active -= 1
+
+            async def learn(update: int, spec: dict, path: Path) -> None:
+                del spec, path
+                await asyncio.sleep(0.001)
+                pipeline.state.updates_completed = update + 1
+
+            pipeline.learner = FakeLearner()
+            pipeline._generate_shard = generate
+            pipeline._learn_and_publish = learn
+            await pipeline.run()
+            return maximum_active, claimed
+
+        with tempfile.TemporaryDirectory() as directory:
+            maximum_active, claimed = asyncio.run(exercise(directory))
+        self.assertGreater(maximum_active, 1, "generators never overlapped")
+        self.assertEqual(
+            len(claimed), len(set(claimed)), f"duplicate sequences: {claimed}"
+        )
+
+    def test_one_generator_is_the_serial_path(self) -> None:
+        # The default must behave exactly as before, or every existing run
+        # changes shape when this lands.
+        pipeline = Pipeline(
+            PipelineConfig(output="/tmp/x", updates=3, telemetry_opponents=0)
+        )
+        self.assertEqual(pipeline.config.concurrent_generators, 1)
+        self.assertFalse(
+            pipeline._should_start_generation(
+                [], learning_through=None, generation_active=True
+            )
+        )
+
     def test_async_state_machine_overlaps_both_completion_orders(self) -> None:
         class FakeLearner:
             async def close(self, *, force: bool = False) -> None:
@@ -322,9 +394,14 @@ class PipelineSchedulingTests(unittest.TestCase):
             active = 0
             maximum_active = 0
 
-            async def generate(_model: ModelArtifact | None) -> ReplayArtifact:
+            async def generate(
+                _model: ModelArtifact | None, sequence: int | None = None
+            ) -> ReplayArtifact:
                 nonlocal active, maximum_active
-                sequence = pipeline.state.next_shard
+                # The scheduler assigns a sequence when generators may overlap;
+                # fall back to the committed one for the serial path.
+                if sequence is None:
+                    sequence = pipeline.state.next_shard
                 active += 1
                 maximum_active = max(maximum_active, active)
                 try:
