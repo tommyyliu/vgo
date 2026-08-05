@@ -454,6 +454,7 @@ class DDRNetPolicyValueNet(nn.Module):
         context_attention_blocks: int = 0,
         attention_heads: int = 8,
         raster_resolution: int | None = None,
+        optimistic_policy: bool = False,
     ) -> None:
         super().__init__()
         if stem_stride not in (1, 2, 4):
@@ -468,6 +469,10 @@ class DDRNetPolicyValueNet(nn.Module):
         self.policy_resolution = policy_resolution
         self.stem_stride = stem_stride
         self.context_attention_blocks = context_attention_blocks
+        # A second policy head trained on the same targets but weighted toward
+        # positions that beat the net's prediction. Search reads it; generation
+        # does not. See vgo_training/optimistic.py.
+        self.optimistic_policy = optimistic_policy
         self.attention_heads = attention_heads
         self.raster_resolution = raster_resolution
         # Stem divides by stem_stride; each context stage halves again.
@@ -635,6 +640,14 @@ class DDRNetPolicyValueNet(nn.Module):
             nn.ReLU(),
         )
         self.ownership_map = nn.Conv2d(detail_channels, 1, kernel_size=1)
+        if optimistic_policy:
+            self.optimistic_features = nn.Sequential(
+                nn.Conv2d(
+                    context_channels, detail_channels, kernel_size=3, padding=1
+                ),
+                nn.ReLU(),
+            )
+            self.optimistic_map = nn.Conv2d(detail_channels, 1, kernel_size=1)
         self.pass_head = nn.Linear(context_channels, 1)
         self.value_head = nn.Sequential(
             nn.Linear(context_channels, context_channels),
@@ -808,6 +821,17 @@ class DDRNetPolicyValueNet(nn.Module):
             # so it stays out of the exported graph entirely. The value logits
             # collapse to the scalar utility here, so the exported graph keeps
             # emitting exactly what the search always consumed.
+            #
+            # The optimistic policy is the exception: search is precisely what
+            # reads it, so it is appended after the contract's two outputs
+            # rather than dropped. A consumer that only wants the first two is
+            # unaffected.
+            if self.optimistic_policy:
+                return (
+                    policy_logits,
+                    value_utility(values),
+                    self._optimistic_logits(fused, target_size),
+                )
             return policy_logits, value_utility(values)
 
         # Training only. The normalized heads carry most of the loss and so are
@@ -833,7 +857,7 @@ class DDRNetPolicyValueNet(nn.Module):
             self.ownership_features_normed,
             self.ownership_map_normed,
         )
-        return (
+        outputs = (
             policy_logits,
             values,
             normed_logits,
@@ -841,6 +865,21 @@ class DDRNetPolicyValueNet(nn.Module):
             ownership,
             normed_ownership,
         )
+        if self.optimistic_policy:
+            outputs = outputs + (self._optimistic_logits(fused, target_size),)
+        return outputs
+
+    def _optimistic_logits(
+        self, fused: torch.Tensor, target_size: tuple[int, int]
+    ) -> torch.Tensor:
+        """Placement logits from the optimistic head, on the policy grid.
+
+        No pass logit: a pass is never the move an optimistic prior should be
+        pushing search toward, and leaving it out keeps the head's width equal
+        to the placement block the search reindexes.
+        """
+        placement = self.optimistic_map(self.optimistic_features(fused))
+        return self._resize_policy(placement, target_size).flatten(start_dim=1)
 
 
 def build_model(
@@ -855,6 +894,7 @@ def build_model(
     context_attention_blocks: int = 0,
     attention_heads: int = 8,
     raster_resolution: int | None = None,
+    optimistic_policy: bool = False,
 ) -> nn.Module:
     """Construct a policy-value net by architecture name. Older checkpoints without
     an architecture field are the flat residual tower.
@@ -888,5 +928,6 @@ def build_model(
             context_attention_blocks=context_attention_blocks,
             attention_heads=attention_heads,
             raster_resolution=raster_resolution,
+            optimistic_policy=optimistic_policy,
         )
     raise ValueError(f"unknown model architecture: {architecture!r}")
