@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from .attention import BoardTransformerBlock
+from .pooling import global_pool
 
 
 MODEL_ARCHITECTURES = ("flat", "unet", "ddrnet")
@@ -454,6 +455,7 @@ class DDRNetPolicyValueNet(nn.Module):
         context_attention_blocks: int = 0,
         attention_heads: int = 8,
         raster_resolution: int | None = None,
+        global_pooling: bool = False,
     ) -> None:
         super().__init__()
         if stem_stride not in (1, 2, 4):
@@ -468,6 +470,9 @@ class DDRNetPolicyValueNet(nn.Module):
         self.policy_resolution = policy_resolution
         self.stem_stride = stem_stride
         self.context_attention_blocks = context_attention_blocks
+        # Heads read mean, size-scaled mean and max instead of the mean alone,
+        # so their input is three times as wide. See vgo_training/pooling.py.
+        self.global_pooling = global_pooling
         self.attention_heads = attention_heads
         self.raster_resolution = raster_resolution
         # Stem divides by stem_stride; each context stage halves again.
@@ -482,6 +487,8 @@ class DDRNetPolicyValueNet(nn.Module):
         stem_channels = max(8, width // 2)
         detail_channels = width
         context_channels = width * 2
+        # Pooled heads read three statistics per channel, not one.
+        head_width = context_channels * 3 if global_pooling else context_channels
         deep_channels = width * 4
         stage_blocks = max(1, (blocks + 3) // 4)
 
@@ -635,9 +642,9 @@ class DDRNetPolicyValueNet(nn.Module):
             nn.ReLU(),
         )
         self.ownership_map = nn.Conv2d(detail_channels, 1, kernel_size=1)
-        self.pass_head = nn.Linear(context_channels, 1)
+        self.pass_head = nn.Linear(head_width, 1)
         self.value_head = nn.Sequential(
-            nn.Linear(context_channels, context_channels),
+            nn.Linear(head_width, context_channels),
             nn.ReLU(),
             # Two logits -- P(mover wins), P(mover loses) -- rather than a
             # scalar through tanh. The outcome is categorical, so a
@@ -673,9 +680,9 @@ class DDRNetPolicyValueNet(nn.Module):
             nn.ReLU(),
         )
         self.ownership_map_normed = nn.Conv2d(detail_channels, 1, kernel_size=1)
-        self.pass_head_normed = nn.Linear(context_channels, 1)
+        self.pass_head_normed = nn.Linear(head_width, 1)
         self.value_head_normed = nn.Sequential(
-            nn.Linear(context_channels, context_channels),
+            nn.Linear(head_width, context_channels),
             nn.ReLU(),
             # Two logits -- P(mover wins), P(mover loses) -- rather than a
             # scalar through tanh. The outcome is categorical, so a
@@ -777,7 +784,11 @@ class DDRNetPolicyValueNet(nn.Module):
             placement = self._resize_policy(placement, target_size).flatten(
                 start_dim=1
             )
-            pooled = semantic_features.mean(dim=(-2, -1))
+            pooled = (
+                global_pool(semantic_features)
+                if self.global_pooling
+                else semantic_features.mean(dim=(-2, -1))
+            )
             logits = torch.cat((placement, pass_head(pooled)), dim=1)
             values = value_head(pooled)
             if ownership_features is None:
@@ -855,6 +866,7 @@ def build_model(
     context_attention_blocks: int = 0,
     attention_heads: int = 8,
     raster_resolution: int | None = None,
+    global_pooling: bool = False,
 ) -> nn.Module:
     """Construct a policy-value net by architecture name. Older checkpoints without
     an architecture field are the flat residual tower.
@@ -888,5 +900,6 @@ def build_model(
             context_attention_blocks=context_attention_blocks,
             attention_heads=attention_heads,
             raster_resolution=raster_resolution,
+            global_pooling=global_pooling,
         )
     raise ValueError(f"unknown model architecture: {architecture!r}")
