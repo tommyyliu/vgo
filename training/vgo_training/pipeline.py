@@ -306,6 +306,9 @@ class PipelineConfig:
     # one partial game per actor -- measured 1.39x more useful work per second
     # with this on. Shards then overshoot their target.
     drain_tail: bool = False
+    # Per-shard sampling decay; 1.0 is uniform. Lets a long window stay diverse
+    # while the gradient follows recent play. See vgo_training/recency.py.
+    recency_decay: float = 1.0
     training_threads: int = 4
     training_device: str = "cuda"
     training_precision: str = "bfloat16"
@@ -429,6 +432,8 @@ class PipelineConfig:
             raise ValueError("learning rates must be positive")
         if self.ownership_weight < 0.0:
             raise ValueError("ownership weight must be nonnegative")
+        if not 0.0 < self.recency_decay <= 1.0:
+            raise ValueError("recency decay must be in (0, 1]")
         if self.value_weight < 0.0:
             raise ValueError("value weight must be nonnegative")
         if not 0.0 <= self.validation_fraction < 1.0:
@@ -1358,6 +1363,7 @@ class Pipeline:
             ),
             "value_weight": self.config.value_weight,
             "ownership_weight": self.config.ownership_weight,
+            "recency_decay": self.config.recency_decay,
             "model_width": self.config.model_width,
             "blocks": self.config.blocks,
             "architecture": self.config.architecture,
@@ -2342,6 +2348,15 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="finish in-flight games when a shard fills rather than cancelling them",
+    )
+    parser.add_argument(
+        "--recency-decay",
+        type=float,
+        default=1.0,
+        help=(
+            "per-shard sampling decay; 1.0 samples the window uniformly, 0.9 "
+            "makes each older shard 10%% less likely than its successor"
+        ),
     )
     parser.add_argument(
         "--ownership-weight",

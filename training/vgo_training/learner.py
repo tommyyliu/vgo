@@ -24,6 +24,7 @@ from .dataset import (
 )
 from .model import MODEL_ARCHITECTURES, build_model
 from .packed_states import is_packable, pack as pack_states
+from .recency import row_weights
 from .serve import load_model
 from .train_demo import (
     DIHEDRAL_TRANSFORMS,
@@ -82,6 +83,11 @@ class LearnerConfig:
     # head still exists and still exports as nothing, so this is reversible
     # without touching model identity.
     ownership_weight: float = OWNERSHIP_WEIGHT
+    # Per-shard sampling decay: 1.0 samples the whole window uniformly, 0.9
+    # makes each older shard 10% less likely than its successor. Lets a long
+    # window stay diverse while the gradient follows recent play. Identity
+    # config -- it changes what the model trains on.
+    recency_decay: float = 1.0
     threads: int = 4
     device: str = "cuda"
     precision: str = "float32"
@@ -127,6 +133,8 @@ class LearnerConfig:
             raise ValueError("validation fraction must be in [0, 1)")
         if not math.isfinite(self.ownership_weight) or self.ownership_weight < 0.0:
             raise ValueError("ownership weight must be finite and nonnegative")
+        if not 0.0 < self.recency_decay <= 1.0:
+            raise ValueError("recency decay must be in (0, 1]")
 
     @classmethod
     def from_mapping(
@@ -431,7 +439,15 @@ class ReplayView:
         shuffle: bool,
         generator: torch.Generator | None = None,
         augment: bool = False,
+        weights: torch.Tensor | None = None,
     ) -> list[BatchSpec]:
+        """Batch specs over this view.
+
+        `weights` is one frequency weight per row of the concatenated view,
+        averaging 1.0. Rows are repeated by those weights before shuffling, so
+        an epoch keeps its length in expectation while its composition shifts.
+        See vgo_training/recency.py.
+        """
         if batch_size <= 0:
             raise ValueError("batch size must be positive")
         shard_ids = torch.cat(
@@ -445,6 +461,21 @@ class ReplayView:
             ]
         )
         rows = torch.cat([selection.rows for selection in self.selections])
+        if weights is not None:
+            if weights.numel() != rows.numel():
+                raise ValueError(
+                    f"weights cover {weights.numel()} rows, view has {rows.numel()}"
+                )
+            # floor(w) copies plus one more with the fractional probability,
+            # which is unbiased in expectation.
+            floor = weights.floor()
+            extra = torch.rand(weights.shape, generator=generator) < (weights - floor)
+            counts = (floor + extra.to(weights.dtype)).to(torch.long)
+            repeat = torch.repeat_interleave(
+                torch.arange(counts.numel()), counts
+            )
+            shard_ids = shard_ids[repeat]
+            rows = rows[repeat]
         if shuffle and rows.numel() > 1:
             order = torch.randperm(rows.numel(), generator=generator)
             shard_ids = shard_ids[order]
@@ -1403,6 +1434,20 @@ class PersistentLearner:
         best_optimizer_state = _cpu_clone(self.optimizer.state_dict())
         optimization_started = time.perf_counter()
 
+        # One weight per training row, from shard age. The window arrives
+        # oldest-first, so the last shard is the newest.
+        training_weights = None
+        if config.recency_decay < 1.0:
+            # row_weights expects newest-first; the window is oldest-first, so
+            # build it reversed and flip the result back into window order.
+            sizes = [
+                int(selection.rows.numel())
+                for selection in reversed(split.training.selections)
+            ]
+            training_weights = torch.flip(
+                row_weights(sizes, config.recency_decay), dims=(0,)
+            )
+
         self.model.train()
         for epoch in range(1, config.epochs + 1):
             specs = split.training.batches(
@@ -1410,6 +1455,7 @@ class PersistentLearner:
                 shuffle=True,
                 generator=generator,
                 augment=config.augment,
+                weights=training_weights,
             )
             for (
                 states,
