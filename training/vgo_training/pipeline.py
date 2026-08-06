@@ -192,31 +192,60 @@ def runtime_environment() -> dict[str, str]:
             )
         return environment
 
-    packages = (
-        Path(sys.prefix)
-        / "lib"
-        / f"python{sys.version_info.major}.{sys.version_info.minor}"
-        / "site-packages"
-    )
-    onnxruntime_dir = packages / "onnxruntime_trt"
-    if not onnxruntime_dir.exists():
-        onnxruntime_dir = packages / "onnxruntime_blackwell"
-    library_dirs = [
-        onnxruntime_dir,
-        packages / "tensorrt_libs",
-        packages / "nvidia" / "cu13" / "lib",
-        packages / "nvidia" / "cudnn" / "lib",
-        packages / "torch" / "lib",
+    # A single sys.prefix can split its site-packages across "lib" and "lib64"
+    # -- observed with the onnxruntime-gpu wheel, whose pure-Python dist-info
+    # lands in one and its native code in the other depending on the platform
+    # tags it was built with. Both must be searched; neither predicts the
+    # other.
+    site_packages = [
+        Path(sys.prefix) / libdir / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+        for libdir in ("lib", "lib64")
     ]
+    # Custom source builds (see docs/RUNNING.md) used these directory names;
+    # the prebuilt onnxruntime-gpu wheel installs as plain "onnxruntime". Try
+    # the custom names first so a from-source build already on the box is
+    # preferred over a prebuilt wheel installed alongside it.
+    onnxruntime_dir = next(
+        (
+            packages / name
+            for packages in site_packages
+            for name in ("onnxruntime_trt", "onnxruntime_blackwell", "onnxruntime")
+            if (packages / name).exists()
+        ),
+        None,
+    )
+    library_dirs: list[Path] = []
+    if onnxruntime_dir is not None:
+        library_dirs.append(onnxruntime_dir / "capi")
+        library_dirs.append(onnxruntime_dir)
+    for packages in site_packages:
+        library_dirs += [
+            packages / "tensorrt_libs",
+            packages / "nvidia" / "cu13" / "lib",
+            packages / "nvidia" / "cudnn" / "lib",
+            packages / "torch" / "lib",
+        ]
     existing = [str(path) for path in library_dirs if path.exists()]
     if existing:
         prior = environment.get("LD_LIBRARY_PATH", "")
         environment["LD_LIBRARY_PATH"] = os.pathsep.join(
             existing + ([prior] if prior else [])
         )
-    dylib = onnxruntime_dir / "libonnxruntime.so"
-    if "ORT_DYLIB_PATH" not in environment and dylib.exists():
-        environment["ORT_DYLIB_PATH"] = str(dylib)
+    if "ORT_DYLIB_PATH" not in environment and onnxruntime_dir is not None:
+        for candidate_dir in (onnxruntime_dir / "capi", onnxruntime_dir):
+            if not candidate_dir.is_dir():
+                continue
+            # Unversioned name first (custom builds), then the highest
+            # versioned .so the wheel actually ships (prebuilt wheels do not
+            # provide an unversioned symlink).
+            unversioned = candidate_dir / "libonnxruntime.so"
+            if unversioned.exists():
+                environment["ORT_DYLIB_PATH"] = str(unversioned)
+                break
+            versioned = sorted(candidate_dir.glob("libonnxruntime.so.*"))
+            if versioned:
+                environment["ORT_DYLIB_PATH"] = str(versioned[-1])
+                break
     return environment
 
 
