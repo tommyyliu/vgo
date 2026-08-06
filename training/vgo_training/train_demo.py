@@ -609,9 +609,11 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--warmup-epochs",
-        type=int,
+        type=float,
         default=5,
-        help="wsd only: epochs ramping linearly to the full rate",
+        help="wsd only: epochs ramping linearly to the full rate; fractional "
+        "values are meaningful, and necessary at low epoch counts where a "
+        "whole epoch of warmup would consume the entire run",
     )
     parser.add_argument(
         "--decay-fraction",
