@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use vgo_core::{GameEvent, Position};
+use vgo_core::{GameEvent, Position, planar_length};
 
 use crate::{Action, FineGrid};
 
@@ -115,7 +115,7 @@ impl Policy for NaivePolicy {
             self.position
                 .stones()
                 .iter()
-                .map(|stone| (point.x - stone.x).hypot(point.y - stone.y))
+                .map(|stone| planar_length(point.x - stone.x, point.y - stone.y))
                 .fold(f64::INFINITY, f64::min)
         };
         let transition = action.apply(&self.position);

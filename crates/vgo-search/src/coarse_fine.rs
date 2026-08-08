@@ -234,10 +234,19 @@ fn straddles_boundary(
     if edge_slack < -half_diagonal {
         return false;
     }
+    // Compared as squares: `hypot` is a libm call that cannot be inlined or
+    // vectorized, and this runs once per (cell, stone) over the whole coarse
+    // grid. A negative threshold is satisfied by every distance, so it is
+    // handled before squaring -- squaring it would flip the comparison.
+    let threshold = exclusion - half_diagonal;
+    if threshold <= 0.0 {
+        return true;
+    }
+    let threshold_squared = threshold * threshold;
     position.stones().iter().all(|stone| {
         let dx = point.x - stone.x;
         let dy = point.y - stone.y;
-        dx.hypot(dy) >= exclusion - half_diagonal
+        dx.mul_add(dx, dy * dy) >= threshold_squared
     })
 }
 
