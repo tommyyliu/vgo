@@ -464,6 +464,12 @@ mod tests {
     /// move, not a test failure anyone would otherwise notice.
     #[test]
     fn lazy_nearest_matches_the_exhaustive_scan() {
+        // Bit-exact, not approximate. Both implementations pick a point out of
+        // the same candidate list and hand it to the same `clear_by_margin`, so
+        // agreeing means choosing the identical candidate -- there is no
+        // arithmetic between them that could legitimately round differently.
+        // A tolerance here would hide exactly the tie-order divergence the test
+        // exists to catch.
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut next = move || {
             state ^= state << 13;
@@ -471,49 +477,78 @@ mod tests {
             state ^= state << 17;
             (state >> 11) as f64 / (1u64 << 53) as f64
         };
-        let radius = 0.05571428571428571;
-        for _ in 0..400 {
-            let count = 1 + (next() * 30.0) as usize;
-            let mut stones = Vec::new();
-            let mut attempts = 0;
-            while stones.len() < count && attempts < 2000 {
-                attempts += 1;
-                let x = radius + next() * (1.0 - 2.0 * radius);
-                let y = radius + next() * (1.0 - 2.0 * radius);
-                if stones.iter().all(|s: &crate::Stone| {
-                    super::numeric::length(s.x - x, s.y - y) >= 2.0 * radius
-                }) {
-                    let colour = if stones.len() % 2 == 0 {
-                        crate::Color::Black
-                    } else {
-                        crate::Color::White
-                    };
-                    stones.push(crate::Stone::new(x, y, colour));
+        // The production radius, plus values either side of it: a larger radius
+        // packs fewer stones and leaves more of the board illegal, which is the
+        // regime where the scan walks furthest down the candidate order.
+        let radii = [0.02, 0.05571428571428571, 0.1, 0.2];
+        let mut checked = 0_u32;
+        let mut snapped_seen = 0_u32;
+        let mut illegal_seen = 0_u32;
+        for radius in radii {
+            for _ in 0..250 {
+                let count = 1 + (next() * 30.0) as usize;
+                let mut stones = Vec::new();
+                let mut attempts = 0;
+                while stones.len() < count && attempts < 2000 {
+                    attempts += 1;
+                    let x = radius + next() * (1.0 - 2.0 * radius);
+                    let y = radius + next() * (1.0 - 2.0 * radius);
+                    if stones.iter().all(|s: &crate::Stone| {
+                        super::numeric::length(s.x - x, s.y - y) >= 2.0 * radius
+                    }) {
+                        let colour = if stones.len() % 2 == 0 {
+                            crate::Color::Black
+                        } else {
+                            crate::Color::White
+                        };
+                        stones.push(crate::Stone::new(x, y, colour));
+                    }
                 }
-            }
-            let position = crate::Position::new(radius, stones, crate::Color::Black);
-            let known = vertices(&position);
-            for _ in 0..6 {
-                let query = Point::new(next(), next());
-                let fast = nearest_with(&position, query, Some(&known));
-                let slow = exhaustive_nearest(&position, query, &known);
-                assert_eq!(
-                    (fast.legal, fast.snapped),
-                    (slow.0, slow.2),
-                    "legality/snap disagreed at {query:?}"
-                );
-                if fast.legal {
-                    let dx = fast.point.x - slow.1.x;
-                    let dy = fast.point.y - slow.1.y;
-                    assert!(
-                        super::numeric::length(dx, dy) < 1.0e-12,
-                        "chose {:?}, exhaustive chose {:?}",
-                        fast.point,
-                        slow.1
-                    );
+                let position = crate::Position::new(radius, stones, crate::Color::Black);
+                let known = vertices(&position);
+                for _ in 0..6 {
+                    let query = Point::new(next(), next());
+                    // Both paths: `Some` is what the search uses, `None` makes
+                    // `nearest_with` build the vertex set itself, and only the
+                    // second is reachable from `nearest`.
+                    for supplied in [Some(&known[..]), None] {
+                        let fast = nearest_with(&position, query, supplied);
+                        let slow = exhaustive_nearest(&position, query, &known);
+                        assert_eq!(
+                            (fast.legal, fast.snapped),
+                            (slow.0, slow.2),
+                            "legality/snap disagreed at {query:?} with radius {radius}"
+                        );
+                        if fast.legal {
+                            assert_eq!(
+                                (fast.point.x.to_bits(), fast.point.y.to_bits()),
+                                (slow.1.x.to_bits(), slow.1.y.to_bits()),
+                                "chose {:?}, exhaustive chose {:?} at radius {radius}",
+                                fast.point,
+                                slow.1
+                            );
+                        }
+                        checked += 1;
+                    }
+                    let probe = nearest_with(&position, query, Some(&known));
+                    if probe.snapped {
+                        snapped_seen += 1;
+                    }
+                    if !probe.legal {
+                        illegal_seen += 1;
+                    }
                 }
             }
         }
+        // The comparison is only worth anything if it exercised the branches:
+        // an all-legal sample would never reach the candidate scan at all, and
+        // a board with no legal point never reaches the choice either.
+        assert!(checked > 10_000, "only {checked} comparisons");
+        assert!(snapped_seen > 1_000, "only {snapped_seen} snapped queries");
+        assert!(
+            illegal_seen > 0,
+            "no fully covered board was generated; the None branch is untested"
+        );
     }
 
     /// The pre-optimization scan: build every candidate, test all of them,
