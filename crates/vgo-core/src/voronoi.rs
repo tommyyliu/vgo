@@ -82,24 +82,50 @@ fn distance_squared(a: Point, b: Point) -> f64 {
     (a.x - b.x).mul_add(a.x - b.x, (a.y - b.y) * (a.y - b.y))
 }
 
-fn normalize_polygon(points: Vec<Point>) -> Vec<Point> {
+/// A polygon vertex and the constraint that produced the edge leaving it.
+///
+/// Clipping a convex polygon against a half-plane already knows which
+/// constraint each surviving edge lies on: the edge from vertex `i` to `i + 1`
+/// is whatever most recently cut there. Recording it as the clip happens
+/// replaces the reverse lookup `edge_source` used to do -- a search over every
+/// constraint for the one both endpoints sit on, which cost a `residual` (and
+/// its square root) per constraint per edge per cell, and grew as the cube of
+/// the stone count.
+#[derive(Clone, Copy)]
+struct Vertex {
+    point: Point,
+    /// Source of the edge from this vertex to the next, `None` while a vertex
+    /// is only a corner of the starting square that nothing has cut yet.
+    outgoing: Option<EdgeSource>,
+}
+
+fn normalize_polygon(points: Vec<Vertex>) -> Vec<Vertex> {
     if points.len() < 3 {
         return points;
     }
-    let mut deduped = Vec::with_capacity(points.len());
-    for point in points {
+    // Dropping a vertex merges its outgoing edge into its predecessor's. The
+    // survivor keeps the *later* edge's source, because that is the edge the
+    // merged span actually lies on: the dropped vertex was coincident with or
+    // collinear to its neighbour, so the span continues along where it led.
+    let mut deduped: Vec<Vertex> = Vec::with_capacity(points.len());
+    for vertex in points {
         if deduped
             .last()
-            .is_none_or(|last| distance_squared(point, *last) > numeric::EDGE_EPSILON.powi(2))
+            .is_none_or(|last| distance_squared(vertex.point, last.point) > numeric::EDGE_EPSILON.powi(2))
         {
-            deduped.push(point);
+            deduped.push(vertex);
+        } else if let Some(last) = deduped.last_mut() {
+            last.outgoing = vertex.outgoing;
         }
     }
     if deduped.len() > 1
-        && distance_squared(deduped[0], *deduped.last().expect("nonempty"))
+        && distance_squared(deduped[0].point, deduped.last().expect("nonempty").point)
             <= numeric::EDGE_EPSILON.powi(2)
     {
-        deduped.pop();
+        let tail = deduped.pop().expect("nonempty");
+        if let Some(last) = deduped.last_mut() {
+            last.outgoing = tail.outgoing;
+        }
     }
 
     let mut polygon = deduped;
@@ -108,22 +134,39 @@ fn normalize_polygon(points: Vec<Point>) -> Vec<Point> {
             return polygon;
         }
         let mut changed = false;
-        let mut clean = Vec::with_capacity(polygon.len());
+        let mut clean: Vec<Vertex> = Vec::with_capacity(polygon.len());
+        let mut pending_wrap: Option<Option<EdgeSource>> = None;
         for index in 0..polygon.len() {
-            let a = polygon[(index + polygon.len() - 1) % polygon.len()];
+            let a = polygon[(index + polygon.len() - 1) % polygon.len()].point;
             let b = polygon[index];
-            let c = polygon[(index + 1) % polygon.len()];
-            let abx = b.x - a.x;
-            let aby = b.y - a.y;
-            let bcx = c.x - b.x;
-            let bcy = c.y - b.y;
+            let c = polygon[(index + 1) % polygon.len()].point;
+            let abx = b.point.x - a.x;
+            let aby = b.point.y - a.y;
+            let bcx = c.x - b.point.x;
+            let bcy = c.y - b.point.y;
             let cross = abx.mul_add(bcy, -aby * bcx);
             let scale = numeric::length(abx, aby) + numeric::length(bcx, bcy);
             if cross.abs() <= numeric::COLLINEAR_EPSILON * scale.max(1.0) {
                 changed = true;
+                // `b` is collinear between its neighbours, so the span from the
+                // previous vertex through `b` to `c` is one edge. It carries
+                // b's outgoing source, which is the half of the span that
+                // survives as the edge to `c`.
+                //
+                // Dropping index 0 leaves nothing to fix up yet; the polygon is
+                // cyclic, so the predecessor is the last vertex and it is not
+                // pushed until the end of this pass. `pending_wrap` carries the
+                // source until then.
+                match clean.last_mut() {
+                    Some(previous) => previous.outgoing = b.outgoing,
+                    None => pending_wrap = Some(b.outgoing),
+                }
             } else {
                 clean.push(b);
             }
+        }
+        if let (Some(source), Some(last)) = (pending_wrap, clean.last_mut()) {
+            last.outgoing = source;
         }
         polygon = clean;
         if !changed {
@@ -132,23 +175,44 @@ fn normalize_polygon(points: Vec<Point>) -> Vec<Point> {
     }
 }
 
-fn clip_half_plane(polygon: Vec<Point>, constraint: Constraint) -> Vec<Point> {
+fn clip_half_plane(polygon: Vec<Vertex>, constraint: Constraint) -> Vec<Vertex> {
     let mut output = Vec::with_capacity(polygon.len() + 1);
     for index in 0..polygon.len() {
         let a = polygon[index];
         let b = polygon[(index + 1) % polygon.len()];
-        let fa = constraint.nx.mul_add(a.x, constraint.ny * a.y) - constraint.offset;
-        let fb = constraint.nx.mul_add(b.x, constraint.ny * b.y) - constraint.offset;
+        let fa = constraint.nx.mul_add(a.point.x, constraint.ny * a.point.y) - constraint.offset;
+        let fb = constraint.nx.mul_add(b.point.x, constraint.ny * b.point.y) - constraint.offset;
         let a_inside = fa <= numeric::COORDINATE_EPSILON;
         let b_inside = fb <= numeric::COORDINATE_EPSILON;
         if a_inside {
+            // `a` survives with the edge it already had, unless that edge is
+            // about to be cut short -- then the span from the crossing point
+            // onward belongs to this constraint, recorded on the new vertex
+            // below.
             output.push(a);
         }
         if a_inside != b_inside {
             let denominator = fa - fb;
             if denominator.abs() > f64::EPSILON {
                 let t = fa / denominator;
-                output.push(Point::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)));
+                let crossing = Point::new(
+                    a.point.x + t * (b.point.x - a.point.x),
+                    a.point.y + t * (b.point.y - a.point.y),
+                );
+                // Leaving the half-plane: the polygon now runs along this
+                // constraint from here to wherever it re-enters, so the new
+                // vertex owns a stretch of this constraint. Re-entering: the
+                // constraint's stretch ends here and the original edge resumes,
+                // which is `a`'s source, already carried by the edge that
+                // brought us to this crossing.
+                let outgoing = if a_inside {
+                    Some(constraint.source)
+                } else {
+                    // Re-entering along the original a->b edge, so the stretch
+                    // from here to `b` is still that edge.
+                    a.outgoing
+                };
+                output.push(Vertex { point: crossing, outgoing });
             }
         }
     }
@@ -165,6 +229,7 @@ fn polygon_area(polygon: &[Point]) -> f64 {
     twice_area.abs() / 2.0
 }
 
+#[cfg(test)]
 fn board_constraint(side: BoardSide) -> Constraint {
     match side {
         BoardSide::Left => Constraint {
@@ -207,6 +272,7 @@ fn bisector_constraint(position: &Position, stone: usize, other: usize) -> Const
     }
 }
 
+#[cfg(test)]
 fn residual(constraint: Constraint, point: Point) -> f64 {
     let length = numeric::length(constraint.nx, constraint.ny);
     if length == 0.0 {
@@ -215,6 +281,11 @@ fn residual(constraint: Constraint, point: Point) -> f64 {
     (constraint.nx.mul_add(point.x, constraint.ny * point.y) - constraint.offset).abs() / length
 }
 
+/// The reverse lookup `compute` used before edge provenance was recorded at
+/// clip time: given an edge, find the constraint both endpoints lie on. Kept
+/// as the specification the recorded sources are tested against -- it is the
+/// definition of a correct classification, just an expensive way to get it.
+#[cfg(test)]
 fn edge_source(constraints: &[Constraint], start: Point, end: Point) -> Option<EdgeSource> {
     constraints
         .iter()
@@ -237,47 +308,59 @@ pub fn compute(position: &Position) -> Geometry {
     let mut diagnostics = GeometryDiagnostics::default();
 
     for (stone, neighbors) in adjacency.iter_mut().enumerate() {
+        // The starting square's sides are board edges, each vertex owning the
+        // side that leaves it: (0,0) to (1,0) is the top, and so on round.
         let mut polygon = vec![
-            Point::new(0.0, 0.0),
-            Point::new(1.0, 0.0),
-            Point::new(1.0, 1.0),
-            Point::new(0.0, 1.0),
-        ];
-        let mut constraints = vec![
-            board_constraint(BoardSide::Left),
-            board_constraint(BoardSide::Right),
-            board_constraint(BoardSide::Top),
-            board_constraint(BoardSide::Bottom),
+            Vertex {
+                point: Point::new(0.0, 0.0),
+                outgoing: Some(EdgeSource::Board(BoardSide::Top)),
+            },
+            Vertex {
+                point: Point::new(1.0, 0.0),
+                outgoing: Some(EdgeSource::Board(BoardSide::Right)),
+            },
+            Vertex {
+                point: Point::new(1.0, 1.0),
+                outgoing: Some(EdgeSource::Board(BoardSide::Bottom)),
+            },
+            Vertex {
+                point: Point::new(0.0, 1.0),
+                outgoing: Some(EdgeSource::Board(BoardSide::Left)),
+            },
         ];
         for other in 0..count {
             if other == stone || polygon.is_empty() {
                 continue;
             }
             let constraint = bisector_constraint(position, stone, other);
-            constraints.push(constraint);
             polygon = clip_half_plane(polygon, constraint);
         }
         polygon = normalize_polygon(polygon);
         let mut edges = Vec::with_capacity(polygon.len());
         for index in 0..polygon.len() {
             let start = polygon[index];
-            let end = polygon[(index + 1) % polygon.len()];
-            if start.distance(end) <= numeric::EDGE_EPSILON {
+            let end = polygon[(index + 1) % polygon.len()].point;
+            if start.point.distance(end) <= numeric::EDGE_EPSILON {
                 diagnostics.degenerate_edges += 1;
                 continue;
             }
-            let source = edge_source(&constraints, start, end);
+            let source = start.outgoing;
             if source.is_none() {
                 diagnostics.unclassified_edges += 1;
             }
             if let Some(EdgeSource::Bisector { other, .. }) = source {
                 neighbors.push(other);
             }
-            edges.push(Edge { start, end, source });
+            edges.push(Edge {
+                start: start.point,
+                end,
+                source,
+            });
         }
+        let points: Vec<Point> = polygon.iter().map(|vertex| vertex.point).collect();
         cells.push(Cell {
-            area: polygon_area(&polygon),
-            polygon,
+            area: polygon_area(&points),
+            polygon: points,
             edges,
         });
     }
@@ -332,7 +415,84 @@ pub fn compute(position: &Position) -> Geometry {
 mod tests {
     use crate::{Color, Position, Stone};
 
-    use super::{EdgeSource, compute};
+    use super::{EdgeSource, compute, edge_source};
+
+    /// Provenance recorded at clip time must agree with the reverse lookup.
+    ///
+    /// `edge_source` classified an edge by searching every constraint for the
+    /// one both endpoints sit on, within four coordinate epsilons. Recording
+    /// the constraint as the clip happens is the same answer arrived at
+    /// directly, and this replays both over random boards to say so -- edge
+    /// sources decide adjacency, adjacency decides groups, and groups decide
+    /// which stones a move captures, so a disagreement here is a different
+    /// game rather than a slower one.
+    ///
+    /// Kept after `edge_source` stopped being reachable from `compute`: it is
+    /// the specification this optimization is measured against.
+    #[test]
+    fn recorded_edge_sources_match_the_reverse_lookup() {
+        let radius = 0.055_714_285_714_285_716_f64;
+        let mut state = 0x51ED_2C4A_9B3F_1E7D_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (mut edges, mut agreed) = (0_usize, 0_usize);
+        for _ in 0..200 {
+            let mut stones: Vec<Stone> = Vec::new();
+            let mut tries = 0;
+            while stones.len() < 24 && tries < 20_000 {
+                tries += 1;
+                let x = radius + next() * (1.0 - 2.0 * radius);
+                let y = radius + next() * (1.0 - 2.0 * radius);
+                if stones.iter().all(|s: &Stone| {
+                    ((s.x - x).powi(2) + (s.y - y).powi(2)).sqrt() >= 2.0 * radius
+                }) {
+                    let colour = if stones.len() % 2 == 0 {
+                        Color::Black
+                    } else {
+                        Color::White
+                    };
+                    stones.push(Stone::new(x, y, colour));
+                }
+            }
+            if stones.len() < 24 {
+                continue;
+            }
+            let position = Position::new(radius, stones, Color::Black);
+            let geometry = compute(&position);
+            for (stone, cell) in geometry.cells.iter().enumerate() {
+                // The constraint list the reverse lookup used to search.
+                let mut constraints = vec![
+                    super::board_constraint(super::BoardSide::Left),
+                    super::board_constraint(super::BoardSide::Right),
+                    super::board_constraint(super::BoardSide::Top),
+                    super::board_constraint(super::BoardSide::Bottom),
+                ];
+                for other in 0..position.stones().len() {
+                    if other != stone {
+                        constraints.push(super::bisector_constraint(&position, stone, other));
+                    }
+                }
+                for edge in &cell.edges {
+                    let looked_up = edge_source(&constraints, edge.start, edge.end);
+                    edges += 1;
+                    if edge.source == looked_up {
+                        agreed += 1;
+                    } else {
+                        panic!(
+                            "edge {:?}->{:?} of cell {stone}: recorded {:?}, lookup {:?}",
+                            edge.start, edge.end, edge.source, looked_up
+                        );
+                    }
+                }
+            }
+        }
+        assert!(edges > 5_000, "only {edges} edges compared");
+        assert_eq!(edges, agreed);
+    }
 
     #[test]
     fn two_sites_split_the_board_and_retain_provenance() {
