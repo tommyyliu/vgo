@@ -129,6 +129,14 @@ wheels = [
 ]
 
 [[package]]
+name = "flatbuffers"
+version = "25.12.19"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e8/2d/d2a548598be01649e2d46231d151a6c56d10b964d94043a335ae56ea2d92/flatbuffers-25.12.19-py2.py3-none-any.whl", hash = "sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4", size = 26661, upload-time = "2025-12-19T23:16:13.622Z" },
+]
+
+[[package]]
 name = "fonttools"
 version = "4.63.0"
 source = { registry = "https://pypi.org/simple" }
@@ -538,6 +546,22 @@ wheels = [
 ]
 
 [[package]]
+name = "onnxruntime-gpu"
+version = "1.28.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "flatbuffers", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "numpy", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "packaging", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "protobuf", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/95/99/ed28c67950b42fe9911ae4bf02a4015f4e3da8a607ff91c836c31fb798e4/onnxruntime_gpu-1.28.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3ad3f1660488390def834fab93a70d76a5bec6b10df75e92eee38426fef57e81", size = 249773839, upload-time = "2026-07-29T16:31:37.807Z" },
+    { url = "https://files.pythonhosted.org/packages/1f/8f/7d0613468fda5c15c53095f971abe934145d174c025f7fc98649a9454a64/onnxruntime_gpu-1.28.0-cp314-cp314-win_amd64.whl", hash = "sha256:965f2cad344510bfe2a024ba5c485528caafcc3cf11b218dfb988b0f0e34057d", size = 242095308, upload-time = "2026-07-25T01:25:25.706Z" },
+    { url = "https://files.pythonhosted.org/packages/50/b8/1cfd3c7a7ddfede5629e48a9f6c5cce7ae3702fe607fba8cdaf7ec14ae02/onnxruntime_gpu-1.28.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:00445199a517ed8216a02480a2070386ba72ff519366b319ba78af8c3911a86d", size = 249777734, upload-time = "2026-07-29T16:31:47.579Z" },
+]
+
+[[package]]
 name = "onnxscript"
 version = "0.7.1"
 source = { registry = "https://pypi.org/simple" }
@@ -777,6 +801,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "numpy" },
     { name = "onnx" },
+    { name = "onnxruntime-gpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
     { name = "onnxscript" },
     { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
@@ -796,6 +821,7 @@ requires-dist = [
     { name = "matplotlib", marker = "extra == 'plots'", specifier = ">=3.10" },
     { name = "numpy", specifier = ">=2.5.1" },
     { name = "onnx", specifier = ">=1.19.0" },
+    { name = "onnxruntime-gpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=1.28.0" },
     { name = "onnxscript", specifier = ">=0.5.0" },
     { name = "tensorrt-cu13-libs", marker = "(sys_platform == 'linux' and extra == 'tensorrt') or (sys_platform == 'win32' and extra == 'tensorrt')", specifier = "==10.16.1.11" },
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.13.0" },

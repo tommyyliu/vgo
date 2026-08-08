@@ -5,6 +5,18 @@ requires-python = ">=3.14"
 dependencies = [
     "numpy>=2.5.1",
     "onnx>=1.19.0",
+    # The Rust side dlopens libonnxruntime.so from this wheel via
+    # ORT_DYLIB_PATH, so it is a runtime dependency of generation and the
+    # arena, not only of the Python learner. It was previously installed by
+    # hand, which meant `uv sync` produced an environment that imported fine
+    # and could not run a single game.
+    #
+    # A from-source build (installed as onnxruntime_trt or
+    # onnxruntime_blackwell) still wins if one is present: runtime_environment
+    # tries those directory names before this wheel's plain "onnxruntime". See
+    # 38919af -- the prebuilt wheel had no sm_120 kernel image for a while,
+    # which is why the from-source path exists at all.
+    "onnxruntime-gpu>=1.28.0; sys_platform == 'win32' or sys_platform == 'linux'",
     "onnxscript>=0.5.0",
     "torch>=2.13.0",
     "triton-windows>=3.7,<3.8; sys_platform == 'win32'",
