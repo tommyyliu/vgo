@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::{Color, Point, Position, Validation, legal_set, numeric, voronoi};
 
@@ -41,23 +41,92 @@ impl Outcome {
 }
 
 #[derive(Clone, Debug)]
-pub struct SurvivalEvidence {
-    pub stone: usize,
-    pub vertex: Point,
-    pub free_distance: f64,
-    pub influence_radius: f64,
-}
-
-#[derive(Clone, Debug)]
 pub struct Analysis {
     pub validation: Validation,
     pub geometry: voronoi::Geometry,
     pub legal_vertices: Vec<Point>,
     pub alive_groups: HashSet<usize>,
     pub settled_groups: HashSet<usize>,
-    pub survival_evidence: HashMap<usize, SurvivalEvidence>,
     pub score: Score,
     pub outcome: Outcome,
+}
+
+/// Which groups are settled, without the scoring a full `Analysis` carries.
+///
+/// `place` applies captures before it can know the committed position, so it
+/// analyses the provisional board once, and again if removing enemy stones
+/// changed it. Those two calls read `settled_groups` and `geometry.groups` and
+/// nothing else -- the score they compute describes a board that is about to
+/// change, and the outcome derived from it is discarded.
+///
+/// Sharing `settlement` between them keeps the liveness search in one place
+/// while letting the intermediate callers skip what they would throw away.
+#[derive(Clone, Debug)]
+pub struct Settlement {
+    pub geometry: voronoi::Geometry,
+    pub settled_groups: HashSet<usize>,
+}
+
+/// Groups with a witness that a placement can still reach them.
+///
+/// The shared core of `Analysis::new` and `Settlement::new`: everything either
+/// one needs before it can say which groups are settled.
+fn alive_groups_of(
+    position: &Position,
+    geometry: &voronoi::Geometry,
+    legal_vertices: &[Point],
+    playable: bool,
+) -> HashSet<usize> {
+    let mut alive_groups = HashSet::new();
+    if !playable {
+        return alive_groups;
+    }
+    for (stone_index, cell) in geometry.cells.iter().enumerate() {
+        let group = geometry.groups[stone_index];
+        if alive_groups.contains(&group) {
+            continue;
+        }
+        let stone = position.stones()[stone_index];
+        let stone_point = Point::new(stone.x, stone.y);
+        for &vertex in &cell.polygon {
+            if legal_set::escape_witness(position, vertex, stone_point, Some(legal_vertices))
+                .is_some()
+            {
+                alive_groups.insert(group);
+                break;
+            }
+        }
+    }
+    alive_groups
+}
+
+fn settled_from(geometry: &voronoi::Geometry, alive_groups: &HashSet<usize>) -> HashSet<usize> {
+    geometry
+        .groups
+        .iter()
+        .copied()
+        .filter(|group| !alive_groups.contains(group))
+        .collect()
+}
+
+impl Settlement {
+    /// Settlement alone, skipping the score and outcome a full analysis builds.
+    #[must_use]
+    pub fn new(position: &Position) -> Self {
+        let geometry = voronoi::compute(position);
+        let legal_vertices = legal_set::vertices(position);
+        let alive_groups = alive_groups_of(
+            position,
+            &geometry,
+            &legal_vertices,
+            position.validate().is_playable(),
+        );
+        let settled_groups = settled_from(&geometry, &alive_groups);
+        Self {
+            geometry,
+            settled_groups,
+        }
+    }
 }
 
 impl Analysis {
@@ -66,46 +135,9 @@ impl Analysis {
         let validation = position.validate();
         let geometry = voronoi::compute(position);
         let legal_vertices = legal_set::vertices(position);
-        let mut alive_groups = HashSet::new();
-        let mut survival_evidence = HashMap::new();
-
-        if validation.is_playable() {
-            for (stone_index, cell) in geometry.cells.iter().enumerate() {
-                let group = geometry.groups[stone_index];
-                if alive_groups.contains(&group) {
-                    continue;
-                }
-                let stone = position.stones()[stone_index];
-                for &vertex in &cell.polygon {
-                    let stone_point = Point::new(stone.x, stone.y);
-                    if let Some(witness) = legal_set::escape_witness(
-                        position,
-                        vertex,
-                        stone_point,
-                        Some(&legal_vertices),
-                    ) {
-                        alive_groups.insert(group);
-                        survival_evidence.insert(
-                            group,
-                            SurvivalEvidence {
-                                stone: stone_index,
-                                vertex,
-                                free_distance: vertex.distance(witness),
-                                influence_radius: vertex.distance(stone_point),
-                            },
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-
-        let settled_groups = geometry
-            .groups
-            .iter()
-            .copied()
-            .filter(|group| !alive_groups.contains(group))
-            .collect();
+        let alive_groups =
+            alive_groups_of(position, &geometry, &legal_vertices, validation.is_playable());
+        let settled_groups = settled_from(&geometry, &alive_groups);
         let mut score = Score::default();
         for (index, stone) in position.stones().iter().enumerate() {
             match stone.color {
@@ -138,7 +170,6 @@ impl Analysis {
             legal_vertices,
             alive_groups,
             settled_groups,
-            survival_evidence,
             score,
             outcome: Outcome {
                 winner,

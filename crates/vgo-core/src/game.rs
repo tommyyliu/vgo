@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{Analysis, Color, Phase, Position, Stone, legal_set};
+use crate::{Analysis, Color, Phase, Position, Settlement, Stone, legal_set};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MoveError {
@@ -25,16 +25,16 @@ pub struct MoveResult {
     pub captured: usize,
 }
 
-fn remove_settled(position: &Position, analysis: &Analysis, color: Color) -> (Position, usize) {
+fn remove_settled(position: &Position, settlement: &Settlement, color: Color) -> (Position, usize) {
     let doomed: HashSet<usize> = position
         .stones()
         .iter()
         .enumerate()
         .filter(|(index, stone)| {
             stone.color == color
-                && analysis
+                && settlement
                     .settled_groups
-                    .contains(&analysis.geometry.groups[*index])
+                    .contains(&settlement.geometry.groups[*index])
         })
         .map(|(index, _)| index)
         .collect();
@@ -66,15 +66,19 @@ pub fn place(position: &Position, x: f64, y: f64) -> Result<MoveResult, MoveErro
     let mut stones = position.stones().to_vec();
     stones.push(Stone::new(x, y, mover));
     let mut provisional = position.with_stones(stones);
-    let mut current_analysis = Analysis::new(&provisional);
+    // Settlement only: both of these describe a board that captures are about
+    // to change, so the score and outcome a full analysis would compute are
+    // discarded unread. Only the committed position below needs those.
+    let mut current_settlement = Settlement::new(&provisional);
 
-    let (after_enemy, enemy_count) = remove_settled(&provisional, &current_analysis, mover.other());
+    let (after_enemy, enemy_count) =
+        remove_settled(&provisional, &current_settlement, mover.other());
     provisional = after_enemy;
     if enemy_count > 0 {
-        current_analysis = Analysis::new(&provisional);
+        current_settlement = Settlement::new(&provisional);
     }
 
-    let (after_self, self_count) = remove_settled(&provisional, &current_analysis, mover);
+    let (after_self, self_count) = remove_settled(&provisional, &current_settlement, mover);
     // A placement that leaves the board exactly as it was is a pass, not a
     // move. Comparing the stone counts rather than the capture counts states
     // that directly: a lone stone that self-captures is a no-op, while a
