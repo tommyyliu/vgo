@@ -53,7 +53,7 @@ fn visit_candidates(
     for stone in position.stones() {
         let dx = point.x - stone.x;
         let dy = point.y - stone.y;
-        let radial_distance = dx.hypot(dy);
+        let radial_distance = numeric::length(dx, dy);
         let directions: &[(f64, f64)] = if radial_distance < numeric::EDGE_EPSILON {
             &[(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
         } else {
@@ -145,7 +145,7 @@ pub fn vertices(position: &Position) -> Vec<Point> {
         for second in first + 1..stones.len() {
             let dx = stones[second].x - stones[first].x;
             let dy = stones[second].y - stones[first].y;
-            let separation = dx.hypot(dy);
+            let separation = numeric::length(dx, dy);
             if separation < numeric::EDGE_EPSILON
                 || separation > 2.0 * diameter + numeric::COORDINATE_EPSILON
             {
@@ -258,7 +258,7 @@ pub fn nearest_with(
     for stone in position.stones() {
         let dx = point.x - stone.x;
         let dy = point.y - stone.y;
-        let radial = dx.hypot(dy);
+        let radial = numeric::length(dx, dy);
         // A query exactly on a stone's centre has no ray to push along, so try
         // the four axes instead of dividing by zero.
         if radial < numeric::EDGE_EPSILON {
@@ -333,7 +333,7 @@ fn clear_by_margin(position: &Position, point: Point) -> Point {
     for _ in 0..4 {
         let mut worst: Option<(f64, &crate::Stone)> = None;
         for stone in position.stones() {
-            let distance = (moved.x - stone.x).hypot(moved.y - stone.y);
+            let distance = numeric::length(moved.x - stone.x, moved.y - stone.y);
             if distance < target && worst.is_none_or(|(seen, _)| distance < seen) {
                 worst = Some((distance, stone));
             }

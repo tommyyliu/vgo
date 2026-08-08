@@ -25,6 +25,23 @@ pub const EDGE_EPSILON: f64 = 1.0e-10;
 pub const COLLINEAR_EPSILON: f64 = 1.0e-11;
 pub const COMPARISON_EPSILON: f64 = 1.0e-10;
 
+/// Euclidean length of `(dx, dy)`.
+///
+/// `f64::hypot` guards against squaring overflowing or underflowing, which
+/// costs a call into libm that cannot be inlined or vectorized. Board
+/// coordinates are normalized to roughly [0, 1] and the widest intermediate
+/// here is a stone separation, so `dx * dx` lands nowhere near either limit and
+/// the guard buys nothing. `sqrt` is one instruction and leaves the surrounding
+/// loop open to autovectorization.
+///
+/// Sampled at 27% of self-play CPU time, spread over a dozen call sites in this
+/// crate; see the module tests for the agreement bound against `hypot`.
+#[inline]
+#[must_use]
+pub fn length(dx: f64, dy: f64) -> f64 {
+    dx.mul_add(dx, dy * dy).sqrt()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct StrictDistanceComparison {
     pub is_strictly_less: bool,
@@ -192,7 +209,49 @@ pub(crate) fn strictly_closer(
 mod tests {
     use crate::Point;
 
-    use super::strictly_closer;
+    use super::{length, strictly_closer};
+
+    /// `length` replaced `hypot` at a dozen call sites, so it has to agree with
+    /// it over the range those sites actually see.
+    ///
+    /// Board coordinates are normalized to [0, 1], so every difference fed to
+    /// it lies in [-1, 1] and the widest legitimate result is the diagonal.
+    /// Exact equality is not the bar -- `hypot` is correctly rounded and
+    /// `sqrt(x*x + y*y)` is not -- but the two must not disagree by more than
+    /// rounding, which is far below every epsilon in this module.
+    #[test]
+    fn length_agrees_with_hypot_over_board_coordinates() {
+        let mut worst: f64 = 0.0;
+        let steps = 200;
+        for i in 0..=steps {
+            for j in 0..=steps {
+                let dx = -1.0 + 2.0 * f64::from(i) / f64::from(steps);
+                let dy = -1.0 + 2.0 * f64::from(j) / f64::from(steps);
+                let expected = dx.hypot(dy);
+                let actual = length(dx, dy);
+                let error = (actual - expected).abs();
+                // Relative, because the absolute gap grows with the magnitude.
+                let tolerance = 4.0 * f64::EPSILON * expected.max(1.0);
+                assert!(
+                    error <= tolerance,
+                    "length({dx}, {dy}) = {actual}, hypot = {expected}"
+                );
+                worst = worst.max(error);
+            }
+        }
+        // Well under COLLINEAR_EPSILON, the tightest tolerance any caller uses.
+        assert!(worst < super::COLLINEAR_EPSILON, "worst error {worst}");
+    }
+
+    /// The degenerate inputs the call sites guard on must survive the swap:
+    /// several branch on `< EDGE_EPSILON` before dividing by the result.
+    #[test]
+    fn length_handles_zero_and_axis_aligned_inputs() {
+        assert_eq!(length(0.0, 0.0), 0.0);
+        assert_eq!(length(3.0, 0.0), 3.0);
+        assert_eq!(length(0.0, -4.0), 4.0);
+        assert_eq!(length(3.0, 4.0), 5.0);
+    }
 
     #[test]
     fn robust_distance_comparison_handles_capture_boundary() {

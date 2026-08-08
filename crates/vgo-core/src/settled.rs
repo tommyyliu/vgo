@@ -69,7 +69,7 @@ impl<'a> SettledRegion<'a> {
             .iter()
             .enumerate()
             .map(|(index, other)| {
-                let separation = (other.x - origin.x).hypot(other.y - origin.y);
+                let separation = numeric::length(other.x - origin.x, other.y - origin.y);
                 (index, separation)
             })
             .collect();
@@ -139,7 +139,7 @@ impl<'a> SettledRegion<'a> {
                 }
                 let px = self.origin.x + t * ux - other.x;
                 let py = self.origin.y + t * uy - other.y;
-                let span = px.hypot(py);
+                let span = numeric::length(px, py);
                 if span < numeric::EDGE_EPSILON {
                     continue;
                 }
@@ -183,7 +183,7 @@ impl<'a> SettledRegion<'a> {
                 } else {
                     (reached_x, line)
                 };
-                if ((foot_x - reached_x).hypot(foot_y - reached_y) - t).abs()
+                if (numeric::length(foot_x - reached_x, foot_y - reached_y) - t).abs()
                     > numeric::EDGE_EPSILON
                 {
                     continue;
@@ -220,7 +220,7 @@ impl<'a> SettledRegion<'a> {
     pub fn contains(&self, point: Point) -> bool {
         let dx = point.x - self.origin.x;
         let dy = point.y - self.origin.y;
-        let distance = dx.hypot(dy);
+        let distance = numeric::length(dx, dy);
         if distance < numeric::EDGE_EPSILON {
             return true;
         }
@@ -320,8 +320,10 @@ impl<'a> SettledRegion<'a> {
                 * ((region.origin.x + ta * ax) + (region.origin.x + tb * bx));
             let chord_y = 0.5
                 * ((region.origin.y + ta * ay) + (region.origin.y + tb * by));
-            let deviation = (region.origin.x + tm * ux - chord_x)
-                .hypot(region.origin.y + tm * uy - chord_y);
+            let deviation = numeric::length(
+                region.origin.x + tm * ux - chord_x,
+                region.origin.y + tm * uy - chord_y,
+            );
             if depth >= max_depth || deviation <= tolerance {
                 loop_points.push(Point::new(
                     region.origin.x + tm * ux,

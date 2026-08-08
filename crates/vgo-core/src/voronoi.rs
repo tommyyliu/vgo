@@ -14,7 +14,7 @@ impl Point {
 
     #[must_use]
     pub fn distance(self, other: Self) -> f64 {
-        (self.x - other.x).hypot(self.y - other.y)
+        numeric::length(self.x - other.x, self.y - other.y)
     }
 }
 
@@ -118,7 +118,7 @@ fn normalize_polygon(points: Vec<Point>) -> Vec<Point> {
             let bcx = c.x - b.x;
             let bcy = c.y - b.y;
             let cross = abx.mul_add(bcy, -aby * bcx);
-            let scale = abx.hypot(aby) + bcx.hypot(bcy);
+            let scale = numeric::length(abx, aby) + numeric::length(bcx, bcy);
             if cross.abs() <= numeric::COLLINEAR_EPSILON * scale.max(1.0) {
                 changed = true;
             } else {
@@ -208,7 +208,7 @@ fn bisector_constraint(position: &Position, stone: usize, other: usize) -> Const
 }
 
 fn residual(constraint: Constraint, point: Point) -> f64 {
-    let length = constraint.nx.hypot(constraint.ny);
+    let length = numeric::length(constraint.nx, constraint.ny);
     if length == 0.0 {
         return f64::INFINITY;
     }
