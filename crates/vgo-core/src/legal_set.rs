@@ -284,17 +284,44 @@ pub fn nearest_with(
         None => candidates.extend(vertices(position)),
     }
 
-    let mut best: Option<(f64, Point)> = None;
-    for candidate in candidates {
-        if !contains(position, candidate.x, candidate.y) {
-            continue;
+    // Nearest first, then stop at the first legal one: the scan wants the
+    // closest candidate `contains` accepts, so testing in distance order makes
+    // the first acceptance the answer and leaves the rest untested.
+    //
+    // Selected lazily rather than by sorting the list up front. Sorting costs
+    // O(m log m) over a candidate list the vertex set makes O(n^2), and a query
+    // deep in contested space -- which is most of what a search asks about --
+    // walks far enough down the order to pay all of it. Repeatedly taking the
+    // minimum instead costs one linear pass per candidate actually tested, so
+    // an answer found immediately does almost no work and an answer found last
+    // degrades to the exhaustive scan rather than losing to it.
+    let mut ranked: Vec<(f64, Point)> = candidates
+        .into_iter()
+        .map(|candidate| {
+            let dx = candidate.x - point.x;
+            let dy = candidate.y - point.y;
+            (dx.mul_add(dx, dy * dy), candidate)
+        })
+        .collect();
+    let mut best = None;
+    let mut remaining = ranked.len();
+    while remaining > 0 {
+        // `total_cmp` rather than `partial_cmp`: a NaN key must not silently
+        // win the minimum, and candidates are clamped but not proven finite.
+        let (index, _) = ranked[..remaining]
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.0.total_cmp(&b.1.0))
+            .expect("remaining is non-zero");
+        let (_, candidate) = ranked[index];
+        if contains(position, candidate.x, candidate.y) {
+            best = Some(candidate);
+            break;
         }
-        let dx = candidate.x - point.x;
-        let dy = candidate.y - point.y;
-        let squared = dx.mul_add(dx, dy * dy);
-        if best.is_none_or(|(best_squared, _)| squared < best_squared) {
-            best = Some((squared, candidate));
-        }
+        // Retire the rejected candidate by swapping the unscanned tail over it,
+        // so the next pass never reconsiders it.
+        remaining -= 1;
+        ranked.swap(index, remaining);
     }
     match best {
         // No legal point exists anywhere: the board is full, and the caller
@@ -304,7 +331,7 @@ pub fn nearest_with(
             legal: false,
             snapped: false,
         },
-        Some((_, found)) => Nearest {
+        Some(found) => Nearest {
             point: clear_by_margin(position, found),
             legal: true,
             snapped: true,
@@ -386,7 +413,7 @@ pub(crate) fn escape_witness(
 mod tests {
     use crate::{Color, Point, Position, Stone};
 
-    use super::{contains, distance, nearest, vertices};
+    use super::{contains, distance, nearest, nearest_with, vertices};
 
     #[test]
     fn closed_boundaries_are_legal() {
@@ -427,13 +454,127 @@ mod tests {
         assert!(!found.snapped, "a legal query must not be moved");
     }
 
+    /// Selecting lazily must pick exactly what the exhaustive scan did.
+    ///
+    /// The original scan kept a strict `<` running minimum, so among candidates
+    /// at an equal distance it kept the first in list order. Retiring rejected
+    /// candidates by swapping the tail over them reorders the list, so ties are
+    /// no longer resolved by position. This replays both over random positions
+    /// and compares the chosen point -- a disagreement is a silently different
+    /// move, not a test failure anyone would otherwise notice.
+    #[test]
+    fn lazy_nearest_matches_the_exhaustive_scan() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let radius = 0.05571428571428571;
+        for _ in 0..400 {
+            let count = 1 + (next() * 30.0) as usize;
+            let mut stones = Vec::new();
+            let mut attempts = 0;
+            while stones.len() < count && attempts < 2000 {
+                attempts += 1;
+                let x = radius + next() * (1.0 - 2.0 * radius);
+                let y = radius + next() * (1.0 - 2.0 * radius);
+                if stones.iter().all(|s: &crate::Stone| {
+                    super::numeric::length(s.x - x, s.y - y) >= 2.0 * radius
+                }) {
+                    let colour = if stones.len() % 2 == 0 {
+                        crate::Color::Black
+                    } else {
+                        crate::Color::White
+                    };
+                    stones.push(crate::Stone::new(x, y, colour));
+                }
+            }
+            let position = crate::Position::new(radius, stones, crate::Color::Black);
+            let known = vertices(&position);
+            for _ in 0..6 {
+                let query = Point::new(next(), next());
+                let fast = nearest_with(&position, query, Some(&known));
+                let slow = exhaustive_nearest(&position, query, &known);
+                assert_eq!(
+                    (fast.legal, fast.snapped),
+                    (slow.0, slow.2),
+                    "legality/snap disagreed at {query:?}"
+                );
+                if fast.legal {
+                    let dx = fast.point.x - slow.1.x;
+                    let dy = fast.point.y - slow.1.y;
+                    assert!(
+                        super::numeric::length(dx, dy) < 1.0e-12,
+                        "chose {:?}, exhaustive chose {:?}",
+                        fast.point,
+                        slow.1
+                    );
+                }
+            }
+        }
+    }
+
+    /// The pre-optimization scan: build every candidate, test all of them,
+    /// keep a strict running minimum. Mirrors `nearest_with` exactly.
+    fn exhaustive_nearest(
+        position: &Position,
+        point: Point,
+        known: &[Point],
+    ) -> (bool, Point, bool) {
+        if contains(position, point.x, point.y) {
+            return (true, point, false);
+        }
+        let radius = position.radius();
+        let diameter = 2.0 * radius + super::numeric::SNAP_MARGIN;
+        let inset = (radius + super::numeric::SNAP_MARGIN).min(0.5);
+        let clamp = |value: f64| value.clamp(inset.min(1.0 - inset), inset.max(1.0 - inset));
+        let mut candidates = vec![Point::new(clamp(point.x), clamp(point.y))];
+        for stone in position.stones() {
+            let dx = point.x - stone.x;
+            let dy = point.y - stone.y;
+            let radial = super::numeric::length(dx, dy);
+            if radial < super::numeric::EDGE_EPSILON {
+                for (ux, uy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                    candidates.push(Point::new(
+                        clamp(stone.x + diameter * ux),
+                        clamp(stone.y + diameter * uy),
+                    ));
+                }
+            } else {
+                candidates.push(Point::new(
+                    clamp(stone.x + diameter * dx / radial),
+                    clamp(stone.y + diameter * dy / radial),
+                ));
+            }
+        }
+        candidates.push(Point::new(inset, clamp(point.y)));
+        candidates.push(Point::new(1.0 - inset, clamp(point.y)));
+        candidates.push(Point::new(clamp(point.x), inset));
+        candidates.push(Point::new(clamp(point.x), 1.0 - inset));
+        candidates.extend_from_slice(known);
+        let mut best: Option<(f64, Point)> = None;
+        for candidate in candidates {
+            if !contains(position, candidate.x, candidate.y) {
+                continue;
+            }
+            let dx = candidate.x - point.x;
+            let dy = candidate.y - point.y;
+            let squared = dx.mul_add(dx, dy * dy);
+            if best.is_none_or(|(best_squared, _)| squared < best_squared) {
+                best = Some((squared, candidate));
+            }
+        }
+        match best {
+            None => (false, point, false),
+            Some((_, found)) => (true, super::clear_by_margin(position, found), true),
+        }
+    }
+
     #[test]
     fn nearest_projects_an_illegal_query_onto_the_legal_set() {
-        let position = Position::new(
-            0.1,
-            vec![Stone::new(0.5, 0.5, Color::Black)],
-            Color::Black,
-        );
+        let position = Position::new(0.1, vec![Stone::new(0.5, 0.5, Color::Black)], Color::Black);
         // Directly on the stone's centre: illegal, and with no ray to push
         // along, so this also covers the degenerate direction case.
         let found = nearest(&position, Point::new(0.5, 0.5));
@@ -480,7 +621,10 @@ mod tests {
         // A lattice that steps over the sliver cannot name it, but the nearest
         // cell it can name projects back into it.
         let coarse = 0.5 + 0.003;
-        assert!(!contains(&position, coarse, 0.5), "the probe must be illegal");
+        assert!(
+            !contains(&position, coarse, 0.5),
+            "the probe must be illegal"
+        );
         let found = nearest(&position, Point::new(coarse, 0.5));
         assert!(found.legal && found.snapped);
         assert!(contains(&position, found.point.x, found.point.y));
