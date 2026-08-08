@@ -300,12 +300,33 @@ fn edge_source(constraints: &[Constraint], start: Point, end: Point) -> Option<E
         .map(|(_, source)| source)
 }
 
+/// Circumradius of a polygon about a site: the furthest its boundary reaches.
+///
+/// The cutoff in `compute` compares candidate distances against twice this, so
+/// an empty polygon has to answer zero rather than the identity of a maximum
+/// over nothing -- a cell clipped away entirely can admit no further bisector.
+fn circumradius(polygon: &[Vertex], site: Point) -> f64 {
+    polygon
+        .iter()
+        .map(|vertex| numeric::length(vertex.point.x - site.x, vertex.point.y - site.y))
+        .fold(0.0, f64::max)
+}
+
 #[must_use]
 pub fn compute(position: &Position) -> Geometry {
     let count = position.stones().len();
     let mut cells = Vec::with_capacity(count);
     let mut adjacency = vec![Vec::new(); count];
     let mut diagnostics = GeometryDiagnostics::default();
+
+    // Candidates are visited in increasing distance so the cutoff below can
+    // stop rather than merely skip: clipping only shrinks the polygon, so its
+    // circumradius falls monotonically while the distance rises, and once the
+    // two cross they stay crossed. Sorting is O(n log n) per cell against the
+    // O(n) clips it saves, which is why this is a stepping stone -- a grid
+    // walked outward enumerates in approximately this order for far less. See
+    // docs/VORONOI_CUTOFF.md.
+    let mut order: Vec<(f64, usize)> = Vec::with_capacity(count.saturating_sub(1));
 
     for (stone, neighbors) in adjacency.iter_mut().enumerate() {
         // The starting square's sides are board edges, each vertex owning the
@@ -328,9 +349,39 @@ pub fn compute(position: &Position) -> Geometry {
                 outgoing: Some(EdgeSource::Board(BoardSide::Left)),
             },
         ];
+        let site = {
+            let s = position.stones()[stone];
+            Point::new(s.x, s.y)
+        };
+        order.clear();
         for other in 0..count {
-            if other == stone || polygon.is_empty() {
+            if other == stone {
                 continue;
+            }
+            let o = position.stones()[other];
+            order.push((numeric::length(o.x - site.x, o.y - site.y), other));
+        }
+        // `total_cmp` so a NaN coordinate cannot make the comparator
+        // inconsistent; ties break by index, which keeps the clip sequence a
+        // function of the position rather than of sort implementation details.
+        order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        for &(distance, other) in &order {
+            if polygon.is_empty() {
+                break;
+            }
+            // Claim 1: |p - s| <= R for every p in the polygon, so a site
+            // further than 2R has |p - o| >= |o - s| - |p - s| > R >= |p - s|
+            // and its bisector cannot cut. Claim 2: R is non-increasing and
+            // `distance` non-decreasing, so this holds for every later
+            // candidate too and the loop stops rather than skipping.
+            //
+            // The margin is one epsilon of slack against `R` reading an ulp
+            // high, which would stop a clip early and leave the cell wrong.
+            // Erring the other way costs a no-op clip.
+            if distance > 2.0f64.mul_add(circumradius(&polygon, site), numeric::COORDINATE_EPSILON)
+            {
+                break;
             }
             let constraint = bisector_constraint(position, stone, other);
             polygon = clip_half_plane(polygon, constraint);
@@ -413,9 +464,132 @@ pub fn compute(position: &Position) -> Geometry {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Color, Position, Stone};
+    use crate::{Color, Point, Position, Stone};
 
     use super::{EdgeSource, compute, edge_source};
+
+    /// Clipping against every stone, the way `compute` did before the cutoff.
+    ///
+    /// The specification the cutoff is measured against: it must produce the
+    /// same diagram, not a close one. See docs/VORONOI_CUTOFF.md.
+    fn compute_exhaustively(position: &Position) -> Vec<(Vec<Point>, f64)> {
+        let count = position.stones().len();
+        let mut out = Vec::with_capacity(count);
+        for stone in 0..count {
+            let mut polygon = vec![
+                super::Vertex { point: Point::new(0.0, 0.0), outgoing: None },
+                super::Vertex { point: Point::new(1.0, 0.0), outgoing: None },
+                super::Vertex { point: Point::new(1.0, 1.0), outgoing: None },
+                super::Vertex { point: Point::new(0.0, 1.0), outgoing: None },
+            ];
+            // Same order the cutoff visits in, so only the stopping differs.
+            let site = {
+                let s = position.stones()[stone];
+                Point::new(s.x, s.y)
+            };
+            let mut order: Vec<(f64, usize)> = (0..count)
+                .filter(|&other| other != stone)
+                .map(|other| {
+                    let o = position.stones()[other];
+                    (super::numeric::length(o.x - site.x, o.y - site.y), other)
+                })
+                .collect();
+            order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            for &(_, other) in &order {
+                if polygon.is_empty() {
+                    break;
+                }
+                polygon = super::clip_half_plane(
+                    polygon,
+                    super::bisector_constraint(position, stone, other),
+                );
+            }
+            polygon = super::normalize_polygon(polygon);
+            let points: Vec<Point> = polygon.iter().map(|v| v.point).collect();
+            let area = super::polygon_area(&points);
+            out.push((points, area));
+        }
+        out
+    }
+
+    /// The distance cutoff must not change the diagram, only how long it takes.
+    ///
+    /// Stopping early is sound only if a stone beyond twice the current
+    /// circumradius truly cannot cut the polygon (claim 1) and no later one can
+    /// either (claim 2). Both are geometric arguments about exact reals; this
+    /// checks they survive contact with f64 over boards including the tangent
+    /// packing real games produce, where stones sit at exactly 2r and the
+    /// bound is tightest.
+    #[test]
+    fn the_distance_cutoff_matches_exhaustive_clipping() {
+        let radius = 0.055_714_285_714_285_716_f64;
+        let mut state = 0x7A3C_1F58_D02E_9B46_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (mut cells, mut boards) = (0_usize, 0_usize);
+        for round in 0..240 {
+            // Half the boards pack stones at exactly 2r from an existing one.
+            let tangent = round % 2 == 1;
+            let mut stones: Vec<Stone> = Vec::new();
+            let mut tries = 0;
+            while stones.len() < 26 && tries < 40_000 {
+                tries += 1;
+                let (x, y) = if tangent && !stones.is_empty() && next() < 0.7 {
+                    let s = stones[(next() * stones.len() as f64) as usize % stones.len()];
+                    let angle = next() * std::f64::consts::TAU;
+                    (s.x + 2.0 * radius * angle.cos(), s.y + 2.0 * radius * angle.sin())
+                } else {
+                    (radius + next() * (1.0 - 2.0 * radius), radius + next() * (1.0 - 2.0 * radius))
+                };
+                if x < radius || x > 1.0 - radius || y < radius || y > 1.0 - radius {
+                    continue;
+                }
+                if stones.iter().all(|s: &Stone| {
+                    super::numeric::length(s.x - x, s.y - y) >= 2.0 * radius - 1.0e-12
+                }) {
+                    let colour = if stones.len() % 2 == 0 { Color::Black } else { Color::White };
+                    stones.push(Stone::new(x, y, colour));
+                }
+            }
+            if stones.len() < 20 {
+                continue;
+            }
+            let position = Position::new(radius, stones, Color::Black);
+            let fast = compute(&position);
+            let slow = compute_exhaustively(&position);
+            boards += 1;
+            for (index, (points, area)) in slow.iter().enumerate() {
+                let cell = &fast.cells[index];
+                assert_eq!(
+                    cell.polygon.len(),
+                    points.len(),
+                    "cell {index} has {} vertices, exhaustive has {}",
+                    cell.polygon.len(),
+                    points.len()
+                );
+                for (a, b) in cell.polygon.iter().zip(points.iter()) {
+                    assert_eq!(
+                        (a.x.to_bits(), a.y.to_bits()),
+                        (b.x.to_bits(), b.y.to_bits()),
+                        "cell {index} vertex differs: {a:?} vs {b:?}"
+                    );
+                }
+                assert_eq!(
+                    cell.area.to_bits(),
+                    area.to_bits(),
+                    "cell {index} area differs: {} vs {area}",
+                    cell.area
+                );
+                cells += 1;
+            }
+        }
+        assert!(boards > 100, "only {boards} boards exercised");
+        assert!(cells > 2_000, "only {cells} cells compared");
+    }
 
     /// Provenance recorded at clip time must agree with the reverse lookup.
     ///
