@@ -95,6 +95,13 @@ class LearnerConfig:
     # checkpoint carrying it is fixed to the raster it was constructed for.
     context_attention_blocks: int = 0
     attention_heads: int = 8
+    # Muon on the conv/linear trunk, Adam on heads, norms and biases. 0.0 keeps
+    # plain Adam everywhere, which is what every run before this used. Measured
+    # on the 25-shard window, the same w96 model reached policy_kl 0.845 at
+    # epoch 1 under Adam against 0.736 under Muon, and the architecture sweep
+    # that chose w64 was run entirely under Muon -- so a run comparing itself to
+    # those numbers has to use it.
+    muon_learning_rate: float = 0.0
     threads: int = 4
     device: str = "cuda"
     precision: str = "float32"
@@ -1062,6 +1069,45 @@ def _atomic_torch_save(value: object, output: Path) -> None:
             os.close(descriptor)
 
 
+def _build_optimizer(
+    model: nn.Module,
+    config: "LearnerConfig",
+    log: "Callable[[str], None]",
+) -> torch.optim.Optimizer:
+    """Adam, or Muon on the trunk with Adam on everything else.
+
+    `muon_learning_rate` of 0.0 keeps the plain Adam every run before this
+    used. Above zero, 2D+ weights that are not an output head go to Muon: the
+    heads are 1x1 convs and thin linears, which are rank-degenerate and so
+    meaningless to orthogonalize, and norm weights are 1D.
+    """
+    if config.muon_learning_rate <= 0.0:
+        return torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+
+    from .muon import HybridMuon
+
+    trunk, rest = [], []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        head = any(
+            token in name
+            for token in ("policy_map", "pass_head", "value_head", "ownership_map")
+        )
+        (trunk if parameter.ndim >= 2 and not head else rest).append(parameter)
+    log(
+        f"muon: {sum(p.numel() for p in trunk):,} trunk params @ lr "
+        f"{config.muon_learning_rate}, {sum(p.numel() for p in rest):,} on Adam "
+        f"@ lr {config.learning_rate}"
+    )
+    return HybridMuon(
+        [
+            {"params": trunk, "lr": config.muon_learning_rate, "use_muon": True},
+            {"params": rest, "lr": config.learning_rate, "use_muon": False},
+        ]
+    )
+
+
 class PersistentLearner:
     """Long-lived model, optimizer, replay cache, and staging-buffer owner."""
 
@@ -1282,7 +1328,7 @@ class PersistentLearner:
                 torch.set_float32_matmul_precision("high")
                 torch.backends.cudnn.benchmark = True
                 model.compile()
-            optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+            optimizer = _build_optimizer(model, config, self._log)
             if config.restore_optimizer and checkpoint.get("optimizer_state_dict") is not None:
                 try:
                     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -1307,14 +1353,20 @@ class PersistentLearner:
             optimizer_restored = config.restore_optimizer
             if not config.restore_optimizer:
                 assert self.model is not None
-                self.optimizer = torch.optim.Adam(
-                    self.model.parameters(), lr=config.learning_rate
-                )
+                self.optimizer = _build_optimizer(self.model, config, self._log)
 
         assert self.optimizer is not None
         for group in self.optimizer.param_groups:
-            group["lr"] = config.learning_rate
-            group["initial_lr"] = config.learning_rate
+            # A Muon group keeps its own rate. Stamping the Adam rate over every
+            # group would silently drop the trunk from 0.01 to 1e-3, and the
+            # scheduler multiplies from `initial_lr`, so both have to survive.
+            rate = (
+                config.muon_learning_rate
+                if group.get("use_muon")
+                else config.learning_rate
+            )
+            group["lr"] = rate
+            group["initial_lr"] = rate
         return optimizer_restored, parent_checkpoint, parent_checkpoint_digest
 
     def _ensure_stager(
@@ -1860,6 +1912,7 @@ def parse_arguments() -> argparse.Namespace:
         "--compile", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--muon-learning-rate", type=float, default=0.0)
     return parser.parse_args()
 
 

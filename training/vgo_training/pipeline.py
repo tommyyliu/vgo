@@ -330,6 +330,7 @@ class PipelineConfig:
     # transformer blocks. 0 is byte-identical to a net built without them.
     context_attention_blocks: int = 0
     attention_heads: int = 8
+    muon_learning_rate: float = 0.0
     model_width: int = 64
     blocks: int = 8
     training_epochs: int = 10
@@ -1420,6 +1421,7 @@ class Pipeline:
             "norm_groups": self.config.norm_groups,
             "context_attention_blocks": self.config.context_attention_blocks,
             "attention_heads": self.config.attention_heads,
+            "muon_learning_rate": self.config.muon_learning_rate,
             "threads": self.config.training_threads,
             "device": self.config.training_device,
             "precision": self.config.training_precision,
@@ -2424,6 +2426,17 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--attention-heads", type=int, default=8)
+    parser.add_argument(
+        "--muon-learning-rate",
+        type=float,
+        default=0.0,
+        help=(
+            "Muon on the conv/linear trunk at this rate, Adam on heads and "
+            "norms at --learning-rate. 0 keeps plain Adam everywhere. The "
+            "architecture sweep that chose w64 was run under Muon at 0.01, so "
+            "a run comparing itself to those numbers needs it"
+        ),
+    )
     parser.add_argument(
         "--variance-scaled",
         action=argparse.BooleanOptionalAction,
