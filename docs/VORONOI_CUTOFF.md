@@ -83,12 +83,8 @@ essentially nothing against knowing it in advance.
 ## What is not yet established
 
 - **Ordering.** The claims need candidates sorted by distance, and sorting all
-  `n - 1` per cell is `O(n log n)`, worse than the clipping it saves. The
-  intended fix is a uniform grid walked outward ring by ring, which enumerates
-  in approximately increasing distance. Claim 2 needs *exact* ordering, so
-  either the enumeration must be exactly sorted within its guarantees or the
-  stopping rule must be weakened to skipping. **This is the open design
-  question.**
+  `n - 1` per cell is `O(n log n)`, worse than the clipping it saves. This is
+  still the open question; a grid walk was tried and did not pay (below).
 
 - **Floating point in the acceptance test.** `d > 2R` is compared in `f64`. If
   `R` is high by an ulp the loop stops one candidate early and the cell is
@@ -105,7 +101,50 @@ essentially nothing against knowing it in advance.
   more than the clip it avoids -- but it means the measured counts above are of
   the rule, not of the true neighbour count (about 5).
 
+## A grid walk was tried and reverted
+
+Replacing the per-cell sort with a uniform grid walked outward ring by ring is
+the obvious way to drop the `O(n log n)`. It was implemented, made correct, and
+then reverted for being slower where it matters:
+
+| stones | per-cell sort | grid ring walk |
+| -----: | ------------: | -------------: |
+|     35 |       60.5 us |      108.5 us  |
+|    140 |      590.8 us |      617.2 us  |
+|    500 |     7012.7 us |     6251.9 us  |
+
+It only wins past ~300 stones, and production plays at 35.
+
+Why it lost: a ring is dismissed only once `(m - 1) * side` exceeds twice the
+circumradius, and with cells of `8r` that takes two rings -- a 5x5 block of
+cells. That gathers far more candidates than the ~8 the sorted walk clips, and
+each ring still sorts its own members to keep the clip sequence a function of
+the position rather than of bucket insertion order. The sort never went away;
+it moved and multiplied.
+
+Three defects were found and fixed along the way, all worth knowing if this is
+attempted again:
+
+- The ring membership test compared against `column - ring` in `usize`, which
+  underflows at the low edge and silently dropped cells. Chebyshev distance
+  (`c.abs_diff(column).max(r.abs_diff(row))`) is the version that works.
+- `dimension` was `floor(1 / side)`, leaving the last cell oversized. The ring
+  bound assumes every cell is exactly `side` wide, so stones clamped into that
+  cell were nearer than the bound claimed. `ceil` fixes it.
+- Rings 0 and 1 both touch the centre cell, so the walk cannot stop before
+  finishing ring 1 however small the circumradius is.
+
+The grid also cannot preserve bit-identity: its clip order differs from the
+sorted walk's, and clipping is not associative in `f64`. Measured over 240
+boards the polygons agreed to 8.9e-16 (4 ulps) and areas to 1.4e-16, against a
+~3 ulp baseline the existing code already has from permuting stone order. A
+120-sample shard against a real model was unchanged, so the perturbation is far
+below anything that moves a discrete decision -- but "identical geometry" stops
+being available as a test.
+
 ## Status
 
-Not implemented. The measurements come from a simulation of the rule against
-`Analysis::new`'s existing output, not from a working implementation.
+The cutoff is implemented and in `compute`. Candidates are still sorted per
+cell, so the build is `O(n^2 log n)` in the worst case and `O(n k)` in the
+clipping that dominates it; the sort is what to attack next, but not with a
+uniform grid at these board sizes.
