@@ -243,9 +243,19 @@ def build_command(
         # A model exported under a non-default layout declares its own channel
         # count, and loading validates it against the raster the arena builds.
         "--candidate-raster-kind", str(config.get("raster_kind", "semantic")),
-        # Above the run's own cap. Arena games have no resignation to shorten
-        # them, so a cap tuned for self-play truncates more of them here.
-        "--max-plies", str(int(config.get("arena_maximum_plies", 120))),
+        # Above the run's own cap, because arena games have no resignation to
+        # shorten them and a cap tuned for self-play truncates more of them
+        # here -- but derived from that cap rather than fixed at 120. A run
+        # capping self-play at 70 was paying for 120-ply arena games, which is
+        # most of why a rating pass cost over two hours: at ~58s a game the
+        # length of the game is the whole cost.
+        "--max-plies",
+        str(
+            int(
+                config.get("arena_maximum_plies")
+                or 1.5 * int(config.get("maximum_plies", 80))
+            )
+        ),
         "--threads", str(int(config.get("arena_actors", 64))),
         "--leaf-batch", str(int(config.get("leaf_batch", 4))),
         "--resolution", str(int(config.get("resolution", 128))),
