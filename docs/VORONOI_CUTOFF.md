@@ -142,6 +142,32 @@ boards the polygons agreed to 8.9e-16 (4 ulps) and areas to 1.4e-16, against a
 below anything that moves a discrete decision -- but "identical geometry" stops
 being available as a test.
 
+## The collinearity square roots were not the cost
+
+`normalize_polygon` samples at ~18% of self-play CPU and runs on every vertex
+of every intermediate polygon, once per clip. Its collinearity predicate is
+
+```text
+|cross| <= COLLINEAR_EPSILON * max(|ab| + |bc|, 1)
+```
+
+which reads as two square roots per vertex, about nine per call. Instrumenting
+the real clip sequence showed those square roots never change an outcome: over
+46,424 calls on random boards and 69,368 on tangent-packed ones, the pass
+removed **zero** vertices and never needed a second iteration. The clipper does
+not produce collinear vertices at this tolerance, so every square root was
+proving a negative.
+
+Replacing them with a one-sided squared-length rejection -- sound by
+`(|ab| + |bc|)^2 <= 2 (|ab|^2 + |bc|^2)`, falling through to the exact form when
+it cannot decide -- measured **no improvement**: 2790 us against a 2800 us
+baseline on `mcts/32-sim/spatial`, inside the noise. Reverted.
+
+The lesson is that `sqrt` is one instruction and the compiler already knew it.
+The 18% is the polygon traversal, not the arithmetic inside it: bounds checks,
+the modular indexing for the cyclic neighbours, and the `Vec` allocated per
+pass. An optimization here has to remove the walk, not the square roots.
+
 ## Status
 
 The cutoff is implemented and in `compute`. Candidates are still sorted per
