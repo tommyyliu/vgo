@@ -99,16 +99,35 @@ struct Vertex {
     outgoing: Option<EdgeSource>,
 }
 
-fn normalize_polygon(points: Vec<Vertex>) -> Vec<Vertex> {
+/// Buffers the clip path writes through, so a cell costs no allocation.
+///
+/// `clip_half_plane` and `normalize_polygon` each produced a fresh `Vec` per
+/// call, and both run once per clip -- about eight clips a cell, three
+/// allocations each. Counted with a wrapping allocator, `Analysis::new` made
+/// 643 allocations at 20 stones and 1,425 at 51, roughly 30 a cell. The
+/// polygons are a handful of vertices, so almost all of that is allocator
+/// traffic rather than memory the geometry needs.
+///
+/// One scratch is threaded through a whole `compute`, which reuses whatever
+/// capacity the widest polygon so far required.
+#[derive(Default)]
+struct Scratch {
+    output: Vec<Vertex>,
+    deduped: Vec<Vertex>,
+    clean: Vec<Vertex>,
+}
+
+fn normalize_polygon(points: &mut Vec<Vertex>, scratch: &mut Scratch) {
     if points.len() < 3 {
-        return points;
+        return;
     }
     // Dropping a vertex merges its outgoing edge into its predecessor's. The
     // survivor keeps the *later* edge's source, because that is the edge the
     // merged span actually lies on: the dropped vertex was coincident with or
     // collinear to its neighbour, so the span continues along where it led.
-    let mut deduped: Vec<Vertex> = Vec::with_capacity(points.len());
-    for vertex in points {
+    let deduped = &mut scratch.deduped;
+    deduped.clear();
+    for vertex in points.iter().copied() {
         if deduped
             .last()
             .is_none_or(|last| distance_squared(vertex.point, last.point) > numeric::EDGE_EPSILON.powi(2))
@@ -127,14 +146,16 @@ fn normalize_polygon(points: Vec<Vertex>) -> Vec<Vertex> {
             last.outgoing = tail.outgoing;
         }
     }
+    std::mem::swap(points, deduped);
 
-    let mut polygon = deduped;
+    let polygon = points;
     loop {
         if polygon.len() < 3 {
-            return polygon;
+            return;
         }
         let mut changed = false;
-        let mut clean: Vec<Vertex> = Vec::with_capacity(polygon.len());
+        let clean = &mut scratch.clean;
+        clean.clear();
         let mut pending_wrap: Option<Option<EdgeSource>> = None;
         for index in 0..polygon.len() {
             let a = polygon[(index + polygon.len() - 1) % polygon.len()].point;
@@ -168,15 +189,18 @@ fn normalize_polygon(points: Vec<Vertex>) -> Vec<Vertex> {
         if let (Some(source), Some(last)) = (pending_wrap, clean.last_mut()) {
             last.outgoing = source;
         }
-        polygon = clean;
+        std::mem::swap(polygon, clean);
         if !changed {
-            return polygon;
+            return;
         }
     }
 }
 
-fn clip_half_plane(polygon: Vec<Vertex>, constraint: Constraint) -> Vec<Vertex> {
-    let mut output = Vec::with_capacity(polygon.len() + 1);
+fn clip_half_plane(polygon: &mut Vec<Vertex>, constraint: Constraint, scratch: &mut Scratch) {
+    // Taken out of the scratch so `polygon` and the output can be borrowed at
+    // once; put back at the end, capacity intact.
+    let mut output = std::mem::take(&mut scratch.output);
+    output.clear();
     for index in 0..polygon.len() {
         let a = polygon[index];
         let b = polygon[(index + 1) % polygon.len()];
@@ -216,7 +240,12 @@ fn clip_half_plane(polygon: Vec<Vertex>, constraint: Constraint) -> Vec<Vertex> 
             }
         }
     }
-    normalize_polygon(output)
+    // The clipped result becomes the polygon, and the polygon's old buffer
+    // goes back to the scratch as next clip's output -- so the two keep
+    // trading the same two allocations for the whole of `compute`.
+    std::mem::swap(polygon, &mut output);
+    scratch.output = output;
+    normalize_polygon(polygon, scratch);
 }
 
 fn polygon_area(polygon: &[Point]) -> f64 {
@@ -327,6 +356,8 @@ pub fn compute(position: &Position) -> Geometry {
     // walked outward enumerates in approximately this order for far less. See
     // docs/VORONOI_CUTOFF.md.
     let mut order: Vec<(f64, usize)> = Vec::with_capacity(count.saturating_sub(1));
+    // One set of buffers for the whole call; see `Scratch`.
+    let mut scratch = Scratch::default();
 
     for (stone, neighbors) in adjacency.iter_mut().enumerate() {
         // The starting square's sides are board edges, each vertex owning the
@@ -384,9 +415,9 @@ pub fn compute(position: &Position) -> Geometry {
                 break;
             }
             let constraint = bisector_constraint(position, stone, other);
-            polygon = clip_half_plane(polygon, constraint);
+            clip_half_plane(&mut polygon, constraint, &mut scratch);
         }
-        polygon = normalize_polygon(polygon);
+        normalize_polygon(&mut polygon, &mut scratch);
         let mut edges = Vec::with_capacity(polygon.len());
         for index in 0..polygon.len() {
             let start = polygon[index];
@@ -475,6 +506,7 @@ mod tests {
     fn compute_exhaustively(position: &Position) -> Vec<(Vec<Point>, f64)> {
         let count = position.stones().len();
         let mut out = Vec::with_capacity(count);
+        let mut scratch = super::Scratch::default();
         for stone in 0..count {
             let mut polygon = vec![
                 super::Vertex { point: Point::new(0.0, 0.0), outgoing: None },
@@ -499,12 +531,13 @@ mod tests {
                 if polygon.is_empty() {
                     break;
                 }
-                polygon = super::clip_half_plane(
-                    polygon,
+                super::clip_half_plane(
+                    &mut polygon,
                     super::bisector_constraint(position, stone, other),
+                    &mut scratch,
                 );
             }
-            polygon = super::normalize_polygon(polygon);
+            super::normalize_polygon(&mut polygon, &mut scratch);
             let points: Vec<Point> = polygon.iter().map(|v| v.point).collect();
             let area = super::polygon_area(&points);
             out.push((points, area));
