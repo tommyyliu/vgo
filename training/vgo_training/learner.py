@@ -95,13 +95,14 @@ class LearnerConfig:
     # checkpoint carrying it is fixed to the raster it was constructed for.
     context_attention_blocks: int = 0
     attention_heads: int = 8
-    # Muon on the conv/linear trunk, Adam on heads, norms and biases. 0.0 keeps
-    # plain Adam everywhere, which is what every run before this used. Measured
-    # on the 25-shard window, the same w96 model reached policy_kl 0.845 at
-    # epoch 1 under Adam against 0.736 under Muon, and the architecture sweep
-    # that chose w64 was run entirely under Muon -- so a run comparing itself to
-    # those numbers has to use it.
-    muon_learning_rate: float = 0.0
+    # Muon on the conv/linear trunk, Adam on heads, norms and biases.
+    # Measured on the 25-shard window, the same w96 model reached policy_kl
+    # 0.845 at epoch 1 under plain Adam against 0.736 under Muon, and the
+    # architecture sweep that chose w64 ran entirely under Muon -- so a run
+    # comparing itself to those numbers has to use it. `full_adam` opts out
+    # and puts every parameter on Adam at `learning_rate`.
+    muon_learning_rate: float = 0.01
+    full_adam: bool = False
     threads: int = 4
     device: str = "cuda"
     precision: str = "float32"
@@ -1076,12 +1077,12 @@ def _build_optimizer(
 ) -> torch.optim.Optimizer:
     """Adam, or Muon on the trunk with Adam on everything else.
 
-    `muon_learning_rate` of 0.0 keeps the plain Adam every run before this
-    used. Above zero, 2D+ weights that are not an output head go to Muon: the
-    heads are 1x1 convs and thin linears, which are rank-degenerate and so
-    meaningless to orthogonalize, and norm weights are 1D.
+    `full_adam` puts every parameter on Adam, which is what every run before
+    Muon landed used. Otherwise 2D+ weights that are not an output head go to
+    Muon: the heads are 1x1 convs and thin linears, which are rank-degenerate
+    and so meaningless to orthogonalize, and norm weights are 1D.
     """
-    if config.muon_learning_rate <= 0.0:
+    if config.full_adam:
         return torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
     from .muon import HybridMuon
@@ -1912,7 +1913,8 @@ def parse_arguments() -> argparse.Namespace:
         "--compile", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--muon-learning-rate", type=float, default=0.0)
+    parser.add_argument("--muon-learning-rate", type=float, default=0.01)
+    parser.add_argument("--full-adam", action="store_true")
     return parser.parse_args()
 
 
