@@ -34,34 +34,13 @@ pub struct FineGrid {
     height: usize,
     coarse: usize, // coarse-cell size in fine cells (pool factor), both axes
     logits: Vec<f32>,
+    legal: Vec<bool>,
     /// Where each playable cell places a stone: the cell centre, unless the
     /// centre was just illegal and projected onto legal area inside the cell.
-    ///
-    /// Held as `f32` rather than `Point`, which halves the largest part of a
-    /// grid: 16 bytes a cell against 8, and at 128x128 every node of a search
-    /// tree carries one. Board coordinates live in `[0, 1]`, where `f32`
-    /// resolves to 3e-8 -- an order of magnitude inside `COORDINATE_EPSILON`
-    /// and 33x inside the `SNAP_MARGIN` that `nearest_legal_placement_with`
-    /// already pushes a snapped point past its constraint by. Measured over
-    /// 110,940 resolved placements, 86,552 of them snapped and so sitting as
-    /// close to a constraint as the geometry allows, none stopped being legal
-    /// when rounded.
-    placement: Vec<(f32, f32)>,
+    placement: Vec<Point>,
 }
 
 impl FineGrid {
-    /// Whether a cell can be played, derived rather than stored.
-    ///
-    /// `legal` was a parallel `Vec<bool>` set on exactly the cells that also
-    /// got a finite logit, so it duplicated 16 KB a node to say what the
-    /// logits already said. Cells that resolved to nothing keep the
-    /// `NEG_INFINITY` the map is initialized with, which is also what holds
-    /// them out of every softmax.
-    #[inline]
-    fn is_playable(&self, index: usize) -> bool {
-        self.logits[index] > f32::NEG_INFINITY
-    }
-
     /// Build from a fine logit map. `logit_at(row, col)` returns the net's placement
     /// logit for that fine cell; legality is decided by placing a stone at the cell
     /// centre. `coarse` is the pool factor (e.g. 8 turns a 128 grid into 16 coarse
@@ -75,6 +54,7 @@ impl FineGrid {
     ) -> Self {
         let coarse = coarse.clamp(1, width.min(height));
         let mut logits = vec![f32::NEG_INFINITY; width * height];
+        let mut legal = vec![false; width * height];
         // A cell is playable when its centre is legal, or when the centre is
         // only just illegal and projects onto legal area still inside the cell.
         // The second case is what keeps thin legal regions reachable: legality
@@ -89,7 +69,7 @@ impl FineGrid {
         // of its nearest stone, within half a cell diagonal of the boundary.
         // Cells deeper inside a stone cannot be rescued, and cells already
         // clear need no rescuing, so only that thin band pays for a projection.
-        let mut placement = vec![(0.0_f32, 0.0_f32); width * height];
+        let mut placement = vec![Point::new(0.0, 0.0); width * height];
         // The vertex set depends only on the position but is ~78% of a single
         // projection's cost, and this loop projects several hundred cells.
         // Computing it once per grid rather than once per cell is the
@@ -117,8 +97,9 @@ impl FineGrid {
                     None
                 };
                 if let Some(resolved) = resolved {
+                    legal[idx] = true;
                     logits[idx] = logit_at(row, col);
-                    placement[idx] = (resolved.x as f32, resolved.y as f32);
+                    placement[idx] = resolved;
                 }
             }
         }
@@ -127,15 +108,9 @@ impl FineGrid {
             height,
             coarse,
             logits,
+            legal,
             placement,
         }
-    }
-
-    /// The placement for a cell, widened back from storage.
-    #[inline]
-    fn placement_at(&self, index: usize) -> Point {
-        let (x, y) = self.placement[index];
-        Point::new(f64::from(x), f64::from(y))
     }
 
     /// Grid dimensions, for callers that need to map points back to cells.
@@ -172,7 +147,7 @@ impl FineGrid {
         for row in r0..(r0 + self.coarse).min(self.height) {
             for col in c0..(c0 + self.coarse).min(self.width) {
                 let idx = row * self.width + col;
-                if self.is_playable(idx) {
+                if self.legal[idx] {
                     let v = self.logits[idx];
                     best = Some(best.map_or(v, |b| b.max(v)));
                 }
@@ -220,7 +195,7 @@ pub fn sample_candidates(
         for row in r0..(r0 + grid.coarse).min(grid.height) {
             for col in c0..(c0 + grid.coarse).min(grid.width) {
                 let idx = row * grid.width + col;
-                if grid.is_playable(idx) {
+                if grid.legal[idx] {
                     fine.push((row, col, grid.logits[idx]));
                 }
             }
@@ -231,7 +206,7 @@ pub fn sample_candidates(
         let p_fine = fine_probs[fi];
 
         out.push(CandidateSample {
-            point: grid.placement_at(row * grid.width + col),
+            point: grid.placement[row * grid.width + col],
             beta: p_coarse * p_fine,
         });
     }
@@ -363,7 +338,7 @@ mod tests {
             let mut legal_fine = 0;
             for r in r0..(r0 + coarse).min(height) {
                 for c in c0..(c0 + coarse).min(width) {
-                    if grid.is_playable(r * width + c) {
+                    if grid.legal[r * width + c] {
                         legal_fine += 1;
                     }
                 }
@@ -493,10 +468,10 @@ mod tests {
         let mut reached = false;
         for col in 0..width {
             let idx = row * width + col;
-            if !grid.is_playable(idx) {
+            if !grid.legal[idx] {
                 continue;
             }
-            let placement = grid.placement_at(idx);
+            let placement = grid.placement[idx];
             if is_legal_placement(&position, placement.x, placement.y)
                 && (placement.y - 0.5).abs() < 0.05
                 && (placement.x - 0.5).abs() < 0.05
@@ -532,11 +507,11 @@ mod tests {
         for row in 0..height {
             for col in 0..width {
                 let idx = row * width + col;
-                if !grid.is_playable(idx) {
+                if !grid.legal[idx] {
                     continue;
                 }
                 let centre = cell_center(row, col, width, height);
-                let placement = grid.placement_at(idx);
+                let placement = grid.placement[idx];
                 assert!(
                     (placement.x - centre.x).abs() <= half_x + 1.0e-12
                         && (placement.y - centre.y).abs() <= half_y + 1.0e-12,
