@@ -326,6 +326,10 @@ class PipelineConfig:
     architecture: str = "ddrnet"
     variance_scaled: bool = False
     norm_groups: int | None = None
+    # Trailing residual blocks per ddrnet context stage replaced with
+    # transformer blocks. 0 is byte-identical to a net built without them.
+    context_attention_blocks: int = 0
+    attention_heads: int = 8
     model_width: int = 64
     blocks: int = 8
     training_epochs: int = 10
@@ -1414,6 +1418,8 @@ class Pipeline:
             "architecture": self.config.architecture,
             "variance_scaled": self.config.variance_scaled,
             "norm_groups": self.config.norm_groups,
+            "context_attention_blocks": self.config.context_attention_blocks,
+            "attention_heads": self.config.attention_heads,
             "threads": self.config.training_threads,
             "device": self.config.training_device,
             "precision": self.config.training_precision,
@@ -2405,6 +2411,19 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
             "structurally rather than by a constant fixed at initialization"
         ),
     )
+    parser.add_argument(
+        "--context-attention-blocks",
+        type=int,
+        default=0,
+        help=(
+            "trailing residual blocks in each ddrnet context stage to replace "
+            "with transformer blocks; 0 is the plain convolutional net. "
+            "Attention is the only part of this model that is not "
+            "resolution-agnostic -- rotary tables are built per board size -- "
+            "so a checkpoint carrying it is fixed to its raster"
+        ),
+    )
+    parser.add_argument("--attention-heads", type=int, default=8)
     parser.add_argument(
         "--variance-scaled",
         action=argparse.BooleanOptionalAction,

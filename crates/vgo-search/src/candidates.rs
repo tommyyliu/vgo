@@ -12,9 +12,34 @@ impl Action {
     pub fn apply(self, position: &Position) -> vgo_core::MoveResult {
         match self {
             Self::Pass => pass(position).expect("pass candidate must be legal"),
-            Self::Place(point) => {
-                place(position, point.x, point.y).expect("placement candidate must be legal")
-            }
+            Self::Place(point) => place(position, point.x, point.y).unwrap_or_else(|error| {
+                // The panic this replaces said only "IllegalPlacement", which
+                // is three different failures wearing one name and gave no way
+                // to tell which. Report the board that rejected the point so a
+                // reproduction does not require rerunning generation.
+                let stones = position.stones();
+                let nearest = stones
+                    .iter()
+                    .map(|stone| {
+                        vgo_core::planar_length(point.x - stone.x, point.y - stone.y)
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                panic!(
+                    "placement candidate must be legal: {error:?}\n  \
+                     point ({:.17}, {:.17})\n  \
+                     radius {:.17}, required clearance {:.17}\n  \
+                     nearest stone {nearest:.17} ({} stones, phase {:?})\n  \
+                     contains={} in_inset={}",
+                    point.x,
+                    point.y,
+                    position.radius(),
+                    2.0 * position.radius(),
+                    stones.len(),
+                    position.phase(),
+                    vgo_core::is_legal_placement(position, point.x, point.y),
+                    nearest >= 2.0 * position.radius(),
+                )
+            }),
         }
     }
 }

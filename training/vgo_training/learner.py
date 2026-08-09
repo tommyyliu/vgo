@@ -88,6 +88,13 @@ class LearnerConfig:
     # window stay diverse while the gradient follows recent play. Identity
     # config -- it changes what the model trains on.
     recency_decay: float = 1.0
+    # Trailing residual blocks in each ddrnet context stage to replace with
+    # transformer blocks. Identity config at 0, which is byte-identical to a
+    # net built without it. Attention is the one part of this model that is
+    # not resolution-agnostic -- rotary tables are built per board size -- so a
+    # checkpoint carrying it is fixed to the raster it was constructed for.
+    context_attention_blocks: int = 0
+    attention_heads: int = 8
     threads: int = 4
     device: str = "cuda"
     precision: str = "float32"
@@ -1234,6 +1241,13 @@ class PersistentLearner:
                         checkpoint.get("variance_scaled", False)
                     ),
                     "norm_groups": checkpoint.get("norm_groups"),
+                    # Follows the parent for the same reason as the K
+                    # constants: the attention blocks are part of the function
+                    # the loaded weights were trained for.
+                    "context_attention_blocks": int(
+                        checkpoint.get("context_attention_blocks", 0)
+                    ),
+                    "attention_heads": int(checkpoint.get("attention_heads", 8)),
                 }
             else:
                 model = build_model(
@@ -1244,6 +1258,9 @@ class PersistentLearner:
                     policy_resolution=decoupled,
                     variance_scaled=config.variance_scaled,
                     norm_groups=config.norm_groups,
+                    context_attention_blocks=config.context_attention_blocks,
+                    attention_heads=config.attention_heads,
+                    raster_resolution=window.height,
                 )
                 checkpoint = {}
                 metadata = {
@@ -1256,6 +1273,8 @@ class PersistentLearner:
                     "architecture": config.architecture,
                     "variance_scaled": config.variance_scaled,
                     "norm_groups": config.norm_groups,
+                    "context_attention_blocks": config.context_attention_blocks,
+                    "attention_heads": config.attention_heads,
                 }
             model = model.to(device)
             compiled = bool(config.compile and device.type == "cuda")
