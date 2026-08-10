@@ -51,3 +51,7 @@ path = "src/generation_bench.rs"
 [[bin]]
 name = "vgo-feed-bench"
 path = "src/feed_bench.rs"
+
+[[bin]]
+name = "vgo-tournament"
+path = "src/tournament.rs"
