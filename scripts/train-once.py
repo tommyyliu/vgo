@@ -42,6 +42,12 @@ def main() -> None:
     )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=256)
+    # Without these the optimizer silently follows LearnerConfig's defaults,
+    # which is Muon -- so a script meant to hold the optimizer fixed across an
+    # A/B would quietly pick one of the two arms being compared.
+    parser.add_argument("--muon-learning-rate", type=float, default=0.01)
+    parser.add_argument("--full-adam", action="store_true",
+                        help="put every parameter on Adam instead of Muon-on-trunk")
     parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--value-weight", type=float, default=2.0)
     parser.add_argument("--ownership-weight", type=float, default=0.0)
@@ -104,6 +110,8 @@ def main() -> None:
         report_every=arguments.report_every,
         validation_fraction=arguments.validation_fraction,
         augment=arguments.augment,
+        muon_learning_rate=arguments.muon_learning_rate,
+        full_adam=arguments.full_adam,
     )
 
     arguments.output.parent.mkdir(parents=True, exist_ok=True)

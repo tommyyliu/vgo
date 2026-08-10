@@ -1686,6 +1686,19 @@ class PersistentLearner:
             value_weight=config.value_weight,
             precision=config.precision,
         )
+        # Both halves have always been stored in the checkpoint metadata, but
+        # only validation was ever printed, so the generalization gap -- the
+        # thing that says whether an update memorized its window -- was
+        # invisible without reading the JSON afterwards. Log it per update.
+        self._log(
+            "train/val  "
+            f"value_mae {final_training['value_mae']:.5f}/"
+            f"{final_validation['value_mae']:.5f} "
+            f"gap {final_validation['value_mae'] - final_training['value_mae']:+.5f}  "
+            f"policy_kl {final_training['policy_kl']:.5f}/"
+            f"{final_validation['policy_kl']:.5f} "
+            f"gap {final_validation['policy_kl'] - final_training['policy_kl']:+.5f}"
+        )
 
         output = request.output.resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
