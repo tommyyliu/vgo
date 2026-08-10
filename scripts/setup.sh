@@ -101,12 +101,20 @@ if ! $check_only; then
   # Building now rather than letting the first update do it: .cargo/config.toml
   # sets -C target-cpu=native, so this must happen on the machine that runs it,
   # and a cold cache would otherwise compile in the middle of the first shard.
+  #
+  # --examples matters and is easy to miss: the learner rasterizes compact
+  # (5-channel) states by shelling out to the vgo-raster *example*
+  # render_shard, and `cargo build --release` alone does not build examples.
+  # Without it the first training step fails, several minutes into the run.
+  cargo build --release --examples
   cargo build --release
 fi
 for binary in vgo-generate-demo vgo-arena vgo-tournament vgo-serve-move; do
   [[ -x "target/release/$binary" ]] || die "target/release/$binary missing; run without --check"
 done
-ok "release binaries present"
+[[ -x target/release/examples/render_shard ]] \
+  || die "target/release/examples/render_shard missing; the compact rasterizer needs it (cargo build --release --examples)"
+ok "release binaries and examples present"
 
 # ------------------------------------------------------------- the ORT dlopen
 step "ONNX Runtime"

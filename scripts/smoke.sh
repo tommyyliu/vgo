@@ -23,6 +23,11 @@ provider="${PROVIDER:-tensorrt}"
 
 [[ -x training/.venv/bin/python3 ]] || { echo "no venv; run ./scripts/setup.sh first" >&2; exit 1; }
 
+# A fresh clone has no artifacts/ -- it is gitignored -- so the log redirect
+# below would fail before the run ever starts. The pipeline creates its own
+# output directory but not its parent.
+mkdir -p "$(dirname "$output")"
+
 cleanup () {
   if [[ -z "${KEEP:-}" && -d "$output" ]]; then rm -rf "$output"; fi
 }
