@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import signal
 from typing import Sequence
 
 from .pipeline import (
@@ -75,7 +76,23 @@ def run(arguments: argparse.Namespace | PipelineConfig) -> dict[str, object]:
     return asyncio.run(execute())
 
 
+def _terminate_like_interrupt(signum: int, frame: object) -> None:
+    raise KeyboardInterrupt
+
+
 def main(argv: Sequence[str] | None = None) -> None:
+    # Route SIGTERM onto the Ctrl-C path, which already works. Without this the
+    # default disposition kills the interpreter outright, `_run`'s finally never
+    # runs, and two things follow: the generation and arena children -- spawned
+    # with start_new_session=True so they survive their parent -- are orphaned
+    # rather than signalled, and the session's wall time is never accumulated.
+    # SIGTERM is how a detached run is stopped by hand and how a provider asks
+    # an instance to shut down, so it is the common case, not the rare one.
+    #
+    # Installed here rather than in Pipeline: a library that rewrites signal
+    # handlers on import surprises everything that embeds it, including the
+    # tests.
+    signal.signal(signal.SIGTERM, _terminate_like_interrupt)
     report = run(parse_arguments(argv))
     print(json.dumps(report, indent=2))
 

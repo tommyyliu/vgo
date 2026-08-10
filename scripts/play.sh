@@ -14,7 +14,6 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-venv="$root/training/.venv/lib/python3.14/site-packages"
 
 model="${1:-}"
 if [[ -z "$model" ]]; then
@@ -33,18 +32,33 @@ if [[ -z "$model" || ! -f "$model" ]]; then
   exit 1
 fi
 
-ort="$venv/onnxruntime_trt/libonnxruntime.so"
-if [[ ! -f "$ort" ]]; then
-  # Fall back to the CUDA-only build if the TensorRT one is not installed.
-  ort="$venv/onnxruntime/capi/libonnxruntime.so"
-fi
-if [[ ! -f "$ort" ]]; then
-  echo "libonnxruntime.so not found under $venv; is the training venv installed?" >&2
+# Ask the pipeline for the environment rather than rebuilding it here. This
+# script used to hardcode both the site-packages path (with the Python version
+# baked in) and an unversioned libonnxruntime.so, and broke on a venv that had
+# neither: the prebuilt wheel ships libonnxruntime.so.1.28.0 with no
+# unversioned symlink, and the interpreter is not always python3.14.
+# runtime_environment already handles the versioned name, lib64, and the whole
+# LD_LIBRARY_PATH -- and it is what rl_loop gives its own stages, so serving a
+# model now uses the same environment that generation and arenas do.
+eval "$(
+  "$root/training/.venv/bin/python3" -c "
+import shlex, sys
+sys.path.insert(0, '$root/training')
+from vgo_training.pipeline import runtime_environment
+environment = runtime_environment()
+for key in ('ORT_DYLIB_PATH', 'LD_LIBRARY_PATH'):
+    value = environment.get(key)
+    if value:
+        print(f'export {key}={shlex.quote(value)}')
+" 2>/dev/null
+)"
+if [[ -z "${ORT_DYLIB_PATH:-}" || ! -f "${ORT_DYLIB_PATH}" ]]; then
+  # Refuse rather than proceed: a failed dlopen deadlocks in ort::api() instead
+  # of returning an error, so the server would hang silently before listening.
+  echo "libonnxruntime not found via the training venv (ORT_DYLIB_PATH=${ORT_DYLIB_PATH:-unset})." >&2
+  echo "Is it installed?  cd training && uv sync --frozen --extra tensorrt" >&2
   exit 1
 fi
-
-export ORT_DYLIB_PATH="$ort"
-export LD_LIBRARY_PATH="$venv/onnxruntime_trt:$venv/tensorrt_libs:$venv/nvidia/cu13/lib:$venv/nvidia/cudnn/lib:$venv/torch/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Read the raster shape from the model rather than hardcoding it. The server
 # validates its --resolution and --policy-resolution against the exported

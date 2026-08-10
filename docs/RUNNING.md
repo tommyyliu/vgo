@@ -6,16 +6,44 @@ lives.
 
 ## Prerequisites
 
-- Rust via `rust-toolchain.toml`; `cargo test --workspace` will fetch what it
-  needs.
-- `uv` for the Python side. `uv run` creates and syncs `training/.venv` on first
-  use.
+On a new machine, run `./scripts/setup.sh`. It installs `uv` and `rustup` if
+absent, syncs the venv, builds the release binaries, and — the part worth
+having — verifies that `ORT_DYLIB_PATH` resolves and both execution providers
+register. A failed ONNX Runtime load *hangs* rather than errors, because the
+error is constructed through `ort::api()`, which waits on the initialization
+lock the failing load still holds; the process then sits at 0% CPU looking
+exactly like a deadlock. Catching that at setup is worth the thirty seconds.
+
+Then prove the box before committing hours to it:
+
+```bash
+./scripts/setup.sh      # ~10 min, network-bound
+./scripts/smoke.sh      # ~90s, a full RL loop at trivial settings
+./runs/ddrnet-attn.sh   # the real thing
+```
+
+What it needs underneath:
+
+- An NVIDIA **driver**. The CUDA toolkit is not required — the wheels carry
+  their own CUDA and TensorRT runtime libraries. No from-source onnxruntime
+  build is needed either, including on Blackwell/sm_120; see the notice at the
+  top of [`NVRTX_HANDOFF.md`](NVRTX_HANDOFF.md).
+- Rust via `rust-toolchain.toml`, and `cargo` **on `PATH` at run time**, not
+  just at build time: the coordinator shells out to `cargo run --release` for
+  every generation, arena and warmup stage.
+- `uv` for the Python side, and `zstd` on `PATH` — shard retirement shells out
+  to it, and swallows the failure, so without it the run survives but replay
+  disk grows unbounded.
+- A C compiler, for `torch.compile` (on by default; `--no-compile` avoids it).
 - Chrome at `C:\Program Files\Google\Chrome\Application\chrome.exe` for the
-  browser test suites.
-- An NVIDIA GPU for `--training-device cuda` and `--provider tensorrt`. Rust
-  inference selects it with `--inference-device-id`; PyTorch accepts ordinary
-  device strings such as `cuda`, `cuda:0`, or `cuda:1`. The CPU paths work
-  everywhere and are much slower.
+  browser test suites (Windows only).
+
+Sizing a machine: generation is **CPU-bound**, running 87–89% user across 32
+logical cores while the GPU sits at 50–63%. Choose on vCPU count rather than
+GPU class, and set `VGO_ACTORS` from the core count. Reference throughput is
+~6.6 self-play samples/sec on a 16-core/32-thread 9950X with an RTX 5070 Ti.
+`--actors 64`, `--inference-batch 64` and `--inference-slots 2` assume a 16 GB
+card. Budget ~25 GB of disk for the toolchains and ~5 GB per 40-update run.
 
 ## Tests
 
@@ -42,23 +70,37 @@ run at its first validation pass.
 [`RL_LOOP.md`](RL_LOOP.md) describes the queue, artifact, and recovery
 contracts.
 
-Every run this project has kept is launched from a committed `launch.sh` beside
-its output, not from a command typed at a prompt. That file is the record of
-what a run *was* -- its settings are learning identity, so a run cannot be
-resumed with different ones, and the header comment explains why each value was
-chosen. Copy the most recent one and edit it:
+Every run is launched from a recipe in [`runs/`](../runs/), not from a command
+typed at a prompt. That file is the record of what a run *was* -- its settings
+are learning identity, so a run cannot be resumed with different ones, and the
+header comment explains why each value was chosen.
+
+`runs/` is tracked; `artifacts/` is not. Each recipe copies itself to
+`<run>/launch.sh` on start, so the record still sits beside the output (and
+`scripts/rate-checkpoints.py` can follow `--initial-checkpoint` lineage
+through it), but the master copy survives a fresh clone. Copy the nearest
+recipe and edit it:
 
 ```bash
-cp artifacts/ddrnet-own/launch.sh artifacts/my-run/launch.sh
-$EDITOR artifacts/my-run/launch.sh          # --output, --seed, and the change under test
-./artifacts/my-run/launch.sh > artifacts/my-run/logs/run.log 2>&1
+cp runs/ddrnet-attn.sh runs/my-run.sh
+$EDITOR runs/my-run.sh                      # --seed and the change under test
+./runs/my-run.sh                            # -> artifacts/my-run, tees to logs/run.log
 ```
+
+Only settings in `OPERATIONAL_CONFIG_FIELDS` may be parameterized, because
+only those may differ on resume: `VGO_UPDATES`, `VGO_ACTORS`,
+`VGO_ARENA_ACTORS`, `VGO_SLOTS`, `VGO_TRAINING_THREADS`. A unit test enforces
+this. See [`runs/README.md`](../runs/README.md).
 
 Run it detached if you want it to survive the shell:
 
 ```bash
-setsid nohup ./artifacts/my-run/launch.sh > artifacts/my-run/logs/run.log 2>&1 &
+setsid nohup ./runs/my-run.sh &
 ```
+
+Stop it with `kill` (SIGTERM). The coordinator installs a handler that routes
+SIGTERM onto the Ctrl-C path, so children are signalled rather than orphaned
+and the session's wall time is recorded. Re-running the same command resumes.
 
 The current shape of a run, as of `ddrnet-own`:
 

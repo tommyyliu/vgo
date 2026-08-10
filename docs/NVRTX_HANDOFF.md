@@ -1,5 +1,25 @@
 # Blackwell (sm_120) GPU inference — hand-off notes
 
+> **Obsolete for setup. Do not follow this to provision a machine.**
+>
+> Everything below describes building onnxruntime from source because the
+> prebuilt wheel had no sm_120 kernel image. That was true of onnxruntime
+> 1.24 and is **no longer true**: the stock `onnxruntime-gpu` wheel pinned in
+> `training/pyproject.toml` (1.28.0 at time of writing) ships working
+> TensorRT and CUDA execution providers for sm_120. Verified 2026-08-10 on
+> the same RTX 5070 Ti — full RL loops, 528-game tournaments, and generation
+> all run on `--provider tensorrt` with zero failures and no custom build.
+>
+> To set up a machine: **`./scripts/setup.sh`**, then `./scripts/smoke.sh`.
+> That is the whole procedure. Following the recipe below instead costs
+> several hours assembling a userspace CUDA toolchain, a patched gcc-15 and
+> TensorRT SDK headers to reproduce a library you already have.
+>
+> Kept because `runtime_environment()` still prefers `onnxruntime_trt/` and
+> `onnxruntime_blackwell/` when present, so those names appear in stack
+> traces and in this history — and because the `fuse_conv_bias` finding below
+> is still live and still load-bearing.
+
 Status updated 2026-07-24; command syntax refreshed 2026-07-27. Goal was "run
 the RL loop for a few steps" on this machine (Linux / Fedora 44, RTX 5070 Ti /
 Blackwell / sm_120). **RESOLVED — the RL loop runs end-to-end on `--provider
@@ -7,14 +27,16 @@ cuda`.** This records the GPU path. The measurements below predate the current
 pipelined coordinator, persistent learner, and final coarse-to-fine replay-v3
 design; use [`RL_LOOP.md`](RL_LOOP.md) as the operational source of truth.
 
-## TL;DR
+## TL;DR (historical — see the notice above)
 
-The prebuilt onnxruntime that the Rust `ort` crate downloads has **no sm_120
-kernel image**, so `cuda`/`tensorrt` fail with `cudaErrorNoKernelImageForDevice`
-and TensorRT-RTX (`nvrtx`) fails at engine build. The fix (per
-microsoft/onnxruntime#26177, confirmed on this exact GPU) is to **build
-onnxruntime from source with `CMAKE_CUDA_ARCHITECTURES=120`** and load it via
-`ort`'s `load-dynamic`.
+The prebuilt onnxruntime that the Rust `ort` crate downloaded **in 2026-07** had
+**no sm_120 kernel image**, so `cuda`/`tensorrt` failed with
+`cudaErrorNoKernelImageForDevice` and TensorRT-RTX (`nvrtx`) failed at engine
+build. The fix at the time (per microsoft/onnxruntime#26177, confirmed on this
+exact GPU) was to **build onnxruntime from source with
+`CMAKE_CUDA_ARCHITECTURES=120`** and load it via `ort`'s `load-dynamic`. The
+`load-dynamic` switch is still how inference works; the from-source build is
+not needed on onnxruntime ≥ 1.28.
 
 After that, GPU inference produced garbage (`invalid inference value` NaN in the
 arena). **Root cause: `with_fuse_conv_bias(true)` in `cuda_provider()`
@@ -189,8 +211,15 @@ Committed to the repo: the `ort` `load-dynamic` switch
 `OnnxProvider::NvRtx` (TensorRT-RTX) variant was removed — the story is kept
 here for anyone who wants to retry it after a future onnxruntime/ort release.
 
-Not committed (they live in `training/.venv`, which is gitignored, and would be
-rebuilt by following the steps above): the userspace CUDA toolchain, the
-self-built `libonnxruntime.so` in `onnxruntime_trt/` and `onnxruntime_blackwell/`,
-and the TensorRT SDK headers. A fresh checkout on another machine needs those
-built/installed before `--provider cuda`/`tensorrt` will load.
+Not committed (they lived in `training/.venv`, which is gitignored): the
+userspace CUDA toolchain, the self-built `libonnxruntime.so` in
+`onnxruntime_trt/` and `onnxruntime_blackwell/`, and the TensorRT SDK headers.
+
+**A fresh checkout no longer needs any of that.** `uv sync --extra tensorrt`
+installs the stock `onnxruntime-gpu` wheel, which carries sm_120 kernels and
+both execution providers, and `runtime_environment()` falls through to it when
+the self-built directories are absent — which is the path every run has taken
+since. `./scripts/setup.sh` does this and verifies the result; `--extra
+tensorrt` is required rather than optional, because `runtime_environment()`
+puts `site-packages/tensorrt_libs` on `LD_LIBRARY_PATH` and the TensorRT
+provider will not register without it.

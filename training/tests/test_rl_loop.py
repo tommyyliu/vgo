@@ -2,12 +2,14 @@ import asyncio
 from dataclasses import asdict
 import json
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from vgo_training.pipeline import (
+    OPERATIONAL_CONFIG_FIELDS,
     CommandResult,
     ModelArtifact,
     Pipeline,
@@ -964,6 +966,48 @@ class TelemetrySubsetTests(unittest.TestCase):
                 {int(job["candidate_version"]) for job in pipeline.state.telemetry_pending}
             )
             self.assertEqual(rated, [1, 2, 3])
+
+
+class RunRecipeTest(unittest.TestCase):
+    """The recipes in runs/ must only parameterize resume-safe settings.
+
+    A run refuses to resume if its identity config changed, so exposing a
+    non-operational flag as an environment variable makes the run unresumable
+    the moment anyone sets it -- and it fails at resume, hours later, not when
+    the variable is set. Catch it here instead.
+    """
+
+    def recipes(self) -> list[Path]:
+        directory = Path(__file__).resolve().parents[2] / "runs"
+        return sorted(directory.glob("*.sh"))
+
+    def test_recipes_exist(self) -> None:
+        self.assertTrue(self.recipes(), "runs/ has no recipes; a clone can run nothing")
+
+    def test_only_operational_fields_are_parameterized(self) -> None:
+        for recipe in self.recipes():
+            text = recipe.read_text(encoding="utf-8")
+            for flag, variable in re.findall(
+                r'--([a-z0-9-]+)\s+"\$\{(VGO_[A-Z0-9_]+)', text
+            ):
+                with self.subTest(recipe=recipe.name, variable=variable):
+                    self.assertIn(
+                        flag.replace("-", "_"),
+                        OPERATIONAL_CONFIG_FIELDS,
+                        f"{variable} feeds --{flag}, which is part of run identity",
+                    )
+
+    def test_recipes_pin_the_optimizer(self) -> None:
+        # The default is Muon on the trunk. Runs from before that flag existed
+        # were Adam, so a recipe that says neither is ambiguous about the one
+        # setting that moved Elo by ~112 between the two 40-update runs.
+        for recipe in self.recipes():
+            text = recipe.read_text(encoding="utf-8")
+            with self.subTest(recipe=recipe.name):
+                self.assertTrue(
+                    "--full-adam" in text or "--muon-learning-rate" in text,
+                    f"{recipe.name} does not state its optimizer",
+                )
 
 
 if __name__ == "__main__":

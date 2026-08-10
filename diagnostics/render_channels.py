@@ -3,7 +3,11 @@
 Written with zlib/struct rather than matplotlib so it adds no dependency to the
 venv the running pipeline uses.
 """
-import sys, glob, zlib, struct; sys.path.insert(0,"/home/tommy/PycharmProjects/vgo/training")
+import sys, glob, zlib, struct
+from pathlib import Path
+# Derived, not hardcoded: this file lives at <root>/diagnostics/.
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "training"))
 import torch, numpy as np
 from vgo_training.model import DDRNetPolicyValueNet
 from vgo_training import dataset as ds
@@ -11,7 +15,7 @@ from vgo_training import dataset as ds
 NAMES = ['current_stones','opponent_stones','current_voronoi','opponent_voronoi',
          'current_distance','opponent_distance','voronoi_ridge','legal_clearance',
          'radius','previous_pass']
-OUT = "/home/tommy/PycharmProjects/vgo/diagnostics/rasters"
+OUT = str(ROOT / "diagnostics" / "rasters")
 
 def png(path, rgb):
     h, w, _ = rgb.shape

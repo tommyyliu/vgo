@@ -8,7 +8,8 @@ tensor directly and renders channels straight from the data the net is fed.
 import sys
 from pathlib import Path
 
-ROOT = Path("/home/tommy/PycharmProjects/vgo")
+# Derived, not hardcoded: this file lives at <root>/experiments/policy-diagnosis/.
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "training"))
 
 import matplotlib
