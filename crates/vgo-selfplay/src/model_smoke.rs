@@ -21,6 +21,13 @@ use vgo_raster::RasterConfig;
 use vgo_search::{Action, EvaluationError, Evaluator, SearchConfig, search_with_evaluator};
 use vgo_selfplay::play_game as run_playout;
 
+/// Path to the training venv's interpreter, relative to the repo root.
+/// The layout differs by platform: `bin/` on Unix, `Scripts/` on Windows.
+#[cfg(windows)]
+const VENV_PYTHON: &str = "training/.venv/Scripts/python.exe";
+#[cfg(not(windows))]
+const VENV_PYTHON: &str = "training/.venv/bin/python3";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InferenceRuntime {
     Python,
@@ -50,7 +57,8 @@ impl std::str::FromStr for InferenceRuntime {
 
 #[derive(Debug, Parser)]
 struct Arguments {
-    #[arg(long, default_value = "training/.venv/Scripts/python.exe")]
+    // bin/ on Unix, Scripts/ on Windows -- see VENV_PYTHON.
+    #[arg(long, default_value = VENV_PYTHON)]
     python: PathBuf,
     #[arg(long, default_value = "training")]
     training: PathBuf,

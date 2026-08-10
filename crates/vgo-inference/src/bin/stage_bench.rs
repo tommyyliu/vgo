@@ -7,6 +7,13 @@ use vgo_inference::{
 };
 use vgo_raster::{CHANNEL_COUNT, RasterConfig, SemanticRaster, rasterize, rasterize_into};
 
+/// Path to the training venv's interpreter, relative to the repo root.
+/// The layout differs by platform: `bin/` on Unix, `Scripts/` on Windows.
+#[cfg(windows)]
+const VENV_PYTHON: &str = "training/.venv/Scripts/python.exe";
+#[cfg(not(windows))]
+const VENV_PYTHON: &str = "training/.venv/bin/python3";
+
 fn value_argument<T>(arguments: &[String], name: &str, default: T) -> Result<T, String>
 where
     T: std::str::FromStr,
@@ -121,11 +128,7 @@ fn make_inputs(rasters: &[SemanticRaster], batch: usize) -> Vec<InferenceInput> 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = env::args().collect::<Vec<_>>();
     let root = env::current_dir()?;
-    let python = path_argument(
-        &arguments,
-        "--python",
-        root.join("training/.venv/Scripts/python.exe"),
-    );
+    let python = path_argument(&arguments, "--python", root.join(VENV_PYTHON));
     let working_directory = path_argument(&arguments, "--training", root.join("training"));
     let checkpoint = path_argument(
         &arguments,

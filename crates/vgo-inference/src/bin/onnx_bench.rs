@@ -14,6 +14,13 @@ use vgo_inference::{
 };
 use vgo_raster::{RasterConfig, rasterize};
 
+/// Path to the training venv's interpreter, relative to the repo root.
+/// The layout differs by platform: `bin/` on Unix, `Scripts/` on Windows.
+#[cfg(windows)]
+const VENV_PYTHON: &str = "training/.venv/Scripts/python.exe";
+#[cfg(not(windows))]
+const VENV_PYTHON: &str = "training/.venv/bin/python3";
+
 fn argument_value<'a>(arguments: &'a [String], name: &str) -> Result<Option<&'a str>, String> {
     let Some(index) = arguments.iter().position(|argument| argument == name) else {
         return Ok(None);
@@ -82,11 +89,9 @@ fn parse_arguments(arguments: &[String], root: &Path) -> Result<Arguments, Strin
         "--checkpoint",
         root.join("artifacts/raster-demo/model.pt"),
     )?;
-    let python = path_argument(
-        arguments,
-        "--python",
-        root.join("training/.venv/Scripts/python.exe"),
-    )?;
+    // The venv puts the interpreter under bin/ on Unix and Scripts/ on Windows;
+    // hardcoding either made this unrunnable on the other without --python.
+    let python = path_argument(arguments, "--python", root.join(VENV_PYTHON))?;
     let training = path_argument(arguments, "--training", root.join("training"))?;
     let cache_directory = path_argument(
         arguments,
@@ -99,11 +104,7 @@ fn parse_arguments(arguments: &[String], root: &Path) -> Result<Arguments, Strin
     // A model exported under a non-default layout declares its own channel
     // count, and loading validates against the raster it is handed -- so the
     // bench has to be told which layout, or a compact model fails warmup.
-    let raster_kind = value_argument(
-        arguments,
-        "--raster-kind",
-        vgo_raster::RasterKind::Semantic,
-    )?;
+    let raster_kind = value_argument(arguments, "--raster-kind", vgo_raster::RasterKind::Semantic)?;
     let batch = value_argument(arguments, "--batch", 8_usize)?;
     let warmup = value_argument(arguments, "--warmup", 10_usize)?;
     let iterations = value_argument(arguments, "--iterations", 200_usize)?;
