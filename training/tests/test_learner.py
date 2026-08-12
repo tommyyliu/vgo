@@ -297,6 +297,15 @@ class PersistentLearnerTests(unittest.TestCase):
     def test_failed_update_discards_partial_runtime_before_implicit_retry(
         self,
     ) -> None:
+        # Both optimizers, because the failure is injected by patching the
+        # optimizer's `step` and only one of them is ever constructed. This
+        # test silently stopped firing when Muon became the default: it
+        # patched Adam, the learner built HybridMuon, and nothing raised.
+        for full_adam in (True, False):
+            with self.subTest(full_adam=full_adam):
+                self._failed_update_discards_partial_runtime(full_adam)
+
+    def _failed_update_discards_partial_runtime(self, full_adam: bool) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             cache, path, _ = cache_fixture(root)
@@ -312,11 +321,15 @@ class PersistentLearnerTests(unittest.TestCase):
                 report_every=1,
                 validation_fraction=0.0,
                 augment=False,
+                full_adam=full_adam,
             )
             learner = PersistentLearner(
                 defaults=config, replay_cache=cache, log=lambda _: None
             )
-            original_step = torch.optim.Adam.step
+            from vgo_training.muon import HybridMuon
+
+            optimizer_class = torch.optim.Adam if full_adam else HybridMuon
+            original_step = optimizer_class.step
 
             def fail_after_step(optimizer, closure=None):
                 original_step(optimizer, closure)
@@ -325,7 +338,7 @@ class PersistentLearnerTests(unittest.TestCase):
             retry_output = root / "retry.pt"
             clean_output = root / "clean.pt"
             try:
-                with patch.object(torch.optim.Adam, "step", fail_after_step):
+                with patch.object(optimizer_class, "step", fail_after_step):
                     with self.assertRaisesRegex(
                         RuntimeError, "injected optimizer failure"
                     ):

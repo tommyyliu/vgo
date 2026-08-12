@@ -104,6 +104,18 @@ link. The spanning rounds are the long baselines.
 Pairing on estimated rating does not bias the fit. The MLE stays unbiased as
 long as pairing depends on prior estimates rather than on outcomes.
 
+**Naive is banded like everything else.** Given `--ratings` containing
+`naive/-1`, it enters the pool as an ordinary member and the bands pair it with
+the update-0-era checkpoints it can still take games from — 1.5x the
+information per naive game versus joining whole rounds, and it needs no tuning
+as the field improves, because it simply sinks in the ordering. `--naive-rounds`
+is then ignored (the run says so); it only applies to uniform matchmaking,
+where there is no fit to band on.
+
+Naive is worth keeping in the field because it is the one player whose strength
+does not drift between runs. Everything else is rated relative to the rest of
+the field; naive is what stops the whole scale from floating.
+
 ## The pool is fixed at launch
 
 **`dense-curve.py` globs its checkpoints once, when it starts.** Checkpoints

@@ -148,9 +148,10 @@ def main() -> None:
     parser.add_argument("--spanning-every", type=int, default=4,
                         help="every Nth round spans the whole range instead")
     parser.add_argument("--naive-rounds", type=int, default=4,
-                        help="rounds that also include naive, chosen from those "
-                             "with the earliest checkpoints; 0 disables and "
-                             "gives up the absolute scale")
+                        help="uniform matchmaking only: rounds that also include "
+                             "naive, chosen from those with the earliest "
+                             "checkpoints. Under --ratings naive is banded as an "
+                             "ordinary pool member and this is ignored.")
     parser.add_argument("--pairs", type=int, default=1,
                         help="colour-swapped pairs per pairing; each is 2 games")
     parser.add_argument("--simulations", type=int, default=1600)
@@ -169,24 +170,49 @@ def main() -> None:
     rng = random.Random(arguments.seed)
     if arguments.ratings and arguments.ratings.exists():
         ratings = json.loads(arguments.ratings.read_text(encoding="utf-8"))
+        # Naive joins the pool rather than being bolted onto whole rounds. It
+        # has a rating like anything else, so banding pairs it with the weakest
+        # checkpoints -- the only ones it takes games from -- instead of letting
+        # it play a full round of eight, most of them foregone. It also
+        # self-regulates: as the field improves naive sinks in the ordering and
+        # stops being drawn at all.
+        naive_is_pooled = "naive/-1" in ratings
+        if naive_is_pooled:
+            pool.append(("naive", -1, None))
         schedule = banded_rounds(pool, ratings, arguments.rounds_per_checkpoint,
                                  arguments.field, arguments.band,
                                  arguments.spanning_every, rng)
         print(f"matchmaking: banded (window {arguments.band}, "
-              f"spanning every {arguments.spanning_every})")
+              f"spanning every {arguments.spanning_every}"
+              + (", naive in the pool)" if "naive/-1" in ratings else ")"))
     else:
+        naive_is_pooled = False
         schedule = rounds(pool, arguments.rounds_per_checkpoint, arguments.field, rng)
         print("matchmaking: uniform random")
 
-    # Naive goes where it is still competitive -- the rounds whose checkpoints
-    # are earliest. Against late checkpoints it scores zero, and a pairing with
-    # no losses contributes nothing to anyone's rating.
-    ranked = sorted(range(len(schedule)),
-                    key=lambda i: sum(v for _, v, _ in schedule[i]) / len(schedule[i]))
-    with_naive = set(ranked[:max(arguments.naive_rounds, 0)])
+    # Whole-round naive is the fallback for when there is no fit to band on.
+    # The two mechanisms are exclusive: bolting naive onto a round *as well*
+    # would hand it a second helping of games, most against opponents its own
+    # band already ruled out.
+    if naive_is_pooled:
+        if arguments.naive_rounds:
+            print(f"note     : ignoring --naive-rounds {arguments.naive_rounds}; "
+                  "naive is banded as a pool member instead")
+        with_naive = set()
+    else:
+        # Naive goes where it is still competitive -- the rounds whose
+        # checkpoints are earliest. Against late checkpoints it scores zero,
+        # and a pairing with no losses contributes nothing to anyone's rating.
+        ranked = sorted(range(len(schedule)),
+                        key=lambda i: sum(v for _, v, _ in schedule[i]) / len(schedule[i]))
+        with_naive = set(ranked[:max(arguments.naive_rounds, 0)])
 
     def games_in(index: int) -> int:
-        players = len(schedule[index]) + (1 if index in with_naive else 0)
+        # A naive entry is already counted in the group when it is a pool
+        # member; only the whole-round mode adds a player.
+        extra = 1 if (index in with_naive
+                      and not any(e[0] == "naive" for e in schedule[index])) else 0
+        players = len(schedule[index]) + extra
         return players * (players - 1) // 2 * arguments.pairs * 2
 
     total = sum(games_in(i) for i in range(len(schedule)))
@@ -236,10 +262,12 @@ def main() -> None:
                    "--cache-directory", str(root / "artifacts/onnx-cache"),
                    "--seed", str(arguments.seed + index)]
         for _, _, onnx in group:
-            command += ["--model", str(onnx)]
-        if index in with_naive:
+            if onnx is not None:
+                command += ["--model", str(onnx)]
+        if any(entry[0] == "naive" for entry in group) or index in with_naive:
             command.append("--include-naive")
-        names = ", ".join(f"{r.split('-')[-1]}:v{v}" for r, v, _ in group)
+        names = ", ".join("naive" if r == "naive" else f"{r.split('-')[-1]}:v{v}"
+                          for r, v, _ in group)
         if index in with_naive:
             names += " + naive"
         elapsed = time.time() - started
