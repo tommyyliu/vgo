@@ -60,6 +60,21 @@ struct Arguments {
     /// present" moves the zero every time the field changes.
     #[arg(long, default_value_t = false)]
     include_naive: bool,
+    /// Play one reference player against every other, and nobody else.
+    ///
+    /// The default complete round-robin spends most of its games on pairings a
+    /// previous tournament already covered. When the field is densely rated
+    /// already and only the tie to a reference is missing, a star costs
+    /// `field - 1` pairings instead of `field * (field - 1) / 2`.
+    ///
+    /// The reference is naive when `--include-naive` is set, otherwise the
+    /// first `--model`. Note that a reference which never wins does not gain a
+    /// stable rating from more games: a winless record has no finite
+    /// maximum-likelihood estimate, so the fitted gap keeps widening with the
+    /// game count instead of converging. Point this at a weak *checkpoint*,
+    /// which loses most games but not all, rather than at naive.
+    #[arg(long, default_value_t = false)]
+    star: bool,
     /// Colour-swapped pairs per pairing; each pair is two games.
     #[arg(long, default_value_t = 4)]
     pairs: usize,
@@ -292,8 +307,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // pairing's games run alongside the first's.
     let mut pairings = Vec::new();
     let mut assignments = Vec::new();
+    // In star mode the reference is the last seat when naive is in the field
+    // (it is appended last) and seat 0 otherwise.
+    let reference = if arguments.include_naive {
+        field_size - 1
+    } else {
+        0
+    };
     for first in 0..field_size {
         for second in (first + 1)..field_size {
+            if arguments.star && first != reference && second != reference {
+                continue;
+            }
             let pairing = pairings.len();
             pairings.push((first, second));
             for pair in 0..arguments.pairs {
@@ -323,9 +348,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let workers = arguments.concurrency.min(assignments.len());
     eprintln!(
-        "tournament: {} models, {} pairings, {} games, {} in flight",
+        "tournament: {} models, {} pairings{}, {} games, {} in flight",
         field_size,
         pairings.len(),
+        if arguments.star {
+            format!(" (star on {})", labels[reference])
+        } else {
+            String::new()
+        },
         assignments.len(),
         workers,
     );

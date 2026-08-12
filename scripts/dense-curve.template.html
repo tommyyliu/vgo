@@ -1,0 +1,196 @@
+<title>Every checkpoint on one scale</title>
+
+<style>
+:root{color-scheme:light;
+  --plane:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink-2:#52514e;--muted:#898781;
+  --grid:#e1e0d9;--axis:#c3c2b7;--rule:rgba(11,11,11,.10);--wash:rgba(11,11,11,.035);
+  --c1:#2a78d6;--c2:#eb6834;--c3:#1baf7a;--c4:#eda100;--c5:#e87ba4;--warn:#fab219;}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;
+  --plane:#0d0d0d;--surface:#1a1a19;--ink:#fff;--ink-2:#c3c2b7;--muted:#898781;
+  --grid:#2c2c2a;--axis:#383835;--rule:rgba(255,255,255,.10);--wash:rgba(255,255,255,.045);
+  --c1:#3987e5;--c2:#d95926;--c3:#199e70;--c4:#c98500;--c5:#d55181;--warn:#fab219;}}
+:root[data-theme="dark"]{color-scheme:dark;
+  --plane:#0d0d0d;--surface:#1a1a19;--ink:#fff;--ink-2:#c3c2b7;--muted:#898781;
+  --grid:#2c2c2a;--axis:#383835;--rule:rgba(255,255,255,.10);--wash:rgba(255,255,255,.045);
+  --c1:#3987e5;--c2:#d95926;--c3:#199e70;--c4:#c98500;--c5:#d55181;--warn:#fab219;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--plane);color:var(--ink);
+  font-family:system-ui,-apple-system,"Segoe UI",sans-serif;font-size:15px;line-height:1.55}
+.wrap{max-width:1000px;margin:0 auto;padding:38px 24px 70px;display:flex;flex-direction:column;gap:24px}
+.eyebrow{font-size:11px;font-weight:600;letter-spacing:.13em;text-transform:uppercase;color:var(--muted);margin:0}
+h1{font-size:clamp(26px,4.2vw,36px);line-height:1.1;letter-spacing:-.02em;font-weight:640;margin:8px 0 0;text-wrap:balance}
+.standfirst{margin:12px 0 0;max-width:64ch;color:var(--ink-2);font-size:16px}
+h2{font-size:13px;font-weight:640;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-2);margin:0}
+.section{display:flex;flex-direction:column;gap:12px}
+.lede{margin:-4px 0 0;font-size:13.5px;color:var(--muted);max-width:76ch}
+.card{background:var(--surface);border:1px solid var(--rule);border-radius:4px;padding:16px 16px 10px;position:relative}
+svg{width:100%;height:auto;display:block;overflow:visible}
+text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+.tick{font-size:10px;fill:var(--muted);font-variant-numeric:tabular-nums}
+.axt{font-size:11px;fill:var(--muted)}
+.gl{stroke:var(--grid);stroke-width:1}
+.bl{stroke:var(--axis);stroke-width:1}
+.series{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.endlab{font-size:11px;font-weight:640}
+.legend{display:flex;gap:16px;flex-wrap:wrap}
+.legend span{display:inline-flex;align-items:center;gap:7px;font-size:13px;color:var(--ink-2);font-weight:500}
+.sw{width:14px;height:3px;border-radius:2px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.tile{background:var(--surface);border:1px solid var(--rule);border-radius:4px;padding:13px 15px;display:flex;flex-direction:column;gap:2px}
+.tile .k{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.tile .v{font-size:23px;font-weight:620;letter-spacing:-.02em}
+.tile .s{font-size:12.5px;color:var(--ink-2)}
+.note{background:var(--surface);border:1px solid var(--rule);border-left:3px solid var(--warn);
+  border-radius:4px;padding:15px 18px;display:flex;flex-direction:column;gap:6px}
+.note b{font-weight:640}
+.note p{margin:0;font-size:14px;color:var(--ink-2);max-width:76ch}
+.tip{position:absolute;pointer-events:none;background:var(--surface);border:1px solid var(--rule);
+  border-radius:4px;padding:7px 10px;font-size:12px;color:var(--ink);box-shadow:0 4px 14px rgba(0,0,0,.13);
+  opacity:0;transition:opacity .1s;z-index:5;white-space:nowrap;font-variant-numeric:tabular-nums}
+.tip .hd{font-weight:640;margin-bottom:3px}
+footer{border-top:1px solid var(--rule);padding-top:14px;font-size:12.5px;color:var(--muted)}
+</style>
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">Voronoi Go · dense rating</p>
+    <h1>Every checkpoint on one scale</h1>
+    <p class="standfirst">
+      Random short round-robins across all five runs, tied together by a single
+      Bradley-Terry fit. Plotted against cumulative self-play samples, because
+      update number is not comparable between runs whose shards differ in size.
+    </p>
+  </header>
+
+  <section class="section" id="stats"></section>
+
+  <section class="section">
+    <div class="legend" id="legend"></div>
+    <div class="card" id="chart"></div>
+    <p class="lede" id="caption"></p>
+  </section>
+
+  <div class="note">
+    <b>Reading this while it is still running</b>
+    <p>
+      Ratings are fitted over the connected part of the match graph only —
+      checkpoints the sampling has not yet linked are omitted rather than given
+      a number the prior invented. Early on, points move as connections appear.
+      Error bars are ±1 standard error against the field mean.
+    </p>
+  </div>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+const DATA=/*DATA*/null/*DATA*/;
+const NS="http://www.w3.org/2000/svg";
+const el=(t,a,s)=>{const e=document.createElementNS(NS,t);
+  for(const k in a)e.setAttribute(k,a[k]); for(const k in s)e.style.setProperty(k,s[k]); return e;};
+const runs=Object.keys(DATA.series);
+
+const stats=document.getElementById("stats");
+const tiles=document.createElement("div"); tiles.className="tiles";
+const tile=(k,v,s)=>{const d=document.createElement("div"); d.className="tile";
+  d.innerHTML=`<div class="k">${k}</div><div class="v">${v}</div>`+(s?`<div class="s">${s}</div>`:"");
+  tiles.appendChild(d);};
+tile("Checkpoints rated", DATA.rated, `of ${DATA.pool} in the pool`);
+tile("Games", DATA.games.toLocaleString(), `${DATA.pairings} pairings`);
+// Say what the anchor is actually worth. Naive pins the zero only if it wins
+// sometimes; at 1-47 the offset is the prior's, and only the spacing between
+// checkpoints is evidence.
+if(DATA.naive && DATA.naive.games){
+  const n=DATA.naive;
+  tile("Anchor", `${n.wins}-${n.losses}`,
+       n.wins<=1 ? "naive is ~winless: the zero is prior-driven, spacing is not"
+                 : "naive anchors the scale");
+} else tile("Scale","relative","no naive link yet");
+if(DATA.stranded) tile("Not yet connected", DATA.stranded, "omitted from the fit");
+stats.appendChild(tiles);
+
+const lg=document.getElementById("legend");
+for(const r of runs){const s=document.createElement("span");
+  s.innerHTML=`<i class="sw" style="background:var(${DATA.vars[r]})"></i>${DATA.names[r]}`;
+  lg.appendChild(s);}
+
+const W=880,H=470,ML=62,MR=118,MT=18,MB=48,PW=W-ML-MR,PH=H-MT-MB;
+const pts=runs.flatMap(r=>DATA.series[r]).filter(p=>p.n>0);
+const xs=pts.map(p=>Math.log10(p.n)), ys=pts.map(p=>p.elo);
+const x0=Math.min(...xs)-0.06, x1=Math.max(...xs)+0.06;
+let y0=Math.min(...ys.map((v,i)=>v-pts[i].se)), y1=Math.max(...ys.map((v,i)=>v+pts[i].se));
+const pad=(y1-y0)*0.08||50; y0-=pad; y1+=pad;
+const sx=v=>ML+(Math.log10(v)-x0)/(x1-x0)*PW, sy=v=>MT+PH-(v-y0)/(y1-y0)*PH;
+const svg=document.createElementNS(NS,"svg");
+svg.setAttribute("viewBox",`0 0 ${W} ${H}`); svg.setAttribute("role","img");
+svg.setAttribute("aria-label","Elo against cumulative self-play samples for every rated checkpoint, by run.");
+function ticks(lo,hi,n){const sp=hi-lo||1,raw=sp/n,mag=Math.pow(10,Math.floor(Math.log10(raw)));
+  const st=[1,2,2.5,5,10].map(x=>x*mag).find(x=>x>=raw)||mag*10;const o=[];
+  for(let v=Math.ceil(lo/st)*st;v<=hi+1e-9;v+=st)o.push(v);return o;}
+for(const t of ticks(y0,y1,5)){
+  svg.appendChild(el("line",{class:"gl",x1:ML,x2:ML+PW,y1:sy(t).toFixed(1),y2:sy(t).toFixed(1)}));
+  const l=el("text",{class:"tick",x:ML-9,y:sy(t)+3.5,"text-anchor":"end"});
+  l.textContent=Math.round(t); svg.appendChild(l);}
+svg.appendChild(el("line",{class:"bl",x1:ML,x2:ML+PW,y1:MT+PH,y2:MT+PH}));
+// Naive has no sample count, so it cannot sit on this axis -- draw it as the
+// reference level it actually is.
+if(DATA.naive && DATA.naive.games && sy(0)>MT && sy(0)<MT+PH){
+  svg.appendChild(el("line",{x1:ML,x2:ML+PW,y1:sy(0),y2:sy(0),"stroke-width":1.5,
+    "stroke-dasharray":"6 4"},{stroke:"var(--muted)",opacity:.7}));
+  const l=el("text",{class:"tick",x:ML+6,y:sy(0)-6});
+  l.textContent=`naive (${DATA.naive.wins}-${DATA.naive.losses})`; svg.appendChild(l);
+}
+for(const v of [5000,10000,20000,50000,100000,200000,400000]){
+  if(Math.log10(v)<x0||Math.log10(v)>x1) continue;
+  const l=el("text",{class:"tick",x:sx(v),y:MT+PH+17,"text-anchor":"middle"});
+  l.textContent=(v/1000)+"k"; svg.appendChild(l);
+  svg.appendChild(el("line",{class:"gl",x1:sx(v),x2:sx(v),y1:MT,y2:MT+PH},{opacity:.5}));}
+const ax=el("text",{class:"axt",x:ML+PW/2,y:H-6,"text-anchor":"middle"});
+ax.textContent="cumulative self-play samples (log scale)"; svg.appendChild(ax);
+const ay=el("text",{class:"axt",x:13,y:MT+PH/2,"text-anchor":"middle",
+  transform:`rotate(-90 13 ${MT+PH/2})`}); ay.textContent="Elo"; svg.appendChild(ay);
+
+const tip=document.createElement("div"); tip.className="tip";
+const ends=[];
+for(const r of runs){
+  const color=`var(${DATA.vars[r]})`;
+  const p=DATA.series[r].filter(d=>d.n>0);
+  if(!p.length) continue;
+  if(p.length>1){
+    const d=p.map((q,i)=>(i?"L":"M")+sx(q.n).toFixed(1)+" "+sy(q.elo).toFixed(1)).join(" ");
+    svg.appendChild(el("path",{class:"series",d},{stroke:color,opacity:.85}));
+  }
+  for(const q of p){
+    svg.appendChild(el("line",{x1:sx(q.n),x2:sx(q.n),y1:sy(q.elo-q.se),y2:sy(q.elo+q.se),
+      "stroke-width":1.5},{stroke:color,opacity:.3}));
+    const dot=el("circle",{cx:sx(q.n),cy:sy(q.elo),r:3.6,"stroke-width":1.5},
+      {fill:color,stroke:"var(--surface)"});
+    dot.addEventListener("mouseenter",()=>{
+      const b=svg.getBoundingClientRect(), sc=b.width/W;
+      tip.innerHTML=`<div class="hd">${DATA.names[r]} · update ${q.v}</div>`+
+        `<div>${Math.round(q.elo)} ± ${Math.round(q.se)} Elo</div>`+
+        `<div>${q.n.toLocaleString()} samples · ${q.games} games</div>`;
+      tip.style.opacity=1;
+      tip.style.left=Math.min(sx(q.n)*sc+12,b.width-190)+"px";
+      tip.style.top=(sy(q.elo)*sc-10)+"px";});
+    dot.addEventListener("mouseleave",()=>{tip.style.opacity=0;});
+    svg.appendChild(dot);
+  }
+  const last=p[p.length-1];
+  ends.push({name:DATA.names[r],color,x:sx(last.n),y:sy(last.elo)});
+}
+ends.sort((a,b)=>a.y-b.y);
+for(let i=1;i<ends.length;i++) if(ends[i].y-ends[i-1].y<13) ends[i].y=ends[i-1].y+13;
+for(const e of ends){const l=el("text",{class:"endlab",x:e.x+9,y:e.y+4},{fill:e.color});
+  l.textContent=e.name; svg.appendChild(l);}
+const chart=document.getElementById("chart");
+chart.appendChild(svg); chart.appendChild(tip);
+
+document.getElementById("caption").textContent=
+  "Each point is one checkpoint. Whiskers are ±1 standard error against the field mean. "+
+  "Lines join checkpoints within a run and are drawn between measured points, not interpolated evidence.";
+document.getElementById("foot").textContent=
+  "All runs: DDRNet width 64, 16 blocks, one attention block per context stage, 1600 simulations "+
+  "during generation, cold start. Rating games at 800 simulations, 105 ply cap. "+
+  "Runs differ in optimizer and in samples per shard.";
+</script>

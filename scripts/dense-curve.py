@@ -58,6 +58,54 @@ def checkpoints(run: Path, stride: int) -> list[tuple[int, Path]]:
     return picked
 
 
+def banded_rounds(pool, ratings, per_checkpoint, field, band, spanning_every, rng):
+    """Rounds drawn from a rating neighbourhood, with periodic spanning rounds.
+
+    Bradley-Terry information per game is proportional to p(1-p), so a game
+    between evenly matched players is worth several times one decided 97-3.
+    Measured on this field, random pairing averages 0.111 while banding to eight
+    neighbours averages 0.241 -- 2.2x the information for the same games, with
+    47% of random pairings currently differing by more than 400 Elo.
+
+    Banding alone is not enough. Matching only near neighbours turns the
+    comparison graph into a chain: every link is precise, but comparing the ends
+    accumulates error through every link between, so long-range comparisons get
+    worse. Every `spanning_every`-th round is therefore drawn stratified across
+    the whole range -- poor information per game, but these are the long
+    baselines that hold the scale together.
+
+    Pairing on estimated rating does not bias the fit: the maximum-likelihood
+    estimate stays unbiased as long as pairing depends on prior estimates rather
+    than on outcomes. It changes variance, not location.
+    """
+    def rating(entry):
+        return ratings.get(f"{entry[0]}/{entry[1]}", 0.0)
+
+    order = sorted(pool, key=rating)
+    total = max(1, -(-len(pool) * per_checkpoint // field))
+    counts = {id(p): 0 for p in pool}
+    out = []
+    for index in range(total):
+        if spanning_every and index % spanning_every == 0:
+            # One from each stratum, so the round spans the whole rating range.
+            step = max(1, len(order) // field)
+            group = [rng.choice(order[i:i + step]) for i in range(0, len(order), step)][:field]
+        else:
+            # Seed on the least-played checkpoint so coverage stays even, then
+            # fill from its neighbourhood.
+            seed = min(pool, key=lambda p: (counts[id(p)], rng.random()))
+            centre = order.index(seed)
+            low = max(0, min(centre - band // 2, len(order) - band))
+            window = order[low:low + band]
+            group = rng.sample(window, min(field, len(window)))
+            if seed not in group:
+                group[0] = seed
+        for entry in group:
+            counts[id(entry)] += 1
+        out.append(group)
+    return out
+
+
 def rounds(pool: list, per_checkpoint: int, field: int, rng: random.Random):
     """Chunk `per_checkpoint` shuffled copies of the pool into rounds.
 
@@ -92,6 +140,13 @@ def main() -> None:
     parser.add_argument("--rounds-per-checkpoint", type=int, default=5)
     parser.add_argument("--field", type=int, default=8,
                         help="checkpoints per round")
+    parser.add_argument("--ratings", type=Path, default=None,
+                        help="ratings JSON from build-dense-curve.py; enables "
+                             "banded matchmaking")
+    parser.add_argument("--band", type=int, default=12,
+                        help="neighbours a banded round draws from")
+    parser.add_argument("--spanning-every", type=int, default=4,
+                        help="every Nth round spans the whole range instead")
     parser.add_argument("--naive-rounds", type=int, default=4,
                         help="rounds that also include naive, chosen from those "
                              "with the earliest checkpoints; 0 disables and "
@@ -112,7 +167,16 @@ def main() -> None:
         for version, onnx in checkpoints(run, arguments.stride):
             pool.append((run.name, version, onnx))
     rng = random.Random(arguments.seed)
-    schedule = rounds(pool, arguments.rounds_per_checkpoint, arguments.field, rng)
+    if arguments.ratings and arguments.ratings.exists():
+        ratings = json.loads(arguments.ratings.read_text(encoding="utf-8"))
+        schedule = banded_rounds(pool, ratings, arguments.rounds_per_checkpoint,
+                                 arguments.field, arguments.band,
+                                 arguments.spanning_every, rng)
+        print(f"matchmaking: banded (window {arguments.band}, "
+              f"spanning every {arguments.spanning_every})")
+    else:
+        schedule = rounds(pool, arguments.rounds_per_checkpoint, arguments.field, rng)
+        print("matchmaking: uniform random")
 
     # Naive goes where it is still competitive -- the rounds whose checkpoints
     # are earliest. Against late checkpoints it scores zero, and a pairing with
@@ -130,7 +194,11 @@ def main() -> None:
           f"(stride {arguments.stride})")
     print(f"schedule : {len(schedule)} rounds, {len(with_naive)} with naive, "
           f"{total} games")
-    print(f"estimate : {total / 0.073 / 3600:.1f}h at the measured 0.073 games/s")
+    # Measured on an idle box: 0.165 games/s at 800 simulations, 0.073 at 1600
+    # while contending with a training run. Scale by the simulation count.
+    rate = 0.165 * (800 / max(arguments.simulations, 1))
+    print(f"estimate : {total / rate / 3600:.1f}h at ~{rate:.3f} games/s "
+          f"({arguments.simulations} simulations)")
     if arguments.dry_run:
         for index, group in enumerate(schedule[:5]):
             print(f"  round {index}: "
