@@ -77,11 +77,20 @@ def records(text: str) -> list[dict]:
     return found
 
 
-def identify(path: str) -> tuple[str, int]:
+def identify(path: str) -> tuple[str, int] | None:
+    """(run, update) for a checkpoint path, or None if it is not one.
+
+    Ad-hoc tournaments sometimes include models that live outside a run's
+    updates/ tree -- the cross-training experiment wrote its four to
+    artifacts/crosstrain/models/. Those cannot be placed on a run's sample axis,
+    so records mentioning them are skipped rather than aborting the pool.
+    """
     if path == "naive":
         return "naive", -1
     parts = Path(path).parts
     match = _UPDATE.search(path)
+    if "updates" not in parts or match is None:
+        return None
     return parts[parts.index("updates") - 1], int(match.group(1))
 
 
@@ -107,7 +116,12 @@ def naive_record(matches: list[dict], identifier: int | None) -> dict | None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--records", type=Path, action="append",
-                        help="repeatable; several tournaments pool into one fit")
+                        help="repeatable; default is every tournament under "
+                             "artifacts/ at the chosen simulation count")
+    parser.add_argument("--simulations", type=int, default=800,
+                        help="pool only tournaments played at this search "
+                             "budget; a model at 1600 simulations is a different "
+                             "player from the same model at 800")
     parser.add_argument("--ratings-json", type=Path, default=None,
                         help="also write {run/version: elo}, which dense-curve.py "
                              "reads to band its matchmaking")
@@ -122,26 +136,52 @@ def main() -> None:
                         default=Path(__file__).resolve().parent / "dense-curve.template.html")
     arguments = parser.parse_args()
 
-    sources = arguments.records or [_ROOT / "artifacts/dense-curve/records.jsonl"]
-    found = []
+    sources = arguments.records or sorted(
+        (_ROOT / "artifacts").glob("*/records.jsonl"))
+    found, mixed = [], []
     for source in sources:
-        if source.exists():
-            found += records(source.read_text(encoding="utf-8"))
+        if not source.exists() or not source.stat().st_size:
+            continue
+        batch = records(source.read_text(encoding="utf-8"))
+        if not batch:
+            continue
+        # Records written before the field existed carry no simulation count.
+        # Fall back to the launcher's name only where it is unambiguous; here
+        # the one legacy tournament at another budget is the joint one.
+        counts = {r.get("simulations") for r in batch}
+        if counts == {None}:
+            if "joint-tournament" in str(source):
+                mixed.append((source.name, "1600, legacy"))
+                continue
+        elif counts - {None, arguments.simulations}:
+            mixed.append((source.parent.name, sorted(c for c in counts if c)))
+            batch = [r for r in batch
+                     if r.get("simulations") in (None, arguments.simulations)]
+        found += batch
+    if mixed:
+        print("skipped, different search budget: "
+              + ", ".join(f"{n} ({c})" for n, c in mixed))
     if not found:
         raise SystemExit("no records yet")
 
     keys, labels = {}, {}
-    matches = []
+    matches, skipped = [], 0
     for record in found:
         if int(record["completed"]) == 0:
             continue
         pair = []
         for side in ("candidate_model", "opponent_model"):
-            run, version = identify(record[side])
+            placed = identify(record[side])
+            if placed is None:
+                break
+            run, version = placed
             key = f"{run}#{version}"
             keys[key] = (run, version)
             labels[key] = "naive" if run == "naive" else f"{run} v{version}"
             pair.append(key)
+        if len(pair) != 2:
+            skipped += 1
+            continue
         matches.append({"a": pair[0], "b": pair[1],
                         "a_wins": int(record["candidate_wins"]),
                         "b_wins": int(record["candidate_losses"]),
@@ -213,7 +253,8 @@ def main() -> None:
             {f"{keys[inverse[i]][0]}/{keys[inverse[i]][1]}": elo
              for i, elo in ratings.items()}, indent=2) + "\n", encoding="utf-8")
     print(f"-> {arguments.output}  ({payload['rated']} of {payload['pool']} rated, "
-          f"{payload['games']} games, {payload['stranded']} not yet connected)")
+          f"{payload['games']} games, {payload['stranded']} not yet connected"
+          + (f", {skipped} records skipped: not run checkpoints)" if skipped else ")"))
 
 
 if __name__ == "__main__":

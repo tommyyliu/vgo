@@ -52,21 +52,38 @@ and back both files up first.
 curve. Records append and readers parse by brace depth, so a tournament can be
 read while it runs and stopped without losing completed rounds.
 
+### The two commands
+
 ```bash
-# a tournament over every run, uniform pairing
+# 1. rebuild the curve from every tournament ever played
+training/.venv/bin/python3 scripts/build-dense-curve.py \
+  --ratings-json ratings.json --output curve.html
+
+# 2. play more games (banded off the fit from step 1)
 training/.venv/bin/python3 scripts/dense-curve.py artifacts/<run> [artifacts/<run> ...] \
   --stride 2 --rounds-per-checkpoint 3 --field 8 --pairs 2 \
+  --ratings ratings.json --band 12 --spanning-every 4 \
   --simulations 800 --concurrency 100 --output artifacts/dense-curve-N --seed <n>
-
-# fit and render, pooling every tournament played so far
-training/.venv/bin/python3 scripts/build-dense-curve.py \
-  --records artifacts/dense-curve/records.jsonl \
-  --records artifacts/dense-curve-N/records.jsonl \
-  --ratings-json ratings.json --output curve.html
 ```
 
+Then repeat step 1. That is the whole loop: fit, play, refit.
+
+**Step 1 needs no arguments.** It discovers every `artifacts/*/records.jsonl`
+and pools whatever was played at `--simulations` (default 800), which includes
+the small hand-run matches, not just the sampled tournaments -- a 120-game
+head-to-head is better evidence per pairing than anything the sampling
+produces. Records at other budgets are skipped and named, because a model at
+1600 simulations is a different player from the same model at 800. Records
+naming models outside a run's `updates/` tree -- the cross-training experiment
+wrote four such -- are skipped and counted.
+
 `--anchor <run>/<version>` puts zero on a chosen checkpoint; the default is
-naive when it is in the field.
+naive when it is in the field. Anchoring is only a translation: it moves zero,
+never the spacing, so no comparison changes. Prefer a reference that wins
+*some* games; one that never wins has no finite rating and its distance from
+the field grows with the game count instead of converging.
+
+Pass `--records` explicitly only to pool a subset.
 
 ### Banded matchmaking
 

@@ -153,7 +153,7 @@ impl Tally {
 /// Flushing matters more than it looks: stdout is a pipe to a file here, so a
 /// buffered record is not on disk, and the whole point of writing early is that
 /// a run which dies partway still leaves usable results behind.
-fn emit(first: &str, second: &str, tally: &Tally) {
+fn emit(first: &str, second: &str, tally: &Tally, simulations: u32) {
     let decided = tally.decided();
     let score = if decided > 0 {
         (tally.first_wins as f64 + 0.5 * tally.draws as f64) / decided as f64
@@ -173,7 +173,11 @@ fn emit(first: &str, second: &str, tally: &Tally) {
             "  \"candidate_wins\": {},\n",
             "  \"candidate_losses\": {},\n",
             "  \"draws\": {},\n",
-            "  \"candidate_score\": {:.6}\n",
+            "  \"candidate_score\": {:.6},\n",
+            // Ratings from different search budgets are ratings of different
+            // players, so anything pooling records has to be able to tell them
+            // apart. Readers that do not know the field ignore it.
+            "  \"simulations\": {}\n",
             "}}"
         ),
         first,
@@ -184,6 +188,7 @@ fn emit(first: &str, second: &str, tally: &Tally) {
         tally.second_wins,
         tally.draws,
         score,
+        simulations,
     );
     let _ = out.flush();
 }
@@ -409,7 +414,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let (first, second) = pairings[assignment.pairing];
                         // Written under the lock so concurrent completions
                         // cannot interleave two records on stdout.
-                        emit(&labels[first], &labels[second], tally);
+                        emit(
+                            &labels[first],
+                            &labels[second],
+                            tally,
+                            arguments.simulations,
+                        );
                     }
                 }
                 let done = finished.fetch_add(1, Ordering::Relaxed) + 1;
