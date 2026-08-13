@@ -293,6 +293,7 @@ pub fn rasterize_compact_into(position: &Position, config: RasterConfig, data: &
     let pixels = config.pixels();
     assert_eq!(data.len(), COMPACT_CHANNELS.len() * pixels);
     let radius = position.radius();
+    let radius_square = radius * radius;
     let to_move = position.to_move();
     let mover_komi = match to_move {
         Color::Black => position.komi() as f32,
@@ -371,13 +372,14 @@ pub fn rasterize_compact_into(position: &Position, config: RasterConfig, data: &
             let opponent_square = opponent_squares[column];
             let nearest_square = nearest_squares[column];
             let second_square = second_squares[column];
-            let current_distance = current_square.sqrt();
-            let opponent_distance = opponent_square.sqrt();
             let nearest = nearest_square.sqrt();
             let second = second_square.sqrt();
 
-            data[pixel] = inside(current_distance, radius);
-            data[pixels + pixel] = inside(opponent_distance, radius);
+            // Squaring is monotonic for nonnegative distances, so the two
+            // stone-disc planes do not need a square root per pixel. The ridge
+            // still needs the actual nearest and second-nearest distances.
+            data[pixel] = f32::from(current_square <= radius_square);
+            data[pixels + pixel] = f32::from(opponent_square <= radius_square);
             data[2 * pixels + pixel] = if second.is_finite() {
                 (1.0 - (second - nearest) / radius).clamp(0.0, 1.0) as f32
             } else {
@@ -516,12 +518,10 @@ fn settled_mask(position: &Position, config: RasterConfig) -> Vec<bool> {
     let mut crossings: Vec<f64> = Vec::with_capacity(16);
     for index in 0..stones.len() {
         let region = SettledRegion::new(position, index, &known_vertices);
-        // A third of a pixel: finer than the raster can express, and far
-        // cheaper than the 2e-5 the client needs for a zoomable vector.
-        region.contour_within_into(
-            1.0 / (3.0 * config.width.max(config.height) as f64),
-            &mut contour,
-        );
+        // One pixel: the contour is only used to classify pixel centres, and
+        // finer chord detail cannot be represented by the output mask. This is
+        // far cheaper than the 2e-5 the client needs for a zoomable vector.
+        region.contour_within_into(1.0 / config.width.max(config.height) as f64, &mut contour);
         if contour.len() < 3 {
             continue;
         }
@@ -980,7 +980,7 @@ mod tests {
                 .filter(|(a, b)| a != b)
                 .count();
             let share = differing as f64 / config.pixels() as f64;
-            // Measured 0.043% at 40 stones; this leaves room for a denser
+            // Measured 0.087% at 40 stones; this leaves room for a denser
             // board without admitting a real regression.
             assert!(
                 share < 0.002,

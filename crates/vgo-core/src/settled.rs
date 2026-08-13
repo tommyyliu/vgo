@@ -300,11 +300,9 @@ impl<'a> SettledRegion<'a> {
         fn flatten(
             region: &SettledRegion,
             loop_points: &mut Vec<Point>,
-            angle_a: f64,
             ta: f64,
             ax: f64,
             ay: f64,
-            angle_b: f64,
             tb: f64,
             bx: f64,
             by: f64,
@@ -312,8 +310,15 @@ impl<'a> SettledRegion<'a> {
             tolerance: f64,
             max_depth: u32,
         ) {
-            let middle = 0.5 * (angle_a + angle_b);
-            let (uy, ux) = middle.sin_cos();
+            // Each interval is shorter than pi, so its angular midpoint is the
+            // normalized sum of its endpoint unit vectors. This is the same
+            // direction as `(angle_a + angle_b) / 2` without a sin/cos pair at
+            // every recursive subdivision.
+            let sum_x = ax + bx;
+            let sum_y = ay + by;
+            let inverse_length = 1.0 / numeric::length(sum_x, sum_y);
+            let ux = sum_x * inverse_length;
+            let uy = sum_y * inverse_length;
             let cap = region.exit_distance(ux, uy) + 0.02;
             let tm = region.radius_along(ux, uy, cap);
             let chord_x = 0.5
@@ -336,29 +341,28 @@ impl<'a> SettledRegion<'a> {
                 return;
             }
             flatten(
-                region, loop_points, angle_a, ta, ax, ay, middle, tm, ux, uy,
-                depth + 1, tolerance, max_depth,
+                region, loop_points, ta, ax, ay, tm, ux, uy, depth + 1,
+                tolerance, max_depth,
             );
             flatten(
-                region, loop_points, middle, tm, ux, uy, angle_b, tb, bx, by,
-                depth + 1, tolerance, max_depth,
+                region, loop_points, tm, ux, uy, tb, bx, by, depth + 1,
+                tolerance, max_depth,
             );
         }
 
-        let mut rays = [(0.0, 0.0, 0.0, 0.0); BASE_RAYS + 1];
+        let mut rays = [(0.0, 0.0, 0.0); BASE_RAYS + 1];
         for k in 0..=BASE_RAYS {
             let angle = std::f64::consts::TAU * k as f64 / BASE_RAYS as f64;
             let (ux, uy, t) = ray(angle);
-            rays[k] = (angle, t, ux, uy);
+            rays[k] = (t, ux, uy);
         }
 
-        points.push(at(rays[0].1, rays[0].2, rays[0].3));
+        points.push(at(rays[0].0, rays[0].1, rays[0].2));
         for k in 0..BASE_RAYS {
-            let (angle_a, ta, ax, ay) = rays[k];
-            let (angle_b, tb, bx, by) = rays[k + 1];
+            let (ta, ax, ay) = rays[k];
+            let (tb, bx, by) = rays[k + 1];
             flatten(
-                self, points, angle_a, ta, ax, ay, angle_b, tb, bx, by, 0,
-                tolerance, MAX_DEPTH,
+                self, points, ta, ax, ay, tb, bx, by, 0, tolerance, MAX_DEPTH,
             );
         }
         points.pop(); // the closing point repeats the first

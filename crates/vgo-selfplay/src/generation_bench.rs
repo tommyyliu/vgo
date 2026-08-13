@@ -330,6 +330,30 @@ fn main() {
         }
         black_box(points);
     }));
+    results.extend(run_case(
+        &config,
+        "settled-contours/128/35/half-pixel",
+        || {
+            let mut points = 0;
+            for region in &settled_regions {
+                region.contour_within_into(1.0 / (2.0 * 128.0), &mut contour_buffer);
+                points += contour_buffer.len();
+            }
+            black_box(points);
+        },
+    ));
+    results.extend(run_case(
+        &config,
+        "settled-contours/128/35/one-pixel",
+        || {
+            let mut points = 0;
+            for region in &settled_regions {
+                region.contour_within_into(1.0 / 128.0, &mut contour_buffer);
+                points += contour_buffer.len();
+            }
+            black_box(points);
+        },
+    ));
     results.extend(run_case(&config, "fine-grid/32x32/pool-4", || {
         let grid = FineGrid::build(black_box(&position), 32, 32, 4, policy_logit);
         black_box(grid);
