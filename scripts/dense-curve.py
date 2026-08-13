@@ -64,6 +64,42 @@ def checkpoints(run: Path, stride: int) -> list[tuple[int, Path]]:
     return picked
 
 
+def exported_maximum_batch(onnx: Path) -> int:
+    """Read the dynamic batch ceiling recorded beside an exported model."""
+    manifest = onnx.with_suffix(".onnx.json")
+    try:
+        report = json.loads(manifest.read_text(encoding="utf-8"))
+        maximum_batch = int(report["input"]["maximum_batch"])
+    except (
+        FileNotFoundError,
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
+        raise SystemExit(
+            f"cannot determine ONNX maximum batch from {manifest}; "
+            "re-export the checkpoint so it has a valid manifest"
+        ) from error
+    if maximum_batch < 1:
+        raise SystemExit(
+            f"invalid ONNX maximum batch {maximum_batch} in {manifest}"
+        )
+    return maximum_batch
+
+
+def round_maximum_batch(group, exported_batches, requested: int) -> int:
+    """Serving batch supported by every model participating in one round."""
+    return min(
+        [requested]
+        + [
+            exported_batches[onnx]
+            for _, _, onnx in group
+            if onnx is not None
+        ]
+    )
+
+
 def seeded_ratings(pool, ratings):
     """Fill unrated checkpoints from their own run's rated neighbours.
 
@@ -227,6 +263,10 @@ def main() -> None:
                         help="colour-swapped pairs per pairing; each is 2 games")
     parser.add_argument("--simulations", type=int, default=1600)
     parser.add_argument("--concurrency", type=int, default=80)
+    parser.add_argument("--maximum-batch", type=int, default=64,
+                        help="desired inference batch ceiling; each round is "
+                             "automatically clamped to the smallest maximum "
+                             "supported by its ONNX models")
     parser.add_argument("--parallel-rounds", type=int, default=1,
                         help="rounds to play at once. One round cannot keep "
                              "the GPU busy: each model gets its own broker, "
@@ -240,6 +280,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=414)
     parser.add_argument("--dry-run", action="store_true")
     arguments = parser.parse_args()
+    if arguments.maximum_batch < 1:
+        parser.error("--maximum-batch must be positive")
 
     root = Path(__file__).resolve().parents[1]
     selected = [parse_run(spec, arguments.stride) for spec in arguments.runs]
@@ -247,6 +289,15 @@ def main() -> None:
     for run, stride in selected:
         for version, onnx in checkpoints(run, stride):
             pool.append((run.name, version, onnx))
+    # Export maximums describe what a model *can* accept, not what TensorRT
+    # will allocate or execute. Keep the requested serving batch independent,
+    # then clamp mixed old/new rounds to their weakest artifact. This lets an
+    # interrupted curve resume across batch-32 and batch-64 checkpoints.
+    exported_batches = {
+        onnx: exported_maximum_batch(onnx)
+        for _, _, onnx in pool
+        if onnx is not None
+    }
     rng = random.Random(arguments.seed)
     if arguments.ratings and arguments.ratings.exists():
         ratings = json.loads(arguments.ratings.read_text(encoding="utf-8"))
@@ -307,6 +358,13 @@ def main() -> None:
         print(f"           {run.name}: {taken} at stride {stride}")
     print(f"schedule : {len(schedule)} rounds, {len(with_naive)} with naive, "
           f"{total} games")
+    export_ceiling = min(exported_batches.values(),
+                         default=arguments.maximum_batch)
+    if export_ceiling < arguments.maximum_batch:
+        print(f"batch    : requested {arguments.maximum_batch}; rounds containing "
+              f"older exports clamp as low as {export_ceiling}")
+    else:
+        print(f"batch    : {arguments.maximum_batch}")
     # Measured on an idle box: 0.165 games/s at 800 simulations, 0.073 at 1600
     # while contending with a training run. Scale by the simulation count.
     rate = 0.165 * (800 / max(arguments.simulations, 1))
@@ -342,15 +400,18 @@ def main() -> None:
     environment = runtime_environment()
     started = time.time()
 
-    def build(index: int) -> tuple[list[str], str]:
+    def build(index: int) -> tuple[list[str], str, int]:
         group = schedule[index]
+        maximum_batch = round_maximum_batch(
+            group, exported_batches, arguments.maximum_batch
+        )
         command = [str(root / "target/release/vgo-tournament"),
                    "--pairs", str(arguments.pairs),
                    "--concurrency", str(arguments.concurrency),
                    "--simulations", str(arguments.simulations),
                    "--maximum-plies", str(arguments.maximum_plies),
                    "--coarse-pool", "16", "--leaf-batch", "4",
-                   "--maximum-batch", "64", "--delay-ms", "1",
+                   "--maximum-batch", str(maximum_batch), "--delay-ms", "1",
                    "--resolution", "128", "--policy-resolution", "128",
                    "--radius", "0.055714285714285716", "--komi", "0.034",
                    "--provider", "tensorrt",
@@ -365,7 +426,7 @@ def main() -> None:
                           for r, v, _ in group)
         if index in with_naive:
             names += " + naive"
-        return command, names
+        return command, names, maximum_batch
 
     # Rounds run concurrently but their records are appended by this process,
     # one finished round at a time. A record is a pretty-printed JSON object
@@ -377,14 +438,15 @@ def main() -> None:
     lanes = max(1, arguments.parallel_rounds)
 
     def launch(index: int) -> None:
-        command, names = build(index)
+        command, names, maximum_batch = build(index)
         partial = arguments.output / f"round-{index:03d}.partial.jsonl"
         stream = partial.open("w", encoding="utf-8")
         process = subprocess.Popen(command, env=environment, stdout=stream)
         running[index] = (process, partial, stream)
         elapsed = (time.time() - started) / 60
         print(f"\n[{index + 1}/{len(schedule)}] {names}"
-              f"   ({elapsed:.0f} min elapsed, {len(running)} rounds in flight)",
+              f"   (batch {maximum_batch}, {elapsed:.0f} min elapsed, "
+              f"{len(running)} rounds in flight)",
               flush=True)
 
     def harvest(index: int) -> None:

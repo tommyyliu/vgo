@@ -592,6 +592,61 @@ class PipelineSchedulingTests(unittest.TestCase):
 
 
 class PipelineRecoveryTests(unittest.TestCase):
+    def test_new_exports_retain_batch_headroom(self) -> None:
+        class Result:
+            def __init__(self, report: dict[str, object]) -> None:
+                self.report = report
+
+            def final_json(self) -> dict[str, object]:
+                return self.report
+
+        class Runner:
+            def __init__(self) -> None:
+                self.command: list[str] | None = None
+
+            async def run(self, command, **_kwargs):
+                self.command = list(command)
+                checkpoint = Path(command[command.index("--checkpoint") + 1])
+                onnx = Path(command[command.index("--output") + 1])
+                maximum_batch = int(
+                    command[command.index("--maximum-batch") + 1]
+                )
+                onnx.write_bytes(b"onnx")
+                return Result({
+                    "schema": "vgo.onnx-manifest.v1",
+                    "checkpoint": str(checkpoint.resolve()),
+                    "checkpoint_sha256": file_sha256(checkpoint),
+                    "onnx": str(onnx.resolve()),
+                    "onnx_sha256": file_sha256(onnx),
+                    "input": {"maximum_batch": maximum_batch},
+                })
+
+        for configured, exported in ((32, 64), (96, 96)):
+            with self.subTest(configured=configured):
+                with tempfile.TemporaryDirectory() as directory:
+                    pipeline = Pipeline(
+                        PipelineConfig(
+                            output=directory,
+                            inference_batch=configured,
+                        )
+                    )
+                    update = Path(directory) / "updates" / "update-000001"
+                    update.mkdir(parents=True)
+                    (update / "candidate.pt").write_bytes(b"checkpoint")
+                    runner = Runner()
+                    pipeline.runner = runner  # type: ignore[assignment]
+
+                    report = asyncio.run(pipeline._export(update))
+
+                assert runner.command is not None
+                self.assertEqual(report["input"]["maximum_batch"], exported)
+                self.assertEqual(
+                    runner.command[
+                        runner.command.index("--maximum-batch") + 1
+                    ],
+                    str(exported),
+                )
+
     def test_exported_model_may_have_a_larger_batch_ceiling(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             pipeline = Pipeline(

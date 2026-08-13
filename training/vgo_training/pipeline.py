@@ -26,6 +26,11 @@ CONFIG_SCHEMA = "vgo.pipeline-config.v1"
 UPDATE_SCHEMA = "vgo.pipeline-update.v1"
 TELEMETRY_SCHEMA = "vgo.telemetry-job.v1"
 LEARNER_PROTOCOL_SCHEMA = "vgo.learner.protocol.v1"
+# The runtime still builds and serves its configured batch (often 32). The
+# exported dynamic axis is only a compatibility ceiling, so retaining modest
+# headroom here does not consume the memory or compute of a batch of 64. It
+# does keep the same checkpoint usable if a later workload can fill 64.
+ONNX_EXPORT_BATCH_HEADROOM = 64
 OPERATIONAL_CONFIG_FIELDS = {
     "output",
     "updates",
@@ -1872,7 +1877,7 @@ class Pipeline:
             "--output",
             str(onnx),
             "--maximum-batch",
-            str(self.config.inference_batch),
+            str(max(ONNX_EXPORT_BATCH_HEADROOM, self.config.inference_batch)),
         ]
         result = await self.runner.run(
             command,
