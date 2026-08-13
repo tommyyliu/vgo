@@ -380,7 +380,7 @@ mod tests {
     use std::convert::Infallible;
 
     use super::{ResignRule, play_game, play_game_with_resignation};
-    use vgo_core::{Color, Position, Stone};
+    use vgo_core::{Color, Position};
     use vgo_search::{SearchConfig, search};
 
     #[test]

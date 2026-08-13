@@ -66,9 +66,9 @@ pub fn place(position: &Position, x: f64, y: f64) -> Result<MoveResult, MoveErro
     let mut stones = position.stones().to_vec();
     stones.push(Stone::new(x, y, mover));
     let mut provisional = position.with_stones(stones);
-    // Settlement only: both of these describe a board that captures are about
-    // to change, so the score and outcome a full analysis would compute are
-    // discarded unread. Only the committed position below needs those.
+    // Settlement first: captures may still change either provisional board, so
+    // scoring it eagerly would usually be throwaway work. If self-capture leaves
+    // the final one unchanged, it is promoted into the committed analysis below.
     let mut current_settlement = Settlement::new(&provisional);
 
     let (after_enemy, enemy_count) =
@@ -86,7 +86,16 @@ pub fn place(position: &Position, x: f64, y: f64) -> Result<MoveResult, MoveErro
     // both report self_count > 0.
     let changed = after_self.stones().len() != position.stones().len();
     let committed = position.after_placement(after_self.stones().to_vec(), changed);
-    let analysis = Analysis::new(&committed);
+    // With no self-capture, `committed` has exactly the radius and stones that
+    // `current_settlement` analysed; committing only changed turn/pass metadata.
+    // Promote those already-computed geometry and liveness results instead of
+    // building the same diagram for a second time. Self-capture changes stones,
+    // so that branch still needs a fresh analysis.
+    let analysis = if self_count == 0 {
+        current_settlement.into_analysis(&committed)
+    } else {
+        Analysis::new(&committed)
+    };
     let mut events = Vec::new();
     if enemy_count > 0 {
         events.push(GameEvent::Capture {
@@ -132,9 +141,111 @@ pub fn pass(position: &Position) -> Result<MoveResult, MoveError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Color, Phase, Position};
+    use crate::{Analysis, Color, GameEvent, MoveResult, Phase, Position, Stone};
 
     use super::{MoveError, pass, place};
+
+    /// Promoting a settlement must be indistinguishable from recomputing the
+    /// committed position, including every floating-point bit in its geometry.
+    fn assert_analysis_matches_fresh(result: &MoveResult) {
+        let actual = &result.analysis;
+        let expected = Analysis::new(&result.position);
+
+        assert_eq!(actual.validation, expected.validation);
+        assert_eq!(actual.alive_groups, expected.alive_groups);
+        assert_eq!(actual.settled_groups, expected.settled_groups);
+        assert_eq!(actual.geometry.adjacency, expected.geometry.adjacency);
+        assert_eq!(actual.geometry.groups, expected.geometry.groups);
+        assert_eq!(actual.geometry.diagnostics, expected.geometry.diagnostics);
+        assert_eq!(actual.geometry.cells.len(), expected.geometry.cells.len());
+
+        let point_bits = |point: crate::Point| (point.x.to_bits(), point.y.to_bits());
+        assert_eq!(
+            actual
+                .legal_vertices
+                .iter()
+                .copied()
+                .map(point_bits)
+                .collect::<Vec<_>>(),
+            expected
+                .legal_vertices
+                .iter()
+                .copied()
+                .map(point_bits)
+                .collect::<Vec<_>>()
+        );
+        for (actual_cell, expected_cell) in
+            actual.geometry.cells.iter().zip(&expected.geometry.cells)
+        {
+            assert_eq!(actual_cell.area.to_bits(), expected_cell.area.to_bits());
+            assert_eq!(
+                actual_cell
+                    .polygon
+                    .iter()
+                    .copied()
+                    .map(point_bits)
+                    .collect::<Vec<_>>(),
+                expected_cell
+                    .polygon
+                    .iter()
+                    .copied()
+                    .map(point_bits)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(actual_cell.edges.len(), expected_cell.edges.len());
+            for (actual_edge, expected_edge) in actual_cell.edges.iter().zip(&expected_cell.edges) {
+                assert_eq!(
+                    point_bits(actual_edge.start),
+                    point_bits(expected_edge.start)
+                );
+                assert_eq!(point_bits(actual_edge.end), point_bits(expected_edge.end));
+                assert_eq!(actual_edge.source, expected_edge.source);
+            }
+        }
+        assert_eq!(actual.score.black.to_bits(), expected.score.black.to_bits());
+        assert_eq!(actual.score.white.to_bits(), expected.score.white.to_bits());
+        assert_eq!(actual.outcome.winner, expected.outcome.winner);
+        assert_eq!(
+            actual.outcome.margin.to_bits(),
+            expected.outcome.margin.to_bits()
+        );
+    }
+
+    #[test]
+    fn promoted_analysis_matches_fresh_after_an_ordinary_placement() {
+        let position = Position::new(0.1, Vec::new(), Color::Black).with_komi(0.12);
+        let result = place(&position, 0.5, 0.5).expect("legal move");
+        assert!(result.events.is_empty(), "fixture must not capture");
+        assert_analysis_matches_fresh(&result);
+    }
+
+    #[test]
+    fn promoted_analysis_matches_fresh_after_enemy_capture() {
+        // Deterministic four-ply position found by the generation sampler. This
+        // move removes both Black groups and no White group, exercising the
+        // post-enemy-removal settlement rather than the initial provisional one.
+        let position = Position::new(
+            0.2,
+            vec![
+                Stone::new(0.799_999, 0.394_301_338_356_336_74, Color::Black),
+                Stone::new(0.450_359_755_708_616_2, 0.200_001, Color::White),
+                Stone::new(0.200_001, 0.590_089_667_194_192_1, Color::Black),
+            ],
+            Color::White,
+        )
+        .with_komi(0.12);
+        let result =
+            place(&position, 0.604_780_272_776_142_7, 0.799_999).expect("legal capturing move");
+        assert_eq!(
+            result.events,
+            vec![GameEvent::Capture {
+                color: Color::Black,
+                count: 2,
+            }],
+            "fixture must capture enemies without self-capture"
+        );
+        assert_analysis_matches_fresh(&result);
+    }
 
     /// A placement that leaves the board unchanged counts as a pass.
     ///

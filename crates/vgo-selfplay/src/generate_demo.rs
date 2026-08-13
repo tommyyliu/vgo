@@ -17,19 +17,17 @@ use clap::{ArgAction, Parser};
 use sha2::{Digest, Sha256};
 use vgo_core::{Analysis, Color, Position};
 use vgo_inference::{
-    BatchedEvaluator, BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, OnnxBatchService,
-    OnnxProvider, OnnxServiceConfig,
+    BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, OnnxBatchService, OnnxProvider,
+    OnnxServiceConfig,
 };
 use vgo_raster::{
-    CHANNELS, COMPACT_CHANNELS, ChannelSpec, RasterConfig, RasterKind, SemanticRaster,
-    action_pixel,
+    CHANNELS, COMPACT_CHANNELS, ChannelSpec, RasterConfig, RasterKind, SemanticRaster, action_pixel,
 };
 use vgo_search::{
     Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, SearchResult, search_at_ply,
 };
 use vgo_selfplay::{
-    ResignRule, award_by_area,
-    play_game_with_resignation as run_playout_with_resignation,
+    ResignRule, award_by_area, play_game_with_resignation as run_playout_with_resignation,
 };
 
 mod replay_stream;
@@ -271,9 +269,9 @@ struct Config {
     fp16: bool,
     #[arg(long, default_value_t = 8)]
     maximum_batch: usize,
-    /// Independent inference brokers and native execution sessions. Multiple
-    /// lanes let host packing, device transfers, and execution overlap without
-    /// adding another per-position tensor copy.
+    /// Native execution sessions behind one shared batching broker. Multiple
+    /// slots overlap host packing, device transfers, and execution without
+    /// fragmenting arrivals across independent collection queues.
     #[arg(long, default_value_t = 2)]
     inference_slots: usize,
     #[arg(long, default_value_t = 1)]
@@ -317,8 +315,7 @@ struct PolicyTarget {
 /// sweep stopping at 0.98 cannot tell a confident call from a certain one. The
 /// tail matters -- 0.70 to 0.98 moved the false-positive rate only 9.0% to
 /// 6.2% while still firing on 504 of ~660 games.
-const CALIBRATION_THRESHOLDS: [f64; 9] =
-    [0.70, 0.80, 0.85, 0.90, 0.95, 0.98, 0.99, 0.995, 0.999];
+const CALIBRATION_THRESHOLDS: [f64; 9] = [0.70, 0.80, 0.85, 0.90, 0.95, 0.98, 0.99, 0.995, 0.999];
 
 /// Windows swept alongside the thresholds.
 ///
@@ -370,7 +367,9 @@ fn calibration_trials(
     CALIBRATION_THRESHOLDS
         .iter()
         .flat_map(|&threshold| {
-            CALIBRATION_WINDOWS.iter().map(move |&window| (threshold, window))
+            CALIBRATION_WINDOWS
+                .iter()
+                .map(move |&window| (threshold, window))
         })
         .map(|(threshold, window)| {
             // Per seat, matching the live rule: a shared counter is reset by the
@@ -410,8 +409,7 @@ fn calibration_trials(
                     fired_confidence: 0.0,
                 },
                 Some((index, conceding, confidence)) => {
-                    let conceding_won =
-                        (conceding == Color::Black) == black_won;
+                    let conceding_won = (conceding == Color::Black) == black_won;
                     ResignTrial {
                         threshold,
                         window,
@@ -636,8 +634,11 @@ fn generate_game(
     // argument -- neither can see the other's locals.
     let soft_from = std::cell::Cell::new(u32::MAX);
     let playout = run_playout_with_resignation(
-        Position::new(config.radius, Vec::new(), Color::Black)
-            .with_komi(sampled_komi(game_seed, config.komi_low, config.komi_high)),
+        Position::new(config.radius, Vec::new(), Color::Black).with_komi(sampled_komi(
+            game_seed,
+            config.komi_low,
+            config.komi_high,
+        )),
         config.maximum_plies,
         resign,
         |position, ply| {
@@ -770,10 +771,7 @@ fn generate_game(
             // side actually was, which is the only way to judge the rule.
             margin: {
                 let analysis = Analysis::new(&playout.final_position);
-                (analysis.score.black
-                    - analysis.score.white
-                    - playout.final_position.komi())
-                .abs()
+                (analysis.score.black - analysis.score.white - playout.final_position.komi()).abs()
             },
             reached_ply_cap: playout.outcome.is_none(),
             resigned: playout.resigned,
@@ -785,9 +783,7 @@ fn generate_game(
                 .final_position
                 .stones()
                 .iter()
-                .map(|stone| {
-                    (stone.x, stone.y, u8::from(stone.color == Color::White))
-                })
+                .map(|stone| (stone.x, stone.y, u8::from(stone.color == Color::White)))
                 .collect(),
         }),
         samples,
@@ -1051,7 +1047,8 @@ fn generate_to_dataset(
             draining.store(true, Ordering::Release);
             replay.allow_overshoot();
         }
-        if draining_started && metrics.active_games.load(Ordering::Relaxed) == 0
+        if draining_started
+            && metrics.active_games.load(Ordering::Relaxed) == 0
             && metrics.writer_backlog.load(Ordering::Relaxed) == 0
         {
             break;
@@ -1231,7 +1228,11 @@ fn komi_buckets(records: &[GameRecord], low: f64, high: f64, count: usize) -> Ve
     (0..count)
         .map(|index| {
             let start = low + width * index as f64;
-            let end = if index + 1 == count { high } else { start + width };
+            let end = if index + 1 == count {
+                high
+            } else {
+                start + width
+            };
             let mut games = 0_usize;
             let mut black = 0_usize;
             let mut ties = 0_usize;
@@ -1329,7 +1330,11 @@ fn write_manifest(
     for (index, (threshold, window, measured, fired, wrong, saved, right_sum, wrong_sum)) in
         report.calibration.iter().enumerate()
     {
-        let comma = if index + 1 == report.calibration.len() { "" } else { "," };
+        let comma = if index + 1 == report.calibration.len() {
+            ""
+        } else {
+            ","
+        };
         // Mean confidence at the moment of firing, split by whether the
         // concession turned out right. Emitted as means rather than sums so a
         // reader does not have to divide, and null when nothing fired.
@@ -1375,6 +1380,10 @@ fn write_manifest(
         config.temperature_plies
     )?;
     writeln!(writer, "  \"radius\": {},", config.radius)?;
+    // Dynamic komi shifts these per shard, so the effective bounds belong in
+    // durable replay rather than only in the coordinator's initial config.
+    writeln!(writer, "  \"komi_low\": {},", config.komi_low)?;
+    writeln!(writer, "  \"komi_high\": {},", config.komi_high)?;
     writeln!(writer, "  \"seed\": {},", config.seed)?;
     writeln!(writer, "  \"maximum_plies\": {},", config.maximum_plies)?;
     writeln!(writer, "  \"actors\": {},", config.actors)?;
@@ -1746,7 +1755,7 @@ fn main() -> std::io::Result<()> {
                         "--model is required for ONNX generation",
                     )
                 })?;
-                let mut lanes = Vec::with_capacity(config.inference_slots);
+                let mut services = Vec::with_capacity(config.inference_slots);
                 // Load native sessions sequentially. TensorRT can reuse the
                 // engine cache without racing two simultaneous cache builders.
                 for _slot in 0..config.inference_slots {
@@ -1761,18 +1770,16 @@ fn main() -> std::io::Result<()> {
                         cache_directory: config.cache_directory.clone(),
                     })
                     .map_err(std::io::Error::other)?;
-                    lanes.push(
-                        BatchedEvaluator::spawn(
-                            BrokerConfig {
-                                maximum_delay: Duration::from_millis(config.delay_ms),
-                                queue_capacity: (config.actors * 4).max(config.maximum_batch * 2),
-                            },
-                            service,
-                        )
-                        .map_err(std::io::Error::other)?,
-                    );
+                    services.push(service);
                 }
-                let pool = BatchedEvaluatorPool::new(lanes).map_err(std::io::Error::other)?;
+                let pool = BatchedEvaluatorPool::spawn(
+                    BrokerConfig {
+                        maximum_delay: Duration::from_millis(config.delay_ms),
+                        queue_capacity: (config.actors * 4).max(config.maximum_batch * 2),
+                    },
+                    services,
+                )
+                .map_err(std::io::Error::other)?;
                 (Arc::new(pool.clone()), Some(pool))
             }
         };
@@ -2012,8 +2019,7 @@ mod tests {
 
     use super::{
         ActorPool, Config, GameEnvelope, GameRecord, GameSamples, PendingSample,
-        calibration_trials, komi_buckets, policy_target, resign_exempt, sampled_komi,
-        search_config,
+        calibration_trials, komi_buckets, policy_target, sampled_komi, search_config,
         validate_config,
     };
     use vgo_core::{Color, Position, Stone};
@@ -2107,9 +2113,9 @@ mod tests {
     #[test]
     fn komi_buckets_place_every_game_including_the_endpoints() {
         let records = vec![
-            game_at(-0.1, true, 0.5),  // exactly `low`
-            game_at(0.2, false, 0.5),  // exactly `high`
-            game_at(0.05, true, 0.5),  // interior
+            game_at(-0.1, true, 0.5), // exactly `low`
+            game_at(0.2, false, 0.5), // exactly `high`
+            game_at(0.05, true, 0.5), // interior
         ];
         let buckets = komi_buckets(&records, -0.1, 0.2, 4);
         let counted: usize = buckets
@@ -2122,7 +2128,11 @@ mod tests {
                 rest[..end].parse::<usize>().expect("integer count")
             })
             .sum();
-        assert_eq!(counted, records.len(), "every game lands in exactly one bucket");
+        assert_eq!(
+            counted,
+            records.len(),
+            "every game lands in exactly one bucket"
+        );
     }
 
     /// The median margin is signed toward Black.
@@ -2144,7 +2154,10 @@ mod tests {
             median < 0.0,
             "White winning both games must give Black a negative median, got {median}"
         );
-        assert!((median + 0.35).abs() < 1.0e-9, "median of -0.30 and -0.40, got {median}");
+        assert!(
+            (median + 0.35).abs() < 1.0e-9,
+            "median of -0.30 and -0.40, got {median}"
+        );
     }
 
     #[test]
@@ -2228,17 +2241,17 @@ mod tests {
     }
 
     #[test]
-    fn generation_defaults_to_two_inference_lanes() {
+    fn generation_defaults_to_two_inference_slots() {
         let default = Config::try_parse_from(["vgo-generate-demo"]).expect("default CLI parses");
         assert_eq!(default.inference_slots, 2);
 
         let configured = Config::try_parse_from(["vgo-generate-demo", "--inference-slots", "4"])
-            .expect("inference lane override parses");
+            .expect("inference slot override parses");
         assert_eq!(configured.inference_slots, 4);
     }
 
     #[test]
-    fn inference_lane_count_must_be_positive() {
+    fn inference_slot_count_must_be_positive() {
         let configured = Config::try_parse_from(["vgo-generate-demo", "--inference-slots", "0"])
             .expect("CLI syntax parses");
         assert_eq!(
@@ -2361,8 +2374,10 @@ mod tests {
         plies: usize,
         margin: f64,
     ) -> Option<vgo_core::Outcome> {
-        let positions: Vec<_> =
-            pending.iter().map(|sample| sample.position.clone()).collect();
+        let positions: Vec<_> = pending
+            .iter()
+            .map(|sample| sample.position.clone())
+            .collect();
         vgo_selfplay::adjudicate_positions(&positions, plies, margin)
     }
 
@@ -2422,8 +2437,7 @@ mod tests {
         // Black's regardless of what the value head thinks -- the samples carry
         // a root value of zero here precisely to show it is not consulted.
         let pending = window_of(lopsided(9, 1), 8);
-        let outcome = adjudicate_window(&pending, 8, 0.10)
-            .expect("a settled board is awarded");
+        let outcome = adjudicate_window(&pending, 8, 0.10).expect("a settled board is awarded");
         assert_eq!(outcome.winner, Some(Color::Black));
     }
 
@@ -2460,14 +2474,19 @@ mod tests {
         // sees -v while the other sees +v, and the run resets every ply. A real
         // losing streak is consecutive plies *by the same player*, which is what
         // the window counts. Using single-seat plies here isolates that.
-        let pending: Vec<PendingSample> =
-            (0..20)
-                .map(|_| adjudication_sample(lopsided(3, 3), -0.99))
-                .collect();
+        let pending: Vec<PendingSample> = (0..20)
+            .map(|_| adjudication_sample(lopsided(3, 3), -0.99))
+            .collect();
         let trials = calibration_trials(&pending, 5, true);
         let strict = trials.iter().find(|t| t.threshold == 0.90).unwrap();
-        assert!(strict.fired, "a sustained despairing evaluation should fire");
-        assert!(strict.wrong, "conceding for the eventual winner is a false positive");
+        assert!(
+            strict.fired,
+            "a sustained despairing evaluation should fire"
+        );
+        assert!(
+            strict.wrong,
+            "conceding for the eventual winner is a false positive"
+        );
         assert!(strict.plies_saved > 0);
     }
 
@@ -2475,10 +2494,9 @@ mod tests {
     fn calibration_marks_a_correct_concession_as_right() {
         // Same evaluations, but Black really does lose: the rule would have
         // been correct, and the plies after it are pure waste.
-        let pending: Vec<PendingSample> =
-            (0..20)
-                .map(|_| adjudication_sample(lopsided(3, 3), -0.99))
-                .collect();
+        let pending: Vec<PendingSample> = (0..20)
+            .map(|_| adjudication_sample(lopsided(3, 3), -0.99))
+            .collect();
         let trials = calibration_trials(&pending, 5, false);
         let strict = trials.iter().find(|t| t.threshold == 0.90).unwrap();
         assert!(strict.fired);
@@ -2489,10 +2507,9 @@ mod tests {
     fn a_higher_threshold_never_fires_more_often() {
         // Monotonicity is what lets the pipeline pick the lowest acceptable
         // threshold: raising it can only make the rule more cautious.
-        let pending: Vec<PendingSample> =
-            (0..30)
-                .map(|_| adjudication_sample(lopsided(3, 3), -0.88))
-                .collect();
+        let pending: Vec<PendingSample> = (0..30)
+            .map(|_| adjudication_sample(lopsided(3, 3), -0.88))
+            .collect();
         let trials = calibration_trials(&pending, 5, false);
         for pair in trials.windows(2) {
             assert!(

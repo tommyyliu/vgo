@@ -41,9 +41,10 @@ Safe to vary per machine: `VGO_UPDATES`, `VGO_ACTORS`, `VGO_ARENA_ACTORS`,
 `VGO_SLOTS`, `VGO_TRAINING_THREADS`.
 
 Not safe, and deliberately literal in every recipe: `--samples-per-shard`,
-`--replay-window`, `--inference-batch`, `--leaf-batch`,
-`--concurrent-generators`, the board and komi settings, the architecture, the
-learning rates, and all seeds.
+`--replay-window`, `--leaf-batch`, `--concurrent-generators`, the board and
+komi settings, the architecture, the learning rates, and all seeds. Inference
+batch is operational, though a resumed value cannot exceed the maximum embedded
+in the current ONNX artifact without re-exporting it.
 
 ## Adding one
 
@@ -59,11 +60,14 @@ of those forward without adding `--full-adam` silently changes the optimizer.
 
 ## Sizing a machine
 
-Generation is **CPU-bound**: it runs 87–89% user across 32 logical cores while
-the GPU sits at 50–63%. Choose an instance on vCPU count, not GPU class, and
-set `VGO_ACTORS` from the core count. Reference throughput is ~6.6 self-play
-samples/sec on a 16-core/32-thread 9950X with an RTX 5070 Ti.
+Generation was CPU-bound before the compact-raster and move-analysis changes.
+With those changes and the shared inference broker, a production-shaped short
+run now saturates the RTX 5070 Ti. Keep enough CPU for actors and encoding, but
+tune the TensorRT batch ceiling on the exact model rather than assuming the
+largest batch wins.
 
-`--actors 64`, `--inference-batch 64` and `--inference-slots 2` assume a 16 GB
-card. A 40-update run needs roughly 5 GB of disk, almost all of it
-`updates/`, which is never pruned.
+For the w64/b16 attention model on this machine, two slots at batch 32 measured
+16,433 positions/s versus 13,343 at batch 64, and improved paired short-shard
+wall time by 9.3%. `--actors 64`, `--inference-batch 32`, and
+`--inference-slots 2` fit a 16 GB card. A 40-update run needs roughly 5 GB of
+disk, almost all of it `updates/`, which is never pruned.

@@ -18,7 +18,9 @@ VGO_UPDATES=80 ./runs/ddrnet-attn.sh artifacts/ddrnet-fresh-attn
 `--updates` may be raised, never lowered. Everything outside
 `OPERATIONAL_CONFIG_FIELDS` is run identity: change one and the run refuses to
 resume. That includes `--samples-per-shard`, `--replay-window`,
-`--inference-batch`, `--leaf-batch`, the architecture and every seed.
+`--leaf-batch`, the architecture and every seed. `--inference-batch` is an
+operational serving control; it may change on resume as long as it does not
+exceed the maximum embedded in the current ONNX artifact.
 
 Stop with `kill` (SIGTERM). `rl_loop` routes it onto the Ctrl-C path, so
 children are signalled rather than orphaned and wall time is recorded. A crash

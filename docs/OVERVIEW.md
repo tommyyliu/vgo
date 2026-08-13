@@ -152,18 +152,20 @@ serves it behind a batching broker: actors submit evaluation requests, a broker
 thread assembles them into batches up to `maximum_batch`, waits at most
 `delay_ms`, and dispatches.
 
-**Two broker lanes are ~48% faster, and production is not yet using them.**
-Each lane owns its own session, thread, and staging buffer, so one lane's
-host-side work overlaps the other's GPU execution. One lane leaves the GPU at
-~81%; two reach 100%. Three collapse — there is only one GPU, so a third session
-adds contention without adding overlap.
+**Two execution slots can overlap host staging and GPU execution.** Each slot
+owns its own session, thread, and staging buffer. A shared broker now builds
+batches before selecting a slot, so the concurrency no longer divides arrivals
+between independent queues. Three slots collapsed in the original measurement
+because there is only one GPU and the third session added contention.
 
-`inference_slots` defaults to 2 in `PipelineConfig`, but the current run
-(`artifacts/ddrnet-komi3/pipeline-config.json`) sets it to **1**, which gives up
-that throughput. Pair it with `inference_batch: 32`: at 64 actors with
-`leaf_batch 4`, a 64-slot batch cannot fill without waiting out `delay_ms`, so
-`slots 2 + batch 32` measured 9839 pos/s against 6599 for `slots 1 + batch 64`.
-This is a config change, not a code change.
+`inference_slots` defaults to 2 in `PipelineConfig`. With the shared broker, the
+exact w64/b16 attention model measured 16,433 pos/s at batch 32, 13,343 at batch
+64, and 14,255 with three slots at batch 16. A paired production-shaped short
+self-play run improved from 20.67s to 18.92s at batch 32 while averaging
+31.8/32 positions. Batch size is a resumable serving control rather than search
+identity; the effective ceiling remains recorded per shard. A resumed ceiling
+must fit the current ONNX artifact, so lowering 64 to 32 works directly while
+raising beyond an old export requires re-exporting it.
 
 The protocol and the evaluator interface are in
 [`INFERENCE_PROTOCOL.md`](INFERENCE_PROTOCOL.md). The Blackwell/sm_120 toolchain

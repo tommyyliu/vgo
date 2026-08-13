@@ -35,12 +35,18 @@ pub struct FineGrid {
     coarse: usize, // coarse-cell size in fine cells (pool factor), both axes
     logits: Vec<f32>,
     legal: Vec<bool>,
-    /// Where each playable cell places a stone: the cell centre, unless the
-    /// centre was just illegal and projected onto legal area inside the cell.
-    placement: Vec<Point>,
+    /// Cells whose illegal centre was projected onto legal area inside the
+    /// cell, keyed by row-major cell index. Ordinary legal cells place at their
+    /// centre and need no stored point. Build order keeps this sorted for lookup.
+    placement_overrides: Vec<(usize, Point)>,
 }
 
 impl FineGrid {
+    // The production-like 128x128/35-stone fixture has 219 snapped cells. A
+    // 256-entry slab avoids growth while occupying 6 KiB, versus the former
+    // dense placement table's 256 KiB.
+    const PLACEMENT_OVERRIDE_CAPACITY: usize = 256;
+
     /// Build from a fine logit map. `logit_at(row, col)` returns the net's placement
     /// logit for that fine cell; legality is decided by placing a stone at the cell
     /// centre. `coarse` is the pool factor (e.g. 8 turns a 128 grid into 16 coarse
@@ -69,14 +75,14 @@ impl FineGrid {
         // of its nearest stone, within half a cell diagonal of the boundary.
         // Cells deeper inside a stone cannot be rescued, and cells already
         // clear need no rescuing, so only that thin band pays for a projection.
-        let mut placement = vec![Point::new(0.0, 0.0); width * height];
+        let mut placement_overrides = Vec::with_capacity(Self::PLACEMENT_OVERRIDE_CAPACITY);
         // The vertex set depends only on the position but is ~78% of a single
         // projection's cost, and this loop projects several hundred cells.
         // Computing it once per grid rather than once per cell is the
         // difference between snapping being affordable and not.
         let known_vertices = legal_set_vertices(position);
-        let half_diagonal = 0.5
-            * ((1.0 / width as f64).powi(2) + (1.0 / height as f64).powi(2)).sqrt();
+        let half_diagonal =
+            0.5 * ((1.0 / width as f64).powi(2) + (1.0 / height as f64).powi(2)).sqrt();
         let exclusion = 2.0 * position.radius();
         let half_x = 0.5 / width as f64;
         let half_y = 0.5 / height as f64;
@@ -84,22 +90,25 @@ impl FineGrid {
             for col in 0..width {
                 let point = cell_center(row, col, width, height);
                 let idx = row * width + col;
-                let resolved = if is_legal_placement(position, point.x, point.y) {
-                    Some(point)
+                let placement_override = if is_legal_placement(position, point.x, point.y) {
+                    None
                 } else if straddles_boundary(position, point, exclusion, half_diagonal) {
                     let snapped =
                         nearest_legal_placement_with(position, point, Some(&known_vertices));
                     let inside = snapped.legal
                         && (snapped.point.x - point.x).abs() <= half_x
                         && (snapped.point.y - point.y).abs() <= half_y;
-                    inside.then_some(snapped.point)
+                    if !inside {
+                        continue;
+                    }
+                    Some(snapped.point)
                 } else {
-                    None
+                    continue;
                 };
-                if let Some(resolved) = resolved {
-                    legal[idx] = true;
-                    logits[idx] = logit_at(row, col);
-                    placement[idx] = resolved;
+                legal[idx] = true;
+                logits[idx] = logit_at(row, col);
+                if let Some(point) = placement_override {
+                    placement_overrides.push((idx, point));
                 }
             }
         }
@@ -109,7 +118,7 @@ impl FineGrid {
             coarse,
             logits,
             legal,
-            placement,
+            placement_overrides,
         }
     }
 
@@ -155,6 +164,17 @@ impl FineGrid {
         }
         best
     }
+
+    fn placement_at(&self, row: usize, col: usize) -> Point {
+        let index = row * self.width + col;
+        match self
+            .placement_overrides
+            .binary_search_by_key(&index, |&(cell, _)| cell)
+        {
+            Ok(override_index) => self.placement_overrides[override_index].1,
+            Err(_) => cell_center(row, col, self.width, self.height),
+        }
+    }
 }
 
 /// Draw `count` candidates with replacement via coarse->fine factored sampling.
@@ -163,7 +183,16 @@ impl FineGrid {
 pub fn sample_candidates(
     grid: &FineGrid,
     count: usize,
+    rng: impl FnMut() -> f64,
+) -> Vec<CandidateSample> {
+    sample_candidates_with(grid, count, rng, |row, col| grid.placement_at(row, col))
+}
+
+fn sample_candidates_with(
+    grid: &FineGrid,
+    count: usize,
     mut rng: impl FnMut() -> f64,
+    mut placement_at: impl FnMut(usize, usize) -> Point,
 ) -> Vec<CandidateSample> {
     let (cwidth, cheight) = grid.coarse_dims();
 
@@ -206,7 +235,7 @@ pub fn sample_candidates(
         let p_fine = fine_probs[fi];
 
         out.push(CandidateSample {
-            point: grid.placement[row * grid.width + col],
+            point: placement_at(row, col),
             beta: p_coarse * p_fine,
         });
     }
@@ -284,10 +313,23 @@ fn sample_index(probs: &[f64], u: f64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vgo_core::{Color, Position};
+    use vgo_core::{Color, Position, Stone};
 
     fn empty_board() -> Position {
         Position::new(1.0 / 6.0, Vec::new(), Color::Black)
+    }
+
+    fn narrow_sliver_position() -> Position {
+        let radius = 1.0 / 18.0;
+        let gap = 4.0 * radius + 0.004;
+        Position::new(
+            radius,
+            vec![
+                Stone::new(0.5 - gap / 2.0, 0.5, Color::Black),
+                Stone::new(0.5 + gap / 2.0, 0.5, Color::Black),
+            ],
+            Color::White,
+        )
     }
 
     /// A deterministic uniform stream for reproducible sampling in tests.
@@ -298,6 +340,142 @@ mod tests {
             i += 1;
             v
         }
+    }
+
+    /// The dense placement table used before snapped cells became sparse.
+    /// Keeping the former construction here makes the representation change a
+    /// bit-for-bit regression test rather than merely a legality check.
+    fn dense_placement_reference(
+        position: &Position,
+        width: usize,
+        height: usize,
+    ) -> (Vec<bool>, Vec<Point>) {
+        let mut legal = vec![false; width * height];
+        let mut placement = vec![Point::new(0.0, 0.0); width * height];
+        let known_vertices = legal_set_vertices(position);
+        let half_diagonal =
+            0.5 * ((1.0 / width as f64).powi(2) + (1.0 / height as f64).powi(2)).sqrt();
+        let exclusion = 2.0 * position.radius();
+        let half_x = 0.5 / width as f64;
+        let half_y = 0.5 / height as f64;
+        for row in 0..height {
+            for col in 0..width {
+                let point = cell_center(row, col, width, height);
+                let index = row * width + col;
+                let resolved = if is_legal_placement(position, point.x, point.y) {
+                    Some(point)
+                } else if straddles_boundary(position, point, exclusion, half_diagonal) {
+                    let snapped =
+                        nearest_legal_placement_with(position, point, Some(&known_vertices));
+                    let inside = snapped.legal
+                        && (snapped.point.x - point.x).abs() <= half_x
+                        && (snapped.point.y - point.y).abs() <= half_y;
+                    inside.then_some(snapped.point)
+                } else {
+                    None
+                };
+                if let Some(resolved) = resolved {
+                    legal[index] = true;
+                    placement[index] = resolved;
+                }
+            }
+        }
+        (legal, placement)
+    }
+
+    #[test]
+    fn sparse_placements_and_samples_match_dense_semantics_bit_for_bit() {
+        let position = narrow_sliver_position();
+        let width = 32;
+        let height = 32;
+        let (expected_legal, expected_placement) =
+            dense_placement_reference(&position, width, height);
+        let mut grid = FineGrid::build(&position, width, height, 4, |row, col| {
+            (row * width + col) as f32 * 0.03125 - 7.0
+        });
+
+        assert_eq!(grid.legal, expected_legal);
+        let mut expected_overrides = Vec::new();
+        for row in 0..height {
+            for col in 0..width {
+                let index = row * width + col;
+                let expected_logit = if expected_legal[index] {
+                    index as f32 * 0.03125 - 7.0
+                } else {
+                    f32::NEG_INFINITY
+                };
+                assert_eq!(
+                    grid.logits[index].to_bits(),
+                    expected_logit.to_bits(),
+                    "logit changed at cell ({row},{col})"
+                );
+                if !expected_legal[index] {
+                    continue;
+                }
+                let expected = expected_placement[index];
+                let actual = grid.placement_at(row, col);
+                assert_eq!(
+                    (actual.x.to_bits(), actual.y.to_bits()),
+                    (expected.x.to_bits(), expected.y.to_bits()),
+                    "placement changed at cell ({row},{col})"
+                );
+                let centre = cell_center(row, col, width, height);
+                if (expected.x.to_bits(), expected.y.to_bits())
+                    != (centre.x.to_bits(), centre.y.to_bits())
+                {
+                    expected_overrides.push((index, expected));
+                }
+            }
+        }
+        assert!(
+            !expected_overrides.is_empty(),
+            "fixture must exercise snapped legal cells"
+        );
+        assert_eq!(grid.placement_overrides.len(), expected_overrides.len());
+        for (&(actual_index, actual), &(expected_index, expected)) in
+            grid.placement_overrides.iter().zip(&expected_overrides)
+        {
+            assert_eq!(actual_index, expected_index);
+            assert_eq!(
+                (actual.x.to_bits(), actual.y.to_bits()),
+                (expected.x.to_bits(), expected.y.to_bits())
+            );
+        }
+        assert!(
+            grid.placement_overrides
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0),
+            "placement overrides must stay in row-major order"
+        );
+
+        // Force sampling through one snapped sliver cell, then compare the
+        // complete sampled output with the former dense placement lookup.
+        let snapped_index = expected_overrides[0].0;
+        for (index, logit) in grid.logits.iter_mut().enumerate() {
+            if grid.legal[index] {
+                *logit = -20.0;
+            }
+        }
+        grid.logits[snapped_index] = 20.0;
+        let random_values = vec![0.13, 0.73, 0.41, 0.89, 0.27, 0.61];
+        let expected =
+            sample_candidates_with(&grid, 64, stream(random_values.clone()), |row, col| {
+                expected_placement[row * width + col]
+            });
+        let actual = sample_candidates(&grid, 64, stream(random_values));
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(
+                (actual.point.x.to_bits(), actual.point.y.to_bits()),
+                (expected.point.x.to_bits(), expected.point.y.to_bits())
+            );
+            assert_eq!(actual.beta.to_bits(), expected.beta.to_bits());
+        }
+        let snapped = expected_placement[snapped_index];
+        assert!(actual.iter().all(|sample| {
+            (sample.point.x.to_bits(), sample.point.y.to_bits())
+                == (snapped.x.to_bits(), snapped.y.to_bits())
+        }));
     }
 
     #[test]
@@ -437,22 +615,11 @@ mod tests {
 
     #[test]
     fn a_legal_sliver_narrower_than_a_cell_stays_playable() {
-        use vgo_core::Stone;
-
         // Two stones leaving a legal gap between them that is thinner than one
         // grid cell, so no cell centre lands inside it. Before projection the
         // sampler could not name any point there, which is what let a group
         // with its last liberty in such a gap survive indefinitely.
-        let radius = 1.0 / 18.0;
-        let gap = 4.0 * radius + 0.004;
-        let position = Position::new(
-            radius,
-            vec![
-                Stone::new(0.5 - gap / 2.0, 0.5, Color::Black),
-                Stone::new(0.5 + gap / 2.0, 0.5, Color::Black),
-            ],
-            Color::White,
-        );
+        let position = narrow_sliver_position();
         assert!(
             is_legal_placement(&position, 0.5, 0.5),
             "the gap between the stones must be legal"
@@ -471,7 +638,7 @@ mod tests {
             if !grid.legal[idx] {
                 continue;
             }
-            let placement = grid.placement[idx];
+            let placement = grid.placement_at(row, col);
             if is_legal_placement(&position, placement.x, placement.y)
                 && (placement.y - 0.5).abs() < 0.05
                 && (placement.x - 0.5).abs() < 0.05
@@ -485,8 +652,6 @@ mod tests {
 
     #[test]
     fn projection_never_places_outside_the_cell_that_named_it() {
-        use vgo_core::Stone;
-
         // A cell stands in for its own logit, so it must not resolve to a
         // placement elsewhere on the board: that would let the sampler reach a
         // point whose logit it never read.
@@ -511,7 +676,7 @@ mod tests {
                     continue;
                 }
                 let centre = cell_center(row, col, width, height);
-                let placement = grid.placement[idx];
+                let placement = grid.placement_at(row, col);
                 assert!(
                     (placement.x - centre.x).abs() <= half_x + 1.0e-12
                         && (placement.y - centre.y).abs() <= half_y + 1.0e-12,

@@ -61,13 +61,13 @@ broker:
 - reports per-position encoding, queue, inference, failure, and observed-batch
   metrics.
 
-Generation routes grouped calls round-robin across `--inference-slots`
-complete broker/session lanes (default `2`). Each lane has its own queue,
-reusable host buffer, ONNX session, and TensorRT execution context. Request
-vectors move to the selected lane without cloning their tensors, while actor
-search and rasterization continue in parallel. Additional lanes trade session
-and execution-context memory for overlapping inference latency, so tune the
-count from end-to-end throughput on the target GPU.
+Generation feeds every grouped call into one shared broker queue. The broker
+packs across all actors until the batch ceiling or deadline, then dispatches
+the batch to one of `--inference-slots` session slots (default `2`). Each slot
+has its own reusable host buffer, ONNX session, and TensorRT execution context,
+while actor search and rasterization continue in parallel. Additional slots
+trade session and execution-context memory for overlapping inference latency,
+so tune the count from end-to-end throughput on the target GPU.
 
 Generation and arenas receive an explicit `device_id`; the pipeline exposes it
 as `--inference-device-id` and forwards the same value to self-play, promotion,

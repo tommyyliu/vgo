@@ -81,7 +81,7 @@ short deadline for peers, and flattens groups across backend batch boundaries up
 to the declared contract. A group larger than the backend ceiling may span
 several calls; its caller still receives exactly one ordered completion after
 every output is reassembled. Encoding therefore scales with actors rather than
-occupying a lane's broker.
+being partitioned across per-slot broker queues.
 
 The implementation exposes three independent contracts:
 
@@ -91,12 +91,13 @@ The implementation exposes three independent contracts:
   capacity, and permits out-of-order completion by sequence number.
 
 Each `BatchService` remains synchronous, but generation can run multiple
-session-owned lanes with `--inference-slots` (default `2`). Requests are moved
-to one lane rather than cloned, so adding a lane does not add another tensor
-copy. Each lane does retain its own session, execution context, and reusable
-input storage; tune the lane count against device memory and end-to-end
-throughput. The `BatchExecutor` contract still permits a future backend to use
-multiple pinned-memory/stream slots inside one session without changing actors,
+session-owned execution slots with `--inference-slots` (default `2`). One
+broker builds batches from the shared actor queue, then assigns each complete
+batch to a free slot; requests are no longer partitioned before batching. Each
+slot retains its own session, execution context, and reusable input storage, so
+tune the slot count against device memory and end-to-end throughput. The
+`BatchExecutor` contract also permits a future backend to use multiple
+pinned-memory/stream slots inside one session without changing actors,
 encoding, batching, or response routing.
 
 Metrics count submitted request positions (the compatibility `requests`
@@ -224,7 +225,7 @@ direct writes into assigned slab rows.
 ## Remaining production work
 
 - Implement pinned reusable slabs and I/O binding to remove the remaining
-  pageable host packing and enable explicit asynchronous transfers per lane.
+  pageable host packing and enable explicit asynchronous transfers per slot.
 - Keep actor workers and the ONNX session alive across same-model shard
   boundaries when measurements show the residual process/session startup is
   material; model-digest-scoped TensorRT warmup already removes engine build

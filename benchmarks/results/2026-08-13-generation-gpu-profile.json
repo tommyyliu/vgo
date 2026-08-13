@@ -1,0 +1,75 @@
+{
+  "schema": "vgo.generation-gpu-profile.v1",
+  "date": "2026-08-13",
+  "base_revision": "f2a33a0",
+  "tree": "shared broker and generation CPU optimizations present as uncommitted changes",
+  "hardware": {
+    "processor": "AMD Ryzen 9 9950X 16-Core Processor",
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "gpu_memory_mebibytes": 16303,
+    "driver": "610.57.04"
+  },
+  "model": {
+    "path": "artifacts/shard-sweep-15000/updates/update-000020/candidate.onnx",
+    "onnx_sha256": "6eabae07f1961c20b072f5c6f7d2782c56acd04161f17840b88f26884896669e",
+    "architecture": "ddrnet",
+    "width": 64,
+    "blocks": 16,
+    "context_attention_blocks": 1,
+    "raster": "compact-5x128x128",
+    "policy": "128x128"
+  },
+  "runtime": {
+    "provider": "tensorrt",
+    "fp16": true,
+    "actors": 64,
+    "leaf_batch": 4,
+    "delay_milliseconds": 1,
+    "broker": "one shared queue dispatching complete batches to idle session slots"
+  },
+  "lane_benchmark": [
+    {"slots": 2, "maximum_batch": 64, "positions_per_second": 13343, "average_batch": 62.6, "inference_milliseconds_per_batch": 9.261},
+    {"slots": 2, "maximum_batch": 48, "positions_per_second": 15039, "average_batch": 47.1, "inference_milliseconds_per_batch": 6.181},
+    {"slots": 2, "maximum_batch": 32, "positions_per_second": 16433, "average_batch": 31.7, "inference_milliseconds_per_batch": 3.818},
+    {"slots": 2, "maximum_batch": 24, "positions_per_second": 14701, "average_batch": 23.8, "inference_milliseconds_per_batch": 3.206},
+    {"slots": 2, "maximum_batch": 16, "positions_per_second": 16211, "average_batch": 15.9, "inference_milliseconds_per_batch": 1.951},
+    {"slots": 3, "maximum_batch": 32, "positions_per_second": 11595, "average_batch": 31.2, "inference_milliseconds_per_batch": 8.008},
+    {"slots": 3, "maximum_batch": 16, "positions_per_second": 14255, "average_batch": 15.9, "inference_milliseconds_per_batch": 3.320}
+  ],
+  "paired_end_to_end": {
+    "common": {
+      "games": 64,
+      "maximum_plies": 20,
+      "simulations": 256,
+      "coarse_pool": 16,
+      "slots": 2,
+      "seed": 8132026
+    },
+    "batch_64": {
+      "wall_seconds": 20.671033,
+      "evaluated_positions": 300308,
+      "batches": 4802,
+      "average_batch": 62.538,
+      "positions_per_second": 14527.963,
+      "encoding_seconds": 89.658961,
+      "inference_seconds": 40.108510
+    },
+    "batch_32": {
+      "wall_seconds": 18.918027,
+      "evaluated_positions": 300373,
+      "batches": 9456,
+      "average_batch": 31.765,
+      "positions_per_second": 15877.607,
+      "encoding_seconds": 82.126348,
+      "inference_seconds": 37.027830
+    },
+    "batch_32_throughput_gain_percent": 9.266
+  },
+  "recommendation": {
+    "actors": 64,
+    "maximum_batch": 32,
+    "slots": 2,
+    "delay_milliseconds": 1,
+    "scope": "w64/b16 attention runs, including resumes whose current ONNX artifact supports batch 32"
+  }
+}

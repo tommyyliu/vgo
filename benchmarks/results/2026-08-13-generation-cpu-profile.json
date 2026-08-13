@@ -1,0 +1,124 @@
+{
+  "schema": "vgo.generation-cpu-profile.v1",
+  "date": "2026-08-13",
+  "base_revision": "f2a33a0e004cce9cafda8f7ed03c5888a64aaa89",
+  "build": {
+    "profile": "release",
+    "rustc": "1.97.1",
+    "target_cpu": "native"
+  },
+  "hardware": {
+    "processor": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_processors": 32
+  },
+  "production_observation": {
+    "source": "artifacts/ddrnet-fresh-attn/replay/shard-000059/manifest.json",
+    "configuration": {
+      "raster_resolution": 128,
+      "policy_resolution": 128,
+      "raster_kind": "compact",
+      "coarse_pool": 16,
+      "simulations": 1600,
+      "actors": 64,
+      "leaf_batch": 4,
+      "inference_batch": 64,
+      "inference_lanes": 2
+    },
+    "positions": 6850273,
+    "batches": 240816,
+    "average_batch": 28.446087,
+    "wall_seconds": 886.077319,
+    "encoding_seconds": 12850.339566,
+    "encoding_milliseconds_per_position": 1.875887,
+    "encoding_continuous_core_equivalents": 14.502504,
+    "backend_seconds": 1188.071133,
+    "backend_milliseconds_per_position": 0.173434,
+    "writer_seconds": 0.288586,
+    "writer_backpressure_seconds": 0.022679,
+    "conclusion": "generation is host/encoding bound; the backend and replay writer are not the current limits"
+  },
+  "stage_benchmark": {
+    "command": "taskset -c 0 target/release/vgo-generation-bench --samples 11 --sample-millis 250 --json",
+    "baseline": {
+      "measurement_note": "same base revision and host, pinned release runs before the changes",
+      "raster_compact_128_35_into_ns": 1408000.0,
+      "fine_grid_128_pool_16_ns": 376000.0,
+      "mcts_32_spatial_ns": 2680000.0,
+      "mcts_32_spatial_128_ns": 9831000.0
+    },
+    "optimized": {
+      "analysis_20_stone_ns": 22198.846,
+      "raster_compact_128_35_alloc_ns": 1061699.953,
+      "raster_compact_128_35_into_ns": 1053165.500,
+      "settled_contours_128_35_reuse_ns": 757443.150,
+      "fine_grid_128_pool_16_ns": 388260.756,
+      "sample_128_one_ns": 6470.638,
+      "sample_128_32_ns": 16322.781,
+      "move_apply_ns": 49307.365,
+      "mcts_32_spatial_ns": 2221167.558,
+      "mcts_32_spatial_128_ns": 8556054.625
+    },
+    "headline_changes_percent": {
+      "raster_compact_128_35_into": -25.201314,
+      "mcts_32_spatial": -17.120614,
+      "mcts_32_spatial_128": -12.968623
+    }
+  },
+  "feed_scaling": {
+    "dataset": "artifacts/ddrnet-komi3/replay/shard-000035/dataset.vgo",
+    "dataset_sha256": "919d634b1c2bcf9268e699c100b3d5e6ade6968b28fff25098c758c128300fc2",
+    "positions": 6144,
+    "stones": {
+      "minimum": 0,
+      "mean": 26.249,
+      "median": 28,
+      "maximum": 52
+    },
+    "command": "target/release/vgo-feed-bench --dataset artifacts/ddrnet-komi3/replay/shard-000035/dataset.vgo --threads 1,16,32,48,64 --samples 3 --sample-millis 1500 --group 4 --batch 64 --lanes 2 --delay-ms 1 --json",
+    "results": [
+      {"threads": 1, "baseline_raster_positions_per_second": 660.0, "optimized_raster_positions_per_second": 803.863, "raster_change_percent": 21.797424, "baseline_host_positions_per_second": 546.0, "optimized_host_positions_per_second": 652.905, "host_change_percent": 19.579670},
+      {"threads": 16, "baseline_raster_positions_per_second": 9436.0, "optimized_raster_positions_per_second": 12051.221, "raster_change_percent": 27.715356, "baseline_host_positions_per_second": 8238.0, "optimized_host_positions_per_second": 9964.842, "host_change_percent": 20.961908},
+      {"threads": 32, "baseline_raster_positions_per_second": 13356.0, "optimized_raster_positions_per_second": 18189.645, "raster_change_percent": 36.190813, "baseline_host_positions_per_second": 12282.0, "optimized_host_positions_per_second": 16217.571, "host_change_percent": 32.043405},
+      {"threads": 48, "baseline_raster_positions_per_second": 13809.0, "optimized_raster_positions_per_second": 18252.391, "raster_change_percent": 32.177500, "baseline_host_positions_per_second": 13217.0, "optimized_host_positions_per_second": 17210.090, "host_change_percent": 30.211773},
+      {"threads": 64, "baseline_raster_positions_per_second": 13801.0, "optimized_raster_positions_per_second": 18265.508, "raster_change_percent": 32.349163, "baseline_host_positions_per_second": 13302.0, "optimized_host_positions_per_second": 17424.084, "host_change_percent": 30.988453}
+    ]
+  },
+  "changes": [
+    {
+      "area": "compact raster distance planes",
+      "method": "row/stone/column sweep with row-local minima; hoist vertical distance and expose contiguous inner loops",
+      "correctness": "bit-identical compact planes checked against the semantic raster at 48x48, 63x47, and 128x128"
+    },
+    {
+      "area": "move transition analysis",
+      "method": "promote the final capture Settlement into Analysis when self-capture did not change the stones",
+      "correctness": "fresh and promoted analyses compare bit-for-bit across validation, geometry, liveness, score, and outcome"
+    },
+    {
+      "area": "FineGrid placement storage",
+      "method": "derive ordinary cell centers and retain only exact snapped-point overrides",
+      "active_fixture_dense_bytes": 262144,
+      "active_fixture_sparse_capacity_bytes": 6144,
+      "active_fixture_reduction_percent": 97.65625,
+      "short_mcts_change_percent": 0.55,
+      "correctness": "legal masks, logits, placement coordinates, sampled points, and beta values match the former dense representation bit-for-bit"
+    },
+    {
+      "area": "prior normalization",
+      "method": "compute each exponential once and normalize the stored values"
+    }
+  ],
+  "validation": {
+    "commands": [
+      "cargo test --workspace --offline",
+      "cargo test --release --workspace --offline",
+      "cargo clippy --workspace --all-targets --offline",
+      "git diff --check"
+    ],
+    "release_tests_passed": 144,
+    "release_tests_failed": 0,
+    "release_tests_ignored": 3,
+    "notes": "Clippy completes with pre-existing warnings in unrelated code. Hardware counter profilers were unavailable in this environment, so attribution combines retained production telemetry, isolated stage benchmarks, and real-position scaling."
+  }
+}

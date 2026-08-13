@@ -38,11 +38,12 @@ What it needs underneath:
 - Chrome at `C:\Program Files\Google\Chrome\Application\chrome.exe` for the
   browser test suites (Windows only).
 
-Sizing a machine: generation is **CPU-bound**, running 87–89% user across 32
-logical cores while the GPU sits at 50–63%. Choose on vCPU count rather than
-GPU class, and set `VGO_ACTORS` from the core count. Reference throughput is
-~6.6 self-play samples/sec on a 16-core/32-thread 9950X with an RTX 5070 Ti.
-`--actors 64`, `--inference-batch 64` and `--inference-slots 2` assume a 16 GB
+Sizing a machine: the old pipeline was CPU-bound, but the compact-raster and
+move-analysis changes plus the shared inference broker can now saturate the GPU
+in a production-shaped short run. Keep enough CPU for actors and encoding, and
+benchmark the exact model: on the RTX 5070 Ti, the w64/b16 attention model with
+two slots reached 16,433 positions/s at batch 32 versus 13,343 at batch 64.
+`--actors 64`, `--inference-batch 32`, and `--inference-slots 2` fit a 16 GB
 card. Budget ~25 GB of disk for the toolchains and ~5 GB per 40-update run.
 
 ## Tests
@@ -52,7 +53,7 @@ two before any change lands; they are fast.
 
 ```bash
 cargo test --release --workspace          # 21 suites: rules, search, self-play
-cd training && .venv/bin/python3 -m unittest discover -s tests   # 88 tests
+cd training && .venv/bin/python3 -m unittest discover -s tests   # 151 tests
 ```
 
 ```bash
@@ -71,9 +72,9 @@ run at its first validation pass.
 contracts.
 
 Every run is launched from a recipe in [`runs/`](../runs/), not from a command
-typed at a prompt. That file is the record of what a run *was* -- its settings
-are learning identity, so a run cannot be resumed with different ones, and the
-header comment explains why each value was chosen.
+typed at a prompt. That file records both learning identity and operational
+serving settings, and the header comment explains why each value was chosen.
+Identity fields cannot change on resume; explicitly operational fields can.
 
 `runs/` is tracked; `artifacts/` is not. Each recipe copies itself to
 `<run>/launch.sh` on start, so the record still sits beside the output (and
@@ -110,6 +111,8 @@ The current shape of a run, as of `ddrnet-own`:
   --updates 60 --samples-per-shard 6144 --shards-per-update 1 --replay-window 6 \
   --resolution 128 --policy-resolution 128 --radius 0.055714285714285716 \
   --raster-kind compact --komi-low=-0.166 --komi-high=0.234 \
+  --dynamic-komi --komi-target-black-win-rate 0.5 \
+  --komi-recenter-minimum-games 256 --komi-recenter-maximum-step 0.025 \
   --coarse-pool 16 --generation-simulations 512 \
   --temperature 1.0 --temperature-plies 30 --maximum-plies 70 \
   --resign-target-false-positive 0.02 --resign-soft-simulations 64 \
@@ -291,8 +294,16 @@ training/.venv/bin/python3 scripts/komi-balance-fit.py artifacts/ddrnet-komi3 \
 Fits `P(Black wins) = sigmoid(a + b*komi)` over played-out games and reports the
 crossing with a bootstrap interval. **This does not stay put.** On one lineage
 the balance point moved from +0.163 to +0.034 over about forty updates as the
-model strengthened, and nothing in the loop measures it -- the drift was found
-only while investigating something else. Refit every ten updates or so.
+model strengthened.
+
+`--dynamic-komi` now runs the same kind of fit inside the coordinator over exact
+game komi/outcomes in the trailing replay window. It keeps the configured range
+width, targets `--komi-target-black-win-rate` (0.5 by default), waits for
+`--komi-recenter-minimum-games`, and limits each shard's centre movement to
+`--komi-recenter-maximum-step`. Effective bounds are recorded in every replay
+manifest, so a resumed run derives the same next decision from durable history.
+Use this standalone fit for an interval and an independent audit of the online
+controller rather than as a required manual control step.
 
 `--last N` restricts the fit to recent shards, which is necessary once a run's
 play changes character. Resigned games are excluded automatically: under
@@ -516,7 +527,9 @@ this reason.
 **BF16 training and FP16 inference are independent.** `--training-precision
 bfloat16` controls PyTorch autocast and fails early if the selected CUDA device
 does not support BF16. `--fp16` controls TensorRT engine precision. Changing
-training precision or inference FP16 mode changes the run's learning identity.
+training precision changes learning identity; inference FP16 is an operational
+serving control and its effective value remains recorded in generation
+manifests. Check checkpoint activations for FP16 overflow before enabling it.
 
 **A silently killed training stage is usually the device running out of memory.**
 Under a process supervisor the traceback can be lost with the process tree,

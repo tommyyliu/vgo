@@ -55,16 +55,19 @@ pub struct Analysis {
 ///
 /// `place` applies captures before it can know the committed position, so it
 /// analyses the provisional board once, and again if removing enemy stones
-/// changed it. Those two calls read `settled_groups` and `geometry.groups` and
-/// nothing else -- the score they compute describes a board that is about to
-/// change, and the outcome derived from it is discarded.
+/// changed it. Intermediate capture checks read `settled_groups` and
+/// `geometry.groups`; when no self-capture changes the last provisional board,
+/// the remaining fields let that same work become the committed `Analysis`.
 ///
-/// Sharing `settlement` between them keeps the liveness search in one place
-/// while letting the intermediate callers skip what they would throw away.
+/// Sharing `settlement` between them keeps the liveness search in one place,
+/// skips provisional scoring, and avoids rebuilding the final geometry.
 #[derive(Clone, Debug)]
 pub struct Settlement {
     pub geometry: voronoi::Geometry,
     pub settled_groups: HashSet<usize>,
+    validation: Validation,
+    legal_vertices: Vec<Point>,
+    alive_groups: HashSet<usize>,
 }
 
 /// Groups with a witness that a placement can still reach them.
@@ -113,31 +116,57 @@ impl Settlement {
     /// Settlement alone, skipping the score and outcome a full analysis builds.
     #[must_use]
     pub fn new(position: &Position) -> Self {
+        let validation = position.validate();
         let geometry = voronoi::compute(position);
         let legal_vertices = legal_set::vertices(position);
         let alive_groups = alive_groups_of(
             position,
             &geometry,
             &legal_vertices,
-            position.validate().is_playable(),
+            validation.is_playable(),
         );
         let settled_groups = settled_from(&geometry, &alive_groups);
         Self {
             geometry,
             settled_groups,
+            validation,
+            legal_vertices,
+            alive_groups,
         }
+    }
+
+    /// Finish an analysis when only position metadata changed since settlement.
+    ///
+    /// A placement commits by changing the turn and pass state after capture
+    /// resolution. Neither field enters validation, geometry, the legal set, or
+    /// group liveness, so a settlement of the same radius and stones already
+    /// contains all of the expensive parts of the committed analysis.
+    pub(crate) fn into_analysis(self, position: &Position) -> Analysis {
+        Analysis::from_parts(
+            position,
+            self.validation,
+            self.geometry,
+            self.legal_vertices,
+            self.alive_groups,
+            self.settled_groups,
+        )
     }
 }
 
 impl Analysis {
     #[must_use]
     pub fn new(position: &Position) -> Self {
-        let validation = position.validate();
-        let geometry = voronoi::compute(position);
-        let legal_vertices = legal_set::vertices(position);
-        let alive_groups =
-            alive_groups_of(position, &geometry, &legal_vertices, validation.is_playable());
-        let settled_groups = settled_from(&geometry, &alive_groups);
+        Settlement::new(position).into_analysis(position)
+    }
+
+    fn from_parts(
+        position: &Position,
+        validation: Validation,
+        geometry: voronoi::Geometry,
+        legal_vertices: Vec<Point>,
+        alive_groups: HashSet<usize>,
+        settled_groups: HashSet<usize>,
+    ) -> Self {
         let mut score = Score::default();
         for (index, stone) in position.stones().iter().enumerate() {
             match stone.color {

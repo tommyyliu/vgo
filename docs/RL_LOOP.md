@@ -56,8 +56,8 @@ The command above changes only the update horizon from its default of 10.
 Other important defaults are one 1,024-sample shard per update, an eight-shard
 replay window, one prefetched shard, 256 simulations, a 96x96 raster with a
 32x32 policy, DDRNet width 64 with 8 blocks, 10 learner epochs at batch 64,
-TensorRT FP16 inference through two batch-16 lanes on device 0, and BF16 CUDA
-training.
+TensorRT FP16 inference through one batch-16 broker with two execution slots on
+device 0, and BF16 CUDA training.
 TensorRT engine warmup is enabled, promotion is disabled, and each accepted
 model queues up to two 16-pair telemetry comparisons.
 
@@ -69,11 +69,13 @@ Important resource controls are:
   preserves sequential MCTS; larger values change the search trajectory and
   help workloads with too few concurrent games to fill a model batch.
 - `--inference-batch` and `--inference-delay-ms`: backend batch ceiling and
-  broker collection window. The batch ceiling is part of the exported ONNX
-  contract and cannot change when resuming a run.
-- `--inference-slots`: independent inference lanes available to generation.
-  Each lane owns its TensorRT session, execution context, and reusable input
-  storage. It defaults to `2` and may be changed when resuming a run.
+  broker collection window. Both are operational controls. The configured
+  batch ceiling can change on resume, but it cannot exceed the maximum embedded
+  in the current ONNX artifact.
+- `--inference-slots`: independent execution slots behind generation's shared
+  batch queue. Each slot owns its TensorRT session, execution context, and
+  reusable input storage. It defaults to `2` and may be changed when resuming a
+  run.
 - `--inference-device-id`: CUDA device number used by Rust generation,
   promotion, and telemetry. It defaults to `0` and is independent of PyTorch's
   `--training-device`.
@@ -111,18 +113,19 @@ new replay quantum needed to trigger an update.
 
 ### Actors and inference
 
-Rust actors run complete games and feed bounded inference lanes. A leaf
+Rust actors run complete games and feed one bounded inference broker. A leaf
 round is submitted as one ordered group rather than spawning an operating-system
 thread per leaf. Repeated descents to the same pending tree edge share an
 evaluation, terminal children bypass inference, and each node caches its spatial
 fine grid.
 
-Each broker coalesces groups up to the model's declared maximum batch and
-validates output count and request IDs before routing results. Generation uses
-two lanes by default; each owns a synchronous ONNX/TensorRT session so transfer
-and execution latency can overlap without cloning request tensors. More lanes
-increase host and device memory residency and should be selected from measured
-end-to-end throughput rather than batch fill alone.
+One broker coalesces groups from every actor up to the model's declared maximum
+batch and validates output count and request IDs before routing results.
+Generation uses two execution slots by default; each owns a synchronous
+ONNX/TensorRT session so transfer and execution latency can overlap without
+cloning request tensors. More slots increase host and device memory residency
+and should be selected from measured end-to-end throughput rather than batch
+fill alone.
 
 ### Streaming replay
 
@@ -141,7 +144,7 @@ writer:
 
 The generator retains only `--examples` rasters. Once the exact boundary is
 reached it signals cancellation, closes the completed-game queue, and joins
-every actor after at most its current search. Only then are the inference lanes
+every actor after at most its current search. Only then are the execution slots
 and native sessions destroyed. This removes the former full-shard RAM copy
 while keeping TensorRT teardown deterministic.
 
@@ -222,15 +225,16 @@ Configuration is divided into two classes:
 
 - **Learning identity** is immutable within a run. It includes replay/search
   semantics, raster and policy shapes, model and optimizer hyperparameters,
-  training precision, provider/FP16 mode, inference batch contract, promotion
-  policy, seeds, and bootstrap artifacts. Changing one requires a new output
-  directory.
+  training precision, inference provider, seeds, and bootstrap artifacts.
+  Changing one requires a new output directory.
 - **Operational controls** may change on restart: `--updates`,
   `--maximum-prefetch-shards`, `--actors`, `--writer-queue-games`,
-  `--inference-delay-ms`, `--inference-slots`, `--inference-device-id`,
-  `--training-threads`, `--warm-inference`, `--training-device`, `--compile`,
-  `--overlap-actor-learner`,
-  `--arena-actors`, `--telemetry-opponents`, and `--telemetry-pairs`.
+  `--inference-batch`, `--inference-delay-ms`, `--inference-slots`,
+  `--inference-device-id`, `--fp16`, `--training-threads`, `--warm-inference`,
+  `--training-device`, `--compile`, `--overlap-actor-learner`,
+  `--arena-actors`, `--promotion-arena`, `--promotion-score`,
+  `--telemetry-opponents`, `--telemetry-pairs`, `--telemetry-every`, and
+  `--retire-shards`.
   `--updates` may increase but cannot be reduced below completed work.
 
 Rerun the original command with the desired operational overrides; all
@@ -294,12 +298,14 @@ Tune operational controls from these measurements: actor count and inference
 delay affect game occupancy and batch fill; inference slots trade additional
 session memory for overlapping backend latency; writer queue depth can absorb
 short serialization bursts; and actor/learner overlap can be disabled when
-concurrent stage work lowers total throughput. `--inference-batch` is a
-learning-identity contract, so changing it requires a new run. A cache miss is expected for a new
-shard and after a coordinator restart; repeated misses for stable shards point
-to lost learner persistence or replay-window churn. Compare steady-state
-updates rather than the first update, which includes compilation and TensorRT
-cache creation.
+concurrent stage work lowers total throughput. `--inference-batch` is a serving
+control and may change on resume. It must not exceed the maximum batch embedded
+in the current ONNX artifact; lowering the ceiling is directly safe, while
+raising it beyond an old export requires re-exporting that model. A cache miss
+is expected for a new shard and after a coordinator restart; repeated misses
+for stable shards point to lost learner persistence or replay-window churn.
+Compare steady-state updates rather than the first update, which includes
+compilation and TensorRT cache creation.
 
 ## Search and replay semantics
 

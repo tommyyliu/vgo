@@ -287,11 +287,7 @@ pub fn rasterize_any_into(position: &Position, config: RasterConfig, data: &mut 
 /// This shares the semantic raster's geometry helpers but writes only the five
 /// requested planes. In particular, it does not allocate, render, and copy a
 /// twelve-plane temporary for every inference position.
-pub fn rasterize_compact_into(
-    position: &Position,
-    config: RasterConfig,
-    data: &mut [f32],
-) {
+pub fn rasterize_compact_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
     assert!(config.width > 0 && config.height > 0);
     assert!(position.validate().is_playable());
     let pixels = config.pixels();
@@ -308,13 +304,73 @@ pub fn rasterize_compact_into(
     // Komi is constant over the board, so write its plane once rather than in
     // the pixel loop below.
     data[4 * pixels..5 * pixels].fill(mover_komi);
+
+    // Walk one stone across a whole raster row at a time. The old pixel-major
+    // loop reread both stone arrays for every pixel and recomputed the same
+    // vertical distance once per column. Row-major accumulation hoists that
+    // square, keeps the four minima in contiguous buffers, and gives LLVM a
+    // simple inner loop to vectorize. Each pixel still sees current stones and
+    // then opponent stones in their original order, with the same arithmetic
+    // and comparisons, so the resulting planes remain bit-for-bit identical to
+    // the semantic writer.
+    let width = config.width;
+    let mut row_storage = vec![f64::INFINITY; 5 * width];
+    let (xs, row_storage) = row_storage.split_at_mut(width);
+    for (column, x) in xs.iter_mut().enumerate() {
+        *x = (column as f64 + 0.5) / width as f64;
+    }
+    let (current_squares, row_storage) = row_storage.split_at_mut(width);
+    let (opponent_squares, row_storage) = row_storage.split_at_mut(width);
+    let (nearest_squares, second_squares) = row_storage.split_at_mut(width);
+
     for row in 0..config.height {
         let y = (row as f64 + 0.5) / config.height as f64;
-        for column in 0..config.width {
-            let x = (column as f64 + 0.5) / config.width as f64;
-            let pixel = row * config.width + column;
-            let (current_square, opponent_square, nearest_square, second_square) =
-                squared_distances(x, y, &current_stones, &opponent_stones);
+        current_squares.fill(f64::INFINITY);
+        opponent_squares.fill(f64::INFINITY);
+        nearest_squares.fill(f64::INFINITY);
+        second_squares.fill(f64::INFINITY);
+
+        for &(stone_x, stone_y) in &current_stones {
+            let dy = y - stone_y;
+            let dy_square = dy * dy;
+            for column in 0..width {
+                let dx = xs[column] - stone_x;
+                let square = dx * dx + dy_square;
+                if square < current_squares[column] {
+                    current_squares[column] = square;
+                }
+                if square < nearest_squares[column] {
+                    second_squares[column] = nearest_squares[column];
+                    nearest_squares[column] = square;
+                } else if square < second_squares[column] {
+                    second_squares[column] = square;
+                }
+            }
+        }
+        for &(stone_x, stone_y) in &opponent_stones {
+            let dy = y - stone_y;
+            let dy_square = dy * dy;
+            for column in 0..width {
+                let dx = xs[column] - stone_x;
+                let square = dx * dx + dy_square;
+                if square < opponent_squares[column] {
+                    opponent_squares[column] = square;
+                }
+                if square < nearest_squares[column] {
+                    second_squares[column] = nearest_squares[column];
+                    nearest_squares[column] = square;
+                } else if square < second_squares[column] {
+                    second_squares[column] = square;
+                }
+            }
+        }
+
+        for column in 0..width {
+            let pixel = row * width + column;
+            let current_square = current_squares[column];
+            let opponent_square = opponent_squares[column];
+            let nearest_square = nearest_squares[column];
+            let second_square = second_squares[column];
             let current_distance = current_square.sqrt();
             let opponent_distance = opponent_square.sqrt();
             let nearest = nearest_square.sqrt();
@@ -1016,7 +1072,10 @@ mod tests {
         );
         // Constant over the board, like radius.
         for pixel in 0..pixels {
-            assert_eq!(from_black.data()[11 * pixels + pixel], from_black.data()[11 * pixels]);
+            assert_eq!(
+                from_black.data()[11 * pixels + pixel],
+                from_black.data()[11 * pixels]
+            );
         }
     }
 
@@ -1024,26 +1083,37 @@ mod tests {
     /// semantic planes it names across sparse and dense positions.
     #[test]
     fn compact_is_a_subset_of_the_semantic_raster() {
-        let full = RasterConfig::square(48);
-        let compact = RasterConfig::square_of(48, RasterKind::Compact);
-        assert_eq!(compact.channels(), COMPACT_CHANNELS.len());
-        let pixels = full.pixels();
+        for (width, height) in [(48, 48), (63, 47), (128, 128)] {
+            let full = RasterConfig {
+                width,
+                height,
+                kind: RasterKind::Semantic,
+            };
+            let compact = RasterConfig {
+                width,
+                height,
+                kind: RasterKind::Compact,
+            };
+            assert_eq!(compact.channels(), COMPACT_CHANNELS.len());
+            let pixels = full.pixels();
 
-        for stones in [0, 1, 12, 40] {
-            let fixture = scattered_position(stones);
-            for to_move in [Color::Black, Color::White] {
-                let position = Position::new(fixture.radius(), fixture.stones().to_vec(), to_move)
-                    .with_komi(0.15);
-                let whole = rasterize(&position, full);
-                let subset = rasterize(&position, compact);
-                for (slot, &channel) in COMPACT_CHANNELS.iter().enumerate() {
-                    assert_eq!(
-                        &subset.data()[slot * pixels..(slot + 1) * pixels],
-                        &whole.data()[channel * pixels..(channel + 1) * pixels],
-                        "compact plane {slot} must equal semantic channel {channel} ({}) at \
-                         {stones} stones with {to_move:?} to move",
-                        CHANNELS[channel].name
-                    );
+            for stones in [0, 1, 12, 40] {
+                let fixture = scattered_position(stones);
+                for to_move in [Color::Black, Color::White] {
+                    let position =
+                        Position::new(fixture.radius(), fixture.stones().to_vec(), to_move)
+                            .with_komi(0.15);
+                    let whole = rasterize(&position, full);
+                    let subset = rasterize(&position, compact);
+                    for (slot, &channel) in COMPACT_CHANNELS.iter().enumerate() {
+                        assert_eq!(
+                            &subset.data()[slot * pixels..(slot + 1) * pixels],
+                            &whole.data()[channel * pixels..(channel + 1) * pixels],
+                            "compact plane {slot} must equal semantic channel {channel} ({}) at \
+                             {width}x{height}, {stones} stones with {to_move:?} to move",
+                            CHANNELS[channel].name
+                        );
+                    }
                 }
             }
         }
@@ -1180,8 +1250,7 @@ mod tests {
             illegal_brightness.len()
         );
         let dimmest_legal = legal_brightness.iter().copied().fold(f32::MAX, f32::min);
-        let brightest_illegal =
-            illegal_brightness.iter().copied().fold(f32::MIN, f32::max);
+        let brightest_illegal = illegal_brightness.iter().copied().fold(f32::MIN, f32::max);
         assert!(
             dimmest_legal > brightest_illegal,
             "legal cells must be tinted brighter than illegal ones: \

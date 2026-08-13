@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import asdict
 import json
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -17,8 +18,10 @@ from vgo_training.pipeline import (
     ReplayArtifact,
     _compress_shard,
     atomic_json,
+    canonical_digest,
     config_from_arguments,
     file_sha256,
+    identity_config,
 )
 from vgo_training.rl_loop import parse_arguments
 
@@ -57,6 +60,18 @@ class PipelineConfigurationTests(unittest.TestCase):
             PipelineConfig(output="run", promotion_score=0.52).validate()
         with self.assertRaisesRegex(ValueError, "inference slots"):
             PipelineConfig(output="run", inference_slots=0).validate()
+        with self.assertRaisesRegex(ValueError, "nonzero initial range"):
+            PipelineConfig(output="run", dynamic_komi=True).validate()
+        with self.assertRaisesRegex(ValueError, "target Black win rate"):
+            PipelineConfig(
+                output="run",
+                komi_target_black_win_rate=1.0,
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "maximum step"):
+            PipelineConfig(
+                output="run",
+                komi_recenter_maximum_step=0.0,
+            ).validate()
 
     def test_json_normalization_makes_a_run_resumable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -81,13 +96,19 @@ class PipelineConfigurationTests(unittest.TestCase):
     def test_operational_controls_can_change_and_targets_can_extend(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             original = Pipeline(
-                PipelineConfig(output=directory, updates=2, actors=64)
+                PipelineConfig(
+                    output=directory,
+                    updates=2,
+                    actors=64,
+                    inference_batch=64,
+                )
             )
             tuned = Pipeline(
                 PipelineConfig(
                     output=directory,
                     updates=5,
                     actors=12,
+                    inference_batch=32,
                     inference_slots=3,
                     maximum_prefetch_shards=2,
                 )
@@ -102,17 +123,112 @@ class PipelineConfigurationTests(unittest.TestCase):
             self.assertEqual(len(history), 2)
             self.assertEqual(history[-1]["config"]["updates"], 5)
             self.assertEqual(history[-1]["config"]["actors"], 12)
+            self.assertEqual(history[-1]["config"]["inference_batch"], 32)
             self.assertEqual(history[-1]["config"]["inference_slots"], 3)
 
     def test_learning_semantics_cannot_change_on_resume(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            Pipeline(PipelineConfig(output=directory))
+            original = Pipeline(PipelineConfig(output=directory))
+            original.state.next_shard = 1
+            original._save_state()
             with self.assertRaisesRegex(ValueError, "learning configuration"):
                 Pipeline(
                     PipelineConfig(
                         output=directory, generation_simulations=257
                     )
                 )
+
+    def test_pristine_run_can_adopt_a_corrected_learning_recipe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            original = Pipeline(PipelineConfig(output=directory))
+            changed = Pipeline(
+                PipelineConfig(output=directory, dynamic_komi=True, komi_high=0.2)
+            )
+
+            self.assertNotEqual(original.config_digest, changed.config_digest)
+            self.assertEqual(changed.state.config_digest, changed.config_digest)
+            stored = json.loads(
+                (Path(directory) / "pipeline-config.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(stored["dynamic_komi"])
+            durable_state = json.loads(
+                (Path(directory) / "pipeline-state.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(durable_state["config_digest"], changed.config_digest)
+
+    def test_promotion_gate_can_be_turned_off_on_resume(self) -> None:
+        # A gated run has to be able to continue ungated: an 8-pair arena
+        # cannot separate two neighbouring checkpoints, so the gate is not
+        # worth freezing into run identity. See OPERATIONAL_CONFIG_FIELDS.
+        with tempfile.TemporaryDirectory() as directory:
+            gated = Pipeline(
+                PipelineConfig(
+                    output=directory, promotion_arena=True, promotion_score=0.55
+                )
+            )
+            gated._save_state()
+            ungated = Pipeline(PipelineConfig(output=directory))
+
+            self.assertEqual(gated.config_digest, ungated.config_digest)
+
+    def test_stale_digest_refreshes_when_identity_still_matches(self) -> None:
+        # Widening OPERATIONAL_CONFIG_FIELDS changes the digest of every run
+        # already on disk. That must not make them unresumable: the identity
+        # comparison against the run's own pipeline-config.json is what decides
+        # whether the configuration really differs, and the digest is a cache
+        # of it. Without this, every such change strands runs mid-flight.
+        with tempfile.TemporaryDirectory() as directory:
+            original = Pipeline(
+                PipelineConfig(
+                    output=directory,
+                    updates=2,
+                    inference_batch=64,
+                )
+            )
+            stored = json.loads(
+                (Path(directory) / "pipeline-config.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            prior_operational_fields = (
+                OPERATIONAL_CONFIG_FIELDS - {"inference_batch"}
+            )
+            original.state.config_digest = canonical_digest(
+                identity_config(stored, prior_operational_fields)
+            )
+            original._save_state()
+
+            resumed = Pipeline(
+                PipelineConfig(
+                    output=directory,
+                    updates=2,
+                    inference_batch=32,
+                )
+            )
+
+            self.assertEqual(resumed.state.config_digest, resumed.config_digest)
+
+    def test_unknown_digest_is_rejected_even_with_a_matching_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            original = Pipeline(PipelineConfig(output=directory, updates=2))
+            original.state.config_digest = "0" * 64
+            original._save_state()
+
+            with self.assertRaisesRegex(ValueError, "different configuration"):
+                Pipeline(PipelineConfig(output=directory, updates=2))
+
+    def test_state_from_a_foreign_run_is_still_rejected(self) -> None:
+        # The refresh above must not become a way to point any state file at
+        # any config: with no pipeline-config.json there is nothing to compare
+        # identity against, so the digest is the only guard left.
+        with tempfile.TemporaryDirectory() as directory:
+            original = Pipeline(PipelineConfig(output=directory, updates=2))
+            original.state.config_digest = "0" * 64
+            original._save_state()
+            (Path(directory) / "pipeline-config.json").unlink()
+
+            with self.assertRaisesRegex(ValueError, "different configuration"):
+                Pipeline(PipelineConfig(output=directory, updates=2))
 
     def test_target_cannot_be_reduced_below_completed_work(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -476,6 +592,30 @@ class PipelineSchedulingTests(unittest.TestCase):
 
 
 class PipelineRecoveryTests(unittest.TestCase):
+    def test_exported_model_may_have_a_larger_batch_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(
+                PipelineConfig(output=directory, inference_batch=32)
+            )
+            checkpoint = Path(directory) / "candidate.pt"
+            onnx = Path(directory) / "candidate.onnx"
+            checkpoint.write_bytes(b"checkpoint")
+            onnx.write_bytes(b"onnx")
+            report = {
+                "schema": "vgo.onnx-manifest.v1",
+                "checkpoint": str(checkpoint.resolve()),
+                "checkpoint_sha256": file_sha256(checkpoint),
+                "onnx": str(onnx.resolve()),
+                "onnx_sha256": file_sha256(onnx),
+                "input": {"maximum_batch": 64},
+            }
+
+            pipeline._validate_export_artifact(checkpoint, onnx, report)
+
+            report["input"]["maximum_batch"] = 16
+            with self.assertRaisesRegex(RuntimeError, "below the configured"):
+                pipeline._validate_export_artifact(checkpoint, onnx, report)
+
     def test_run_lease_excludes_a_second_coordinator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             first = Pipeline(PipelineConfig(output=directory))
@@ -928,6 +1068,161 @@ class AdaptiveResignThresholdTests(unittest.TestCase):
                 good,
             ]
             self.assertEqual(pipeline._adaptive_resign_threshold(), 0.95)
+
+
+class DynamicKomiTests(unittest.TestCase):
+    def _shard(
+        self,
+        directory: str,
+        sequence: int,
+        *,
+        low: float,
+        high: float,
+        crossing: float | None,
+    ) -> dict[str, object]:
+        shard = Path(directory) / f"shard-{sequence:+03d}"
+        shard.mkdir(parents=True, exist_ok=True)
+        games = shard / "games.jsonl"
+        rows: list[dict[str, object]] = []
+        if crossing is not None:
+            # Exact binomial observations from a decreasing logistic whose 50%
+            # point is `crossing`. Mixed outcomes keep the fit identifiable.
+            for point in (-0.1, 0.0, 0.1, 0.2, 0.3):
+                probability = 1.0 / (1.0 + math.exp(20.0 * (point - crossing)))
+                black = round(100 * probability)
+                rows.extend(
+                    {
+                        "komi": point,
+                        "black_utility": 1.0 if index < black else -1.0,
+                        "resigned": False,
+                    }
+                    for index in range(100)
+                )
+        games.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        manifest = shard / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "games": games.name,
+                    "komi_low": low,
+                    "komi_high": high,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {"sequence": sequence, "manifest": str(manifest)}
+
+    def _pipeline(self, directory: str, **overrides: object) -> Pipeline:
+        return Pipeline(
+            PipelineConfig(
+                output=directory,
+                komi_low=-0.166,
+                komi_high=0.234,
+                dynamic_komi=True,
+                komi_recenter_minimum_games=256,
+                komi_recenter_maximum_step=0.025,
+                **overrides,
+            )
+        )
+
+    def test_recent_outcomes_move_the_fixed_width_range_towards_fifty_fifty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = self._pipeline(directory)
+            pipeline.state.replay = [
+                self._shard(
+                    directory,
+                    0,
+                    low=-0.166,
+                    high=0.234,
+                    crossing=0.1,
+                )
+            ]
+
+            decision = pipeline._effective_komi_range()
+            center = 0.5 * (decision.low + decision.high)
+
+            self.assertIsNotNone(decision.fit)
+            assert decision.fit is not None
+            self.assertAlmostEqual(decision.fit.target_komi, 0.1, delta=0.005)
+            self.assertAlmostEqual(center, 0.059, places=9)
+            self.assertAlmostEqual(decision.high - decision.low, 0.4, places=9)
+
+    def test_insufficient_evidence_keeps_the_latest_effective_center(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = self._pipeline(directory)
+            pipeline.state.replay = [
+                self._shard(
+                    directory,
+                    0,
+                    low=-0.12,
+                    high=0.28,
+                    crossing=None,
+                )
+            ]
+
+            decision = pipeline._effective_komi_range()
+
+            self.assertIsNone(decision.fit)
+            self.assertAlmostEqual(0.5 * (decision.low + decision.high), 0.08)
+
+    def test_hard_resignations_are_excluded_from_the_balance_fit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = self._pipeline(directory)
+            replay = self._shard(
+                directory,
+                0,
+                low=-0.166,
+                high=0.234,
+                crossing=0.1,
+            )
+            manifest = Path(str(replay["manifest"]))
+            games = manifest.parent / "games.jsonl"
+            with games.open("a", encoding="utf-8") as stream:
+                for _ in range(1_000):
+                    stream.write(
+                        json.dumps(
+                            {
+                                "komi": 0.3,
+                                "black_utility": 1.0,
+                                "resigned": True,
+                            }
+                        )
+                        + "\n"
+                    )
+            pipeline.state.replay = [replay]
+
+            decision = pipeline._effective_komi_range()
+
+            assert decision.fit is not None
+            self.assertEqual(decision.fit.games, 500)
+            self.assertAlmostEqual(decision.fit.target_komi, 0.1, delta=0.005)
+
+    @patch("vgo_training.pipeline.cargo_executable", return_value="cargo")
+    def test_generation_command_receives_the_adjusted_bounds(self, _cargo: object) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = self._pipeline(directory)
+            pipeline.state.replay = [
+                self._shard(
+                    directory,
+                    0,
+                    low=-0.166,
+                    high=0.234,
+                    crossing=0.1,
+                )
+            ]
+            command = pipeline.generation_command(
+                output=Path(directory) / "staging",
+                sequence=1,
+                model=None,
+            )
+
+            low = next(value for value in command if value.startswith("--komi-low="))
+            high = next(value for value in command if value.startswith("--komi-high="))
+            self.assertAlmostEqual(float(low.split("=", 1)[1]), -0.141)
+            self.assertAlmostEqual(float(high.split("=", 1)[1]), 0.259)
 
 
 class TelemetrySubsetTests(unittest.TestCase):

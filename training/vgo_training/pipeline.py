@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Collection, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -31,6 +32,14 @@ OPERATIONAL_CONFIG_FIELDS = {
     "maximum_prefetch_shards",
     "actors",
     "writer_queue_games",
+    # Request aggregation is serving policy, not learning/search identity. The
+    # batch shape can perturb the last bits of accelerator arithmetic, but so
+    # can the already-operational precision, driver, and execution-slot count;
+    # none changes the intended search. Every shard records the effective batch
+    # ceiling for provenance. A configured ceiling must still fit the maximum
+    # embedded in the current ONNX artifact, so lowering 64 -> 32 is directly
+    # resumable while raising beyond an old export requires re-exporting it.
+    "inference_batch",
     "inference_delay_ms",
     "inference_slots",
     "inference_device_id",
@@ -65,7 +74,41 @@ OPERATIONAL_CONFIG_FIELDS = {
     # launch.sh). Freezing the flag would only mean a run cannot adopt fp16
     # without starting over.
     "fp16",
+    # The promotion gate, like fp16, is a judgement rather than an obvious
+    # operational field: turning it off promotes every candidate, and which
+    # checkpoint generates plainly changes the data that follows. Two things
+    # decide it anyway.
+    #
+    # The gate is a measurement, and at --arena-pairs 8 it is a measurement
+    # with no power. Across shard-sweep-15000's twenty updates every arena's
+    # 95% interval on the candidate's score contains 0.5 -- not one of them
+    # resolved a difference. Scoring 0.55 over 16 games means winning 9, so
+    # under a candidate that is exactly as strong as the incumbent the gate
+    # promotes 40% of the time, and against one that truly scores 0.6 it
+    # rejects 28% of the time. Freezing that into run identity freezes in a
+    # coin flip; the four rejections at updates 7, 9, 11 and 16 stalled the
+    # generator on a stale checkpoint for an entire shard apiece on that
+    # evidence. Raise --arena-pairs before trusting a gate to mean anything.
+    #
+    # And the digest is not the only provenance. Every update writes its own
+    # `promotion_arena` block -- null when the gate is off -- alongside
+    # `accepted`, so which regime produced an update is recoverable per
+    # update, which is what the guard is really protecting. What must stay
+    # frozen is anything changing the content of a shard or a gradient:
+    # resolution, komi range, simulations, model shape, optimizer, replay
+    # window. Those are all still here.
+    "promotion_arena",
+    "promotion_score",
 }
+# These fields became operational after runs had already stored identity
+# digests that included them. Keep the exact historical combinations bounded:
+# accepting an arbitrary mismatched digest would let a foreign state file be
+# silently relabelled merely because a pipeline-config.json happened to exist.
+HISTORICAL_OPERATIONAL_FIELD_ADDITIONS = (
+    frozenset({"inference_batch"}),
+    frozenset({"promotion_arena", "promotion_score"}),
+    frozenset({"inference_batch", "promotion_arena", "promotion_score"}),
+)
 
 
 def _compress_shard(path: Path) -> tuple[Path, int, int]:
@@ -154,12 +197,30 @@ def canonical_digest(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def identity_config(value: dict[str, Any]) -> dict[str, Any]:
+def identity_config(
+    value: dict[str, Any],
+    operational_fields: Collection[str] = OPERATIONAL_CONFIG_FIELDS,
+) -> dict[str, Any]:
     return {
         key: item
         for key, item in value.items()
-        if key not in OPERATIONAL_CONFIG_FIELDS
+        if key not in operational_fields
     }
+
+
+def compatible_config(value: dict[str, Any]) -> dict[str, Any]:
+    """Fill defaults for fields added without changing historical semantics."""
+
+    normalized = value.copy()
+    # Runs written before dynamic komi existed used a fixed configured range,
+    # exactly the false/default behavior. Backfilling only for comparison keeps
+    # those runs resumable while still making `dynamic_komi=True` an identity
+    # change once replay exists.
+    normalized.setdefault("dynamic_komi", False)
+    normalized.setdefault("komi_target_black_win_rate", 0.5)
+    normalized.setdefault("komi_recenter_minimum_games", 256)
+    normalized.setdefault("komi_recenter_maximum_step", 0.025)
+    return normalized
 
 
 def cargo_executable() -> str:
@@ -292,6 +353,107 @@ class ReplayArtifact:
 
 
 @dataclass(frozen=True)
+class KomiBalanceFit:
+    """Recent played-game estimate of the komi giving the requested win rate."""
+
+    target_komi: float
+    slope: float
+    games: int
+    black_equivalents: float
+
+
+@dataclass(frozen=True)
+class KomiRangeDecision:
+    low: float
+    high: float
+    previous_center: float
+    fit: KomiBalanceFit | None
+    games: int
+
+
+def fit_komi_balance(
+    games: Sequence[tuple[float, float]], target_black_win_rate: float
+) -> KomiBalanceFit | None:
+    """Fit ``P(Black wins) = sigmoid(a + b * komi)``.
+
+    Outcomes are Black-relative probabilities: 1 for a Black win, 0 for a
+    White win, and 0.5 for the vanishingly rare tie. Returning ``None`` is the
+    conservative result when the sample does not identify a decreasing komi
+    response. The coordinator then keeps its current range unchanged.
+    """
+
+    if len(games) < 2 or not 0.0 < target_black_win_rate < 1.0:
+        return None
+    xs = [komi for komi, _ in games]
+    ys = [outcome for _, outcome in games]
+    if (
+        not all(math.isfinite(value) for value in xs + ys)
+        or any(not 0.0 <= value <= 1.0 for value in ys)
+        or max(xs) - min(xs) <= 1.0e-9
+    ):
+        return None
+    black_equivalents = sum(ys)
+    # A one-sided result can only say "move farther", not how far. Waiting for
+    # both outcomes is safer than allowing a separated logistic fit to dictate
+    # the next range from its regularizer.
+    if black_equivalents <= 0.0 or black_equivalents >= len(games):
+        return None
+
+    intercept = 0.0
+    slope = 0.0
+    for _ in range(200):
+        gradient_intercept = 0.0
+        gradient_slope = 0.0
+        h00 = 1.0e-9
+        h01 = 0.0
+        h11 = 1.0e-9
+        for komi, outcome in games:
+            logit = intercept + slope * komi
+            probability = (
+                1.0 / (1.0 + math.exp(-logit))
+                if logit >= 0.0
+                else math.exp(logit) / (1.0 + math.exp(logit))
+            )
+            residual = outcome - probability
+            weight = probability * (1.0 - probability)
+            gradient_intercept += residual
+            gradient_slope += residual * komi
+            h00 += weight
+            h01 += weight * komi
+            h11 += weight * komi * komi
+        determinant = h00 * h11 - h01 * h01
+        if abs(determinant) < 1.0e-12:
+            return None
+        step_intercept = (
+            h11 * gradient_intercept - h01 * gradient_slope
+        ) / determinant
+        step_slope = (
+            -h01 * gradient_intercept + h00 * gradient_slope
+        ) / determinant
+        intercept += step_intercept
+        slope += step_slope
+        if not math.isfinite(intercept) or not math.isfinite(slope):
+            return None
+        if abs(step_intercept) + abs(step_slope) < 1.0e-10:
+            break
+
+    # Higher komi favours White. A flat or increasing fitted response is noise
+    # or malformed calibration, not a signal the controller should follow.
+    if slope >= -1.0e-6:
+        return None
+    target_logit = math.log(target_black_win_rate / (1.0 - target_black_win_rate))
+    target_komi = (target_logit - intercept) / slope
+    if not math.isfinite(target_komi):
+        return None
+    return KomiBalanceFit(
+        target_komi=target_komi,
+        slope=slope,
+        games=len(games),
+        black_equivalents=black_equivalents,
+    )
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     output: str
     updates: int = 10
@@ -384,10 +546,18 @@ class PipelineConfig:
     resign_soft_simulations: int = 0
     resign_window: int = 5
     resign_minimum_ply: int = 0
-    # Uniform per game, in [komi_low, komi_high]. Positive favours White:
-    # scoring is `black - white - komi > 0`.
+    # Initial per-game komi range. Positive favours White: scoring is
+    # `black - white - komi > 0`. Generation draws from a truncated normal
+    # centred on this range; dynamic_komi recentres it without changing width.
     komi_low: float = 0.0
     komi_high: float = 0.0
+    # Fit P(Black wins | komi) over the trailing replay window and move the
+    # next shard's range towards the requested win rate. The fit reads exact
+    # played-game komi/outcomes, not the coarser manifest display buckets.
+    dynamic_komi: bool = False
+    komi_target_black_win_rate: float = 0.5
+    komi_recenter_minimum_games: int = 256
+    komi_recenter_maximum_step: float = 0.025
     raster_kind: str = "semantic"
     resign_disable_fraction: float = 0.1
     arena_pairs: int = 16
@@ -472,6 +642,21 @@ class PipelineConfig:
             raise ValueError("radius must be between zero and one half")
         if self.temperature < 0.0:
             raise ValueError("temperature must be nonnegative")
+        if not math.isfinite(self.komi_low) or not math.isfinite(self.komi_high):
+            raise ValueError("komi bounds must be finite")
+        if self.komi_high < self.komi_low:
+            raise ValueError("komi high must not be below komi low")
+        if self.dynamic_komi and self.komi_high <= self.komi_low:
+            raise ValueError("dynamic komi requires a nonzero initial range")
+        if not 0.0 < self.komi_target_black_win_rate < 1.0:
+            raise ValueError("komi target Black win rate must be in (0, 1)")
+        if self.komi_recenter_minimum_games <= 0:
+            raise ValueError("komi recenter minimum games must be positive")
+        if (
+            not math.isfinite(self.komi_recenter_maximum_step)
+            or self.komi_recenter_maximum_step <= 0.0
+        ):
+            raise ValueError("komi recenter maximum step must be finite and positive")
         if self.learning_rate <= 0.0 or self.warm_learning_rate <= 0.0:
             raise ValueError("learning rates must be positive")
         if self.ownership_weight < 0.0:
@@ -833,18 +1018,82 @@ class Pipeline:
         self.output.mkdir(parents=True, exist_ok=True)
         config_path = self.output / "pipeline-config.json"
         prior: dict[str, Any] | None = None
+        pristine_reconfiguration = False
+        state_digest_changed = False
         if config_path.exists():
             prior = json.loads(config_path.read_text(encoding="utf-8"))
-            if identity_config(prior) != identity_config(config_value):
-                raise ValueError(
-                    "pipeline's learning configuration differs from the existing run"
+            if identity_config(compatible_config(prior)) != identity_config(
+                config_value
+            ):
+                # A launcher writes config/state before generation starts. If
+                # that first generator is interrupted, no learned artifact is
+                # tied to the identity yet; allowing the empty shell to adopt a
+                # corrected recipe is both safe and much less error-prone than
+                # asking somebody to hand-edit its digest. Once any shard or
+                # model exists, the original immutability rule applies.
+                try:
+                    candidate = PipelineState.from_json(
+                        json.loads(self.state_path.read_text(encoding="utf-8"))
+                    )
+                except (OSError, ValueError, json.JSONDecodeError):
+                    candidate = None
+                pristine_reconfiguration = bool(
+                    candidate is not None
+                    and candidate.next_shard == 0
+                    and candidate.updates_completed == 0
+                    and not candidate.replay
+                    and not candidate.models
+                    and not candidate.rejected_models
                 )
+                if not pristine_reconfiguration:
+                    raise ValueError(
+                        "pipeline's learning configuration differs from the existing run"
+                    )
         if self.state_path.exists():
             state = PipelineState.from_json(
                 json.loads(self.state_path.read_text(encoding="utf-8"))
             )
-            if state.config_digest != self.config_digest:
-                raise ValueError("pipeline state belongs to a different configuration")
+            if pristine_reconfiguration:
+                print(
+                    "[state] adopting changed learning configuration before the "
+                    "first shard",
+                    flush=True,
+                )
+                state.config_digest = self.config_digest
+                state_digest_changed = True
+            elif state.config_digest != self.config_digest:
+                if prior is None:
+                    raise ValueError(
+                        "pipeline state belongs to a different configuration"
+                    )
+                # The identity comparison above already passed against this
+                # run's own pipeline-config.json, so the two configurations
+                # agree on every field that is part of identity *today*. A
+                # digest that still disagrees may have been written before a
+                # field became operational. Accept only digests produced by
+                # those known historical field sets; an arbitrary mismatch may
+                # be a foreign state file.
+                historical_digests = {
+                    canonical_digest(
+                        identity_config(
+                            prior,
+                            OPERATIONAL_CONFIG_FIELDS - additions,
+                        )
+                    )
+                    for additions in HISTORICAL_OPERATIONAL_FIELD_ADDITIONS
+                }
+                if state.config_digest not in historical_digests:
+                    raise ValueError(
+                        "pipeline state belongs to a different configuration"
+                    )
+                print(
+                    "[state] config digest was taken under a different set of "
+                    f"operational fields ({state.config_digest[:12]} -> "
+                    f"{self.config_digest[:12]}); identity matches, refreshing",
+                    flush=True,
+                )
+                state.config_digest = self.config_digest
+                state_digest_changed = True
         else:
             state = PipelineState(config_digest=self.config_digest)
             for index, replay in enumerate(self.config.initial_replay):
@@ -880,6 +1129,8 @@ class Pipeline:
             raise ValueError(
                 "updates cannot be reduced below already completed work"
             )
+        if state_digest_changed:
+            atomic_json(self.state_path, state.to_json())
         if prior != config_value:
             history_path = self.output / "pipeline-config-history.json"
             history = (
@@ -963,6 +1214,103 @@ class Pipeline:
             "--",
         ]
 
+    @staticmethod
+    def _manifest_komi_range(manifest: dict[str, Any]) -> tuple[float, float] | None:
+        """Effective range recorded by a shard, including pre-controller shards."""
+
+        try:
+            low = float(manifest["komi_low"])
+            high = float(manifest["komi_high"])
+        except (KeyError, TypeError, ValueError):
+            # Older manifests record the same endpoints through their display
+            # buckets. This lets a dynamic continuation start from the latest
+            # range it actually played rather than snapping to its nominal one.
+            try:
+                buckets = manifest["komi_calibration"]
+                low = min(float(bucket["low"]) for bucket in buckets)
+                high = max(float(bucket["high"]) for bucket in buckets)
+            except (KeyError, TypeError, ValueError):
+                return None
+        if not math.isfinite(low) or not math.isfinite(high) or high <= low:
+            return None
+        return low, high
+
+    def _recent_komi_games(self) -> list[tuple[float, float]]:
+        """Exact recent ``(komi, Black outcome)`` rows eligible for fitting."""
+
+        games: list[tuple[float, float]] = []
+        for replay in self.state.replay[-self.config.replay_window :]:
+            try:
+                manifest_path = Path(str(replay["manifest"]))
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                games_path = manifest_path.parent / str(manifest["games"])
+                lines = games_path.read_text(encoding="utf-8").splitlines()
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    # A hard resignation assigns the winner using the rule
+                    # whose calibration is under test. Soft resignation records
+                    # `resigned: false` because it plays to an independent end.
+                    if bool(row.get("resigned", False)):
+                        continue
+                    komi = float(row["komi"])
+                    utility = float(row["black_utility"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if math.isfinite(komi) and math.isfinite(utility) and -1.0 <= utility <= 1.0:
+                    games.append((komi, (utility + 1.0) / 2.0))
+        return games
+
+    def _effective_komi_range(self) -> KomiRangeDecision:
+        """Range for the next shard, derived only from durable prior replay."""
+
+        config = self.config
+        width = config.komi_high - config.komi_low
+        configured_center = 0.5 * (config.komi_low + config.komi_high)
+        if not config.dynamic_komi:
+            return KomiRangeDecision(
+                low=config.komi_low,
+                high=config.komi_high,
+                previous_center=configured_center,
+                fit=None,
+                games=0,
+            )
+
+        current_center = configured_center
+        for replay in reversed(self.state.replay):
+            try:
+                manifest = json.loads(
+                    Path(str(replay["manifest"])).read_text(encoding="utf-8")
+                )
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if effective := self._manifest_komi_range(manifest):
+                current_center = 0.5 * (effective[0] + effective[1])
+                break
+
+        recent = self._recent_komi_games()
+        fit = (
+            fit_komi_balance(recent, config.komi_target_black_win_rate)
+            if len(recent) >= config.komi_recenter_minimum_games
+            else None
+        )
+        next_center = current_center
+        if fit is not None:
+            delta = fit.target_komi - current_center
+            maximum = config.komi_recenter_maximum_step
+            next_center += max(-maximum, min(maximum, delta))
+        return KomiRangeDecision(
+            low=next_center - width / 2.0,
+            high=next_center + width / 2.0,
+            previous_center=current_center,
+            fit=fit,
+            games=len(recent),
+        )
+
     def _adaptive_resign_threshold(self) -> float:
         """Lowest threshold whose measured error stays under the target.
 
@@ -1033,6 +1381,7 @@ class Pipeline:
     ) -> list[str]:
         config = self.config
         threshold = self._adaptive_resign_threshold()
+        komi = self._effective_komi_range()
         if config.resign_target_false_positive > 0.0:
             # Always log under adaptation: "chose 0.95 because it qualified" and
             # "chose 0.95 because nothing did" were previously indistinguishable,
@@ -1048,6 +1397,23 @@ class Pipeline:
                 print(
                     f"[resign] threshold {threshold} chosen for shard {sequence} "
                     f"(target FP {target:.0f}%)",
+                    flush=True,
+                )
+        if config.dynamic_komi:
+            center = 0.5 * (komi.low + komi.high)
+            target = 100.0 * config.komi_target_black_win_rate
+            if komi.fit is None:
+                print(
+                    f"[komi] shard {sequence}: keeping center "
+                    f"{komi.previous_center:+.4f}; {komi.games} eligible games "
+                    f"(need {config.komi_recenter_minimum_games} and a decreasing fit)",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[komi] shard {sequence}: {komi.fit.games} games fit "
+                    f"Black {target:.0f}% at {komi.fit.target_komi:+.4f}; "
+                    f"center {komi.previous_center:+.4f} -> {center:+.4f}",
                     flush=True,
                 )
         command = self._rust_command("vgo-generate-demo") + [
@@ -1077,8 +1443,8 @@ class Pipeline:
             str(config.resign_soft_simulations),
             # `=` form: a negative komi otherwise parses as a flag, since clap
             # cannot tell `-0.1` from a short option.
-            f"--komi-low={config.komi_low}",
-            f"--komi-high={config.komi_high}",
+            f"--komi-low={komi.low}",
+            f"--komi-high={komi.high}",
             "--raster-kind",
             str(config.raster_kind),
             "--model-raster-kind",
@@ -1600,8 +1966,16 @@ class Pipeline:
         if not isinstance(digest, str) or len(digest) != 64:
             raise RuntimeError("ONNX export report has no valid model digest")
         maximum_batch = report.get("input", {}).get("maximum_batch")
-        if int(maximum_batch) != self.config.inference_batch:
-            raise RuntimeError("ONNX export batch contract does not match the pipeline")
+        try:
+            maximum_batch = int(maximum_batch)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "ONNX export report has no valid maximum batch"
+            ) from error
+        if maximum_batch < self.config.inference_batch:
+            raise RuntimeError(
+                "ONNX export maximum batch is below the configured inference batch"
+            )
         if file_sha256(onnx) != digest:
             raise RuntimeError("ONNX checksum does not match its export report")
 
@@ -2384,7 +2758,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
         "--inference-slots",
         type=int,
         default=2,
-        help="independent inference lanes used by self-play generation",
+        help="execution slots behind self-play generation's shared batch queue",
     )
     parser.add_argument(
         "--provider", choices=("cpu", "cuda", "tensorrt"), default="tensorrt"
@@ -2542,6 +2916,33 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
             "highest komi a game may draw. A range teaches the relationship "
             "between komi and the position; one value teaches one balance point"
         ),
+    )
+    parser.add_argument(
+        "--dynamic-komi",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "recenter the fixed-width komi distribution from exact outcomes in "
+            "the trailing replay window"
+        ),
+    )
+    parser.add_argument(
+        "--komi-target-black-win-rate",
+        type=float,
+        default=0.5,
+        help="Black win rate the dynamic komi controller targets",
+    )
+    parser.add_argument(
+        "--komi-recenter-minimum-games",
+        type=int,
+        default=256,
+        help="played games required before trusting a dynamic komi fit",
+    )
+    parser.add_argument(
+        "--komi-recenter-maximum-step",
+        type=float,
+        default=0.025,
+        help="largest change in the komi distribution's center per shard",
     )
     parser.add_argument(
         "--raster-kind",

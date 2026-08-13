@@ -493,12 +493,13 @@ fn normalize_priors(children: &mut [Child]) {
         .iter()
         .map(|child| child.policy_logit)
         .fold(f64::NEG_INFINITY, f64::max);
-    let total: f64 = children
-        .iter()
-        .map(|child| (child.policy_logit - maximum).exp())
-        .sum();
+    let mut total = 0.0;
+    for child in children.iter_mut() {
+        child.prior = (child.policy_logit - maximum).exp();
+        total += child.prior;
+    }
     for child in children {
-        child.prior = (child.policy_logit - maximum).exp() / total;
+        child.prior /= total;
     }
 }
 

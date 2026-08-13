@@ -27,6 +27,12 @@
 #                 head overfits its window at 2.6x Adam's rate
 #   1600 sims     cheaper per shard than 2400, and the search-time candidate
 #                 panic seen at 2400 has not reproduced below it
+#   batch 32      with the shared broker and two TensorRT slots, the exact
+#                 w64/b16/attention model reached 16,433 positions/s versus
+#                 13,343 at batch 64. A paired 64-game generation run improved
+#                 from 20.67s to 18.92s (9.3%) while filling 31.8/32 positions.
+#                 This is a serving control and may be changed on resume when
+#                 it does not exceed the current ONNX artifact's maximum.
 #
 # Only settings in the pipeline's OPERATIONAL_CONFIG_FIELDS are exposed as
 # environment variables. Everything else is part of the run's identity: the
@@ -56,6 +62,8 @@ exec .venv/bin/python3 -m vgo_training.rl_loop \
   --samples-per-shard 1600 --shards-per-update 1 --replay-window 6 \
   --resolution 128 --policy-resolution 128 --radius 0.055714285714285716 \
   --raster-kind compact --komi-low=-0.166 --komi-high=0.234 \
+  --dynamic-komi --komi-target-black-win-rate 0.5 \
+  --komi-recenter-minimum-games 256 --komi-recenter-maximum-step 0.025 \
   --coarse-pool 16 --generation-simulations 1600 \
   --temperature 1.0 --temperature-plies 30 --maximum-plies 70 \
   --resign-target-false-positive 0.02 --resign-soft-simulations 800 \
@@ -72,7 +80,7 @@ exec .venv/bin/python3 -m vgo_training.rl_loop \
   --report-every 1 --validation-fraction 0.1 \
   --actors "${VGO_ACTORS:-64}" --arena-actors "${VGO_ARENA_ACTORS:-${VGO_ACTORS:-64}}" \
   --leaf-batch 4 \
-  --inference-batch 64 --inference-delay-ms 1 \
+  --inference-batch 32 --inference-delay-ms 1 \
   --inference-slots "${VGO_SLOTS:-2}" \
   --provider tensorrt --fp16 --warm-inference \
   --overlap-actor-learner --retire-shards \

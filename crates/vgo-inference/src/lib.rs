@@ -4,7 +4,9 @@ mod executor;
 mod onnx;
 mod protocol;
 
-pub use executor::{BatchExecutor, CompletedBatch, InferenceBatch, ThreadedBatchExecutor};
+pub use executor::{
+    BatchExecutor, CompletedBatch, InferenceBatch, ThreadedBatchExecutor, ThreadedBatchExecutorPool,
+};
 pub use onnx::{OnnxBatchService, OnnxProvider, OnnxServiceConfig};
 pub use protocol::{
     InferenceInput, InferenceOutput, encode_request_frame, read_response_frame,
@@ -12,6 +14,7 @@ pub use protocol::{
 };
 
 use std::{
+    collections::{HashMap, VecDeque},
     io::{BufReader, BufWriter, Write},
     path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
@@ -217,6 +220,7 @@ impl AtomicMetrics {
 
 struct Request {
     inputs: Vec<InferenceInput>,
+    encoding_nanoseconds: u64,
     queued_at: Instant,
     response: SyncSender<Result<Vec<InferenceOutput>, EvaluationError>>,
 }
@@ -330,10 +334,11 @@ impl BatchedEvaluator {
                 InferenceInput::new(id, rasterize(position, self.inner.contract.raster))
             })
             .collect::<Vec<_>>();
-        self.inner.metrics.encoding_nanoseconds.fetch_add(
-            encoding_started.elapsed().as_nanos() as u64,
-            Ordering::Relaxed,
-        );
+        let encoding_nanoseconds = encoding_started.elapsed().as_nanos() as u64;
+        self.inner
+            .metrics
+            .encoding_nanoseconds
+            .fetch_add(encoding_nanoseconds, Ordering::Relaxed);
 
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         self.inner
@@ -346,6 +351,7 @@ impl BatchedEvaluator {
             .expect("sender exists while evaluator is alive")
             .send(Request {
                 inputs,
+                encoding_nanoseconds,
                 queued_at: Instant::now(),
                 response: response_sender,
             })
@@ -386,32 +392,64 @@ impl Evaluator for BatchedEvaluator {
     }
 }
 
-/// A round-robin pool of independent inference brokers.
+/// One shared batching broker backed by independent inference execution slots.
 ///
-/// Every logical [`Evaluator::evaluate`] or [`Evaluator::evaluate_batch`] call
-/// is submitted intact to one lane. The pool only routes the borrowed
-/// positions; raster payloads are created once by the selected lane and are
-/// never cloned between lanes.
+/// All callers feed the same FIFO queue. The broker constructs each backend
+/// batch before assigning it to a free slot, so adding execution concurrency
+/// does not fragment arrivals across independent collection deadlines.
 #[derive(Clone)]
 pub struct BatchedEvaluatorPool {
     inner: Arc<PoolInner>,
 }
 
 struct PoolInner {
-    lanes: Vec<BatchedEvaluator>,
-    next_lane: AtomicUsize,
+    sender: Option<SyncSender<Request>>,
+    next_id: AtomicU64,
+    contract: BatchContract,
+    lane_contracts: Vec<BatchContract>,
+    metrics: Arc<AtomicMetrics>,
+    lane_metrics: Vec<Arc<AtomicMetrics>>,
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for PoolInner {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(handle) = self.join.lock().expect("pool broker join lock").take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl BatchedEvaluatorPool {
-    pub fn new(lanes: Vec<BatchedEvaluator>) -> Result<Self, EvaluationError> {
-        let Some(first) = lanes.first() else {
+    pub fn spawn<S: BatchService + 'static>(
+        config: BrokerConfig,
+        services: Vec<S>,
+    ) -> Result<Self, EvaluationError> {
+        if config.queue_capacity == 0 {
+            return Err(EvaluationError::new("queue capacity must be positive"));
+        }
+        let Some(first) = services.first() else {
             return Err(EvaluationError::new(
-                "inference evaluator pool must contain at least one lane",
+                "inference evaluator pool must contain at least one service",
             ));
         };
         let expected = first.contract();
-        for (index, lane) in lanes.iter().enumerate().skip(1) {
-            let actual = lane.contract();
+        if expected.maximum_batch == 0
+            || expected.raster.width == 0
+            || expected.raster.height == 0
+            || expected.policy.width == 0
+            || expected.policy.height == 0
+        {
+            return Err(EvaluationError::new(
+                "inference service contract dimensions must be positive",
+            ));
+        }
+        let lane_contracts = services
+            .iter()
+            .map(BatchService::contract)
+            .collect::<Vec<_>>();
+        for (index, actual) in lane_contracts.iter().copied().enumerate().skip(1) {
             if actual.raster != expected.raster {
                 return Err(EvaluationError::new(format!(
                     "inference evaluator lane {index} has raster contract {:?}, expected {:?}",
@@ -424,77 +462,140 @@ impl BatchedEvaluatorPool {
                     actual.policy, expected.policy
                 )));
             }
+            if actual.maximum_batch != expected.maximum_batch {
+                return Err(EvaluationError::new(format!(
+                    "inference evaluator lane {index} has maximum batch {}, expected {}",
+                    actual.maximum_batch, expected.maximum_batch
+                )));
+            }
         }
+        let executor = ThreadedBatchExecutorPool::spawn(services)?;
+        let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
+        let metrics = Arc::new(AtomicMetrics::default());
+        let lane_metrics = (0..lane_contracts.len())
+            .map(|_| Arc::new(AtomicMetrics::default()))
+            .collect::<Vec<_>>();
+        let broker_metrics = Arc::clone(&metrics);
+        let broker_lane_metrics = lane_metrics.clone();
+        let join = thread::Builder::new()
+            .name(String::from("vgo-inference-pool-broker"))
+            .spawn(move || {
+                run_pool_broker(
+                    config,
+                    expected,
+                    executor,
+                    receiver,
+                    broker_metrics,
+                    broker_lane_metrics,
+                );
+            })
+            .map_err(|error| EvaluationError::new(format!("start inference broker: {error}")))?;
         Ok(Self {
             inner: Arc::new(PoolInner {
-                lanes,
-                next_lane: AtomicUsize::new(0),
+                sender: Some(sender),
+                next_id: AtomicU64::new(1),
+                contract: expected,
+                lane_contracts,
+                metrics,
+                lane_metrics,
+                join: Mutex::new(Some(join)),
             }),
         })
     }
 
     #[must_use]
     pub fn lane_count(&self) -> usize {
-        self.inner.lanes.len()
+        self.inner.lane_metrics.len()
     }
 
     #[must_use]
     pub fn lane_contracts(&self) -> Vec<BatchContract> {
-        self.inner
-            .lanes
-            .iter()
-            .map(BatchedEvaluator::contract)
-            .collect()
+        self.inner.lane_contracts.clone()
     }
 
     #[must_use]
     pub fn lane_metrics(&self) -> Vec<BrokerMetrics> {
         self.inner
-            .lanes
+            .lane_metrics
             .iter()
-            .map(BatchedEvaluator::metrics)
+            .map(|metrics| metrics.snapshot())
             .collect()
     }
 
     #[must_use]
     pub fn metrics(&self) -> BrokerMetrics {
-        self.lane_metrics()
-            .into_iter()
-            .fold(BrokerMetrics::default(), |mut total, lane| {
-                total.requests = total.requests.saturating_add(lane.requests);
-                total.batches = total.batches.saturating_add(lane.batches);
-                total.positions = total.positions.saturating_add(lane.positions);
-                total.maximum_batch = total.maximum_batch.max(lane.maximum_batch);
-                total.failures = total.failures.saturating_add(lane.failures);
-                total.encoding_nanoseconds = total
-                    .encoding_nanoseconds
-                    .saturating_add(lane.encoding_nanoseconds);
-                total.queue_nanoseconds = total
-                    .queue_nanoseconds
-                    .saturating_add(lane.queue_nanoseconds);
-                total.inference_nanoseconds = total
-                    .inference_nanoseconds
-                    .saturating_add(lane.inference_nanoseconds);
-                total
-            })
+        self.inner.metrics.snapshot()
     }
 
-    fn next_lane(&self) -> &BatchedEvaluator {
-        let index = self.inner.next_lane.fetch_add(1, Ordering::Relaxed) % self.inner.lanes.len();
-        &self.inner.lanes[index]
+    fn evaluate_positions(
+        &self,
+        positions: &[Position],
+    ) -> Result<Vec<Evaluation>, EvaluationError> {
+        if positions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let encoding_started = Instant::now();
+        let inputs = positions
+            .iter()
+            .map(|position| {
+                let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+                InferenceInput::new(id, rasterize(position, self.inner.contract.raster))
+            })
+            .collect::<Vec<_>>();
+        let encoding_nanoseconds = encoding_started.elapsed().as_nanos() as u64;
+        self.inner
+            .metrics
+            .encoding_nanoseconds
+            .fetch_add(encoding_nanoseconds, Ordering::Relaxed);
+        self.inner
+            .metrics
+            .requests
+            .fetch_add(inputs.len() as u64, Ordering::Relaxed);
+
+        let (response, completion) = mpsc::sync_channel(1);
+        self.inner
+            .sender
+            .as_ref()
+            .expect("sender exists while evaluator pool is alive")
+            .send(Request {
+                inputs,
+                encoding_nanoseconds,
+                queued_at: Instant::now(),
+                response,
+            })
+            .map_err(|_| EvaluationError::new("inference broker has stopped"))?;
+
+        completion
+            .recv()
+            .map_err(|_| EvaluationError::new("inference broker dropped the response"))??
+            .into_iter()
+            .map(|output| {
+                let (_, current_value, policy) = output.into_parts();
+                Ok(Evaluation::new(
+                    current_value,
+                    Box::new(DensePolicy {
+                        config: self.inner.contract.policy,
+                        logits: policy,
+                    }),
+                ))
+            })
+            .collect()
     }
 }
 
 impl Evaluator for BatchedEvaluatorPool {
     fn evaluate(&self, position: &Position) -> Result<Evaluation, EvaluationError> {
-        self.next_lane().evaluate(position)
+        self.evaluate_positions(std::slice::from_ref(position))
+            .map(|mut evaluations| {
+                evaluations
+                    .pop()
+                    .expect("one position produces one evaluation")
+            })
     }
 
     fn evaluate_batch(&self, positions: &[Position]) -> Result<Vec<Evaluation>, EvaluationError> {
-        if positions.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.next_lane().evaluate_batch(positions)
+        self.evaluate_positions(positions)
     }
 }
 
@@ -648,6 +749,326 @@ fn run_broker(
     }
 }
 
+struct QueuedPoolRequest {
+    key: u64,
+    inputs: std::vec::IntoIter<InferenceInput>,
+    next_offset: usize,
+    encoding_nanoseconds: u64,
+    queued_at: Instant,
+}
+
+struct PendingPoolResponse {
+    outputs: Vec<Option<InferenceOutput>>,
+    remaining: usize,
+    response: SyncSender<Result<Vec<InferenceOutput>, EvaluationError>>,
+}
+
+struct PoolBatchPart {
+    key: u64,
+    offset: usize,
+    count: usize,
+    encoding_nanoseconds: u64,
+    queued_at: Instant,
+}
+
+struct InFlightPoolBatch {
+    expected_ids: Vec<u64>,
+    parts: Vec<PoolBatchPart>,
+    position_count: usize,
+    slot: usize,
+}
+
+fn enqueue_pool_request(
+    request: Request,
+    key: u64,
+    queued: &mut VecDeque<QueuedPoolRequest>,
+    responses: &mut HashMap<u64, PendingPoolResponse>,
+) {
+    let count = request.inputs.len();
+    debug_assert!(count > 0, "evaluators do not submit empty requests");
+    responses.insert(
+        key,
+        PendingPoolResponse {
+            outputs: (0..count).map(|_| None).collect(),
+            remaining: count,
+            response: request.response,
+        },
+    );
+    queued.push_back(QueuedPoolRequest {
+        key,
+        inputs: request.inputs.into_iter(),
+        next_offset: 0,
+        encoding_nanoseconds: request.encoding_nanoseconds,
+        queued_at: request.queued_at,
+    });
+}
+
+fn fail_pool_requests(
+    error: &EvaluationError,
+    responses: &mut HashMap<u64, PendingPoolResponse>,
+    receiver: &Receiver<Request>,
+) {
+    for (_, pending) in responses.drain() {
+        let _ = pending.response.send(Err(error.clone()));
+    }
+    for request in receiver.try_iter() {
+        let _ = request.response.send(Err(error.clone()));
+    }
+}
+
+fn run_pool_broker<S: BatchService + 'static>(
+    config: BrokerConfig,
+    contract: BatchContract,
+    mut executor: ThreadedBatchExecutorPool<S>,
+    receiver: Receiver<Request>,
+    metrics: Arc<AtomicMetrics>,
+    lane_metrics: Vec<Arc<AtomicMetrics>>,
+) {
+    let mut queued = VecDeque::<QueuedPoolRequest>::new();
+    let mut responses = HashMap::<u64, PendingPoolResponse>::new();
+    let mut in_flight = HashMap::<u64, InFlightPoolBatch>::new();
+    let mut next_request = 0_u64;
+    let mut next_batch = 0_u64;
+    let mut disconnected = false;
+
+    loop {
+        while executor.in_flight() < executor.capacity() {
+            if queued.is_empty() && !disconnected {
+                let received = if executor.in_flight() == 0 {
+                    receiver.recv().map_err(|_| RecvTimeoutError::Disconnected)
+                } else {
+                    receiver.recv_timeout(config.maximum_delay)
+                };
+                match received {
+                    Ok(request) => {
+                        enqueue_pool_request(request, next_request, &mut queued, &mut responses);
+                        next_request = next_request.wrapping_add(1);
+                    }
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => disconnected = true,
+                }
+            }
+            if queued.is_empty() {
+                break;
+            }
+
+            let deadline = Instant::now() + config.maximum_delay;
+            let mut inputs = Vec::with_capacity(contract.maximum_batch);
+            let mut parts = Vec::<PoolBatchPart>::new();
+            loop {
+                while inputs.len() < contract.maximum_batch {
+                    let Some(current) = queued.front_mut() else {
+                        break;
+                    };
+                    let remaining = current.inputs.len();
+                    let count = remaining.min(contract.maximum_batch - inputs.len());
+                    let offset = current.next_offset;
+                    inputs.extend(current.inputs.by_ref().take(count));
+                    current.next_offset += count;
+                    let encoded = if count == remaining {
+                        current.encoding_nanoseconds
+                    } else {
+                        ((u128::from(current.encoding_nanoseconds) * count as u128)
+                            / remaining as u128) as u64
+                    };
+                    current.encoding_nanoseconds -= encoded;
+                    parts.push(PoolBatchPart {
+                        key: current.key,
+                        offset,
+                        count,
+                        encoding_nanoseconds: encoded,
+                        queued_at: current.queued_at,
+                    });
+                    if current.inputs.len() == 0 {
+                        queued.pop_front();
+                    }
+                }
+                if inputs.len() == contract.maximum_batch || !queued.is_empty() || disconnected {
+                    break;
+                }
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                match receiver.recv_timeout(remaining) {
+                    Ok(request) => {
+                        enqueue_pool_request(request, next_request, &mut queued, &mut responses);
+                        next_request = next_request.wrapping_add(1);
+                    }
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+
+            let position_count = inputs.len();
+            let expected_ids = inputs.iter().map(InferenceInput::id).collect::<Vec<_>>();
+            let batch = match InferenceBatch::new(next_batch, inputs) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    fail_pool_requests(&error, &mut responses, &receiver);
+                    return;
+                }
+            };
+            let slot = match executor.submit(batch) {
+                Ok(slot) => slot,
+                Err(error) => {
+                    fail_pool_requests(&error, &mut responses, &receiver);
+                    return;
+                }
+            };
+            let dispatched = Instant::now();
+            let lane = &lane_metrics[slot];
+            let mut queue_nanoseconds = 0_u64;
+            let mut encoding_nanoseconds = 0_u64;
+            for part in &parts {
+                let queued_for = dispatched.duration_since(part.queued_at).as_nanos() as u64;
+                queue_nanoseconds =
+                    queue_nanoseconds.saturating_add(queued_for.saturating_mul(part.count as u64));
+                encoding_nanoseconds =
+                    encoding_nanoseconds.saturating_add(part.encoding_nanoseconds);
+            }
+            metrics.batches.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .positions
+                .fetch_add(position_count as u64, Ordering::Relaxed);
+            metrics
+                .maximum_batch
+                .fetch_max(position_count, Ordering::Relaxed);
+            metrics
+                .queue_nanoseconds
+                .fetch_add(queue_nanoseconds, Ordering::Relaxed);
+            lane.requests
+                .fetch_add(position_count as u64, Ordering::Relaxed);
+            lane.batches.fetch_add(1, Ordering::Relaxed);
+            lane.positions
+                .fetch_add(position_count as u64, Ordering::Relaxed);
+            lane.maximum_batch
+                .fetch_max(position_count, Ordering::Relaxed);
+            lane.encoding_nanoseconds
+                .fetch_add(encoding_nanoseconds, Ordering::Relaxed);
+            lane.queue_nanoseconds
+                .fetch_add(queue_nanoseconds, Ordering::Relaxed);
+            in_flight.insert(
+                next_batch,
+                InFlightPoolBatch {
+                    expected_ids,
+                    parts,
+                    position_count,
+                    slot,
+                },
+            );
+            next_batch = next_batch.wrapping_add(1);
+        }
+
+        if executor.in_flight() == 0 {
+            if disconnected && queued.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        let completion = match executor.receive() {
+            Ok(completion) => completion,
+            Err(error) => {
+                for batch in in_flight.values() {
+                    metrics
+                        .failures
+                        .fetch_add(batch.position_count as u64, Ordering::Relaxed);
+                    lane_metrics[batch.slot]
+                        .failures
+                        .fetch_add(batch.position_count as u64, Ordering::Relaxed);
+                }
+                fail_pool_requests(&error, &mut responses, &receiver);
+                return;
+            }
+        };
+        let sequence = completion.sequence();
+        let slot = completion.slot();
+        let elapsed = completion.elapsed().as_nanos() as u64;
+        let Some(batch) = in_flight.remove(&sequence) else {
+            let error = EvaluationError::new(format!(
+                "inference executor returned unknown batch sequence {sequence}"
+            ));
+            fail_pool_requests(&error, &mut responses, &receiver);
+            return;
+        };
+        debug_assert_eq!(slot, batch.slot);
+        metrics
+            .inference_nanoseconds
+            .fetch_add(elapsed, Ordering::Relaxed);
+        lane_metrics[slot]
+            .inference_nanoseconds
+            .fetch_add(elapsed, Ordering::Relaxed);
+        let result = (|| {
+            let outputs = completion.into_outputs();
+            if outputs.len() != batch.expected_ids.len() {
+                return Err(EvaluationError::new(format!(
+                    "inference backend returned {} outputs for {} inputs",
+                    outputs.len(),
+                    batch.expected_ids.len()
+                )));
+            }
+            for (index, (output, expected_id)) in
+                outputs.iter().zip(&batch.expected_ids).enumerate()
+            {
+                if output.id() != *expected_id {
+                    return Err(EvaluationError::new(format!(
+                        "inference output {index} has request id {}, expected {expected_id}",
+                        output.id()
+                    )));
+                }
+            }
+            Ok(outputs)
+        })();
+        let outputs = match result {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                metrics
+                    .failures
+                    .fetch_add(batch.position_count as u64, Ordering::Relaxed);
+                lane_metrics[slot]
+                    .failures
+                    .fetch_add(batch.position_count as u64, Ordering::Relaxed);
+                fail_pool_requests(&error, &mut responses, &receiver);
+                return;
+            }
+        };
+
+        let mut outputs = outputs.into_iter();
+        let mut completed_requests = Vec::new();
+        for part in batch.parts {
+            let pending = responses
+                .get_mut(&part.key)
+                .expect("in-flight batch references a pending response");
+            for (target, output) in pending.outputs[part.offset..part.offset + part.count]
+                .iter_mut()
+                .zip(outputs.by_ref().take(part.count))
+            {
+                debug_assert!(target.is_none(), "each request position completes once");
+                *target = Some(output);
+            }
+            pending.remaining -= part.count;
+            if pending.remaining == 0 {
+                completed_requests.push(part.key);
+            }
+        }
+        debug_assert!(outputs.next().is_none());
+        for key in completed_requests {
+            let pending = responses
+                .remove(&key)
+                .expect("completed response remains registered");
+            let ordered = pending
+                .outputs
+                .into_iter()
+                .map(|output| output.expect("all request positions completed"))
+                .collect();
+            let _ = pending.response.send(Ok(ordered));
+        }
+    }
+}
+
 fn io_error(error: std::io::Error) -> EvaluationError {
     EvaluationError::new(format!("inference transport: {error}"))
 }
@@ -659,6 +1080,21 @@ mod tests {
 
     struct ConstantService {
         wrong_id: bool,
+    }
+
+    struct FailingService;
+
+    impl BatchService for FailingService {
+        fn contract(&self) -> BatchContract {
+            test_contract(2)
+        }
+
+        fn infer(
+            &mut self,
+            _batch: &[InferenceInput],
+        ) -> Result<Vec<InferenceOutput>, EvaluationError> {
+            Err(EvaluationError::new("synthetic inference failure"))
+        }
     }
 
     impl BatchService for ConstantService {
@@ -715,6 +1151,7 @@ mod tests {
     struct TaggedService {
         contract: BatchContract,
         current_value: f64,
+        delay: Duration,
         batch_sizes: Arc<Mutex<Vec<usize>>>,
         drops: Arc<AtomicUsize>,
     }
@@ -728,6 +1165,7 @@ mod tests {
             &mut self,
             batch: &[InferenceInput],
         ) -> Result<Vec<InferenceOutput>, EvaluationError> {
+            thread::sleep(self.delay);
             self.batch_sizes
                 .lock()
                 .expect("tagged batch-size lock")
@@ -751,25 +1189,19 @@ mod tests {
         }
     }
 
-    fn tagged_evaluator(
+    fn tagged_service(
         current_value: f64,
         contract: BatchContract,
         batch_sizes: Arc<Mutex<Vec<usize>>>,
         drops: Arc<AtomicUsize>,
-    ) -> BatchedEvaluator {
-        BatchedEvaluator::spawn(
-            BrokerConfig {
-                maximum_delay: Duration::ZERO,
-                queue_capacity: 8,
-            },
-            TaggedService {
-                contract,
-                current_value,
-                batch_sizes,
-                drops,
-            },
-        )
-        .unwrap()
+    ) -> TaggedService {
+        TaggedService {
+            contract,
+            current_value,
+            delay: Duration::ZERO,
+            batch_sizes,
+            drops,
+        }
     }
 
     fn test_contract(maximum_batch: usize) -> BatchContract {
@@ -859,6 +1291,7 @@ mod tests {
             sender
                 .send(Request {
                     inputs,
+                    encoding_nanoseconds: 0,
                     queued_at: Instant::now(),
                     response,
                 })
@@ -919,149 +1352,203 @@ mod tests {
     }
 
     #[test]
-    fn evaluator_pool_routes_calls_round_robin() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let lanes = [-0.5, 0.0, 0.5]
-            .into_iter()
-            .map(|value| {
-                tagged_evaluator(
-                    value,
-                    test_contract(2),
-                    Arc::new(Mutex::new(Vec::new())),
-                    Arc::clone(&drops),
-                )
-            })
-            .collect();
-        let pool = BatchedEvaluatorPool::new(lanes).unwrap();
+    fn evaluator_pool_rejects_mismatched_request_ids() {
+        let pool = BatchedEvaluatorPool::spawn(
+            broker_config(),
+            vec![
+                ConstantService { wrong_id: true },
+                ConstantService { wrong_id: true },
+            ],
+        )
+        .unwrap();
         let position = Position::new(0.1, Vec::new(), Color::Black);
-
-        let values = (0..6)
-            .map(|_| pool.evaluate(&position).unwrap().current_value)
-            .collect::<Vec<_>>();
-
-        assert_eq!(values, vec![-0.5, 0.0, 0.5, -0.5, 0.0, 0.5]);
-        assert_eq!(pool.lane_count(), 3);
+        let error = match pool.evaluate(&position) {
+            Ok(_) => panic!("mismatched request id should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("expected"));
+        assert_eq!(pool.metrics().failures, 1);
         assert_eq!(
             pool.lane_metrics()
                 .iter()
-                .map(|metrics| metrics.positions)
-                .collect::<Vec<_>>(),
-            vec![2, 2, 2]
+                .map(|lane| lane.failures)
+                .sum::<u64>(),
+            1
         );
     }
 
     #[test]
-    fn evaluator_pool_keeps_each_group_on_one_lane() {
+    fn evaluator_pool_propagates_service_failures() {
+        let pool =
+            BatchedEvaluatorPool::spawn(broker_config(), vec![FailingService, FailingService])
+                .unwrap();
+        let position = Position::new(0.1, Vec::new(), Color::Black);
+        let error = match pool.evaluate(&position) {
+            Ok(_) => panic!("service failure should reach the caller"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("synthetic inference failure"));
+        assert_eq!(pool.metrics().failures, 1);
+    }
+
+    #[test]
+    fn evaluator_pool_builds_full_batches_from_one_shared_queue() {
+        const CALLERS: usize = 8;
         let drops = Arc::new(AtomicUsize::new(0));
         let first_batches = Arc::new(Mutex::new(Vec::new()));
         let second_batches = Arc::new(Mutex::new(Vec::new()));
-        let pool = BatchedEvaluatorPool::new(vec![
-            tagged_evaluator(
-                -0.25,
-                test_contract(2),
-                Arc::clone(&first_batches),
-                Arc::clone(&drops),
-            ),
-            tagged_evaluator(
-                0.75,
-                test_contract(2),
-                Arc::clone(&second_batches),
-                Arc::clone(&drops),
-            ),
-        ])
-        .unwrap();
-        let positions = [
-            Position::new(0.1, Vec::new(), Color::Black),
-            Position::new(0.1, Vec::new(), Color::White),
-            Position::new(0.1, Vec::new(), Color::Black),
-        ];
-
-        let first = pool.evaluate_batch(&positions).unwrap();
-        let second = pool.evaluate_batch(&positions).unwrap();
-
-        assert!(
-            first
-                .iter()
-                .all(|evaluation| evaluation.current_value == -0.25)
+        let pool = Arc::new(
+            BatchedEvaluatorPool::spawn(
+                BrokerConfig {
+                    maximum_delay: Duration::from_millis(100),
+                    queue_capacity: CALLERS,
+                },
+                vec![
+                    tagged_service(
+                        -0.5,
+                        test_contract(4),
+                        Arc::clone(&first_batches),
+                        Arc::clone(&drops),
+                    ),
+                    tagged_service(
+                        0.5,
+                        test_contract(4),
+                        Arc::clone(&second_batches),
+                        Arc::clone(&drops),
+                    ),
+                ],
+            )
+            .unwrap(),
         );
-        assert!(
-            second
+        let ready = Arc::new(std::sync::Barrier::new(CALLERS));
+        let position = Position::new(0.1, Vec::new(), Color::Black);
+
+        thread::scope(|scope| {
+            for _ in 0..CALLERS {
+                let pool = Arc::clone(&pool);
+                let ready = Arc::clone(&ready);
+                let position = position.clone();
+                scope.spawn(move || {
+                    ready.wait();
+                    let value = pool.evaluate(&position).unwrap().current_value;
+                    assert!(value == -0.5 || value == 0.5);
+                });
+            }
+        });
+
+        let mut batch_sizes = first_batches.lock().unwrap().clone();
+        batch_sizes.extend(second_batches.lock().unwrap().iter().copied());
+        batch_sizes.sort_unstable();
+        assert_eq!(batch_sizes, vec![4, 4]);
+        assert_eq!(pool.lane_count(), 2);
+        let lanes = pool.lane_metrics();
+        assert_eq!(lanes.iter().map(|lane| lane.positions).sum::<u64>(), 8);
+        assert_eq!(lanes.iter().map(|lane| lane.batches).sum::<u64>(), 2);
+        let total = pool.metrics();
+        assert_eq!(total.requests, 8);
+        assert_eq!(total.positions, 8);
+        assert_eq!(total.batches, 2);
+        assert_eq!(total.maximum_batch, 4);
+        assert_eq!(
+            lanes
                 .iter()
-                .all(|evaluation| evaluation.current_value == 0.75)
+                .map(|lane| lane.encoding_nanoseconds)
+                .sum::<u64>(),
+            total.encoding_nanoseconds
         );
         assert_eq!(
-            *first_batches.lock().expect("first batch-size lock"),
-            vec![2, 1]
+            lanes.iter().map(|lane| lane.queue_nanoseconds).sum::<u64>(),
+            total.queue_nanoseconds
         );
         assert_eq!(
-            *second_batches.lock().expect("second batch-size lock"),
-            vec![2, 1]
+            lanes
+                .iter()
+                .map(|lane| lane.inference_nanoseconds)
+                .sum::<u64>(),
+            total.inference_nanoseconds
         );
     }
 
     #[test]
-    fn evaluator_pool_aggregates_and_exposes_lane_metrics() {
+    fn evaluator_pool_reassembles_groups_split_across_slots() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let pool = BatchedEvaluatorPool::new(vec![
-            tagged_evaluator(
-                -0.25,
-                test_contract(2),
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::clone(&drops),
-            ),
-            tagged_evaluator(
-                0.75,
-                test_contract(4),
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::clone(&drops),
-            ),
-        ])
+        let first_batches = Arc::new(Mutex::new(Vec::new()));
+        let second_batches = Arc::new(Mutex::new(Vec::new()));
+        let mut slow = tagged_service(
+            -0.25,
+            test_contract(4),
+            Arc::clone(&first_batches),
+            Arc::clone(&drops),
+        );
+        slow.delay = Duration::from_millis(20);
+        let pool = BatchedEvaluatorPool::spawn(
+            broker_config(),
+            vec![
+                slow,
+                tagged_service(
+                    0.75,
+                    test_contract(4),
+                    Arc::clone(&second_batches),
+                    Arc::clone(&drops),
+                ),
+            ],
+        )
         .unwrap();
-        let positions = [
-            Position::new(0.1, Vec::new(), Color::Black),
-            Position::new(0.1, Vec::new(), Color::White),
-            Position::new(0.1, Vec::new(), Color::Black),
-        ];
-        pool.evaluate_batch(&positions).unwrap();
-        pool.evaluate_batch(&positions).unwrap();
+        let positions = (0..9)
+            .map(|index| {
+                Position::new(
+                    0.1,
+                    Vec::new(),
+                    if index % 2 == 0 {
+                        Color::Black
+                    } else {
+                        Color::White
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
 
-        let lanes = pool.lane_metrics();
-        assert_eq!(lanes.len(), 2);
-        assert_eq!(lanes[0].requests, 3);
-        assert_eq!(lanes[0].batches, 2);
-        assert_eq!(lanes[0].positions, 3);
-        assert_eq!(lanes[0].maximum_batch, 2);
-        assert_eq!(lanes[1].requests, 3);
-        assert_eq!(lanes[1].batches, 1);
-        assert_eq!(lanes[1].positions, 3);
-        assert_eq!(lanes[1].maximum_batch, 3);
+        let evaluations = pool.evaluate_batch(&positions).unwrap();
 
+        assert_eq!(evaluations.len(), 9);
+        assert_eq!(
+            evaluations
+                .iter()
+                .map(|evaluation| evaluation.current_value)
+                .collect::<Vec<_>>(),
+            vec![-0.25, -0.25, -0.25, -0.25, 0.75, 0.75, 0.75, 0.75, 0.75]
+        );
+        let mut batch_sizes = first_batches.lock().unwrap().clone();
+        batch_sizes.extend(second_batches.lock().unwrap().iter().copied());
+        batch_sizes.sort_unstable();
+        assert_eq!(batch_sizes, vec![1, 4, 4]);
         let total = pool.metrics();
-        assert_eq!(total.requests, 6);
+        assert_eq!(total.requests, 9);
         assert_eq!(total.batches, 3);
-        assert_eq!(total.positions, 6);
-        assert_eq!(total.maximum_batch, 3);
+        assert_eq!(total.positions, 9);
+        assert_eq!(total.maximum_batch, 4);
         assert_eq!(total.failures, 0);
         assert_eq!(
             pool.lane_contracts()
                 .iter()
                 .map(|contract| contract.maximum_batch)
                 .collect::<Vec<_>>(),
-            vec![2, 4]
+            vec![4, 4]
         );
     }
 
     #[test]
     fn evaluator_pool_validates_lane_contracts() {
-        let error = match BatchedEvaluatorPool::new(Vec::new()) {
+        let error = match BatchedEvaluatorPool::spawn(broker_config(), Vec::<TaggedService>::new())
+        {
             Ok(_) => panic!("an empty evaluator pool should fail"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("at least one lane"));
+        assert!(error.to_string().contains("at least one service"));
 
         let drops = Arc::new(AtomicUsize::new(0));
         let lane = |contract| {
-            tagged_evaluator(
+            tagged_service(
                 0.0,
                 contract,
                 Arc::new(Mutex::new(Vec::new())),
@@ -1076,31 +1563,44 @@ mod tests {
             },
             ..test_contract(2)
         };
-        let error =
-            match BatchedEvaluatorPool::new(vec![lane(test_contract(2)), lane(raster_mismatch)]) {
-                Ok(_) => panic!("mismatched raster contracts should fail"),
-                Err(error) => error,
-            };
+        let error = match BatchedEvaluatorPool::spawn(
+            broker_config(),
+            vec![lane(test_contract(2)), lane(raster_mismatch)],
+        ) {
+            Ok(_) => panic!("mismatched raster contracts should fail"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("raster contract"));
 
         let policy_mismatch = BatchContract {
             policy: RasterConfig::square(3),
             ..test_contract(2)
         };
-        let error =
-            match BatchedEvaluatorPool::new(vec![lane(test_contract(2)), lane(policy_mismatch)]) {
-                Ok(_) => panic!("mismatched policy contracts should fail"),
-                Err(error) => error,
-            };
+        let error = match BatchedEvaluatorPool::spawn(
+            broker_config(),
+            vec![lane(test_contract(2)), lane(policy_mismatch)],
+        ) {
+            Ok(_) => panic!("mismatched policy contracts should fail"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("policy contract"));
+
+        let error = match BatchedEvaluatorPool::spawn(
+            broker_config(),
+            vec![lane(test_contract(2)), lane(test_contract(3))],
+        ) {
+            Ok(_) => panic!("mismatched maximum batches should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("maximum batch"));
     }
 
     #[test]
     fn evaluator_pool_drops_all_lanes_after_its_last_clone() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let lanes = (0..2)
+        let services = (0..2)
             .map(|_| {
-                tagged_evaluator(
+                tagged_service(
                     0.0,
                     test_contract(2),
                     Arc::new(Mutex::new(Vec::new())),
@@ -1108,7 +1608,7 @@ mod tests {
                 )
             })
             .collect();
-        let pool = BatchedEvaluatorPool::new(lanes).unwrap();
+        let pool = BatchedEvaluatorPool::spawn(broker_config(), services).unwrap();
         let clone = pool.clone();
 
         drop(pool);

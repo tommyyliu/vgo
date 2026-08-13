@@ -45,7 +45,7 @@ Use `--no-warm-inference` to disable it. CUDA and CPU providers skip the step.
 The learner is persistent across updates, not across coordinator processes. On
 restart the coordinator verifies durable replay/model identities, starts a new
 service, reloads the accepted parent checkpoint, and rebuilds its in-memory
-cache. Runtime controls such as update target, actor and inference-lane counts,
+cache. Runtime controls such as update target, actor and inference-slot counts,
 prefetch depth, device placement, compilation, inference warmup, and telemetry
 capacity may change on restart; learning semantics and artifact contracts may
 not. See the

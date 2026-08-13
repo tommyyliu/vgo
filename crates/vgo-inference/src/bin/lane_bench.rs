@@ -1,7 +1,7 @@
 // Drives the real BatchedEvaluatorPool with a fixed number of concurrent
-// callers, so lane counts are compared through the production broker path
+// callers, so slot counts are compared through the production broker path
 // rather than a hand-rolled loop. This answers whether a second session
-// overlaps one lane's staging memcpy with another lane's GPU execution.
+// overlaps one slot's staging memcpy with another slot's GPU execution.
 use std::{
     env,
     hint::black_box,
@@ -15,8 +15,7 @@ use std::{
 
 use vgo_core::{Color, Position, Stone};
 use vgo_inference::{
-    BatchedEvaluator, BatchedEvaluatorPool, BrokerConfig, OnnxBatchService, OnnxProvider,
-    OnnxServiceConfig,
+    BatchedEvaluatorPool, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
 };
 use vgo_raster::{RasterConfig, RasterKind};
 use vgo_search::Evaluator;
@@ -29,7 +28,15 @@ fn fixture_positions() -> Vec<Position> {
         .flat_map(|y| coordinates.into_iter().map(move |x| (x, y)))
         .enumerate()
         .map(|(index, (x, y))| {
-            Stone::new(x, y, if index % 2 == 0 { Color::Black } else { Color::White })
+            Stone::new(
+                x,
+                y,
+                if index % 2 == 0 {
+                    Color::Black
+                } else {
+                    Color::White
+                },
+            )
         })
         .collect::<Vec<_>>();
     (0..=stones.len())
@@ -73,15 +80,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fp16: true,
             cache_directory: cache.clone(),
         })?;
-        built.push(BatchedEvaluator::spawn(
-            BrokerConfig {
-                maximum_delay: Duration::from_millis(delay_ms),
-                queue_capacity: (callers * 4).max(batch * 2),
-            },
-            service,
-        )?);
+        built.push(service);
     }
-    let pool = Arc::new(BatchedEvaluatorPool::new(built)?);
+    let pool = Arc::new(BatchedEvaluatorPool::spawn(
+        BrokerConfig {
+            maximum_delay: Duration::from_millis(delay_ms),
+            queue_capacity: (callers * 4).max(batch * 2),
+        },
+        built,
+    )?);
 
     let positions = fixture_positions();
     let evaluations = Arc::new(AtomicUsize::new(0));
@@ -130,11 +137,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let inference_ns: u64 = metrics.iter().map(|m| m.inference_nanoseconds).sum();
     let queue_ns: u64 = metrics.iter().map(|m| m.queue_nanoseconds).sum();
 
-    println!(
-        "lanes={lanes} callers={callers} group={group} batch={batch} delay_ms={delay_ms}"
-    );
+    println!("lanes={lanes} callers={callers} group={group} batch={batch} delay_ms={delay_ms}");
     println!("  positions/s   {:9.0}", total as f64 / elapsed);
-    println!("  average batch {:9.1}", positions_done as f64 / batches.max(1) as f64);
+    println!(
+        "  average batch {:9.1}",
+        positions_done as f64 / batches.max(1) as f64
+    );
     println!(
         "  broker infer  {:9.3} ms/batch",
         inference_ns as f64 / 1e6 / batches.max(1) as f64

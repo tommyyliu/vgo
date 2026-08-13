@@ -244,6 +244,7 @@ fn main() {
         .collect();
     let mut contour_buffer = Vec::new();
     let sampling_grid = FineGrid::build(&position, 32, 32, 4, policy_logit);
+    let sampling_grid_128 = FineGrid::build(&raster_position, 128, 128, 16, policy_logit);
     let placement = generate_candidates(&position, 32, 50_001)
         .into_iter()
         .find_map(|candidate| match candidate.action {
@@ -252,6 +253,7 @@ fn main() {
         })
         .expect("fixture has a legal placement");
     let evaluator = SpatialEvaluator { resolution: 32 };
+    let evaluator_128 = SpatialEvaluator { resolution: 128 };
     let search_config = SearchConfig {
         simulations: 32,
         initial_candidates: 4,
@@ -264,6 +266,10 @@ fn main() {
         temperature: 1.0,
         temperature_plies: 30,
         leaf_batch: 1,
+    };
+    let search_config_128 = SearchConfig {
+        coarse_pool: 16,
+        ..search_config
     };
 
     let mut results = Vec::new();
@@ -328,6 +334,10 @@ fn main() {
         let grid = FineGrid::build(black_box(&position), 32, 32, 4, policy_logit);
         black_box(grid);
     }));
+    results.extend(run_case(&config, "fine-grid/128x128/pool-16", || {
+        let grid = FineGrid::build(black_box(&raster_position), 128, 128, 16, policy_logit);
+        black_box(grid);
+    }));
 
     let mut sample_state = 0xd1b5_4a32_d192_ed03_u64;
     results.extend(run_case(&config, "sample/one-candidate", || {
@@ -336,6 +346,14 @@ fn main() {
     }));
     results.extend(run_case(&config, "sample/32-candidates", || {
         let sampled = sample_candidates(&sampling_grid, 32, || next_random(&mut sample_state));
+        black_box(sampled);
+    }));
+    results.extend(run_case(&config, "sample-128/one-candidate", || {
+        let sampled = sample_candidates(&sampling_grid_128, 1, || next_random(&mut sample_state));
+        black_box(sampled);
+    }));
+    results.extend(run_case(&config, "sample-128/32-candidates", || {
+        let sampled = sample_candidates(&sampling_grid_128, 32, || next_random(&mut sample_state));
         black_box(sampled);
     }));
     results.extend(run_case(&config, "candidate-sequence/32", || {
@@ -348,6 +366,17 @@ fn main() {
     results.extend(run_case(&config, "mcts/32-sim/spatial", || {
         let result = search_at_ply(black_box(&position), search_config, 50_001, &evaluator, 12)
             .expect("in-process evaluator cannot fail");
+        black_box((result.action, result.stats));
+    }));
+    results.extend(run_case(&config, "mcts/32-sim/spatial-128", || {
+        let result = search_at_ply(
+            black_box(&raster_position),
+            search_config_128,
+            50_001,
+            &evaluator_128,
+            12,
+        )
+        .expect("in-process evaluator cannot fail");
         black_box((result.action, result.stats));
     }));
 

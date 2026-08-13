@@ -26,6 +26,12 @@ out connected on their own (checked at 42 checkpoints, one component).
 
     scripts/dense-curve.py artifacts/ddrnet-fresh-attn artifacts/ddrnet-fresh-muon \\
         --stride 2 --rounds-per-checkpoint 5 --field 8 --output artifacts/dense-curve
+
+A run may carry its own stride as `run:stride`, so the arm under test can be
+rated at every checkpoint while the ladder it is measured against stays sparse:
+
+    scripts/dense-curve.py artifacts/ddrnet-fresh-attn:3 artifacts/shard-sweep-15000:1 \\
+        --ratings ratings.json --output artifacts/dense-curve-6
 """
 
 from __future__ import annotations
@@ -56,6 +62,52 @@ def checkpoints(run: Path, stride: int) -> list[tuple[int, Path]]:
     if found[-1] not in picked:
         picked.append(found[-1])
     return picked
+
+
+def seeded_ratings(pool, ratings):
+    """Fill unrated checkpoints from their own run's rated neighbours.
+
+    Banding looks up `ratings[run/version]`, and anything missing falls back to
+    0.0 -- which is naive's rating, the bottom of the field. That is the worst
+    available guess for the arm under test: an unrated checkpoint is unrated
+    because it is *new*, and new checkpoints are a run's strongest. Seeding them
+    at naive puts the whole point of the tournament into 8-0 pairings, which is
+    the exact failure banding exists to prevent.
+
+    Within one run adjacent checkpoints are close in strength, so a rated
+    neighbour is a good prior: interpolate between the two nearest rated
+    versions, hold flat beyond the last one. Extrapolating the trend instead
+    would guess higher and is probably closer to the truth, but a prior that
+    overshoots pairs a checkpoint above the field it can actually learn from,
+    and flat is the conservative error.
+
+    This only steers matchmaking. The fit afterwards reads game outcomes alone,
+    so a wrong prior costs information, never accuracy.
+    """
+    seeded = {}
+    by_run = {}
+    for name, version, _ in pool:
+        by_run.setdefault(name, []).append(version)
+    for name, versions in by_run.items():
+        known = sorted((v, ratings[f"{name}/{v}"])
+                       for v in set(versions) if f"{name}/{v}" in ratings)
+        if not known:
+            continue
+        for version in sorted(set(versions)):
+            if f"{name}/{version}" in ratings:
+                continue
+            below = [k for k in known if k[0] <= version]
+            above = [k for k in known if k[0] >= version]
+            if below and above:
+                (low, low_rating), (high, high_rating) = below[-1], above[0]
+                span = high - low
+                weight = 0.0 if span == 0 else (version - low) / span
+                seeded[f"{name}/{version}"] = (
+                    low_rating + weight * (high_rating - low_rating)
+                )
+            else:
+                seeded[f"{name}/{version}"] = (below or above)[-1 if below else 0][1]
+    return seeded
 
 
 def banded_rounds(pool, ratings, per_checkpoint, field, band, spanning_every, rng):
@@ -132,11 +184,30 @@ def rounds(pool: list, per_checkpoint: int, field: int, rng: random.Random):
     return out
 
 
+def parse_run(spec: str, default: int) -> tuple[Path, int]:
+    """`path` or `path:stride`, defaulting to --stride.
+
+    The run under test and the ladder it is measured against want different
+    densities. A new arm needs every checkpoint -- its shape is the question --
+    while the established run is only there to span the strength range and
+    connect the graph, so rating it densely spends games re-deriving a curve
+    that is already known. One global stride forces the two together and makes
+    the field several times larger than the question needs.
+    """
+    head, separator, tail = spec.rpartition(":")
+    if separator and head and tail.isdigit():
+        return Path(head), int(tail)
+    return Path(spec), default
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("runs", type=Path, nargs="+")
+    parser.add_argument("runs", nargs="+",
+                        help="run directory, or run:stride to override "
+                             "--stride for that run alone")
     parser.add_argument("--stride", type=int, default=2,
-                        help="rate every Nth checkpoint")
+                        help="rate every Nth checkpoint, for runs that do not "
+                             "carry their own")
     parser.add_argument("--rounds-per-checkpoint", type=int, default=5)
     parser.add_argument("--field", type=int, default=8,
                         help="checkpoints per round")
@@ -156,6 +227,14 @@ def main() -> None:
                         help="colour-swapped pairs per pairing; each is 2 games")
     parser.add_argument("--simulations", type=int, default=1600)
     parser.add_argument("--concurrency", type=int, default=80)
+    parser.add_argument("--parallel-rounds", type=int, default=1,
+                        help="rounds to play at once. One round cannot keep "
+                             "the GPU busy: each model gets its own broker, "
+                             "which blocks on an empty queue between batches, "
+                             "so a round of 8 models and 112 games averages "
+                             "~9 positions against a 64 batch. Concurrent "
+                             "rounds give the card independent request "
+                             "streams without changing the schedule.")
     parser.add_argument("--maximum-plies", type=int, default=105)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=414)
@@ -163,9 +242,10 @@ def main() -> None:
     arguments = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
+    selected = [parse_run(spec, arguments.stride) for spec in arguments.runs]
     pool = []
-    for run in arguments.runs:
-        for version, onnx in checkpoints(run, arguments.stride):
+    for run, stride in selected:
+        for version, onnx in checkpoints(run, stride):
             pool.append((run.name, version, onnx))
     rng = random.Random(arguments.seed)
     if arguments.ratings and arguments.ratings.exists():
@@ -179,6 +259,11 @@ def main() -> None:
         naive_is_pooled = "naive/-1" in ratings
         if naive_is_pooled:
             pool.append(("naive", -1, None))
+        seeded = seeded_ratings(pool, ratings)
+        if seeded:
+            print(f"seeded   : {len(seeded)} unrated checkpoints placed from "
+                  "their run's rated neighbours")
+        ratings = {**seeded, **ratings}
         schedule = banded_rounds(pool, ratings, arguments.rounds_per_checkpoint,
                                  arguments.field, arguments.band,
                                  arguments.spanning_every, rng)
@@ -216,15 +301,25 @@ def main() -> None:
         return players * (players - 1) // 2 * arguments.pairs * 2
 
     total = sum(games_in(i) for i in range(len(schedule)))
-    print(f"pool     : {len(pool)} checkpoints over {len(arguments.runs)} runs "
-          f"(stride {arguments.stride})")
+    print(f"pool     : {len(pool)} checkpoints over {len(selected)} runs")
+    for run, stride in selected:
+        taken = sum(1 for name, _, _ in pool if name == run.name)
+        print(f"           {run.name}: {taken} at stride {stride}")
     print(f"schedule : {len(schedule)} rounds, {len(with_naive)} with naive, "
           f"{total} games")
     # Measured on an idle box: 0.165 games/s at 800 simulations, 0.073 at 1600
     # while contending with a training run. Scale by the simulation count.
     rate = 0.165 * (800 / max(arguments.simulations, 1))
     print(f"estimate : {total / rate / 3600:.1f}h at ~{rate:.3f} games/s "
-          f"({arguments.simulations} simulations)")
+          f"({arguments.simulations} simulations, one round at a time)")
+    if arguments.parallel_rounds > 1:
+        # Deliberately not divided by the lane count. The rate above is a
+        # single round's, and the whole reason for running rounds concurrently
+        # is that one round leaves the card idle -- so the speedup is whatever
+        # of that idle time the extra rounds reclaim, which is measured, not
+        # predicted. Quoting total/rate/lanes here would invent a number.
+        print(f"           {arguments.parallel_rounds} rounds in flight; "
+              "real rate to be measured against that baseline")
     if arguments.dry_run:
         for index, group in enumerate(schedule[:5]):
             print(f"  round {index}: "
@@ -246,9 +341,9 @@ def main() -> None:
 
     environment = runtime_environment()
     started = time.time()
-    for index, group in enumerate(schedule):
-        if index in done:
-            continue
+
+    def build(index: int) -> tuple[list[str], str]:
+        group = schedule[index]
         command = [str(root / "target/release/vgo-tournament"),
                    "--pairs", str(arguments.pairs),
                    "--concurrency", str(arguments.concurrency),
@@ -270,17 +365,60 @@ def main() -> None:
                           for r, v, _ in group)
         if index in with_naive:
             names += " + naive"
-        elapsed = time.time() - started
+        return command, names
+
+    # Rounds run concurrently but their records are appended by this process,
+    # one finished round at a time. A record is a pretty-printed JSON object
+    # spanning many lines, so two tournaments sharing the append handle would
+    # interleave halves of two objects and corrupt the file for every reader.
+    # Each round therefore writes to its own file and is spliced in on exit.
+    running: dict[int, tuple[subprocess.Popen, Path, object]] = {}
+    queued = [index for index in range(len(schedule)) if index not in done]
+    lanes = max(1, arguments.parallel_rounds)
+
+    def launch(index: int) -> None:
+        command, names = build(index)
+        partial = arguments.output / f"round-{index:03d}.partial.jsonl"
+        stream = partial.open("w", encoding="utf-8")
+        process = subprocess.Popen(command, env=environment, stdout=stream)
+        running[index] = (process, partial, stream)
+        elapsed = (time.time() - started) / 60
         print(f"\n[{index + 1}/{len(schedule)}] {names}"
-              f"   ({elapsed / 60:.0f} min elapsed)", flush=True)
-        with records.open("a", encoding="utf-8") as stream:
-            completed = subprocess.run(command, env=environment, stdout=stream)
-        if completed.returncode != 0:
-            print(f"  round failed ({completed.returncode}); "
-                  f"its completed pairings are still on file")
-            continue
+              f"   ({elapsed:.0f} min elapsed, {len(running)} rounds in flight)",
+              flush=True)
+
+    def harvest(index: int) -> None:
+        process, partial, stream = running.pop(index)
+        stream.close()
+        if process.returncode != 0:
+            # Do not splice a partial round in. Its pairings would be replayed
+            # on the next resume and counted twice, which biases the fit toward
+            # whatever the interrupted round happened to finish.
+            kept = partial.with_name(f"round-{index:03d}.failed.jsonl")
+            partial.replace(kept)
+            print(f"  round {index + 1} failed ({process.returncode}); "
+                  f"kept {kept.name}, will replay on resume", flush=True)
+            return
+        with records.open("a", encoding="utf-8") as sink:
+            sink.write(partial.read_text(encoding="utf-8"))
+        partial.unlink()
         done.add(index)
         done_path.write_text(json.dumps(sorted(done)), encoding="utf-8")
+        print(f"  round {index + 1} complete ({len(done)}/{len(schedule)})",
+              flush=True)
+
+    while queued or running:
+        while queued and len(running) < lanes:
+            launch(queued.pop(0))
+        finished = None
+        while finished is None:
+            for index, (process, _, _) in list(running.items()):
+                if process.poll() is not None:
+                    finished = index
+                    break
+            if finished is None:
+                time.sleep(1.0)
+        harvest(finished)
 
     print(f"\n-> {records}")
     print(f"   scripts/rate-tournament.py {records} --json {arguments.output}/elo.json")

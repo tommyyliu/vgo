@@ -24,8 +24,8 @@ use std::{
 use clap::Parser;
 use vgo_core::{Color, Position, Stone};
 use vgo_inference::{
-    BatchContract, BatchService, BatchedEvaluator, BatchedEvaluatorPool, BrokerConfig,
-    BrokerMetrics, InferenceInput, InferenceOutput,
+    BatchContract, BatchService, BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, InferenceInput,
+    InferenceOutput,
 };
 use vgo_raster::{RasterConfig, RasterKind, rasterize};
 use vgo_search::{EvaluationError, Evaluator};
@@ -69,7 +69,7 @@ struct Config {
     /// Maximum positions gathered for one fake backend call.
     #[arg(long, default_value_t = 64)]
     batch: usize,
-    /// Independent broker/packing lanes in the host-pipeline measurement.
+    /// Packing execution slots behind the shared broker.
     #[arg(long, default_value_t = 2)]
     lanes: usize,
     /// Broker collection deadline in milliseconds.
@@ -329,19 +329,17 @@ fn build_pool(
     maximum_batch: usize,
     maximum_delay: Duration,
 ) -> BatchedEvaluatorPool {
-    let lanes = (0..lanes)
-        .map(|_| {
-            BatchedEvaluator::spawn(
-                BrokerConfig {
-                    maximum_delay,
-                    queue_capacity: (callers * 4).max(maximum_batch * 2),
-                },
-                PackingService::new(raster, maximum_batch),
-            )
-            .expect("start packing broker")
-        })
+    let services = (0..lanes)
+        .map(|_| PackingService::new(raster, maximum_batch))
         .collect();
-    BatchedEvaluatorPool::new(lanes).expect("compatible packing lanes")
+    BatchedEvaluatorPool::spawn(
+        BrokerConfig {
+            maximum_delay,
+            queue_capacity: (callers * 4).max(maximum_batch * 2),
+        },
+        services,
+    )
+    .expect("start shared packing broker")
 }
 
 fn metrics_delta(after: BrokerMetrics, before: BrokerMetrics) -> BrokerMetrics {
