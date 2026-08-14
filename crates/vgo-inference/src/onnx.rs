@@ -2,6 +2,7 @@ use std::{
     fs,
     io::{BufReader, Read},
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use ort::{
@@ -13,7 +14,7 @@ use sha2::{Digest, Sha256};
 use vgo_raster::RasterConfig;
 use vgo_search::EvaluationError;
 
-use crate::{BatchContract, BatchService, InferenceInput, InferenceOutput};
+use crate::{BatchContract, BatchService, InferenceInput, InferenceOutput, InferenceStageMetrics};
 
 const MODEL_SCHEMA: &str = "vgo.raster-policy-value.onnx.v1";
 
@@ -76,6 +77,7 @@ pub struct OnnxBatchService {
     /// freeing several megabytes for each short GPU run creates avoidable host
     /// allocator pressure on the inference critical path.
     states: Vec<f32>,
+    last_stages: InferenceStageMetrics,
 }
 
 impl OnnxBatchService {
@@ -151,6 +153,7 @@ impl OnnxBatchService {
             maximum_batch: config.maximum_batch,
             provider: config.provider,
             states: Vec::with_capacity(state_capacity),
+            last_stages: InferenceStageMetrics::default(),
         })
     }
 
@@ -175,6 +178,7 @@ impl BatchService for OnnxBatchService {
     }
 
     fn infer(&mut self, batch: &[InferenceInput]) -> Result<Vec<InferenceOutput>, EvaluationError> {
+        self.last_stages = InferenceStageMetrics::default();
         if batch.is_empty() || batch.len() > self.maximum_batch {
             return Err(EvaluationError::new(format!(
                 "ONNX batch size {} is outside supported range 1..{}",
@@ -188,6 +192,7 @@ impl BatchService for OnnxBatchService {
         {
             return Err(EvaluationError::new("ONNX batch raster shape mismatch"));
         }
+        let packing_started = Instant::now();
         self.states.clear();
         for input in batch {
             self.states.extend_from_slice(input.raster().data());
@@ -200,38 +205,52 @@ impl BatchService for OnnxBatchService {
                 self.raster.width,
             ],
             self.states.as_slice(),
-        ))
-        .map_err(|error| evaluation_error("construct ONNX input tensor", error))?;
-        let outputs = self
-            .session
-            .run(ort::inputs! {"states" => input})
-            .map_err(|error| evaluation_error("run ONNX inference", error))?;
-        let (policy_shape, policies) = outputs["policy_logits"]
-            .try_extract_tensor::<f32>()
-            .map_err(|error| evaluation_error("extract ONNX policy output", error))?;
-        let (value_shape, values) = outputs["values"]
-            .try_extract_tensor::<f32>()
-            .map_err(|error| evaluation_error("extract ONNX value output", error))?;
-        let policy_size = self.policy.pixels() + 1;
-        if **policy_shape != [batch.len() as i64, policy_size as i64]
-            || **value_shape != [batch.len() as i64]
-        {
-            return Err(EvaluationError::new(format!(
-                "ONNX output shape mismatch: policy={policy_shape}, value={value_shape}"
-            )));
-        }
-        batch
-            .iter()
-            .enumerate()
-            .map(|(index, request)| {
-                let start = index * policy_size;
-                InferenceOutput::new(
-                    request.id(),
-                    f64::from(values[index]),
-                    policies[start..start + policy_size].to_vec(),
-                )
-            })
-            .collect()
+        ));
+        self.last_stages.input_packing_nanoseconds = packing_started.elapsed().as_nanos() as u64;
+        let input =
+            input.map_err(|error| evaluation_error("construct ONNX input tensor", error))?;
+
+        let session_started = Instant::now();
+        let outputs = self.session.run(ort::inputs! {"states" => input});
+        self.last_stages.session_run_nanoseconds = session_started.elapsed().as_nanos() as u64;
+        let outputs = outputs.map_err(|error| evaluation_error("run ONNX inference", error))?;
+
+        let materialization_started = Instant::now();
+        let result = (|| {
+            let (policy_shape, policies) = outputs["policy_logits"]
+                .try_extract_tensor::<f32>()
+                .map_err(|error| evaluation_error("extract ONNX policy output", error))?;
+            let (value_shape, values) = outputs["values"]
+                .try_extract_tensor::<f32>()
+                .map_err(|error| evaluation_error("extract ONNX value output", error))?;
+            let policy_size = self.policy.pixels() + 1;
+            if **policy_shape != [batch.len() as i64, policy_size as i64]
+                || **value_shape != [batch.len() as i64]
+            {
+                return Err(EvaluationError::new(format!(
+                    "ONNX output shape mismatch: policy={policy_shape}, value={value_shape}"
+                )));
+            }
+            batch
+                .iter()
+                .enumerate()
+                .map(|(index, request)| {
+                    let start = index * policy_size;
+                    InferenceOutput::new(
+                        request.id(),
+                        f64::from(values[index]),
+                        policies[start..start + policy_size].to_vec(),
+                    )
+                })
+                .collect()
+        })();
+        self.last_stages.output_materialization_nanoseconds =
+            materialization_started.elapsed().as_nanos() as u64;
+        result
+    }
+
+    fn last_inference_stages(&self) -> InferenceStageMetrics {
+        self.last_stages
     }
 }
 

@@ -131,25 +131,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let elapsed = started.elapsed().as_secs_f64();
 
     let total = evaluations.load(Ordering::Relaxed);
-    let metrics = pool.lane_metrics();
-    let batches: u64 = metrics.iter().map(|m| m.batches).sum();
-    let positions_done: u64 = metrics.iter().map(|m| m.positions).sum();
-    let inference_ns: u64 = metrics.iter().map(|m| m.inference_nanoseconds).sum();
-    let queue_ns: u64 = metrics.iter().map(|m| m.queue_nanoseconds).sum();
+    let metrics = pool.metrics();
+    let batches = metrics.batches.max(1);
+    let positions_done = metrics.positions.max(1);
 
     println!("lanes={lanes} callers={callers} group={group} batch={batch} delay_ms={delay_ms}");
     println!("  positions/s   {:9.0}", total as f64 / elapsed);
     println!(
         "  average batch {:9.1}",
-        positions_done as f64 / batches.max(1) as f64
+        metrics.positions as f64 / batches as f64
     );
     println!(
-        "  broker infer  {:9.3} ms/batch",
-        inference_ns as f64 / 1e6 / batches.max(1) as f64
+        "  dispatch       {:9} full / {} deadline / {} drain",
+        metrics.full_batches, metrics.deadline_batches, metrics.drain_batches
     );
     println!(
-        "  queue wait    {:9.3} ms/position",
-        queue_ns as f64 / 1e6 / positions_done.max(1) as f64
+        "  queue wait     {:9.3} ms/position ({:.3} channel + {:.3} broker)",
+        metrics.queue_nanoseconds as f64 / 1e6 / positions_done as f64,
+        metrics.channel_nanoseconds as f64 / 1e6 / positions_done as f64,
+        metrics.broker_queue_nanoseconds as f64 / 1e6 / positions_done as f64,
+    );
+    println!(
+        "  broker batch   {:9.3} ms collect + {:.4} ms submit",
+        metrics.batch_collection_nanoseconds as f64 / 1e6 / batches as f64,
+        metrics.batch_submission_nanoseconds as f64 / 1e6 / batches as f64,
+    );
+    println!(
+        "  inference      {:9.3} ms/batch ({:.3} pack + {:.3} session + {:.3} output + {:.3} other)",
+        metrics.inference_nanoseconds as f64 / 1e6 / batches as f64,
+        metrics.input_packing_nanoseconds as f64 / 1e6 / batches as f64,
+        metrics.session_run_nanoseconds as f64 / 1e6 / batches as f64,
+        metrics.output_materialization_nanoseconds as f64 / 1e6 / batches as f64,
+        metrics.inference_unattributed_nanoseconds() as f64 / 1e6 / batches as f64,
+    );
+    println!(
+        "  broker waits   {:9.3}s idle-input / {:.3}s overlap-input / {:.3}s completion",
+        metrics.idle_request_wait_nanoseconds as f64 / 1e9,
+        metrics.overlap_request_wait_nanoseconds as f64 / 1e9,
+        metrics.completion_wait_nanoseconds as f64 / 1e9,
     );
     Ok(())
 }

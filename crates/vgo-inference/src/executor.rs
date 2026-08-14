@@ -7,7 +7,7 @@ use std::{
 
 use vgo_search::EvaluationError;
 
-use crate::{BatchService, InferenceInput, InferenceOutput};
+use crate::{BatchService, InferenceInput, InferenceOutput, InferenceStageMetrics};
 
 #[derive(Debug)]
 pub struct InferenceBatch {
@@ -44,6 +44,7 @@ pub struct CompletedBatch {
     sequence: u64,
     slot: usize,
     elapsed: Duration,
+    stages: InferenceStageMetrics,
     outputs: Vec<InferenceOutput>,
 }
 
@@ -61,6 +62,11 @@ impl CompletedBatch {
     #[must_use]
     pub const fn elapsed(&self) -> Duration {
         self.elapsed
+    }
+
+    #[must_use]
+    pub const fn stages(&self) -> InferenceStageMetrics {
+        self.stages
     }
 
     #[must_use]
@@ -106,10 +112,13 @@ impl<S: BatchService + 'static> ThreadedBatchExecutor<S> {
                 while let Ok(batch) = batch_receiver.recv() {
                     let sequence = batch.sequence;
                     let started = Instant::now();
-                    let completion = service.infer(&batch.inputs).map(|outputs| CompletedBatch {
+                    let result = service.infer(&batch.inputs);
+                    let stages = service.last_inference_stages();
+                    let completion = result.map(|outputs| CompletedBatch {
                         sequence,
                         slot: 0,
                         elapsed: started.elapsed(),
+                        stages,
                         outputs,
                     });
                     let failed = completion.is_err();
@@ -207,13 +216,15 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
                     while let Ok(batch) = receiver.recv() {
                         let sequence = batch.sequence;
                         let started = Instant::now();
-                        let completion =
-                            service.infer(&batch.inputs).map(|outputs| CompletedBatch {
-                                sequence,
-                                slot,
-                                elapsed: started.elapsed(),
-                                outputs,
-                            });
+                        let result = service.infer(&batch.inputs);
+                        let stages = service.last_inference_stages();
+                        let completion = result.map(|outputs| CompletedBatch {
+                            sequence,
+                            slot,
+                            elapsed: started.elapsed(),
+                            stages,
+                            outputs,
+                        });
                         let failed = completion.is_err();
                         if completions.send(completion).is_err() || failed {
                             break;

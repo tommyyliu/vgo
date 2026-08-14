@@ -1,0 +1,136 @@
+{
+  "schema": "vgo.inference-stage-profile.v1",
+  "date": "2026-08-13",
+  "base_revision": "b806715518557d6b1ae996fe54b93419fa12438b",
+  "tree": "inference stage instrumentation present as uncommitted changes",
+  "hardware": {
+    "processor": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_processors": 32,
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "gpu_memory_mebibytes": 16303,
+    "driver": "610.57.04"
+  },
+  "model": {
+    "path": "artifacts/shard-sweep-15000/updates/update-000030/candidate.onnx",
+    "onnx_sha256": "277a75ef12e31e4b9949478461fd6b19aa855b92c9bf1c9a98f8420fff06c5b7",
+    "architecture": "ddrnet",
+    "width": 64,
+    "blocks": 16,
+    "context_attention_blocks": 1,
+    "raster": "compact-5x128x128",
+    "policy": "128x128"
+  },
+  "lane_benchmark": {
+    "common": {
+      "callers": 64,
+      "leaf_group": 4,
+      "maximum_batch": 32,
+      "delay_milliseconds": 1,
+      "provider": "tensorrt",
+      "fp16": true
+    },
+    "samples": [
+      {
+        "slots": 1,
+        "positions_per_second": 10023,
+        "average_batch": 31.8,
+        "full_batches": 3143,
+        "deadline_batches": 20,
+        "queue_milliseconds_per_position": 21.791,
+        "channel_milliseconds_per_position": 21.780,
+        "broker_queue_milliseconds_per_position": 0.012,
+        "collection_milliseconds_per_batch": 0.020,
+        "submission_milliseconds_per_batch": 0.0026,
+        "inference_milliseconds_per_batch": 3.134,
+        "input_packing_milliseconds_per_batch": 0.562,
+        "session_run_milliseconds_per_batch": 2.383,
+        "output_materialization_milliseconds_per_batch": 0.188
+      },
+      {
+        "slots": 2,
+        "positions_per_second": 15174,
+        "average_batch": 31.8,
+        "full_batches": 7128,
+        "deadline_batches": 40,
+        "queue_milliseconds_per_position": 12.078,
+        "channel_milliseconds_per_position": 12.065,
+        "broker_queue_milliseconds_per_position": 0.012,
+        "collection_milliseconds_per_batch": 0.020,
+        "submission_milliseconds_per_batch": 0.0028,
+        "inference_milliseconds_per_batch": 4.148,
+        "input_packing_milliseconds_per_batch": 0.880,
+        "session_run_milliseconds_per_batch": 3.013,
+        "output_materialization_milliseconds_per_batch": 0.253
+      },
+      {
+        "slots": 3,
+        "positions_per_second": 10756,
+        "average_batch": 31.5,
+        "full_batches": 3372,
+        "deadline_batches": 60,
+        "queue_milliseconds_per_position": 14.049,
+        "channel_milliseconds_per_position": 14.033,
+        "broker_queue_milliseconds_per_position": 0.017,
+        "collection_milliseconds_per_batch": 0.035,
+        "submission_milliseconds_per_batch": 0.0037,
+        "inference_milliseconds_per_batch": 8.706,
+        "input_packing_milliseconds_per_batch": 2.244,
+        "session_run_milliseconds_per_batch": 5.907,
+        "output_materialization_milliseconds_per_batch": 0.550
+      }
+    ]
+  },
+  "production_selfplay": {
+    "configuration": {
+      "actors": 64,
+      "slots": 2,
+      "leaf_batch": 4,
+      "maximum_batch": 32,
+      "delay_milliseconds": 1,
+      "simulations": 1600,
+      "coarse_pool": 16,
+      "maximum_plies": 70,
+      "drain_tail": false,
+      "note": "64 games began; the run stopped at the first completed-game sample boundary to measure the fully populated phase"
+    },
+    "wall_seconds": 213.588445,
+    "peak_active_games": 64,
+    "positions": 2949521,
+    "batches": 92770,
+    "positions_per_second": 13809.366,
+    "average_batch": 31.793910,
+    "batch_fill": 0.993560,
+    "full_batch_fraction": 0.988498,
+    "effective_slot_occupancy": 0.977425,
+    "encoding_milliseconds_per_position": 0.486171,
+    "queue_milliseconds_per_position": 9.778459,
+    "channel_milliseconds_per_position": 9.658876,
+    "broker_queue_milliseconds_per_position": 0.119583,
+    "idle_request_wait_seconds": 0.179703,
+    "overlap_request_wait_seconds": 0.360714,
+    "completion_wait_seconds": 207.689969,
+    "collection_milliseconds_per_batch": 0.025521,
+    "submission_milliseconds_per_batch": 0.003463,
+    "inference_milliseconds_per_batch": 4.500738,
+    "input_packing_milliseconds_per_batch": 0.856663,
+    "session_run_milliseconds_per_batch": 3.326370,
+    "output_materialization_milliseconds_per_batch": 0.315435,
+    "inference_unattributed_milliseconds_per_batch": 0.002271
+  },
+  "cpu_feed_benchmark": {
+    "threads": 64,
+    "slots": 2,
+    "maximum_batch": 32,
+    "average_batch": 29.139,
+    "host_positions_per_second": 22626.219,
+    "input_packing_milliseconds_per_batch": 0.777087
+  },
+  "conclusions": [
+    "The shared broker and executor handoff are not throughput bottlenecks: production slot submission costs 0.0035 ms per batch and internal broker residence costs 0.120 ms per position.",
+    "Most reported queue time is capacity wait in the receiver channel while both synchronous slots are occupied; moving it into an internal broker queue would not increase throughput.",
+    "Two slots keep production inference occupied 97.7% of steady-state wall capacity. One slot leaves device throughput unused, while three slots create severe host and GPU contention.",
+    "Explicit input packing and output materialization consume 26.0% of measured production slot time. Session::run consumes 73.9% and still includes runtime overhead and host-device transfers.",
+    "Pinned reusable buffers and ONNX I/O binding are the next justified inference optimization; additional actors have little steady-state device-idle time left to recover at 64 actors."
+  ]
+}

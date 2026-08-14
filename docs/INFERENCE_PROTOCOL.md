@@ -101,9 +101,23 @@ pinned-memory/stream slots inside one session without changing actors,
 encoding, batching, or response routing.
 
 Metrics count submitted request positions (the compatibility `requests`
-counter), executed batches and positions, maximum batch occupancy, failures,
-summed parallel encoding nanoseconds, total queue nanoseconds, and backend
-inference nanoseconds. Summed durations may exceed wall time.
+counter), executed batches and positions, maximum batch occupancy, and
+failures. Timing is split at the ownership boundaries:
+
+- summed parallel actor encoding;
+- position-weighted channel time before the broker receives a request;
+- position-weighted broker time from receipt through slot dispatch;
+- per-batch collection and executor submission;
+- broker waits for an entirely idle executor, a partially idle executor, and
+  executor completion;
+- input packing, ONNX `Session::run`, and output materialization inside each
+  instrumented native slot.
+
+The original total queue and inference counters remain for compatibility.
+Batch counters distinguish full, deadline-expired, and shutdown-drain
+dispatches. `Session::run` still contains runtime overhead and synchronous
+host/device copies; explicit I/O binding is required to separate those.
+Summed parallel and position-weighted durations may exceed wall time.
 
 ## Verified smoke path
 

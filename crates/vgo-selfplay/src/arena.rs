@@ -14,8 +14,7 @@ use std::{
 use clap::{ArgAction, Parser};
 use vgo_core::{Color, Outcome, Point, Position};
 use vgo_inference::{
-    BatchedEvaluator, BrokerConfig, BrokerMetrics, OnnxBatchService, OnnxProvider,
-    OnnxServiceConfig,
+    BatchedEvaluator, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
 };
 use vgo_raster::{RasterConfig, RasterKind};
 use vgo_search::{Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, search_with_evaluator};
@@ -463,16 +462,7 @@ fn run_match(
     };
     let interval = wilson_interval(points, completed);
     let current = candidate.metrics();
-    let candidate_metrics = BrokerMetrics {
-        requests: current.requests - baseline.requests,
-        batches: current.batches - baseline.batches,
-        positions: current.positions - baseline.positions,
-        maximum_batch: current.maximum_batch,
-        failures: current.failures - baseline.failures,
-        encoding_nanoseconds: current.encoding_nanoseconds - baseline.encoding_nanoseconds,
-        queue_nanoseconds: current.queue_nanoseconds - baseline.queue_nanoseconds,
-        inference_nanoseconds: current.inference_nanoseconds - baseline.inference_nanoseconds,
-    };
+    let candidate_metrics = current.delta_since(baseline);
     let opponent_name = if opponent_path.is_some() {
         "onnx"
     } else {

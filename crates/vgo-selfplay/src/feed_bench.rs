@@ -25,7 +25,7 @@ use clap::Parser;
 use vgo_core::{Color, Position, Stone};
 use vgo_inference::{
     BatchContract, BatchService, BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, InferenceInput,
-    InferenceOutput,
+    InferenceOutput, InferenceStageMetrics,
 };
 use vgo_raster::{RasterConfig, RasterKind, rasterize};
 use vgo_search::{EvaluationError, Evaluator};
@@ -106,12 +106,20 @@ struct ScalingResult {
     host_average_batch: f64,
     host_encoding_milliseconds_per_position: f64,
     host_queue_milliseconds_per_position: f64,
+    host_channel_milliseconds_per_position: f64,
+    host_broker_queue_milliseconds_per_position: f64,
+    host_batch_collection_milliseconds_per_batch: f64,
+    host_batch_submission_milliseconds_per_batch: f64,
     host_service_milliseconds_per_batch: f64,
+    host_input_packing_milliseconds_per_batch: f64,
+    host_output_materialization_milliseconds_per_batch: f64,
+    host_full_batch_fraction: f64,
 }
 
 struct PackingService {
     contract: BatchContract,
     states: Vec<f32>,
+    last_stages: InferenceStageMetrics,
 }
 
 impl PackingService {
@@ -126,6 +134,7 @@ impl PackingService {
                 maximum_batch,
             },
             states: Vec::with_capacity(maximum_batch * raster.channels() * raster.pixels()),
+            last_stages: InferenceStageMetrics::default(),
         }
     }
 }
@@ -136,15 +145,26 @@ impl BatchService for PackingService {
     }
 
     fn infer(&mut self, batch: &[InferenceInput]) -> Result<Vec<InferenceOutput>, EvaluationError> {
+        self.last_stages = InferenceStageMetrics::default();
+        let packing_started = Instant::now();
         self.states.clear();
         for input in batch {
             self.states.extend_from_slice(input.raster().data());
         }
         black_box(self.states.as_slice());
-        batch
+        self.last_stages.input_packing_nanoseconds = packing_started.elapsed().as_nanos() as u64;
+        let output_started = Instant::now();
+        let outputs = batch
             .iter()
             .map(|input| InferenceOutput::new(input.id(), 0.0, vec![0.0; 2]))
-            .collect()
+            .collect();
+        self.last_stages.output_materialization_nanoseconds =
+            output_started.elapsed().as_nanos() as u64;
+        outputs
+    }
+
+    fn last_inference_stages(&self) -> InferenceStageMetrics {
+        self.last_stages
     }
 }
 
@@ -343,22 +363,7 @@ fn build_pool(
 }
 
 fn metrics_delta(after: BrokerMetrics, before: BrokerMetrics) -> BrokerMetrics {
-    BrokerMetrics {
-        requests: after.requests.saturating_sub(before.requests),
-        batches: after.batches.saturating_sub(before.batches),
-        positions: after.positions.saturating_sub(before.positions),
-        maximum_batch: after.maximum_batch,
-        failures: after.failures.saturating_sub(before.failures),
-        encoding_nanoseconds: after
-            .encoding_nanoseconds
-            .saturating_sub(before.encoding_nanoseconds),
-        queue_nanoseconds: after
-            .queue_nanoseconds
-            .saturating_sub(before.queue_nanoseconds),
-        inference_nanoseconds: after
-            .inference_nanoseconds
-            .saturating_sub(before.inference_nanoseconds),
-    }
+    after.delta_since(before)
 }
 
 fn run_host_sample(
@@ -474,14 +479,7 @@ fn summarize(
     let broker = host_samples
         .iter()
         .fold(BrokerMetrics::default(), |mut total, sample| {
-            total.requests += sample.broker.requests;
-            total.batches += sample.broker.batches;
-            total.positions += sample.broker.positions;
-            total.maximum_batch = total.maximum_batch.max(sample.broker.maximum_batch);
-            total.failures += sample.broker.failures;
-            total.encoding_nanoseconds += sample.broker.encoding_nanoseconds;
-            total.queue_nanoseconds += sample.broker.queue_nanoseconds;
-            total.inference_nanoseconds += sample.broker.inference_nanoseconds;
+            total.accumulate(sample.broker);
             total
         });
     let positions = broker.positions.max(1) as f64;
@@ -495,7 +493,28 @@ fn summarize(
             / 1.0e6
             / positions,
         host_queue_milliseconds_per_position: broker.queue_nanoseconds as f64 / 1.0e6 / positions,
+        host_channel_milliseconds_per_position: broker.channel_nanoseconds as f64
+            / 1.0e6
+            / positions,
+        host_broker_queue_milliseconds_per_position: broker.broker_queue_nanoseconds as f64
+            / 1.0e6
+            / positions,
+        host_batch_collection_milliseconds_per_batch: broker.batch_collection_nanoseconds as f64
+            / 1.0e6
+            / batches,
+        host_batch_submission_milliseconds_per_batch: broker.batch_submission_nanoseconds as f64
+            / 1.0e6
+            / batches,
         host_service_milliseconds_per_batch: broker.inference_nanoseconds as f64 / 1.0e6 / batches,
+        host_input_packing_milliseconds_per_batch: broker.input_packing_nanoseconds as f64
+            / 1.0e6
+            / batches,
+        host_output_materialization_milliseconds_per_batch: broker
+            .output_materialization_nanoseconds
+            as f64
+            / 1.0e6
+            / batches,
+        host_full_batch_fraction: broker.full_batches as f64 / batches,
     }
 }
 
@@ -545,7 +564,14 @@ fn print_json(config: &Config, positions: &[Position], results: &[ScalingResult]
                 "\"host_positions_per_second\": {:.3}, \"host_average_batch\": {:.3}, ",
                 "\"host_encoding_milliseconds_per_position\": {:.6}, ",
                 "\"host_queue_milliseconds_per_position\": {:.6}, ",
-                "\"host_service_milliseconds_per_batch\": {:.6}}}{}"
+                "\"host_channel_milliseconds_per_position\": {:.6}, ",
+                "\"host_broker_queue_milliseconds_per_position\": {:.6}, ",
+                "\"host_batch_collection_milliseconds_per_batch\": {:.6}, ",
+                "\"host_batch_submission_milliseconds_per_batch\": {:.6}, ",
+                "\"host_service_milliseconds_per_batch\": {:.6}, ",
+                "\"host_input_packing_milliseconds_per_batch\": {:.6}, ",
+                "\"host_output_materialization_milliseconds_per_batch\": {:.6}, ",
+                "\"host_full_batch_fraction\": {:.6}}}{}"
             ),
             result.threads,
             result.raster_positions_per_second,
@@ -553,7 +579,14 @@ fn print_json(config: &Config, positions: &[Position], results: &[ScalingResult]
             result.host_average_batch,
             result.host_encoding_milliseconds_per_position,
             result.host_queue_milliseconds_per_position,
+            result.host_channel_milliseconds_per_position,
+            result.host_broker_queue_milliseconds_per_position,
+            result.host_batch_collection_milliseconds_per_batch,
+            result.host_batch_submission_milliseconds_per_batch,
             result.host_service_milliseconds_per_batch,
+            result.host_input_packing_milliseconds_per_batch,
+            result.host_output_materialization_milliseconds_per_batch,
+            result.host_full_batch_fraction,
             comma,
         );
     }
@@ -573,12 +606,19 @@ fn print_table(config: &Config, positions: &[Position], results: &[ScalingResult
         config.group, config.batch, config.lanes, config.delay_ms
     );
     println!(
-        "{:>7} {:>14} {:>14} {:>10} {:>11} {:>10} {:>11}",
-        "threads", "raster pos/s", "host pos/s", "avg batch", "encode ms", "queue ms", "service ms"
+        "{:>7} {:>14} {:>14} {:>10} {:>11} {:>10} {:>11} {:>10}",
+        "threads",
+        "raster pos/s",
+        "host pos/s",
+        "avg batch",
+        "encode ms",
+        "queue ms",
+        "service ms",
+        "pack ms"
     );
     for result in results {
         println!(
-            "{:>7} {:>14.0} {:>14.0} {:>10.1} {:>11.3} {:>10.3} {:>11.3}",
+            "{:>7} {:>14.0} {:>14.0} {:>10.1} {:>11.3} {:>10.3} {:>11.3} {:>10.3}",
             result.threads,
             result.raster_positions_per_second,
             result.host_positions_per_second,
@@ -586,6 +626,7 @@ fn print_table(config: &Config, positions: &[Position], results: &[ScalingResult
             result.host_encoding_milliseconds_per_position,
             result.host_queue_milliseconds_per_position,
             result.host_service_milliseconds_per_batch,
+            result.host_input_packing_milliseconds_per_batch,
         );
     }
 }

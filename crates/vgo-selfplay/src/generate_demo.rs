@@ -1511,6 +1511,13 @@ fn write_manifest(
         broker.maximum_batch
     )?;
     writeln!(writer, "    \"failures\": {},", broker.failures)?;
+    writeln!(writer, "    \"full_batches\": {},", broker.full_batches)?;
+    writeln!(
+        writer,
+        "    \"deadline_batches\": {},",
+        broker.deadline_batches
+    )?;
+    writeln!(writer, "    \"drain_batches\": {},", broker.drain_batches)?;
     writeln!(
         writer,
         "    \"encoding_seconds\": {:.6},",
@@ -1523,8 +1530,63 @@ fn write_manifest(
     )?;
     writeln!(
         writer,
-        "    \"inference_seconds\": {:.6}",
+        "    \"channel_seconds\": {:.6},",
+        broker.channel_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        writer,
+        "    \"broker_queue_seconds\": {:.6},",
+        broker.broker_queue_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        writer,
+        "    \"idle_request_wait_seconds\": {:.6},",
+        broker.idle_request_wait_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        writer,
+        "    \"overlap_request_wait_seconds\": {:.6},",
+        broker.overlap_request_wait_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        writer,
+        "    \"batch_collection_seconds\": {:.6},",
+        broker.batch_collection_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        writer,
+        "    \"batch_submission_seconds\": {:.6},",
+        broker.batch_submission_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        writer,
+        "    \"completion_wait_seconds\": {:.6},",
+        broker.completion_wait_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        writer,
+        "    \"inference_seconds\": {:.6},",
         broker.inference_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        writer,
+        "    \"input_packing_seconds\": {:.6},",
+        broker.input_packing_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        writer,
+        "    \"session_run_seconds\": {:.6},",
+        broker.session_run_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        writer,
+        "    \"output_materialization_seconds\": {:.6},",
+        broker.output_materialization_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        writer,
+        "    \"inference_unattributed_seconds\": {:.6}",
+        broker.inference_unattributed_nanoseconds() as f64 / 1e9
     )?;
     writeln!(writer, "  }},")?;
     writeln!(writer, "  \"inference_lane_metrics\": [")?;
@@ -1536,15 +1598,26 @@ fn write_manifest(
         };
         writeln!(
             writer,
-            "    {{\"slot\": {slot}, \"requests\": {}, \"batches\": {}, \"positions\": {}, \"maximum_observed_batch\": {}, \"failures\": {}, \"encoding_seconds\": {:.6}, \"queue_seconds\": {:.6}, \"inference_seconds\": {:.6}}}{comma}",
+            "    {{\"slot\": {slot}, \"requests\": {}, \"batches\": {}, \"positions\": {}, \"maximum_observed_batch\": {}, \"failures\": {}, \"full_batches\": {}, \"deadline_batches\": {}, \"drain_batches\": {}, \"encoding_seconds\": {:.6}, \"queue_seconds\": {:.6}, \"channel_seconds\": {:.6}, \"broker_queue_seconds\": {:.6}, \"batch_collection_seconds\": {:.6}, \"batch_submission_seconds\": {:.6}, \"inference_seconds\": {:.6}, \"input_packing_seconds\": {:.6}, \"session_run_seconds\": {:.6}, \"output_materialization_seconds\": {:.6}, \"inference_unattributed_seconds\": {:.6}}}{comma}",
             lane.requests,
             lane.batches,
             lane.positions,
             lane.maximum_batch,
             lane.failures,
+            lane.full_batches,
+            lane.deadline_batches,
+            lane.drain_batches,
             lane.encoding_nanoseconds as f64 / 1e9,
             lane.queue_nanoseconds as f64 / 1e9,
+            lane.channel_nanoseconds as f64 / 1e9,
+            lane.broker_queue_nanoseconds as f64 / 1e9,
+            lane.batch_collection_nanoseconds as f64 / 1e9,
+            lane.batch_submission_nanoseconds as f64 / 1e9,
             lane.inference_nanoseconds as f64 / 1e9,
+            lane.input_packing_nanoseconds as f64 / 1e9,
+            lane.session_run_nanoseconds as f64 / 1e9,
+            lane.output_materialization_nanoseconds as f64 / 1e9,
+            lane.inference_unattributed_nanoseconds() as f64 / 1e9,
         )?;
     }
     writeln!(writer, "  ],")?;
@@ -1958,6 +2031,21 @@ fn main() -> std::io::Result<()> {
     )?;
     writeln!(
         output,
+        "    \"full_batches\": {},",
+        broker_metrics.full_batches
+    )?;
+    writeln!(
+        output,
+        "    \"deadline_batches\": {},",
+        broker_metrics.deadline_batches
+    )?;
+    writeln!(
+        output,
+        "    \"drain_batches\": {},",
+        broker_metrics.drain_batches
+    )?;
+    writeln!(
+        output,
         "    \"encoding_seconds\": {:.6},",
         broker_metrics.encoding_nanoseconds as f64 / 1e9
     )?;
@@ -1968,8 +2056,63 @@ fn main() -> std::io::Result<()> {
     )?;
     writeln!(
         output,
+        "    \"channel_seconds\": {:.6},",
+        broker_metrics.channel_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        output,
+        "    \"broker_queue_seconds\": {:.6},",
+        broker_metrics.broker_queue_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        output,
+        "    \"idle_request_wait_seconds\": {:.6},",
+        broker_metrics.idle_request_wait_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        output,
+        "    \"overlap_request_wait_seconds\": {:.6},",
+        broker_metrics.overlap_request_wait_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        output,
+        "    \"batch_collection_seconds\": {:.6},",
+        broker_metrics.batch_collection_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        output,
+        "    \"batch_submission_seconds\": {:.6},",
+        broker_metrics.batch_submission_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        output,
+        "    \"completion_wait_seconds\": {:.6},",
+        broker_metrics.completion_wait_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        output,
         "    \"inference_seconds\": {:.6},",
         broker_metrics.inference_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        output,
+        "    \"input_packing_seconds\": {:.6},",
+        broker_metrics.input_packing_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        output,
+        "    \"session_run_seconds\": {:.6},",
+        broker_metrics.session_run_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        output,
+        "    \"output_materialization_seconds\": {:.6},",
+        broker_metrics.output_materialization_nanoseconds as f64 / 1e9
+    )?;
+    writeln!(
+        output,
+        "    \"inference_unattributed_seconds\": {:.6},",
+        broker_metrics.inference_unattributed_nanoseconds() as f64 / 1e9
     )?;
     writeln!(
         output,
@@ -1985,15 +2128,26 @@ fn main() -> std::io::Result<()> {
         };
         writeln!(
             output,
-            "    {{\"slot\": {slot}, \"requests\": {}, \"batches\": {}, \"positions\": {}, \"maximum_observed_batch\": {}, \"failures\": {}, \"encoding_seconds\": {:.6}, \"queue_seconds\": {:.6}, \"inference_seconds\": {:.6}}}{comma}",
+            "    {{\"slot\": {slot}, \"requests\": {}, \"batches\": {}, \"positions\": {}, \"maximum_observed_batch\": {}, \"failures\": {}, \"full_batches\": {}, \"deadline_batches\": {}, \"drain_batches\": {}, \"encoding_seconds\": {:.6}, \"queue_seconds\": {:.6}, \"channel_seconds\": {:.6}, \"broker_queue_seconds\": {:.6}, \"batch_collection_seconds\": {:.6}, \"batch_submission_seconds\": {:.6}, \"inference_seconds\": {:.6}, \"input_packing_seconds\": {:.6}, \"session_run_seconds\": {:.6}, \"output_materialization_seconds\": {:.6}, \"inference_unattributed_seconds\": {:.6}}}{comma}",
             lane.requests,
             lane.batches,
             lane.positions,
             lane.maximum_batch,
             lane.failures,
+            lane.full_batches,
+            lane.deadline_batches,
+            lane.drain_batches,
             lane.encoding_nanoseconds as f64 / 1e9,
             lane.queue_nanoseconds as f64 / 1e9,
+            lane.channel_nanoseconds as f64 / 1e9,
+            lane.broker_queue_nanoseconds as f64 / 1e9,
+            lane.batch_collection_nanoseconds as f64 / 1e9,
+            lane.batch_submission_nanoseconds as f64 / 1e9,
             lane.inference_nanoseconds as f64 / 1e9,
+            lane.input_packing_nanoseconds as f64 / 1e9,
+            lane.session_run_nanoseconds as f64 / 1e9,
+            lane.output_materialization_nanoseconds as f64 / 1e9,
+            lane.inference_unattributed_nanoseconds() as f64 / 1e9,
         )?;
     }
     writeln!(output, "  ]\n}}")?;

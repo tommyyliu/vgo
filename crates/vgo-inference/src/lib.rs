@@ -81,9 +81,27 @@ pub struct BatchContract {
     pub maximum_batch: usize,
 }
 
+/// Time spent inside the host-visible stages of one backend call.
+///
+/// `session_run_nanoseconds` still includes runtime setup and any synchronous
+/// host/device transfers performed by ONNX Runtime. Splitting those transfers
+/// further requires I/O binding and explicit device buffers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InferenceStageMetrics {
+    pub input_packing_nanoseconds: u64,
+    pub session_run_nanoseconds: u64,
+    pub output_materialization_nanoseconds: u64,
+}
+
 pub trait BatchService: Send {
     fn contract(&self) -> BatchContract;
     fn infer(&mut self, batch: &[InferenceInput]) -> Result<Vec<InferenceOutput>, EvaluationError>;
+
+    /// Return the stage timings for the most recent `infer` call. Backends
+    /// without internal instrumentation leave the call unattributed.
+    fn last_inference_stages(&self) -> InferenceStageMetrics {
+        InferenceStageMetrics::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -188,7 +206,143 @@ pub struct BrokerMetrics {
     pub failures: u64,
     pub encoding_nanoseconds: u64,
     pub queue_nanoseconds: u64,
+    /// Position-weighted time between actor submission and broker receipt.
+    pub channel_nanoseconds: u64,
+    /// Position-weighted time between broker receipt and slot dispatch.
+    pub broker_queue_nanoseconds: u64,
+    /// Broker wall time waiting for the first request while every slot is idle.
+    pub idle_request_wait_nanoseconds: u64,
+    /// Broker wall time waiting for a request while at least one slot is busy.
+    pub overlap_request_wait_nanoseconds: u64,
+    /// Summed wall time spent constructing batches, including the deadline wait.
+    pub batch_collection_nanoseconds: u64,
+    /// Summed wall time spent transferring batch ownership to executor threads.
+    pub batch_submission_nanoseconds: u64,
+    /// Broker wall time blocked waiting for an executor completion.
+    pub completion_wait_nanoseconds: u64,
+    pub full_batches: u64,
+    pub deadline_batches: u64,
+    pub drain_batches: u64,
     pub inference_nanoseconds: u64,
+    pub input_packing_nanoseconds: u64,
+    pub session_run_nanoseconds: u64,
+    pub output_materialization_nanoseconds: u64,
+}
+
+impl BrokerMetrics {
+    #[must_use]
+    pub fn inference_unattributed_nanoseconds(self) -> u64 {
+        self.inference_nanoseconds.saturating_sub(
+            self.input_packing_nanoseconds
+                .saturating_add(self.session_run_nanoseconds)
+                .saturating_add(self.output_materialization_nanoseconds),
+        )
+    }
+
+    #[must_use]
+    pub fn delta_since(self, earlier: Self) -> Self {
+        Self {
+            requests: self.requests.saturating_sub(earlier.requests),
+            batches: self.batches.saturating_sub(earlier.batches),
+            positions: self.positions.saturating_sub(earlier.positions),
+            maximum_batch: self.maximum_batch,
+            failures: self.failures.saturating_sub(earlier.failures),
+            encoding_nanoseconds: self
+                .encoding_nanoseconds
+                .saturating_sub(earlier.encoding_nanoseconds),
+            queue_nanoseconds: self
+                .queue_nanoseconds
+                .saturating_sub(earlier.queue_nanoseconds),
+            channel_nanoseconds: self
+                .channel_nanoseconds
+                .saturating_sub(earlier.channel_nanoseconds),
+            broker_queue_nanoseconds: self
+                .broker_queue_nanoseconds
+                .saturating_sub(earlier.broker_queue_nanoseconds),
+            idle_request_wait_nanoseconds: self
+                .idle_request_wait_nanoseconds
+                .saturating_sub(earlier.idle_request_wait_nanoseconds),
+            overlap_request_wait_nanoseconds: self
+                .overlap_request_wait_nanoseconds
+                .saturating_sub(earlier.overlap_request_wait_nanoseconds),
+            batch_collection_nanoseconds: self
+                .batch_collection_nanoseconds
+                .saturating_sub(earlier.batch_collection_nanoseconds),
+            batch_submission_nanoseconds: self
+                .batch_submission_nanoseconds
+                .saturating_sub(earlier.batch_submission_nanoseconds),
+            completion_wait_nanoseconds: self
+                .completion_wait_nanoseconds
+                .saturating_sub(earlier.completion_wait_nanoseconds),
+            full_batches: self.full_batches.saturating_sub(earlier.full_batches),
+            deadline_batches: self
+                .deadline_batches
+                .saturating_sub(earlier.deadline_batches),
+            drain_batches: self.drain_batches.saturating_sub(earlier.drain_batches),
+            inference_nanoseconds: self
+                .inference_nanoseconds
+                .saturating_sub(earlier.inference_nanoseconds),
+            input_packing_nanoseconds: self
+                .input_packing_nanoseconds
+                .saturating_sub(earlier.input_packing_nanoseconds),
+            session_run_nanoseconds: self
+                .session_run_nanoseconds
+                .saturating_sub(earlier.session_run_nanoseconds),
+            output_materialization_nanoseconds: self
+                .output_materialization_nanoseconds
+                .saturating_sub(earlier.output_materialization_nanoseconds),
+        }
+    }
+
+    pub fn accumulate(&mut self, other: Self) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.batches = self.batches.saturating_add(other.batches);
+        self.positions = self.positions.saturating_add(other.positions);
+        self.maximum_batch = self.maximum_batch.max(other.maximum_batch);
+        self.failures = self.failures.saturating_add(other.failures);
+        self.encoding_nanoseconds = self
+            .encoding_nanoseconds
+            .saturating_add(other.encoding_nanoseconds);
+        self.queue_nanoseconds = self
+            .queue_nanoseconds
+            .saturating_add(other.queue_nanoseconds);
+        self.channel_nanoseconds = self
+            .channel_nanoseconds
+            .saturating_add(other.channel_nanoseconds);
+        self.broker_queue_nanoseconds = self
+            .broker_queue_nanoseconds
+            .saturating_add(other.broker_queue_nanoseconds);
+        self.idle_request_wait_nanoseconds = self
+            .idle_request_wait_nanoseconds
+            .saturating_add(other.idle_request_wait_nanoseconds);
+        self.overlap_request_wait_nanoseconds = self
+            .overlap_request_wait_nanoseconds
+            .saturating_add(other.overlap_request_wait_nanoseconds);
+        self.batch_collection_nanoseconds = self
+            .batch_collection_nanoseconds
+            .saturating_add(other.batch_collection_nanoseconds);
+        self.batch_submission_nanoseconds = self
+            .batch_submission_nanoseconds
+            .saturating_add(other.batch_submission_nanoseconds);
+        self.completion_wait_nanoseconds = self
+            .completion_wait_nanoseconds
+            .saturating_add(other.completion_wait_nanoseconds);
+        self.full_batches = self.full_batches.saturating_add(other.full_batches);
+        self.deadline_batches = self.deadline_batches.saturating_add(other.deadline_batches);
+        self.drain_batches = self.drain_batches.saturating_add(other.drain_batches);
+        self.inference_nanoseconds = self
+            .inference_nanoseconds
+            .saturating_add(other.inference_nanoseconds);
+        self.input_packing_nanoseconds = self
+            .input_packing_nanoseconds
+            .saturating_add(other.input_packing_nanoseconds);
+        self.session_run_nanoseconds = self
+            .session_run_nanoseconds
+            .saturating_add(other.session_run_nanoseconds);
+        self.output_materialization_nanoseconds = self
+            .output_materialization_nanoseconds
+            .saturating_add(other.output_materialization_nanoseconds);
+    }
 }
 
 #[derive(Default)]
@@ -200,7 +354,20 @@ struct AtomicMetrics {
     failures: AtomicU64,
     encoding_nanoseconds: AtomicU64,
     queue_nanoseconds: AtomicU64,
+    channel_nanoseconds: AtomicU64,
+    broker_queue_nanoseconds: AtomicU64,
+    idle_request_wait_nanoseconds: AtomicU64,
+    overlap_request_wait_nanoseconds: AtomicU64,
+    batch_collection_nanoseconds: AtomicU64,
+    batch_submission_nanoseconds: AtomicU64,
+    completion_wait_nanoseconds: AtomicU64,
+    full_batches: AtomicU64,
+    deadline_batches: AtomicU64,
+    drain_batches: AtomicU64,
     inference_nanoseconds: AtomicU64,
+    input_packing_nanoseconds: AtomicU64,
+    session_run_nanoseconds: AtomicU64,
+    output_materialization_nanoseconds: AtomicU64,
 }
 
 impl AtomicMetrics {
@@ -213,8 +380,36 @@ impl AtomicMetrics {
             failures: self.failures.load(Ordering::Relaxed),
             encoding_nanoseconds: self.encoding_nanoseconds.load(Ordering::Relaxed),
             queue_nanoseconds: self.queue_nanoseconds.load(Ordering::Relaxed),
+            channel_nanoseconds: self.channel_nanoseconds.load(Ordering::Relaxed),
+            broker_queue_nanoseconds: self.broker_queue_nanoseconds.load(Ordering::Relaxed),
+            idle_request_wait_nanoseconds: self
+                .idle_request_wait_nanoseconds
+                .load(Ordering::Relaxed),
+            overlap_request_wait_nanoseconds: self
+                .overlap_request_wait_nanoseconds
+                .load(Ordering::Relaxed),
+            batch_collection_nanoseconds: self.batch_collection_nanoseconds.load(Ordering::Relaxed),
+            batch_submission_nanoseconds: self.batch_submission_nanoseconds.load(Ordering::Relaxed),
+            completion_wait_nanoseconds: self.completion_wait_nanoseconds.load(Ordering::Relaxed),
+            full_batches: self.full_batches.load(Ordering::Relaxed),
+            deadline_batches: self.deadline_batches.load(Ordering::Relaxed),
+            drain_batches: self.drain_batches.load(Ordering::Relaxed),
             inference_nanoseconds: self.inference_nanoseconds.load(Ordering::Relaxed),
+            input_packing_nanoseconds: self.input_packing_nanoseconds.load(Ordering::Relaxed),
+            session_run_nanoseconds: self.session_run_nanoseconds.load(Ordering::Relaxed),
+            output_materialization_nanoseconds: self
+                .output_materialization_nanoseconds
+                .load(Ordering::Relaxed),
         }
+    }
+
+    fn record_stages(&self, stages: InferenceStageMetrics) {
+        self.input_packing_nanoseconds
+            .fetch_add(stages.input_packing_nanoseconds, Ordering::Relaxed);
+        self.session_run_nanoseconds
+            .fetch_add(stages.session_run_nanoseconds, Ordering::Relaxed);
+        self.output_materialization_nanoseconds
+            .fetch_add(stages.output_materialization_nanoseconds, Ordering::Relaxed);
     }
 }
 
@@ -229,16 +424,18 @@ struct PendingRequest {
     inputs: std::vec::IntoIter<InferenceInput>,
     outputs: Vec<InferenceOutput>,
     queued_at: Instant,
+    brokered_at: Instant,
     response: SyncSender<Result<Vec<InferenceOutput>, EvaluationError>>,
 }
 
 impl Request {
-    fn into_pending(self) -> PendingRequest {
+    fn into_pending(self, brokered_at: Instant) -> PendingRequest {
         let output_capacity = self.inputs.len();
         PendingRequest {
             inputs: self.inputs.into_iter(),
             outputs: Vec::with_capacity(output_capacity),
             queued_at: self.queued_at,
+            brokered_at,
             response: self.response,
         }
     }
@@ -640,15 +837,22 @@ fn run_broker(
         let mut current = if let Some(request) = carry.take() {
             request
         } else {
+            let wait_started = Instant::now();
             let Ok(request) = receiver.recv() else {
                 break;
             };
-            request.into_pending()
+            metrics
+                .idle_request_wait_nanoseconds
+                .fetch_add(wait_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            request.into_pending(Instant::now())
         };
 
+        let collection_started = Instant::now();
         let mut inputs = Vec::with_capacity(contract.maximum_batch);
         let mut parts = Vec::<BatchPart>::new();
-        let deadline = Instant::now() + config.maximum_delay;
+        let deadline = collection_started + config.maximum_delay;
+        let mut deadline_expired = false;
+        let mut disconnected = false;
         loop {
             let available = contract.maximum_batch - inputs.len();
             let count = available.min(current.inputs.len());
@@ -668,21 +872,43 @@ fn run_broker(
                 "a partially consumed request must fill the backend batch"
             );
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                deadline_expired = true;
                 break;
             };
             match receiver.recv_timeout(remaining) {
-                Ok(request) => current = request.into_pending(),
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                Ok(request) => current = request.into_pending(Instant::now()),
+                Err(RecvTimeoutError::Timeout) => {
+                    deadline_expired = true;
+                    break;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
             }
         }
 
         let position_count = inputs.len();
-        let now = Instant::now();
+        let dispatched = Instant::now();
+        let collection_nanoseconds = collection_started.elapsed().as_nanos() as u64;
+        let mut queue_nanoseconds = 0_u64;
+        let mut channel_nanoseconds = 0_u64;
+        let mut broker_queue_nanoseconds = 0_u64;
         for part in &parts {
-            let queued = now.duration_since(part.request.queued_at).as_nanos() as u64;
-            metrics
-                .queue_nanoseconds
-                .fetch_add(queued.saturating_mul(part.count as u64), Ordering::Relaxed);
+            let count = part.count as u64;
+            let queued = dispatched.duration_since(part.request.queued_at).as_nanos() as u64;
+            let channel = part
+                .request
+                .brokered_at
+                .duration_since(part.request.queued_at)
+                .as_nanos() as u64;
+            let broker = dispatched
+                .duration_since(part.request.brokered_at)
+                .as_nanos() as u64;
+            queue_nanoseconds = queue_nanoseconds.saturating_add(queued.saturating_mul(count));
+            channel_nanoseconds = channel_nanoseconds.saturating_add(channel.saturating_mul(count));
+            broker_queue_nanoseconds =
+                broker_queue_nanoseconds.saturating_add(broker.saturating_mul(count));
         }
         metrics.batches.fetch_add(1, Ordering::Relaxed);
         metrics
@@ -691,12 +917,33 @@ fn run_broker(
         metrics
             .maximum_batch
             .fetch_max(position_count, Ordering::Relaxed);
+        metrics
+            .queue_nanoseconds
+            .fetch_add(queue_nanoseconds, Ordering::Relaxed);
+        metrics
+            .channel_nanoseconds
+            .fetch_add(channel_nanoseconds, Ordering::Relaxed);
+        metrics
+            .broker_queue_nanoseconds
+            .fetch_add(broker_queue_nanoseconds, Ordering::Relaxed);
+        metrics
+            .batch_collection_nanoseconds
+            .fetch_add(collection_nanoseconds, Ordering::Relaxed);
+        if position_count == contract.maximum_batch {
+            metrics.full_batches.fetch_add(1, Ordering::Relaxed);
+        } else if deadline_expired {
+            metrics.deadline_batches.fetch_add(1, Ordering::Relaxed);
+        } else if disconnected {
+            metrics.drain_batches.fetch_add(1, Ordering::Relaxed);
+        }
         let expected_ids = inputs.iter().map(InferenceInput::id).collect::<Vec<_>>();
         let started = Instant::now();
         let result = service.infer(&inputs);
+        let stages = service.last_inference_stages();
         metrics
             .inference_nanoseconds
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        metrics.record_stages(stages);
         let result = result.and_then(|outputs| {
             if outputs.len() != expected_ids.len() {
                 return Err(EvaluationError::new(format!(
@@ -755,6 +1002,7 @@ struct QueuedPoolRequest {
     next_offset: usize,
     encoding_nanoseconds: u64,
     queued_at: Instant,
+    brokered_at: Instant,
 }
 
 struct PendingPoolResponse {
@@ -769,6 +1017,7 @@ struct PoolBatchPart {
     count: usize,
     encoding_nanoseconds: u64,
     queued_at: Instant,
+    brokered_at: Instant,
 }
 
 struct InFlightPoolBatch {
@@ -784,6 +1033,7 @@ fn enqueue_pool_request(
     queued: &mut VecDeque<QueuedPoolRequest>,
     responses: &mut HashMap<u64, PendingPoolResponse>,
 ) {
+    let brokered_at = Instant::now();
     let count = request.inputs.len();
     debug_assert!(count > 0, "evaluators do not submit empty requests");
     responses.insert(
@@ -800,6 +1050,7 @@ fn enqueue_pool_request(
         next_offset: 0,
         encoding_nanoseconds: request.encoding_nanoseconds,
         queued_at: request.queued_at,
+        brokered_at,
     });
 }
 
@@ -834,11 +1085,23 @@ fn run_pool_broker<S: BatchService + 'static>(
     loop {
         while executor.in_flight() < executor.capacity() {
             if queued.is_empty() && !disconnected {
-                let received = if executor.in_flight() == 0 {
+                let idle = executor.in_flight() == 0;
+                let wait_started = Instant::now();
+                let received = if idle {
                     receiver.recv().map_err(|_| RecvTimeoutError::Disconnected)
                 } else {
                     receiver.recv_timeout(config.maximum_delay)
                 };
+                let waited = wait_started.elapsed().as_nanos() as u64;
+                if idle {
+                    metrics
+                        .idle_request_wait_nanoseconds
+                        .fetch_add(waited, Ordering::Relaxed);
+                } else {
+                    metrics
+                        .overlap_request_wait_nanoseconds
+                        .fetch_add(waited, Ordering::Relaxed);
+                }
                 match received {
                     Ok(request) => {
                         enqueue_pool_request(request, next_request, &mut queued, &mut responses);
@@ -852,7 +1115,9 @@ fn run_pool_broker<S: BatchService + 'static>(
                 break;
             }
 
-            let deadline = Instant::now() + config.maximum_delay;
+            let collection_started = Instant::now();
+            let deadline = collection_started + config.maximum_delay;
+            let mut deadline_expired = false;
             let mut inputs = Vec::with_capacity(contract.maximum_batch);
             let mut parts = Vec::<PoolBatchPart>::new();
             loop {
@@ -878,6 +1143,7 @@ fn run_pool_broker<S: BatchService + 'static>(
                         count,
                         encoding_nanoseconds: encoded,
                         queued_at: current.queued_at,
+                        brokered_at: current.brokered_at,
                     });
                     if current.inputs.len() == 0 {
                         queued.pop_front();
@@ -887,6 +1153,7 @@ fn run_pool_broker<S: BatchService + 'static>(
                     break;
                 }
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    deadline_expired = true;
                     break;
                 };
                 match receiver.recv_timeout(remaining) {
@@ -894,7 +1161,10 @@ fn run_pool_broker<S: BatchService + 'static>(
                         enqueue_pool_request(request, next_request, &mut queued, &mut responses);
                         next_request = next_request.wrapping_add(1);
                     }
-                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Timeout) => {
+                        deadline_expired = true;
+                        break;
+                    }
                     Err(RecvTimeoutError::Disconnected) => {
                         disconnected = true;
                         break;
@@ -903,6 +1173,7 @@ fn run_pool_broker<S: BatchService + 'static>(
             }
 
             let position_count = inputs.len();
+            let collection_nanoseconds = collection_started.elapsed().as_nanos() as u64;
             let expected_ids = inputs.iter().map(InferenceInput::id).collect::<Vec<_>>();
             let batch = match InferenceBatch::new(next_batch, inputs) {
                 Ok(batch) => batch,
@@ -911,6 +1182,7 @@ fn run_pool_broker<S: BatchService + 'static>(
                     return;
                 }
             };
+            let submission_started = Instant::now();
             let slot = match executor.submit(batch) {
                 Ok(slot) => slot,
                 Err(error) => {
@@ -918,14 +1190,24 @@ fn run_pool_broker<S: BatchService + 'static>(
                     return;
                 }
             };
+            let submission_nanoseconds = submission_started.elapsed().as_nanos() as u64;
             let dispatched = Instant::now();
             let lane = &lane_metrics[slot];
             let mut queue_nanoseconds = 0_u64;
+            let mut channel_nanoseconds = 0_u64;
+            let mut broker_queue_nanoseconds = 0_u64;
             let mut encoding_nanoseconds = 0_u64;
             for part in &parts {
+                let count = part.count as u64;
                 let queued_for = dispatched.duration_since(part.queued_at).as_nanos() as u64;
+                let channel_for = part.brokered_at.duration_since(part.queued_at).as_nanos() as u64;
+                let broker_for = dispatched.duration_since(part.brokered_at).as_nanos() as u64;
                 queue_nanoseconds =
-                    queue_nanoseconds.saturating_add(queued_for.saturating_mul(part.count as u64));
+                    queue_nanoseconds.saturating_add(queued_for.saturating_mul(count));
+                channel_nanoseconds =
+                    channel_nanoseconds.saturating_add(channel_for.saturating_mul(count));
+                broker_queue_nanoseconds =
+                    broker_queue_nanoseconds.saturating_add(broker_for.saturating_mul(count));
                 encoding_nanoseconds =
                     encoding_nanoseconds.saturating_add(part.encoding_nanoseconds);
             }
@@ -939,6 +1221,18 @@ fn run_pool_broker<S: BatchService + 'static>(
             metrics
                 .queue_nanoseconds
                 .fetch_add(queue_nanoseconds, Ordering::Relaxed);
+            metrics
+                .channel_nanoseconds
+                .fetch_add(channel_nanoseconds, Ordering::Relaxed);
+            metrics
+                .broker_queue_nanoseconds
+                .fetch_add(broker_queue_nanoseconds, Ordering::Relaxed);
+            metrics
+                .batch_collection_nanoseconds
+                .fetch_add(collection_nanoseconds, Ordering::Relaxed);
+            metrics
+                .batch_submission_nanoseconds
+                .fetch_add(submission_nanoseconds, Ordering::Relaxed);
             lane.requests
                 .fetch_add(position_count as u64, Ordering::Relaxed);
             lane.batches.fetch_add(1, Ordering::Relaxed);
@@ -950,6 +1244,24 @@ fn run_pool_broker<S: BatchService + 'static>(
                 .fetch_add(encoding_nanoseconds, Ordering::Relaxed);
             lane.queue_nanoseconds
                 .fetch_add(queue_nanoseconds, Ordering::Relaxed);
+            lane.channel_nanoseconds
+                .fetch_add(channel_nanoseconds, Ordering::Relaxed);
+            lane.broker_queue_nanoseconds
+                .fetch_add(broker_queue_nanoseconds, Ordering::Relaxed);
+            lane.batch_collection_nanoseconds
+                .fetch_add(collection_nanoseconds, Ordering::Relaxed);
+            lane.batch_submission_nanoseconds
+                .fetch_add(submission_nanoseconds, Ordering::Relaxed);
+            if position_count == contract.maximum_batch {
+                metrics.full_batches.fetch_add(1, Ordering::Relaxed);
+                lane.full_batches.fetch_add(1, Ordering::Relaxed);
+            } else if deadline_expired {
+                metrics.deadline_batches.fetch_add(1, Ordering::Relaxed);
+                lane.deadline_batches.fetch_add(1, Ordering::Relaxed);
+            } else if disconnected {
+                metrics.drain_batches.fetch_add(1, Ordering::Relaxed);
+                lane.drain_batches.fetch_add(1, Ordering::Relaxed);
+            }
             in_flight.insert(
                 next_batch,
                 InFlightPoolBatch {
@@ -969,6 +1281,7 @@ fn run_pool_broker<S: BatchService + 'static>(
             continue;
         }
 
+        let completion_wait_started = Instant::now();
         let completion = match executor.receive() {
             Ok(completion) => completion,
             Err(error) => {
@@ -984,9 +1297,14 @@ fn run_pool_broker<S: BatchService + 'static>(
                 return;
             }
         };
+        metrics.completion_wait_nanoseconds.fetch_add(
+            completion_wait_started.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
         let sequence = completion.sequence();
         let slot = completion.slot();
         let elapsed = completion.elapsed().as_nanos() as u64;
+        let stages = completion.stages();
         let Some(batch) = in_flight.remove(&sequence) else {
             let error = EvaluationError::new(format!(
                 "inference executor returned unknown batch sequence {sequence}"
@@ -1001,6 +1319,8 @@ fn run_pool_broker<S: BatchService + 'static>(
         lane_metrics[slot]
             .inference_nanoseconds
             .fetch_add(elapsed, Ordering::Relaxed);
+        metrics.record_stages(stages);
+        lane_metrics[slot].record_stages(stages);
         let result = (|| {
             let outputs = completion.into_outputs();
             if outputs.len() != batch.expected_ids.len() {
@@ -1084,6 +1404,8 @@ mod tests {
 
     struct FailingService;
 
+    struct StagedService;
+
     impl BatchService for FailingService {
         fn contract(&self) -> BatchContract {
             test_contract(2)
@@ -1094,6 +1416,30 @@ mod tests {
             _batch: &[InferenceInput],
         ) -> Result<Vec<InferenceOutput>, EvaluationError> {
             Err(EvaluationError::new("synthetic inference failure"))
+        }
+    }
+
+    impl BatchService for StagedService {
+        fn contract(&self) -> BatchContract {
+            test_contract(2)
+        }
+
+        fn infer(
+            &mut self,
+            batch: &[InferenceInput],
+        ) -> Result<Vec<InferenceOutput>, EvaluationError> {
+            batch
+                .iter()
+                .map(|input| InferenceOutput::new(input.id(), 0.25, vec![0.0; 5]))
+                .collect()
+        }
+
+        fn last_inference_stages(&self) -> InferenceStageMetrics {
+            InferenceStageMetrics {
+                input_packing_nanoseconds: 11,
+                session_run_nanoseconds: 13,
+                output_materialization_nanoseconds: 17,
+            }
         }
     }
 
@@ -1392,6 +1738,24 @@ mod tests {
     }
 
     #[test]
+    fn evaluator_pool_reports_backend_stage_timings() {
+        let pool = BatchedEvaluatorPool::spawn(broker_config(), vec![StagedService]).unwrap();
+        let position = Position::new(0.1, Vec::new(), Color::Black);
+
+        pool.evaluate(&position).unwrap();
+
+        let metrics = pool.metrics();
+        assert_eq!(metrics.input_packing_nanoseconds, 11);
+        assert_eq!(metrics.session_run_nanoseconds, 13);
+        assert_eq!(metrics.output_materialization_nanoseconds, 17);
+        assert!(metrics.inference_nanoseconds >= 41);
+        assert_eq!(
+            pool.lane_metrics()[0].input_packing_nanoseconds,
+            metrics.input_packing_nanoseconds
+        );
+    }
+
+    #[test]
     fn evaluator_pool_builds_full_batches_from_one_shared_queue() {
         const CALLERS: usize = 8;
         let drops = Arc::new(AtomicUsize::new(0));
@@ -1449,6 +1813,13 @@ mod tests {
         assert_eq!(total.positions, 8);
         assert_eq!(total.batches, 2);
         assert_eq!(total.maximum_batch, 4);
+        assert_eq!(total.full_batches, 2);
+        assert_eq!(total.deadline_batches, 0);
+        assert_eq!(total.drain_batches, 0);
+        assert_eq!(
+            total.queue_nanoseconds,
+            total.channel_nanoseconds + total.broker_queue_nanoseconds
+        );
         assert_eq!(
             lanes
                 .iter()
@@ -1466,6 +1837,10 @@ mod tests {
                 .map(|lane| lane.inference_nanoseconds)
                 .sum::<u64>(),
             total.inference_nanoseconds
+        );
+        assert_eq!(
+            lanes.iter().map(|lane| lane.full_batches).sum::<u64>(),
+            total.full_batches
         );
     }
 
