@@ -4,15 +4,15 @@
 :root{color-scheme:light;
   --plane:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink-2:#52514e;--muted:#898781;
   --grid:#e1e0d9;--axis:#c3c2b7;--rule:rgba(11,11,11,.10);--wash:rgba(11,11,11,.035);
-  --c1:#2a78d6;--c2:#eb6834;--c3:#1baf7a;--c4:#eda100;--c5:#e87ba4;--warn:#fab219;}
+  --c1:#2a78d6;--c2:#eb6834;--c3:#1baf7a;--c4:#eda100;--c5:#e87ba4;--c6:#008300;--warn:#fab219;}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;
   --plane:#0d0d0d;--surface:#1a1a19;--ink:#fff;--ink-2:#c3c2b7;--muted:#898781;
   --grid:#2c2c2a;--axis:#383835;--rule:rgba(255,255,255,.10);--wash:rgba(255,255,255,.045);
-  --c1:#3987e5;--c2:#d95926;--c3:#199e70;--c4:#c98500;--c5:#d55181;--warn:#fab219;}}
+  --c1:#3987e5;--c2:#d95926;--c3:#199e70;--c4:#c98500;--c5:#d55181;--c6:#008300;--warn:#fab219;}}
 :root[data-theme="dark"]{color-scheme:dark;
   --plane:#0d0d0d;--surface:#1a1a19;--ink:#fff;--ink-2:#c3c2b7;--muted:#898781;
   --grid:#2c2c2a;--axis:#383835;--rule:rgba(255,255,255,.10);--wash:rgba(255,255,255,.045);
-  --c1:#3987e5;--c2:#d95926;--c3:#199e70;--c4:#c98500;--c5:#d55181;--warn:#fab219;}
+  --c1:#3987e5;--c2:#d95926;--c3:#199e70;--c4:#c98500;--c5:#d55181;--c6:#008300;--warn:#fab219;}
 *{box-sizing:border-box}
 body{margin:0;background:var(--plane);color:var(--ink);
   font-family:system-ui,-apple-system,"Segoe UI",sans-serif;font-size:15px;line-height:1.55}
@@ -56,9 +56,11 @@ footer{border-top:1px solid var(--rule);padding-top:14px;font-size:12.5px;color:
     <p class="eyebrow">Voronoi Go · dense rating</p>
     <h1>Every checkpoint on one scale</h1>
     <p class="standfirst">
-      Random short round-robins across all five runs, tied together by a single
+      Random short round-robins across every run, tied together by a single
       Bradley-Terry fit. Plotted against cumulative self-play samples, because
       update number is not comparable between runs whose shards differ in size.
+      A run warm-started from another continues on its parent's axis, so the two
+      read as one training history.
     </p>
   </header>
 
@@ -140,15 +142,35 @@ if(DATA.naive && DATA.naive.games && sy(0)>MT && sy(0)<MT+PH){
   const l=el("text",{class:"tick",x:ML+6,y:sy(0)-6});
   l.textContent=`naive (${DATA.naive.wins}-${DATA.naive.losses})`; svg.appendChild(l);
 }
-for(const v of [5000,10000,20000,50000,100000,200000,400000]){
-  if(Math.log10(v)<x0||Math.log10(v)>x1) continue;
+// Generated rather than listed: a continuation extends the axis past where any
+// single run ends, and a hard-coded top tick silently leaves that stretch
+// unlabelled -- the reader then has no scale exactly where the newest data is.
+const XT=[];
+for(let e=3;e<=8;e++) for(const m of [1,2,5]){
+  const v=m*Math.pow(10,e);
+  if(Math.log10(v)>=x0&&Math.log10(v)<=x1) XT.push(v);}
+for(const v of XT){
   const l=el("text",{class:"tick",x:sx(v),y:MT+PH+17,"text-anchor":"middle"});
-  l.textContent=(v/1000)+"k"; svg.appendChild(l);
+  l.textContent=v>=1e6?(v/1e6)+"M":(v/1000)+"k"; svg.appendChild(l);
   svg.appendChild(el("line",{class:"gl",x1:sx(v),x2:sx(v),y1:MT,y2:MT+PH},{opacity:.5}));}
 const ax=el("text",{class:"axt",x:ML+PW/2,y:H-6,"text-anchor":"middle"});
 ax.textContent="cumulative self-play samples (log scale)"; svg.appendChild(ax);
 const ay=el("text",{class:"axt",x:13,y:MT+PH/2,"text-anchor":"middle",
   transform:`rotate(-90 13 ${MT+PH/2})`}); ay.textContent="Elo"; svg.appendChild(ay);
+
+// A continuation resumes its parent's checkpoint, so the two curves are one
+// training history and the sample axis already places them end to end. Draw the
+// join as a recessive dashed link, not as series stroke: the caption promises
+// lines connect measured points, and no game was played across this gap.
+// Appended before the series so it passes under their dots.
+for(const r of runs){
+  const link=(DATA.continues||{})[r]; if(!link) continue;
+  const child=(DATA.series[r]||[]).filter(d=>d.n>0)[0];
+  const parent=(DATA.series[link.parent]||[]).find(d=>d.v===link.version&&d.n>0);
+  if(!child||!parent) continue;
+  svg.appendChild(el("line",{x1:sx(parent.n),y1:sy(parent.elo),x2:sx(child.n),y2:sy(child.elo),
+    "stroke-width":1.5,"stroke-dasharray":"3 3"},{stroke:"var(--muted)",opacity:.75}));
+}
 
 const tip=document.createElement("div"); tip.className="tip";
 const ends=[];
@@ -156,6 +178,12 @@ for(const r of runs){
   const color=`var(${DATA.vars[r]})`;
   const p=DATA.series[r].filter(d=>d.n>0);
   if(!p.length) continue;
+  // On a continuation the sample count is cumulative across the lineage, so say
+  // whose samples are in it rather than letting the number imply this run
+  // generated them all.
+  const link=(DATA.continues||{})[r];
+  const inherited=link?`<div>includes ${link.offset.toLocaleString()} from `
+    +`${DATA.names[link.parent]||link.parent} v${link.version}</div>`:"";
   if(p.length>1){
     const d=p.map((q,i)=>(i?"L":"M")+sx(q.n).toFixed(1)+" "+sy(q.elo).toFixed(1)).join(" ");
     svg.appendChild(el("path",{class:"series",d},{stroke:color,opacity:.85}));
@@ -169,7 +197,7 @@ for(const r of runs){
       const b=svg.getBoundingClientRect(), sc=b.width/W;
       tip.innerHTML=`<div class="hd">${DATA.names[r]} · update ${q.v}</div>`+
         `<div>${Math.round(q.elo)} ± ${Math.round(q.se)} Elo</div>`+
-        `<div>${q.n.toLocaleString()} samples · ${q.games} games</div>`;
+        `<div>${q.n.toLocaleString()} samples · ${q.games} games</div>`+inherited;
       tip.style.opacity=1;
       tip.style.left=Math.min(sx(q.n)*sc+12,b.width-190)+"px";
       tip.style.top=(sy(q.elo)*sc-10)+"px";});
@@ -188,9 +216,12 @@ chart.appendChild(svg); chart.appendChild(tip);
 
 document.getElementById("caption").textContent=
   "Each point is one checkpoint. Whiskers are ±1 standard error against the field mean. "+
-  "Lines join checkpoints within a run and are drawn between measured points, not interpolated evidence.";
+  "Lines join checkpoints within a run and are drawn between measured points, not interpolated evidence. "+
+  "A dashed link marks a warm start: it joins a run to the parent checkpoint it resumed, "+
+  "which is lineage rather than a game anyone played.";
 document.getElementById("foot").textContent=
   "All runs: DDRNet width 64, 16 blocks, one attention block per context stage, 1600 simulations "+
-  "during generation, cold start. Rating games at 800 simulations, 105 ply cap. "+
-  "Runs differ in optimizer and in samples per shard.";
+  "during generation. Rating games at 800 simulations, 105 ply cap. Runs differ in optimizer and "+
+  "in samples per shard; all are cold starts except the dynamic-komi run, which continues "+
+  "Adam 5.1k/shard from its update 59.";
 </script>
