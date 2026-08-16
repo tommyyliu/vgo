@@ -2968,9 +2968,15 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--raster-kind",
-        choices=("semantic", "compact", "rgb"),
+        choices=("semantic", "compact", "compact-pass", "compact-dead-zone", "rgb"),
         default="semantic",
-        help="channel layout; compact is four channels plus komi",
+        help=(
+            "channel layout. compact is four channels plus komi; compact-pass "
+            "adds whether the previous move was a pass, without which a net "
+            "cannot tell that passing now would end the game; compact-dead-zone "
+            "is compact-pass with the official rules' capture predicate in "
+            "place of settled, and the two differ in exactly one plane"
+        ),
     )
     parser.add_argument("--resign-window", type=int, default=5)
     parser.add_argument(

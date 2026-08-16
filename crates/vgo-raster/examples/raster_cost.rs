@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use vgo_core::{Color, Position, Stone};
 use vgo_raster::{
-    CHANNEL_COUNT, COMPACT_CHANNELS, COMPACT_DEAD_ZONE_CHANNELS, RasterConfig, RasterKind,
-    dead_zone_mask, rasterize_compact_dead_zone_into, rasterize_compact_with_settled_into,
+    CHANNEL_COUNT, COMPACT_CHANNELS, COMPACT_PASS_CHANNELS, RasterConfig, RasterKind,
+    dead_zone_mask, rasterize_compact_six_into, rasterize_compact_with_predicate_into,
     rasterize_into, settled_mask, settled_mask_by_bounded_distance,
 };
 
@@ -64,14 +64,14 @@ fn main() {
     println!("{size}x{size}, milliseconds per position, one thread\n");
     println!(
         "{:>7} {:>12} {:>12} {:>12} {:>14}",
-        "stones", "semantic", "compact", "compact-edt", "compact+dead"
+        "stones", "semantic", "compact", "compact-edt", "his rules 6ch"
     );
     println!(
         "{:>7} {:>12} {:>12} {:>12} {:>14}",
         "", format!("{CHANNEL_COUNT}ch"),
         format!("{}ch", COMPACT_CHANNELS.len()),
         format!("{}ch", COMPACT_CHANNELS.len()),
-        format!("{}ch", COMPACT_DEAD_ZONE_CHANNELS.len()),
+        format!("{}ch", COMPACT_PASS_CHANNELS.len()),
     );
 
     let mut totals = [0.0_f64; 4];
@@ -85,7 +85,7 @@ fn main() {
 
         let mut wide = vec![0.0_f32; CHANNEL_COUNT * pixels];
         let mut five = vec![0.0_f32; COMPACT_CHANNELS.len() * pixels];
-        let mut six = vec![0.0_f32; COMPACT_DEAD_ZONE_CHANNELS.len() * pixels];
+        let mut six = vec![0.0_f32; COMPACT_PASS_CHANNELS.len() * pixels];
 
         let a = time(|| {
             rasterize_into(&position, semantic, &mut wide);
@@ -93,16 +93,16 @@ fn main() {
         });
         let b = time(|| {
             let mask = settled_mask(&position, compact);
-            rasterize_compact_with_settled_into(&position, compact, &mask, &mut five);
+            rasterize_compact_with_predicate_into(&position, compact, &mask, &mut five);
             black_box(&five);
         });
         let c = time(|| {
             let mask = settled_mask_by_bounded_distance(&position, compact, 1).0;
-            rasterize_compact_with_settled_into(&position, compact, &mask, &mut five);
+            rasterize_compact_with_predicate_into(&position, compact, &mask, &mut five);
             black_box(&five);
         });
         let d = time(|| {
-            rasterize_compact_dead_zone_into(&position, with_dead, &mut six);
+            rasterize_compact_six_into(&position, with_dead, &mut six);
             black_box(&six);
         });
         for (total, value) in totals.iter_mut().zip([a, b, c, d]) {
@@ -128,20 +128,20 @@ fn main() {
         }
         let stones = position.stones().len();
         let mut five = vec![0.0_f32; COMPACT_CHANNELS.len() * pixels];
-        let mut six = vec![0.0_f32; COMPACT_DEAD_ZONE_CHANNELS.len() * pixels];
+        let mut six = vec![0.0_f32; COMPACT_PASS_CHANNELS.len() * pixels];
         let mask = settled_mask_by_bounded_distance(&position, compact, 1).0;
 
         // The writer with the mask already in hand: stones, ridge, komi, and
         // copying settled in. Everything except deciding what settled is.
         let planes = time(|| {
-            rasterize_compact_with_settled_into(&position, compact, &mask, &mut five);
+            rasterize_compact_with_predicate_into(&position, compact, &mask, &mut five);
             black_box(&five);
         });
         let settled_only = time(|| {
             black_box(settled_mask_by_bounded_distance(&position, compact, 1));
         });
         let whole = time(|| {
-            rasterize_compact_dead_zone_into(&position, with_dead, &mut six);
+            rasterize_compact_six_into(&position, with_dead, &mut six);
             black_box(&six);
         });
         let dead_only = (whole - planes - settled_only).max(0.0);
