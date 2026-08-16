@@ -12,15 +12,25 @@ and the publication — so it continues rather than restarting, and a finished r
 is a no-op.
 
 ```bash
-VGO_UPDATES=80 ./runs/ddrnet-attn.sh artifacts/ddrnet-fresh-attn
+VGO_UPDATES=80 ./runs/ddrnet-attn.sh artifacts/<run>
 ```
+
+A relative output path is resolved against **your shell's directory**, so run
+these from the project root. The launchers pin it there explicitly, because the
+pipeline is exec'd after a `cd` into `training/`: before that guard existed, the
+command above sent `mkdir`, `install` and `tee` to `artifacts/<run>` while
+`--output` landed in `training/artifacts/<run>`, which is an empty directory and
+therefore a cold start. The symptom is a run that begins generating at
+`--runtime naive` while writing its log into the run you meant to continue.
 
 `--updates` may be raised, never lowered. Everything outside
 `OPERATIONAL_CONFIG_FIELDS` is run identity: change one and the run refuses to
 resume. That includes `--samples-per-shard`, `--replay-window`,
-`--leaf-batch`, the architecture and every seed. `--inference-batch` is an
-operational serving control; it may change on resume as long as it does not
-exceed the maximum embedded in the current ONNX artifact.
+`--leaf-batch`, the whole komi group (`--komi-low`, `--komi-high`,
+`--dynamic-komi`), the architecture and every seed. Only 22 fields are
+operational; `pipeline.py:34` is the list. `--inference-batch` is one of them, a
+serving control that may change on resume as long as it does not exceed the
+maximum embedded in the current ONNX artifact.
 
 Stop with `kill` (SIGTERM). `rl_loop` routes it onto the Ctrl-C path, so
 children are signalled rather than orphaned and wall time is recorded. A crash
@@ -28,13 +38,22 @@ costs at most the shard in flight.
 
 ### Runs that predate a flag
 
-A run whose `pipeline-config.json` lacks a field today's code writes cannot
-resume: the identity guard sees a new key, and the state's `config_digest`
-disagrees. `ddrnet-fresh-attn` hit this with `full_adam` / `muon_learning_rate`.
+A missing key blocks a resume only when nothing backfills it. `compatible_config`
+(`pipeline.py:216`) fills defaults for fields added without changing historical
+semantics — currently `dynamic_komi` and the three `komi_recenter_*` fields — so
+runs older than those stay resumable. Anything else absent, like `full_adam` /
+`muon_learning_rate`, is an identity mismatch and refuses.
 
-Fix only when you can establish what the run actually did. For the optimizer,
-read the checkpoint: one param group with no `use_muon` is plain Adam, two
-groups with `use_muon: true` on one is the hybrid.
+The digest usually needs no attention. `pipeline.py:1083` accepts a stored
+`config_digest` that was taken under a known older set of operational fields, so
+a run whose digest predates `inference_batch` or `promotion_arena` becoming
+operational resumes and quietly re-stamps itself. `ddrnet-fresh-attn` still
+carries such a digest today and resumes fine. Recompute one by hand only when
+that fallback rejects it.
+
+Fix a missing field only when you can establish what the run actually did. For
+the optimizer, read the checkpoint: one param group with no `use_muon` is plain
+Adam, two groups with `use_muon: true` on one is the hybrid.
 
 ```bash
 training/.venv/bin/python3 -c "
@@ -43,9 +62,48 @@ import torch; c=torch.load('artifacts/<run>/updates/update-000030/candidate.pt',
 print([{k:v for k,v in g.items() if k!='params'} for g in c['optimizer_state_dict']['param_groups']])"
 ```
 
-Then write the true value into `pipeline-config.json`, recompute
-`config_digest` in `pipeline-state.json` from `canonical_digest(identity_config(config))`,
-and back both files up first.
+Then write the true value into `pipeline-config.json`, backing it up first.
+`ddrnet-fresh-attn` was patched this way on 2026-08-10; both `.bak-20260810`
+files are the pre-patch state.
+
+### The opposite case: a backfilled field you want to change
+
+Backfilling makes an old run resumable at its *historical* behaviour, not at
+today's default. `dynamic_komi` backfills to `false`, so any recipe passing
+`--dynamic-komi` is an identity change and refuses — deliberately, per the note
+at `pipeline.py:220`. Turning the controller on mid-run is exactly what the
+guard is for, since the replay window would then mix shards drawn from two komi
+policies.
+
+Patching the stored config to match your recipe is the wrong instinct here. The
+`full_adam` patch above recorded what the run had *already done*; changing
+`dynamic_komi`, `komi_low` or `komi_high` changes what it will do next, and
+those are all identity fields.
+
+Seed a new run instead — it keeps the trained weights and the training window
+while giving the controller a run it is allowed to steer:
+
+```bash
+./runs/ddrnet-attn-komi.sh   # ddrnet-fresh-attn u59 -> a fresh run, komi on
+```
+
+That launcher is the worked example. Three things it has to get right, all of
+which are easy to miss:
+
+- `--initial-checkpoint` and `--initial-onnx` must be given together, and the
+  seeded model enters state as version −1 so *generation* starts from it. On its
+  own, `--initial-replay` seeds only the training window.
+- Copy the seed shards. Retirement compresses a shard and deletes the
+  uncompressed original (`pipeline.py:119`), so `--initial-replay` pointed at
+  another run rewrites that run's replay directory as housekeeping.
+- Spell the checkpoint path as `"$root/artifacts/..."`. `ancestor_of`
+  (`scripts/rate-checkpoints.py:98`) recovers lineage by a regex that only
+  understands a literal `root`; through any other variable the child silently
+  rates as a cold start.
+
+With replay seeded, the komi controller takes its starting center from the
+newest seeded manifest rather than from `--komi-low/--komi-high`, which then
+supply only the width. Recentering the configured range is inert in that case.
 
 ## Rating checkpoints
 
@@ -138,10 +196,20 @@ records.
 
 ## Things that bite
 
-**`--samples-per-shard` is inert below about 3,400.** Draining the games already
-in flight yields `actors x plies` samples on its own — 64 x ~53. Requesting
-1,600 gives a ~5,200-sample shard of which 69% is the tail. Going genuinely
-smaller means fewer `--actors`, which costs throughput.
+**`--samples-per-shard` is inert below about 3,700.** Draining the games already
+in flight yields `actors x plies` samples on its own. Measured from the shard
+manifests at `--actors 64`, the floor is steady across shard sizes:
+
+| run | requested | produced (mean ± sd) | floor | tail |
+|---|---|---|---|---|
+| `ddrnet-fresh-attn` (60 shards) | 1,600 | 5,455 ± 291 | 3,855 | 71% |
+| `shard-sweep-10000` (29 shards) | 6,480 | 10,248 ± 354 | 3,768 | 37% |
+| `shard-sweep-15000` (40 shards) | 11,480 | 15,016 ± 353 | 3,536 | 24% |
+
+So a 1,600 request is 71% tail. Going genuinely smaller means fewer `--actors`,
+which costs throughput. Note the sd: a shard lands within about ±350 of its
+mean regardless of size, so two arms differing by less than that are not
+differing at all.
 
 **`--arena-pairs 8` is too small to gate on.** Sixteen games at a 0.55 threshold
 needs roughly a +90 Elo gain to pass reliably. Late in a run, where updates
