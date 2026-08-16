@@ -32,6 +32,15 @@ rated at every checkpoint while the ladder it is measured against stays sparse:
 
     scripts/dense-curve.py artifacts/ddrnet-fresh-attn:3 artifacts/shard-sweep-15000:1 \\
         --ratings ratings.json --output artifacts/dense-curve-6
+
+A run may also carry an inclusive update range as `run:stride:low-high`, which
+is what measures a continuation against the run it extends: rate the extension
+densely, and take only the tail of the parent, since those are the checkpoints
+it has to beat and they are already rated well enough to tie the new games into
+the existing scale.
+
+    scripts/dense-curve.py artifacts/ddrnet-attn-komi:2 artifacts/ddrnet-fresh-attn:3:45- \\
+        --ratings ratings.json --output artifacts/extension-curve
 """
 
 from __future__ import annotations
@@ -39,6 +48,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import subprocess
 import sys
 import time
@@ -49,8 +59,15 @@ sys.path.insert(0, str(_TRAINING))
 from vgo_training.pipeline import runtime_environment  # noqa: E402
 
 
-def checkpoints(run: Path, stride: int) -> list[tuple[int, Path]]:
-    """(update, onnx) for every `stride`-th checkpoint, endpoints included."""
+def checkpoints(
+    run: Path, stride: int, window: tuple[int, int] | None = None
+) -> list[tuple[int, Path]]:
+    """(update, onnx) for every `stride`-th checkpoint, endpoints included.
+
+    `window` restricts to an inclusive update range before the stride applies,
+    so the last checkpoint kept is the last one *in the window* rather than the
+    run's final model.
+    """
     found = []
     for directory in sorted((run / "updates").glob("update-*")):
         onnx = directory / "candidate.onnx"
@@ -58,6 +75,12 @@ def checkpoints(run: Path, stride: int) -> list[tuple[int, Path]]:
             found.append((int(directory.name.split("-")[1]), onnx))
     if not found:
         raise SystemExit(f"no checkpoints under {run}")
+    if window is not None:
+        low, high = window
+        found = [c for c in found if low <= c[0] <= high]
+        if not found:
+            raise SystemExit(
+                f"no checkpoints under {run} within updates {low}-{high}")
     picked = [c for c in found if c[0] % stride == 0]
     if found[-1] not in picked:
         picked.append(found[-1])
@@ -220,8 +243,8 @@ def rounds(pool: list, per_checkpoint: int, field: int, rng: random.Random):
     return out
 
 
-def parse_run(spec: str, default: int) -> tuple[Path, int]:
-    """`path` or `path:stride`, defaulting to --stride.
+def parse_run(spec: str, default: int) -> tuple[Path, int, tuple[int, int] | None]:
+    """`path`, `path:stride`, or `path:stride:low-high`, defaulting to --stride.
 
     The run under test and the ladder it is measured against want different
     densities. A new arm needs every checkpoint -- its shape is the question --
@@ -229,11 +252,36 @@ def parse_run(spec: str, default: int) -> tuple[Path, int]:
     connect the graph, so rating it densely spends games re-deriving a curve
     that is already known. One global stride forces the two together and makes
     the field several times larger than the question needs.
+
+    The range narrows that further. Measuring a continuation against its parent
+    only needs the parent's *tail*: those are the checkpoints it has to beat,
+    and they are already densely rated, so they connect the new games to the
+    existing scale for free. The parent's early checkpoints are hundreds of Elo
+    below the whole field and every game against one is close to decided, which
+    is the pairing that carries the least information.
+
+    Either half may be left open: `:3:45-` takes update 45 onward.
     """
-    head, separator, tail = spec.rpartition(":")
-    if separator and head and tail.isdigit():
-        return Path(head), int(tail)
-    return Path(spec), default
+    parts = spec.split(":")
+    if len(parts) > 3:
+        raise SystemExit(f"cannot parse run spec {spec!r}: "
+                         "expected path[:stride[:low-high]]")
+    stride, window = default, None
+    if len(parts) > 1 and parts[1]:
+        if not parts[1].isdigit() or int(parts[1]) < 1:
+            raise SystemExit(f"stride in {spec!r} must be a positive integer")
+        stride = int(parts[1])
+    if len(parts) > 2 and parts[2]:
+        bounds = re.fullmatch(r"(\d*)-(\d*)", parts[2])
+        if not bounds or not (bounds.group(1) or bounds.group(2)):
+            raise SystemExit(f"range in {spec!r} must be low-high, "
+                             "either side optional")
+        low = int(bounds.group(1)) if bounds.group(1) else 0
+        high = int(bounds.group(2)) if bounds.group(2) else sys.maxsize
+        if low > high:
+            raise SystemExit(f"range in {spec!r} is empty: {low} > {high}")
+        window = (low, high)
+    return Path(parts[0]), stride, window
 
 
 def main() -> None:
@@ -275,6 +323,19 @@ def main() -> None:
                              "~9 positions against a 64 batch. Concurrent "
                              "rounds give the card independent request "
                              "streams without changing the schedule.")
+    parser.add_argument("--komi", type=float, default=0.104,
+                        help="komi every game is played at. 0.104 is the "
+                             "current balance point, measured under a narrow "
+                             "komi range; it was 0.034 before 2026-08-16, and "
+                             "by then the 50%% crossing had moved to +0.104, so "
+                             "a game at 0.034 went about 80-20 to Black before a "
+                             "stone was placed. Colours swap within a pairing so "
+                             "that biased nothing, but it wasted most of the "
+                             "information in every game. RESUMING an existing "
+                             "curve requires the value it started with -- pass "
+                             "--komi 0.034 for anything begun before that date, "
+                             "or its finished rounds and its new ones are two "
+                             "different games in one fit.")
     parser.add_argument("--maximum-plies", type=int, default=105)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=414)
@@ -286,8 +347,8 @@ def main() -> None:
     root = Path(__file__).resolve().parents[1]
     selected = [parse_run(spec, arguments.stride) for spec in arguments.runs]
     pool = []
-    for run, stride in selected:
-        for version, onnx in checkpoints(run, stride):
+    for run, stride, window in selected:
+        for version, onnx in checkpoints(run, stride, window):
             pool.append((run.name, version, onnx))
     # Export maximums describe what a model *can* accept, not what TensorRT
     # will allocate or execute. Keep the requested serving batch independent,
@@ -353,9 +414,12 @@ def main() -> None:
 
     total = sum(games_in(i) for i in range(len(schedule)))
     print(f"pool     : {len(pool)} checkpoints over {len(selected)} runs")
-    for run, stride in selected:
+    for run, stride, window in selected:
         taken = sum(1 for name, _, _ in pool if name == run.name)
-        print(f"           {run.name}: {taken} at stride {stride}")
+        span = "" if window is None else (
+            f", updates {window[0]}-"
+            + ("" if window[1] == sys.maxsize else str(window[1])))
+        print(f"           {run.name}: {taken} at stride {stride}{span}")
     print(f"schedule : {len(schedule)} rounds, {len(with_naive)} with naive, "
           f"{total} games")
     export_ceiling = min(exported_batches.values(),
@@ -413,7 +477,8 @@ def main() -> None:
                    "--coarse-pool", "16", "--leaf-batch", "4",
                    "--maximum-batch", str(maximum_batch), "--delay-ms", "1",
                    "--resolution", "128", "--policy-resolution", "128",
-                   "--radius", "0.055714285714285716", "--komi", "0.034",
+                   "--radius", "0.055714285714285716",
+                   "--komi", str(arguments.komi),
                    "--provider", "tensorrt",
                    "--cache-directory", str(root / "artifacts/onnx-cache"),
                    "--seed", str(arguments.seed + index)]

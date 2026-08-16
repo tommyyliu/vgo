@@ -37,8 +37,19 @@ COLORS = {
     "shard-sweep-10000": ("Muon 10.7k/shard", "--c3"),
     "shard-sweep-5000": ("Muon 5.8k/shard", "--c4"),
     "shard-sweep-15000": ("Muon 15.7k/shard", "--c5"),
+    # A new run takes the next free slot rather than being inserted next to the
+    # run it continues. Colour follows the entity: shifting the sweeps down a
+    # slot to make room would repaint four curves that have not changed, and
+    # every earlier copy of this page would disagree with this one.
+    # Kept short: this name is also the direct end-label, and the right margin
+    # only fits about 19 characters before it runs off the plot.
+    "ddrnet-attn-komi": ("Adam 5.1k + komi", "--c6"),
 }
 _UPDATE = re.compile(r"update-(\d+)")
+# Same lineage source as rate-checkpoints.py: --initial-checkpoint is what
+# actually determined the parent, so it is read from the launch script rather
+# than from pipeline state, which only records where training resumed.
+_LINEAGE = re.compile(r'--initial-checkpoint\s+"?\$?\{?root\}?/?([^"\s]+)')
 
 
 def cumulative_samples(run: str) -> dict[int, int]:
@@ -56,6 +67,36 @@ def cumulative_samples(run: str) -> dict[int, int]:
                 pass
         out[index] = total
     return out
+
+
+def continuation(run: str) -> tuple[str, int] | None:
+    """(parent run, parent update) for a warm-started run, from its launch.sh.
+
+    A continuation's update 0 is not a fresh start: it resumes its parent's
+    checkpoint, so on a cumulative-samples axis it belongs where the parent
+    stopped, not at zero. Drawn from zero it lands on top of the parent's first
+    shard and appears to have reached in one update what the parent needed
+    sixty for -- and the join then reads as a collapse of several hundred Elo
+    that never happened.
+
+    Only the sample axis is shifted. The rating itself is measured, not
+    inherited: if the games have not tied the child to the field, the fit
+    leaves it out regardless of what its launch script claims.
+    """
+    launch = _ROOT / "artifacts" / run / "launch.sh"
+    if not launch.exists():
+        return None
+    match = _LINEAGE.search(launch.read_text(encoding="utf-8", errors="replace"))
+    if not match:
+        return None
+    parts = Path(match.group(1)).parts
+    if "updates" not in parts:
+        return None
+    index = parts.index("updates")
+    version = _UPDATE.search(parts[index + 1]) if index + 1 < len(parts) else None
+    if version is None or index == 0:
+        return None
+    return parts[index - 1], int(version.group(1))
 
 
 def records(text: str) -> list[dict]:
@@ -122,6 +163,14 @@ def main() -> None:
                         help="pool only tournaments played at this search "
                              "budget; a model at 1600 simulations is a different "
                              "player from the same model at 800")
+    parser.add_argument("--komi", type=float, default=0.034,
+                        help="pool only tournaments played at this komi. Like "
+                             "the simulation count, a different komi is a "
+                             "different game: the balanced value drifts as the "
+                             "models improve, and it moved from 0.034 to 0.104 "
+                             "on 2026-08-16. Records predating the field are "
+                             "0.034, which is the default so the existing scale "
+                             "keeps building; pass --komi 0.104 for the new one")
     parser.add_argument("--ratings-json", type=Path, default=None,
                         help="also write {run/version: elo}, which dense-curve.py "
                              "reads to band its matchmaking")
@@ -138,7 +187,7 @@ def main() -> None:
 
     sources = arguments.records or sorted(
         (_ROOT / "artifacts").glob("*/records.jsonl"))
-    found, mixed = [], []
+    found, mixed, mixed_komi = [], [], []
     for source in sources:
         if not source.exists() or not source.stat().st_size:
             continue
@@ -157,10 +206,30 @@ def main() -> None:
             mixed.append((source.parent.name, sorted(c for c in counts if c)))
             batch = [r for r in batch
                      if r.get("simulations") in (None, arguments.simulations)]
+        # Same treatment for komi, and for the same reason. A record without the
+        # field predates 2026-08-15 and was played at 0.034 by construction, so
+        # it matches only when that is what was asked for.
+        komis = {r.get("komi") for r in batch}
+        wanted = {k for k in komis
+                  if k is not None and abs(k - arguments.komi) < 1e-9}
+        if komis - wanted - ({None} if abs(arguments.komi - 0.034) < 1e-9 else set()):
+            off = sorted({k for k in komis if k is not None} - wanted)
+            if None in komis and abs(arguments.komi - 0.034) >= 1e-9:
+                off = ["0.034 (unrecorded)"] + [str(k) for k in off]
+            mixed_komi.append((source.parent.name, off))
+            batch = [
+                r for r in batch
+                if (r.get("komi") is not None
+                    and abs(r["komi"] - arguments.komi) < 1e-9)
+                or (r.get("komi") is None and abs(arguments.komi - 0.034) < 1e-9)
+            ]
         found += batch
     if mixed:
         print("skipped, different search budget: "
               + ", ".join(f"{n} ({c})" for n, c in mixed))
+    if mixed_komi:
+        print(f"skipped, not komi {arguments.komi}: "
+              + ", ".join(f"{n} ({c})" for n, c in mixed_komi))
     if not found:
         raise SystemExit("no records yet")
 
@@ -218,6 +287,23 @@ def main() -> None:
 
     inverse = {i: k for k, i in index.items()}
     samples = {run: cumulative_samples(run) for run in COLORS}
+    # Shift every continuation onto its parent's axis, so the pair reads as one
+    # training history rather than two runs that happen to share a chart.
+    offsets: dict[str, int] = {}
+    lineage: dict[str, dict] = {}
+    for run in COLORS:
+        parent = continuation(run)
+        if parent is None:
+            continue
+        name, version = parent
+        parent_samples = samples.get(name) or cumulative_samples(name)
+        if version not in parent_samples:
+            print(f"warning: {run} continues {name} v{version}, which has no "
+                  f"generation log; drawing it from zero", file=sys.stderr)
+            continue
+        offsets[run] = parent_samples[version]
+        lineage[run] = {"parent": name, "version": version,
+                        "offset": parent_samples[version]}
     series: dict[str, list] = {run: [] for run in COLORS}
     for identifier, elo in ratings.items():
         run, version = keys[inverse[identifier]]
@@ -225,8 +311,9 @@ def main() -> None:
             continue
         played = sum(m["a_wins"] + m["b_wins"] + m["draws"] for m in kept
                      if identifier in (m["a"], m["b"]))
+        own = samples[run].get(version)
         series[run].append({"v": version,
-                            "n": samples[run].get(version, 0),
+                            "n": 0 if own is None else own + offsets.get(run, 0),
                             "elo": elo, "se": errors.get(identifier, 0.0),
                             "games": played})
     for run in series:
@@ -236,6 +323,7 @@ def main() -> None:
         "series": {run: series[run] for run in COLORS if series[run]},
         "names": {run: COLORS[run][0] for run in COLORS},
         "vars": {run: COLORS[run][1] for run in COLORS},
+        "continues": lineage,
         "rated": len(ratings),
         "pool": len(keys),
         "games": sum(m["a_wins"] + m["b_wins"] + m["draws"] for m in kept),

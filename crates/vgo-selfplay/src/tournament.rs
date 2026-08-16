@@ -153,7 +153,7 @@ impl Tally {
 /// Flushing matters more than it looks: stdout is a pipe to a file here, so a
 /// buffered record is not on disk, and the whole point of writing early is that
 /// a run which dies partway still leaves usable results behind.
-fn emit(first: &str, second: &str, tally: &Tally, simulations: u32) {
+fn emit(first: &str, second: &str, tally: &Tally, simulations: u32, komi: f64) {
     let decided = tally.decided();
     let score = if decided > 0 {
         (tally.first_wins as f64 + 0.5 * tally.draws as f64) / decided as f64
@@ -177,7 +177,17 @@ fn emit(first: &str, second: &str, tally: &Tally, simulations: u32) {
             // Ratings from different search budgets are ratings of different
             // players, so anything pooling records has to be able to tell them
             // apart. Readers that do not know the field ignore it.
-            "  \"simulations\": {}\n",
+            "  \"simulations\": {},\n",
+            // Komi is the same kind of hazard and was not recorded until
+            // 2026-08-16, when the tournament value moved from 0.034 to 0.104.
+            // 0.034 was the balanced value once; by then the 50% crossing had
+            // moved to +0.104 and a game at 0.034 was going roughly 80-20 to
+            // Black before a stone was placed. Colours swap within a pairing so
+            // that biases nothing, but it costs most of the information in
+            // every game, and pooling two komis into one Elo scale compares
+            // players at two different games. Records without the field are
+            // 0.034 by construction: nothing else was ever played.
+            "  \"komi\": {:.6}\n",
             "}}"
         ),
         first,
@@ -189,6 +199,7 @@ fn emit(first: &str, second: &str, tally: &Tally, simulations: u32) {
         tally.draws,
         score,
         simulations,
+        komi,
     );
     let _ = out.flush();
 }
@@ -419,6 +430,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &labels[second],
                             tally,
                             arguments.simulations,
+                            arguments.komi,
                         );
                     }
                 }

@@ -25,33 +25,41 @@ use clap::Parser;
 use vgo_core::{Color, Position, Stone};
 use vgo_inference::{
     BatchContract, BatchService, BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, InferenceInput,
+    OnnxBatchService, OnnxProvider, OnnxServiceConfig,
     InferenceOutput, InferenceStageMetrics,
 };
 use vgo_raster::{RasterConfig, RasterKind, rasterize};
 use vgo_search::{EvaluationError, Evaluator};
 
 const REPLAY_HEADER_BYTES: usize = 32;
-const REPLAY_VERSION: u32 = 5;
+// Versions whose *position prefix* this understands. The prefix -- radius,
+// komi, to-move, stone count, then STONE_CAPACITY fixed-size stones -- is
+// identical in v5 and v6; only the trailing policy and scalar section changed,
+// and this benchmark never reads it. The constant was duplicated from
+// replay_stream.rs and then drifted, so shards became unreadable here the day
+// the format moved; deriving the stride from the file instead of asserting one
+// is what stops that recurring.
+const READABLE_REPLAY_VERSIONS: [u32; 2] = [5, 6];
 const STONE_CAPACITY: usize = 128;
 const STONE_BYTES: usize = 8 + 8 + 1;
-const POLICY_CAPACITY: usize = 64;
-const POLICY_ENTRY_BYTES: usize = 5 * 4;
-const TRAILING_SCALAR_BYTES: usize = 4 + 4 + 8 + 4 + 8;
-const REPLAY_V5_STRIDE: usize = 8
-    + 8
-    + 1
-    + 4
-    + 1
-    + 4
-    + STONE_CAPACITY * STONE_BYTES
-    + 4
-    + POLICY_CAPACITY * POLICY_ENTRY_BYTES
-    + TRAILING_SCALAR_BYTES;
+/// The position prefix every readable version shares: radius, komi, to-move,
+/// two counts, and STONE_CAPACITY fixed-size stones.
+const REPLAY_POSITION_BYTES: usize = 8 + 8 + 1 + 4 + 1 + 4 + STONE_CAPACITY * STONE_BYTES;
 
 #[derive(Clone, Debug, Parser)]
 #[command(about = "Measure multithreaded CPU capacity for feeding inference")]
 struct Config {
-    /// Replay-v5 dataset whose real positions form the untimed fixture corpus.
+    /// ONNX model to run for real inference. Omit to use the fake packing
+    /// backend, which isolates the host feed path.
+    #[arg(long)]
+    model: Option<PathBuf>,
+    /// Policy grid the model was exported with. Only used with --model.
+    #[arg(long, default_value_t = 128)]
+    policy_resolution: usize,
+    /// TensorRT engine cache, shared with the rest of the project.
+    #[arg(long, default_value = "artifacts/onnx-cache")]
+    cache_directory: PathBuf,
+    /// Replay dataset whose real positions form the untimed fixture corpus.
     #[arg(long)]
     dataset: PathBuf,
     /// Producer thread counts to benchmark.
@@ -195,10 +203,14 @@ fn load_positions(path: &Path) -> io::Result<Vec<Position>> {
         ));
     }
     let version = read_u32(&bytes, 8)?;
-    if version != REPLAY_VERSION {
+    if !READABLE_REPLAY_VERSIONS.contains(&version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("expected replay version {REPLAY_VERSION}, found {version}"),
+            format!(
+                "replay version {version} is not one this benchmark can read \
+                 ({READABLE_REPLAY_VERSIONS:?}); check whether its position \
+                 prefix still matches"
+            ),
         ));
     }
     let samples = read_u32(&bytes, 12)? as usize;
@@ -210,10 +222,11 @@ fn load_positions(path: &Path) -> io::Result<Vec<Position>> {
     }
     let stride = (bytes.len() - REPLAY_HEADER_BYTES) / samples;
     let stones_offset = 8 + 8 + 1 + 4 + 1 + 4;
-    if stride != REPLAY_V5_STRIDE {
+    // Only the prefix is read, so a longer record is fine; a shorter one is not.
+    if stride < REPLAY_POSITION_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("expected replay-v5 record stride {REPLAY_V5_STRIDE}, found {stride}"),
+            format!("record stride {stride} is shorter than the {REPLAY_POSITION_BYTES}-byte position prefix"),
         ));
     }
 
@@ -348,24 +361,47 @@ fn build_pool(
     raster: RasterConfig,
     maximum_batch: usize,
     maximum_delay: Duration,
+    model: Option<&Path>,
+    policy_resolution: usize,
+    cache_directory: &Path,
 ) -> BatchedEvaluatorPool {
+    let broker = BrokerConfig {
+        maximum_delay,
+        queue_capacity: (callers * 4).max(maximum_batch * 2),
+    };
+    // With --model the fake packing backend is replaced by the real ONNX one,
+    // so the measurement includes device transfer and inference. Without it the
+    // benchmark isolates the host feed path, which is the original purpose.
+    if let Some(model) = model {
+        let services = (0..lanes)
+            .map(|_| {
+                OnnxBatchService::load(&OnnxServiceConfig {
+                    model: model.to_path_buf(),
+                    raster,
+                    policy: Some(RasterConfig::square(policy_resolution)),
+                    maximum_batch,
+                    provider: OnnxProvider::TensorRt,
+                    device_id: 0,
+                    fp16: true,
+                    cache_directory: cache_directory.to_path_buf(),
+                })
+                .expect("load ONNX model")
+            })
+            .collect();
+        return BatchedEvaluatorPool::spawn(broker, services)
+            .expect("start shared inference broker");
+    }
     let services = (0..lanes)
         .map(|_| PackingService::new(raster, maximum_batch))
         .collect();
-    BatchedEvaluatorPool::spawn(
-        BrokerConfig {
-            maximum_delay,
-            queue_capacity: (callers * 4).max(maximum_batch * 2),
-        },
-        services,
-    )
-    .expect("start shared packing broker")
+    BatchedEvaluatorPool::spawn(broker, services).expect("start shared packing broker")
 }
 
 fn metrics_delta(after: BrokerMetrics, before: BrokerMetrics) -> BrokerMetrics {
     after.delta_since(before)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_host_sample(
     groups: &[Vec<Position>],
     raster: RasterConfig,
@@ -374,6 +410,9 @@ fn run_host_sample(
     maximum_batch: usize,
     maximum_delay: Duration,
     duration: Duration,
+    model: Option<&Path>,
+    policy_resolution: usize,
+    cache_directory: &Path,
 ) -> HostSample {
     let pool = Arc::new(build_pool(
         lanes,
@@ -381,6 +420,9 @@ fn run_host_sample(
         raster,
         maximum_batch,
         maximum_delay,
+        model,
+        policy_resolution,
+        cache_directory,
     ));
     let warm_positions = groups
         .iter()
@@ -674,6 +716,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.batch,
                 maximum_delay,
                 duration,
+                config.model.as_deref(),
+                config.policy_resolution,
+                &config.cache_directory,
             ));
         }
         results.push(summarize(threads, &raster_samples, &host_samples));
