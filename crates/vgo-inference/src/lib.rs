@@ -28,7 +28,7 @@ use std::{
 };
 
 use vgo_core::Position;
-use vgo_raster::{RasterConfig, action_pixel, rasterize};
+use vgo_raster::{DensePolicy, RasterConfig, action_pixel, rasterize};
 use vgo_search::{Action, Evaluation, EvaluationError, Evaluator, FineGrid, Policy};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -564,10 +564,7 @@ impl BatchedEvaluator {
                 let (_, current_value, policy) = output.into_parts();
                 Ok(Evaluation::new(
                     current_value,
-                    Box::new(DensePolicy {
-                        config: self.inner.contract.policy,
-                        logits: policy,
-                    }),
+                    Box::new(DensePolicy::new(self.inner.contract.policy, policy)),
                 ))
             })
             .collect()
@@ -771,10 +768,7 @@ impl BatchedEvaluatorPool {
                 let (_, current_value, policy) = output.into_parts();
                 Ok(Evaluation::new(
                     current_value,
-                    Box::new(DensePolicy {
-                        config: self.inner.contract.policy,
-                        logits: policy,
-                    }),
+                    Box::new(DensePolicy::new(self.inner.contract.policy, policy)),
                 ))
             })
             .collect()
@@ -793,35 +787,6 @@ impl Evaluator for BatchedEvaluatorPool {
 
     fn evaluate_batch(&self, positions: &[Position]) -> Result<Vec<Evaluation>, EvaluationError> {
         self.evaluate_positions(positions)
-    }
-}
-
-struct DensePolicy {
-    /// Placement grid the logits are laid out on. This is the policy grid, which
-    /// may be coarser than the rendered raster.
-    config: RasterConfig,
-    logits: Vec<f32>,
-}
-
-impl Policy for DensePolicy {
-    fn logit(&self, action: Action) -> f64 {
-        let index = match action {
-            Action::Pass => self.config.pixels(),
-            Action::Place(point) => action_pixel(point.x, point.y, self.config),
-        };
-        f64::from(self.logits[index])
-    }
-
-    fn fine_grid(&self, position: &vgo_core::Position, coarse: usize) -> Option<FineGrid> {
-        let width = self.config.width;
-        let height = self.config.height;
-        Some(FineGrid::build(
-            position,
-            width,
-            height,
-            coarse,
-            |row, col| self.logits[row * width + col],
-        ))
     }
 }
 

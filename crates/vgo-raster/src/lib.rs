@@ -2,6 +2,34 @@
 
 use vgo_core::{Color, Position, SettledRegion, legal_set_vertices};
 
+#[cfg(feature = "gpu")]
+mod gpu;
+#[cfg(feature = "gpu")]
+pub use gpu::settled_mask_gpu;
+
+mod edt;
+mod policy;
+pub use policy::DensePolicy;
+pub use edt::{settled_mask_by_bounded_distance, settled_mask_by_distance};
+
+/// Stone count above which the distance-transform settled mask is worth its
+/// fixed cost. Measured crossover sits between 14 and 28 stones.
+#[cfg(feature = "distance-settled")]
+const DISTANCE_SETTLED_MINIMUM_STONES: usize = 20;
+
+/// Grid cells per stone radius below which the distance-transform mask is not
+/// trustworthy.
+///
+/// Its bound assumes the sampled legal set resolves the real one, and the legal
+/// set between densely packed stones is a sliver a couple of cells wide. Coarsen
+/// the grid and those slivers fall between samples entirely: measured on the
+/// same fixture at r = 1/18, a 128² raster (7.11 cells per radius) disagreed
+/// with the definition on 0 pixels, while a 48² raster (2.67) disagreed on
+/// **9.16%**. Six is chosen between those two points with margin toward the
+/// safe side; it is calibrated, not derived.
+#[cfg(feature = "distance-settled")]
+const DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS: f64 = 6.0;
+
 pub const CHANNEL_COUNT: usize = 12;
 
 /// Channels written by [`rasterize_rgb_into`]: red, green, blue.
@@ -188,6 +216,17 @@ pub struct SemanticRaster {
 }
 
 impl SemanticRaster {
+    /// Wraps caller-owned channel-first data.
+    ///
+    /// For callers that produced the planes themselves — the CUDA path computes
+    /// `settled` on the device and fills the rest here, so it has the buffer
+    /// before it has a `SemanticRaster`.
+    #[must_use]
+    pub fn from_parts(config: RasterConfig, data: Vec<f32>) -> Self {
+        assert_eq!(data.len(), config.channels() * config.pixels());
+        Self { config, data }
+    }
+
     #[must_use]
     pub const fn config(&self) -> RasterConfig {
         self.config
@@ -287,11 +326,64 @@ pub fn rasterize_any_into(position: &Position, config: RasterConfig, data: &mut 
 /// This shares the semantic raster's geometry helpers but writes only the five
 /// requested planes. In particular, it does not allocate, render, and copy a
 /// twelve-plane temporary for every inference position.
+/// The `settled` channel, from whichever implementation is configured.
+///
+/// Every writer goes through here so the compact and semantic rasters cannot
+/// disagree on it — which is exactly what broke when only the compact writer
+/// was switched: `compact_is_a_subset_of_the_semantic_raster` failed, correctly.
+#[must_use]
+pub fn settled_for_raster(position: &Position, config: RasterConfig) -> Vec<bool> {
+    // Dispatch on stone count. The distance-transform form pays a fixed
+    // O(pixels) cost and wins only once the per-stone solve's O(n²) exceeds it:
+    // measured 0.5x at 14 stones, 2.8x at 28, 7.2x at 52. Real shards are not
+    // all late-game -- the corpus this was tuned against runs min 0, mean 26.2
+    // stones -- so always taking it gave back a third of the gain on early
+    // positions.
+    #[cfg(feature = "distance-settled")]
+    {
+        let cells_per_radius =
+            config.width.min(config.height) as f64 * position.radius();
+        if position.stones().len() >= DISTANCE_SETTLED_MINIMUM_STONES
+            && cells_per_radius >= DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS
+        {
+            return edt::settled_mask_by_bounded_distance(position, config, 1).0;
+        }
+    }
+    settled_mask(position, config)
+}
+
 pub fn rasterize_compact_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
+    // `distance-settled` swaps the O(pixels·n²) per-stone solve for the
+    // distance-transform formulation in edt.rs: 2.8x at the median stone count
+    // and 7.2x at the maximum, agreeing with the definition on every fixture
+    // tested while the default disagrees on one or two pixels of 16384. Behind
+    // a feature because it changes a network input, so it wants an A/B on real
+    // shards before it becomes the default.
+    let settled = settled_for_raster(position, config);
+    rasterize_compact_with_settled_into(position, config, &settled, data);
+}
+
+/// The compact raster with `settled` supplied rather than computed.
+///
+/// Split out because `settled` is 92% of this function's cost at the median
+/// stone count and scales as O(n²), while the other four channels are per-pixel
+/// work over the stone list. That asymmetry means the two want different
+/// hardware: `vgo-raster-cuda` computes settled for a whole batch in one launch
+/// and hands the masks here.
+///
+/// The mask must be `config.pixels()` long and indexed row-major, exactly as
+/// [`settled_mask`] returns it.
+pub fn rasterize_compact_with_settled_into(
+    position: &Position,
+    config: RasterConfig,
+    settled: &[bool],
+    data: &mut [f32],
+) {
     assert!(config.width > 0 && config.height > 0);
     assert!(position.validate().is_playable());
     let pixels = config.pixels();
     assert_eq!(data.len(), COMPACT_CHANNELS.len() * pixels);
+    assert_eq!(settled.len(), pixels);
     let radius = position.radius();
     let radius_square = radius * radius;
     let to_move = position.to_move();
@@ -299,7 +391,6 @@ pub fn rasterize_compact_into(position: &Position, config: RasterConfig, data: &
         Color::Black => position.komi() as f32,
         Color::White => -position.komi() as f32,
     };
-    let settled = settled_mask(position, config);
     let (current_stones, opponent_stones) = relative_stones(position, to_move);
 
     // Komi is constant over the board, so write its plane once rather than in
@@ -390,6 +481,92 @@ pub fn rasterize_compact_into(position: &Position, config: RasterConfig, data: &
     }
 }
 
+/// The compact raster as `compact.wgsl` computes it: f32 throughout.
+///
+/// `rasterize_compact_into` is authoritative and works in f64. WGSL has no f64,
+/// so the shader is a deliberate narrowing, and this function is the same
+/// arithmetic in the same order so the cost of that narrowing can be measured
+/// on the host. It is not a second implementation of the raster -- it exists to
+/// be compared against the f64 writer, and `compact.wgsl` must be kept in step
+/// with it. See docs/CLIENT_BOT.md.
+///
+/// `settled` is taken as a caller-supplied mask rather than recomputed: on the
+/// GPU that channel is uploaded, because its cost is per-stone contour geometry
+/// rather than per-pixel work and it does not belong in a pixel shader.
+pub fn rasterize_compact_shader_reference_into(
+    position: &Position,
+    config: RasterConfig,
+    settled: &[bool],
+    data: &mut [f32],
+) {
+    assert!(config.width > 0 && config.height > 0);
+    let pixels = config.pixels();
+    assert_eq!(data.len(), COMPACT_CHANNELS.len() * pixels);
+    assert_eq!(settled.len(), pixels);
+
+    // Matches `const NONE` in compact.wgsl: coordinates are normalised, so the
+    // largest real squared distance is 2 and any sentinel far above it reads as
+    // "no stone seen yet".
+    const NONE: f32 = 1.0e30;
+
+    let radius = position.radius() as f32;
+    let radius_square = radius * radius;
+    let to_move = position.to_move();
+    let mover_komi = match to_move {
+        Color::Black => position.komi() as f32,
+        Color::White => -(position.komi() as f32),
+    };
+    let (current_stones, opponent_stones) = relative_stones(position, to_move);
+
+    for row in 0..config.height {
+        let y = (row as f32 + 0.5) / config.height as f32;
+        for column in 0..config.width {
+            let x = (column as f32 + 0.5) / config.width as f32;
+            let pixel = row * config.width + column;
+
+            let mut current_square = NONE;
+            let mut opponent_square = NONE;
+            let mut nearest_square = NONE;
+            let mut second_square = NONE;
+
+            for &(stone_x, stone_y) in &current_stones {
+                let dx = x - stone_x as f32;
+                let dy = y - stone_y as f32;
+                let square = dx * dx + dy * dy;
+                current_square = current_square.min(square);
+                if square < nearest_square {
+                    second_square = nearest_square;
+                    nearest_square = square;
+                } else if square < second_square {
+                    second_square = square;
+                }
+            }
+            for &(stone_x, stone_y) in &opponent_stones {
+                let dx = x - stone_x as f32;
+                let dy = y - stone_y as f32;
+                let square = dx * dx + dy * dy;
+                opponent_square = opponent_square.min(square);
+                if square < nearest_square {
+                    second_square = nearest_square;
+                    nearest_square = square;
+                } else if square < second_square {
+                    second_square = square;
+                }
+            }
+
+            data[pixel] = f32::from(current_square <= radius_square);
+            data[pixels + pixel] = f32::from(opponent_square <= radius_square);
+            data[2 * pixels + pixel] = if second_square < NONE {
+                (1.0 - (second_square.sqrt() - nearest_square.sqrt()) / radius).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            data[3 * pixels + pixel] = f32::from(settled[pixel]);
+            data[4 * pixels + pixel] = mover_komi;
+        }
+    }
+}
+
 /// Writes a semantic raster into caller-owned contiguous channel-first storage.
 ///
 /// Reusable or pinned inference buffers can use this entry point to avoid an
@@ -432,7 +609,9 @@ pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32
     // solve instead costs 573k solves at 35 stones against the contour's ~20k
     // ray evaluations -- 29x more work, and it measured 239 ms against the
     // whole rest of the raster's 0.5 ms.
-    let settled_mask = settled_mask(position, config);
+    // Same source as the compact writer, or the two disagree on channel 10
+    // and `compact_is_a_subset_of_the_semantic_raster` fails -- correctly.
+    let settled_mask = settled_for_raster(position, config);
     let (current_stones, opponent_stones) = relative_stones(position, to_move);
 
     for row in 0..config.height {
@@ -509,7 +688,14 @@ pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32
     }
 }
 
-fn settled_mask(position: &Position, config: RasterConfig) -> Vec<bool> {
+/// The `settled` channel as a mask, for callers that render the other channels
+/// themselves.
+///
+/// Public because the GPU path needs it: `compact.wgsl` computes the four
+/// per-pixel channels from the stone list, but this one is per-stone contour
+/// geometry scanline-filled, which is not pixel-shader work. The host computes
+/// it and uploads 64 KB rather than the 327 KB whole tensor.
+pub fn settled_mask(position: &Position, config: RasterConfig) -> Vec<bool> {
     let pixels = config.pixels();
     let stones = position.stones();
     let known_vertices = legal_set_vertices(position);
@@ -845,7 +1031,8 @@ mod tests {
 
     use super::{
         CHANNEL_COUNT, CHANNELS, COMPACT_CHANNELS, RGB_CHANNEL_COUNT, RasterConfig, RasterKind,
-        action_pixel, rasterize, rasterize_into, rasterize_rgb,
+        action_pixel, rasterize, rasterize_compact_into,
+        rasterize_compact_shader_reference_into, rasterize_into, rasterize_rgb, settled_for_raster,
     };
 
     /// The pre-optimization formulation: one `hypot` per (pixel, stone) pair.
@@ -1081,6 +1268,99 @@ mod tests {
 
     /// The direct compact writer must stay bit-for-bit identical to the
     /// semantic planes it names across sparse and dense positions.
+    #[test]
+    fn the_shader_reference_matches_the_f64_writer() {
+        // compact.wgsl computes in f32 because WGSL has no f64. This measures
+        // what that costs against the authoritative writer, over positions
+        // shaped like real ones: the median game carries 28 stones and the
+        // longest 52.
+        //
+        // The two disc channels are threshold tests, so a pixel centre landing
+        // within f32 epsilon of a stone's edge can legitimately fall either
+        // way. Those are counted and required to be vanishingly rare rather
+        // than forbidden -- forbidding them would be pinning luck. The ridge is
+        // continuous and is held to a tolerance.
+        let radius = 0.055_714_285_714_285_716;
+        let config = RasterConfig::square_of(128, RasterKind::Compact);
+        let pixels = config.pixels();
+        let mut state = 0x243f_6a88_85a3_08d3_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+
+        let mut boundary_disagreements = 0usize;
+        let mut worst_ridge = 0.0_f32;
+        let mut compared = 0usize;
+
+        for count in [1usize, 2, 7, 28, 52] {
+            let mut stones = Vec::new();
+            let mut attempts = 0;
+            while stones.len() < count && attempts < 4000 {
+                attempts += 1;
+                let x = 0.06 + next() * 0.88;
+                let y = 0.06 + next() * 0.88;
+                // Stones may not overlap within 2r, which is what the exact
+                // simulator enforces; a fixture that violates it is not a
+                // position the shader will ever see.
+                if stones.iter().any(|s: &Stone| {
+                    let (dx, dy) = (s.x - x, s.y - y);
+                    dx * dx + dy * dy < (2.0 * radius) * (2.0 * radius)
+                }) {
+                    continue;
+                }
+                let colour = if stones.len() % 2 == 0 { Color::Black } else { Color::White };
+                stones.push(Stone::new(x, y, colour));
+            }
+            if stones.len() < count {
+                continue;
+            }
+            let to_move = if count % 2 == 0 { Color::Black } else { Color::White };
+            let position = Position::new(radius, stones, to_move).with_komi(0.104);
+            if !position.validate().is_playable() {
+                continue;
+            }
+
+            let mut exact = vec![0.0_f32; COMPACT_CHANNELS.len() * pixels];
+            rasterize_compact_into(&position, config, &mut exact);
+            let settled = settled_for_raster(&position, config);
+            let mut narrowed = vec![0.0_f32; COMPACT_CHANNELS.len() * pixels];
+            rasterize_compact_shader_reference_into(&position, config, &settled, &mut narrowed);
+
+            compared += 1;
+            for pixel in 0..pixels {
+                for channel in [0usize, 1] {
+                    if exact[channel * pixels + pixel] != narrowed[channel * pixels + pixel] {
+                        boundary_disagreements += 1;
+                    }
+                }
+                let delta = (exact[2 * pixels + pixel] - narrowed[2 * pixels + pixel]).abs();
+                worst_ridge = worst_ridge.max(delta);
+                // settled and komi are copied, not computed, so they must be exact.
+                assert_eq!(exact[3 * pixels + pixel], narrowed[3 * pixels + pixel]);
+                assert_eq!(exact[4 * pixels + pixel], narrowed[4 * pixels + pixel]);
+            }
+        }
+
+        assert!(compared >= 4, "fixture generation failed, only {compared} positions");
+        let total = compared * pixels * 2;
+        assert!(
+            boundary_disagreements * 100_000 < total,
+            "f32 flipped {boundary_disagreements} of {total} disc-channel pixels, \
+             which is more than edge cases"
+        );
+        assert!(
+            worst_ridge < 1.0e-4,
+            "ridge drifted by {worst_ridge} in f32, beyond rounding"
+        );
+        println!(
+            "f32 vs f64 over {compared} positions: {boundary_disagreements}/{total} disc pixels \
+             differ, worst ridge delta {worst_ridge:.3e}"
+        );
+    }
+
     #[test]
     fn compact_is_a_subset_of_the_semantic_raster() {
         for (width, height) in [(48, 48), (63, 47), (128, 128)] {

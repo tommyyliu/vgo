@@ -5,8 +5,33 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# wgpu/WGSL: the browser path (docs/CLIENT_BOT.md).
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
+# Settled channel via distance transforms; see rasterize_compact_into.
+distance-settled = []
+
+
 [dependencies]
 vgo-core = { path = "../vgo-core" }
+vgo-search = { path = "../vgo-search" }
+wgpu = { version = "30.0.0", default-features = false, features = ["std", "wgsl", "vulkan"], optional = true }
+bytemuck = { version = "1.25", optional = true }
+pollster = { version = "0.4", optional = true }
 
 [lib]
 path = "src/lib.rs"
+[[bench]]
+name = "compact"
+path = "benches/compact.rs"
+harness = false
+
+[[example]]
+name = "settled_gpu"
+path = "examples/settled_gpu.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "settled_edt"
+path = "examples/settled_edt.rs"
