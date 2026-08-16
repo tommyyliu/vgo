@@ -15,3 +15,13 @@ __pycache__/
 /client/public/model.onnx
 /client/public/ort*.mjs
 /client/public/ort*.wasm
+
+# Sweep workspace: 1.4 GB of shards, arena records and checkpoints. Its own
+# scripts live alongside them and are not tracked either, because they are
+# scratch for one experiment rather than part of the pipeline.
+/experiments/
+
+# Rendered from ratings.json by scripts/build-dense-curve.py, which is tracked,
+# so following diagnostics/.gitignore: only the scripts are.
+/curve.html
+/nohup.out

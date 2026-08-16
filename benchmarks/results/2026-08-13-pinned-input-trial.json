@@ -1,0 +1,107 @@
+{
+  "schema": "vgo.pinned-input-trial.v1",
+  "date": "2026-08-13",
+  "base_revision": "92951e2af4917039a652f3c95d4b5557c6f8d949",
+  "tree": "Deepseek pinned-input implementation plus allocator lifetime fix, uncommitted",
+  "hardware": {
+    "processor": "AMD Ryzen 9 9950X 16-Core Processor",
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "gpu_memory_mebibytes": 16303,
+    "driver": "610.57.04"
+  },
+  "model": {
+    "path": "artifacts/shard-sweep-15000/updates/update-000030/candidate.onnx",
+    "onnx_sha256": "277a75ef12e31e4b9949478461fd6b19aa855b92c9bf1c9a98f8420fff06c5b7",
+    "raster": "compact-5x128x128",
+    "policy": "128x128",
+    "maximum_batch": 32,
+    "provider": "tensorrt",
+    "fp16": true
+  },
+  "review": {
+    "original_allocator_lifetime": "invalid: the local Allocator was dropped after load while its Tensor remained live",
+    "observed_failure": "intermittent SIGSEGV through a null function pointer during or after inference",
+    "fix": "store Tensor and Allocator together and drop the tensor first",
+    "dynamic_batch_handling": "correct: pinned storage is used only for exact batch 32; partial batches retain the pageable path",
+    "output_binding": "not implemented in this trial"
+  },
+  "isolated_session": {
+    "warmup_batches": 100,
+    "timed_batches_per_sample": 1500,
+    "baseline_milliseconds_per_batch": [2.645528, 2.663256, 2.668826],
+    "pinned_milliseconds_per_batch": [2.755731, 2.759844, 2.761850],
+    "baseline_mean_milliseconds_per_batch": 2.659203,
+    "pinned_mean_milliseconds_per_batch": 2.759142,
+    "pinned_latency_change_percent": 3.758
+  },
+  "broker_lane_benchmark": {
+    "common": {
+      "callers": 64,
+      "leaf_group": 4,
+      "maximum_batch": 32,
+      "delay_milliseconds": 1,
+      "seconds_per_sample": 8
+    },
+    "one_slot": {
+      "baseline_positions_per_second": [10197, 10024],
+      "pinned_positions_per_second": [9842, 9899],
+      "baseline_mean_positions_per_second": 10110.5,
+      "pinned_mean_positions_per_second": 9870.5,
+      "pinned_throughput_change_percent": -2.374,
+      "baseline_mean_input_packing_milliseconds_per_batch": 0.561,
+      "pinned_mean_input_packing_milliseconds_per_batch": 0.624,
+      "baseline_mean_session_run_milliseconds_per_batch": 2.356,
+      "pinned_mean_session_run_milliseconds_per_batch": 2.3795
+    },
+    "two_slots": {
+      "baseline_positions_per_second": [15368, 14648],
+      "pinned_positions_per_second": [11554, 11648],
+      "baseline_mean_positions_per_second": 15008,
+      "pinned_mean_positions_per_second": 11601,
+      "pinned_throughput_change_percent": -22.701,
+      "baseline_mean_input_packing_milliseconds_per_batch": 0.9015,
+      "pinned_mean_input_packing_milliseconds_per_batch": 1.4075,
+      "baseline_mean_session_run_milliseconds_per_batch": 3.015,
+      "pinned_mean_session_run_milliseconds_per_batch": 3.6635
+    }
+  },
+  "paired_generation": {
+    "common": {
+      "target_samples": 96,
+      "completed_games": 14,
+      "generated_samples_at_boundary": 99,
+      "actors": 64,
+      "inference_slots": 2,
+      "leaf_batch": 4,
+      "simulations": 256,
+      "maximum_plies": 20,
+      "coarse_pool": 16,
+      "seed": 8132026
+    },
+    "baseline": {
+      "wall_seconds": 6.866224,
+      "positions": 101222,
+      "batches": 3167,
+      "positions_per_second": 14742.018,
+      "inference_milliseconds_per_batch": 4.266569,
+      "input_packing_milliseconds_per_batch": 0.950966,
+      "session_run_milliseconds_per_batch": 2.985011,
+      "output_materialization_milliseconds_per_batch": 0.329055,
+      "failures": 0
+    },
+    "pinned": {
+      "wall_seconds": 9.008916,
+      "positions": 100979,
+      "batches": 3164,
+      "positions_per_second": 11208.785,
+      "inference_milliseconds_per_batch": 5.623064,
+      "input_packing_milliseconds_per_batch": 1.568887,
+      "session_run_milliseconds_per_batch": 3.674016,
+      "output_materialization_milliseconds_per_batch": 0.378283,
+      "failures": 0
+    },
+    "pinned_throughput_change_percent": -23.967,
+    "pinned_wall_time_change_percent": 31.206
+  },
+  "conclusion": "Do not enable this pinned-input path. It regresses the production two-slot configuration by about 24%; pinned host writes and the ORT session section both get slower under overlap."
+}
