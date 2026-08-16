@@ -42,6 +42,13 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="${1:-$root/artifacts/$(basename "${BASH_SOURCE[0]}" .sh)}"
+# Pin a relative argument to the invoking shell's directory. Everything below
+# until `cd "$root/training"` already resolves it that way; --output would
+# resolve it against training/ instead. `./runs/ddrnet-attn.sh
+# artifacts/ddrnet-fresh-attn` therefore wrote logs and launch.sh into the real
+# run while the pipeline cold-started a second one, from naive, in
+# training/artifacts/ddrnet-fresh-attn.
+case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
 mkdir -p "$out/logs"
 
 # Copy the recipe in beside the run. scripts/rate-checkpoints.py reads
@@ -84,6 +91,5 @@ exec .venv/bin/python3 -m vgo_training.rl_loop \
   --inference-slots "${VGO_SLOTS:-2}" \
   --provider tensorrt --fp16 --warm-inference \
   --overlap-actor-learner --retire-shards \
-  --promotion-arena --promotion-score 0.55 \
   --arena-pairs 8 --arena-simulations 256 \
   --seed 21000001 --arena-seed 21005001

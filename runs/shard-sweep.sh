@@ -23,9 +23,25 @@
 # Inference batch is a serving control rather than an experimental variable;
 # batch 32 was 9.3% faster than 64 in a paired run on this exact model shape.
 #
-# Measured so far, at fixed total data, bigger shards are *worse*: -190 +/- 53
-# Elo (3.6 sigma) against the small-shard arm. This script exists to push the
-# arms further and find out whether that gap closes.
+# On the strength result, corrected 2026-08-14. This header used to claim that
+# at fixed total data bigger shards are worse by -190 +/- 53 Elo (3.6 sigma).
+# Treat that as withdrawn:
+#
+#   * No rating data for the 5k or 10k arms survives anywhere in the repo.
+#     ratings.json and both dense-curve records.jsonl files contain only
+#     ddrnet-fresh-attn, shard-sweep-15000 and naive, and none of the sweep runs
+#     has completed telemetry. The figure cannot be reproduced from what is here.
+#   * The only cross-run pairing with real games (1,456 of them) is
+#     ddrnet-fresh-attn against shard-sweep-15000, which differs in optimizer
+#     (Adam vs Muon) *and* gating (0.55 vs ungated) as well as shard size. At
+#     matched total data that pairing runs -30 to -222 Elo across updates 6-30
+#     and passes through -192 at update 24, which is close enough to -190 to
+#     suspect the original number came from it.
+#   * Read off the curves, the two Muon arms that actually isolate shard size --
+#     5.1k and 10.7k -- overlap substantially, with 5.1k perhaps slightly ahead.
+#
+# So the honest state is: no measured shard-size effect on the Muon arm, and the
+# Adam arm untested. Do not quote a number here without a fit behind it.
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -38,13 +54,22 @@ size="$1"
 # constant because the shard a run actually produced is size, not size-floor,
 # and every comparison between arms depends on that being right.
 #
-# It is actors x mean_plies, so it moves with VGO_ACTORS. At the default 64
-# the 15000 arm's shards came out at 15,710 +/- 50 against a request of 11,480,
-# putting the real floor near 4,230 -- mean plies is closer to 66 than the 55
-# this constant assumed. Do not correct it on a running arm: the number that
-# has to stay fixed is the shard size, and changing either this or --actors
-# mid-run changes it. Raising actors to 80 would add ~1,100 samples a shard,
-# a 7% drift in the one variable the sweep is measuring.
+# It is actors x mean_plies, so it moves with VGO_ACTORS. Measured 2026-08-14
+# from the manifest `samples` of every shard on disk, at the default 64 actors:
+#
+#   arm                request   produced        implied floor
+#   ddrnet-fresh-attn    1,600   5,455 +/- 291   3,855
+#   shard-sweep-10000    6,480  10,248 +/- 354   3,768
+#   shard-sweep-15000   11,480  15,016 +/- 353   3,536
+#
+# 3520 is therefore about right, and this comment's previous correction -- that
+# the 15000 arm produced 15,710 +/- 50, putting the floor near 4,230 at ~66 mean
+# plies -- does not reproduce. Measured mean plies is 52-56 across all three.
+#
+# Do not correct the constant on a running arm regardless: the number that has
+# to stay fixed is the shard size, and changing either this or --actors mid-run
+# changes it. Raising actors to 80 would add ~1,100 samples a shard, a 7% drift
+# in the one variable the sweep is measuring.
 floor=3520
 requested=$(( size - floor ))
 if [ "$requested" -lt 1 ]; then
@@ -53,29 +78,25 @@ if [ "$requested" -lt 1 ]; then
 fi
 
 # Promotion gating. Both arms ran gated at 0.55 through their first twenty-odd
-# updates; VGO_GATE=off continues one ungated, which promotes every candidate.
-# That is allowed on a resume -- see the note beside OPERATIONAL_CONFIG_FIELDS
-# in pipeline.py for why, and for the measurement saying an 8-pair arena cannot
-# tell the two checkpoints apart. Keep the default on so this script still
-# reproduces the gated updates it was used for.
-gate=(--promotion-arena --promotion-score 0.55)
-if [ "${VGO_GATE:-on}" = off ]; then
-  gate=()
-fi
+# updates. The gate was removed from the pipeline on 2026-08-16 -- it rejected
+# roughly a quarter of genuine improvements and stalled the generator on a stale
+# checkpoint for a shard each time it fired -- so resuming either arm now
+# publishes every candidate. VGO_GATE is gone with it; the updates already in
+# those runs were produced gated and their pipeline-state records which.
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="${2:-$root/artifacts/shard-sweep-$size}"
+# Pin a relative argument to the invoking shell's directory; --output would
+# otherwise resolve it against `cd "$root/training"` below and start a second
+# run there. training/artifacts/shard-sweep-15000 is what that looks like.
+case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
 mkdir -p "$out/logs"
 
 install -m 755 "${BASH_SOURCE[0]}" "$out/launch.sh"
 
 exec > >(tee -a "$out/logs/run.log") 2>&1
 echo "=== $(date -Is) starting, output $out, shard ~$size (requested $requested)"
-if [ ${#gate[@]} -eq 0 ]; then
-  echo "=== promotion gate OFF: every candidate becomes the generator"
-else
-  echo "=== promotion gate ON at 0.55 over 8 pairs"
-fi
+echo "=== ungated: every candidate becomes the generator"
 
 cd "$root/training"
 exec .venv/bin/python3 -m vgo_training.rl_loop \

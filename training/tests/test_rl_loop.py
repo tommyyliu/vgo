@@ -54,10 +54,6 @@ class PipelineConfigurationTests(unittest.TestCase):
             PipelineConfig(
                 output="run", maximum_prefetch_shards=-1
             ).validate()
-        with self.assertRaisesRegex(ValueError, "nonzero"):
-            PipelineConfig(output="run", promotion_arena=True).validate()
-        with self.assertRaisesRegex(ValueError, "requires"):
-            PipelineConfig(output="run", promotion_score=0.52).validate()
         with self.assertRaisesRegex(ValueError, "inference slots"):
             PipelineConfig(output="run", inference_slots=0).validate()
         with self.assertRaisesRegex(ValueError, "nonzero initial range"):
@@ -157,19 +153,31 @@ class PipelineConfigurationTests(unittest.TestCase):
             self.assertEqual(durable_state["config_digest"], changed.config_digest)
 
     def test_promotion_gate_can_be_turned_off_on_resume(self) -> None:
-        # A gated run has to be able to continue ungated: an 8-pair arena
-        # cannot separate two neighbouring checkpoints, so the gate is not
-        # worth freezing into run identity. See OPERATIONAL_CONFIG_FIELDS.
+        # A run created while the promotion gate still existed has to resume
+        # now that it is gone. Its stored config carries promotion_arena and
+        # promotion_score; both are in OPERATIONAL_CONFIG_FIELDS, so neither
+        # side of the digest sees them and the run is still recognised.
         with tempfile.TemporaryDirectory() as directory:
-            gated = Pipeline(
-                PipelineConfig(
-                    output=directory, promotion_arena=True, promotion_score=0.55
-                )
+            current = Pipeline(PipelineConfig(output=directory))
+            current._save_state()
+            stored = json.loads(
+                (Path(directory) / "pipeline-config.json").read_text()
             )
-            gated._save_state()
-            ungated = Pipeline(PipelineConfig(output=directory))
+            stored["promotion_arena"] = True
+            stored["promotion_score"] = 0.55
+            # The one that actually broke on removal. promotion_* were already
+            # operational so they never entered a digest, but the truncation
+            # rate was pure identity, so a run stored before the gate was
+            # removed has a digest taken over a field this version does not
+            # have.
+            stored["maximum_truncation_rate"] = 0.02
+            (Path(directory) / "pipeline-config.json").write_text(
+                json.dumps(stored)
+            )
 
-            self.assertEqual(gated.config_digest, ungated.config_digest)
+            resumed = Pipeline(PipelineConfig(output=directory))
+
+            self.assertEqual(current.config_digest, resumed.config_digest)
 
     def test_stale_digest_refreshes_when_identity_still_matches(self) -> None:
         # Widening OPERATIONAL_CONFIG_FIELDS changes the digest of every run
@@ -980,13 +988,6 @@ class PipelineRecoveryTests(unittest.TestCase):
             self.assertEqual(pipeline.state.telemetry_pending, [])
             self.assertEqual(len(pipeline.state.telemetry_completed), 2)
 
-    def test_promotion_rejects_excessive_truncation(self) -> None:
-        arena = {"games": 100, "completed": 50, "candidate_score": 1.0}
-        self.assertFalse(Pipeline._promotion_decision(arena, 0.52, 0.02))
-        arena["completed"] = 99
-        self.assertTrue(Pipeline._promotion_decision(arena, 0.52, 0.02))
-
-
 class ShardRetirementTests(unittest.TestCase):
     def _pipeline(self, directory: str, **overrides: object) -> Pipeline:
         return Pipeline(
@@ -1289,7 +1290,6 @@ class TelemetrySubsetTests(unittest.TestCase):
             checkpoint_sha256=f"checkpoint-{version}",
             onnx_sha256=f"onnx-{version}",
             parent_version=version - 1 if version else None,
-            accepted=True,
         )
 
     def test_every_nth_checkpoint_is_queued(self) -> None:
@@ -1318,6 +1318,129 @@ class TelemetrySubsetTests(unittest.TestCase):
             self.assertEqual(rated, [1, 2, 3])
 
 
+class ArenaKomiTests(unittest.TestCase):
+    def test_arena_is_played_at_the_configured_komi(self) -> None:
+        """vgo-arena defaults to komi 0.0, which is not a balanced game.
+
+        The pipeline never passed --komi until 2026-08-16, so every rating it
+        produced was measured where Black wins about 91% -- and once the komi
+        range narrowed to sigma 0.03, at a komi outside the training
+        distribution entirely. Colour-swapped pairs then split every pairing
+        regardless of strength, so the ratings carried almost no signal.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline(PipelineConfig(output=directory))
+            command = pipeline.arena_command(
+                candidate=Path("/models/candidate.onnx"),
+                opponents=[Path("/models/opponent.onnx")],
+                seed=1,
+                pairs=4,
+            )
+
+        self.assertIn("--komi", command, "arena would fall back to komi 0.0")
+        komi = float(command[command.index("--komi") + 1])
+        self.assertAlmostEqual(komi, 0.104, places=6)
+        self.assertNotEqual(komi, 0.0)
+
+
+class InlineTelemetryTests(unittest.TestCase):
+    """Queued Elo matches must run *during* the loop, not after it.
+
+    They used to drain only on --drain-telemetry once the final update landed,
+    which was survivable while the promotion arena reported on every update.
+    The gate was removed on 2026-08-16 and telemetry became the only strength
+    signal a run emits, at which point deferring it meant a 240-update run
+    produced no measurement for eighty hours while the queue grew. This pins
+    the fix: after the loop, nothing is still pending.
+    """
+
+    def test_pending_telemetry_is_drained_inside_the_loop(self) -> None:
+        class FakeLearner:
+            async def close(self, *, force: bool = False) -> None:
+                del force
+
+        async def exercise(directory: str) -> tuple[dict, list[str]]:
+            pipeline = Pipeline(
+                PipelineConfig(
+                    output=directory,
+                    updates=3,
+                    replay_window=1,
+                    samples_per_shard=1,
+                    telemetry_opponents=1,
+                    telemetry_pairs=1,
+                    telemetry_every=1,
+                )
+            )
+            drained: list[str] = []
+
+            async def generate(
+                _model: ModelArtifact | None, sequence: int | None = None
+            ) -> ReplayArtifact:
+                if sequence is None:
+                    sequence = pipeline.state.next_shard
+                return replay(sequence)
+
+            async def learn(
+                update: int,
+                spec: dict[str, object] | None = None,
+                update_path: Path | None = None,
+            ) -> ModelArtifact:
+                del update_path
+                assert spec is not None
+                parent = pipeline.incumbent
+                model = ModelArtifact(
+                    version=update,
+                    checkpoint=f"/models/{update}.pt",
+                    onnx=f"/models/{update}.onnx",
+                    checkpoint_sha256=f"{update + 1:064x}",
+                    onnx_sha256=f"{update + 2:064x}",
+                    parent_version=None if parent is None else parent.version,
+                )
+                pipeline._commit_publication(
+                    {
+                        "schema": "vgo.pipeline-publication.v1",
+                        "update": update,
+                        "through_shard": int(spec["through_shard"]),
+                        "model": asdict(model),
+                    }
+                )
+                return model
+
+            async def run_pending() -> None:
+                # Stand in for the arena subprocess: record that the loop asked
+                # for a drain, and clear the queue as the real one does.
+                drained.extend(
+                    str(job["id"]) for job in pipeline.state.telemetry_pending
+                )
+                pipeline.state.telemetry_completed.extend(
+                    str(job["id"]) for job in pipeline.state.telemetry_pending
+                )
+                pipeline.state.telemetry_pending = []
+
+            pipeline._generate_shard = generate  # type: ignore[method-assign]
+            pipeline._learn_and_publish = learn  # type: ignore[method-assign]
+            pipeline._run_pending_telemetry = run_pending  # type: ignore[method-assign]
+            with patch(
+                "vgo_training.pipeline.LearnerService.start",
+                new=AsyncMock(return_value=FakeLearner()),
+            ):
+                report = await pipeline.run()
+            return report, drained
+
+        with tempfile.TemporaryDirectory() as directory:
+            report, drained = asyncio.run(exercise(directory))
+
+        self.assertEqual(report["updates_completed"], 3)
+        self.assertTrue(
+            drained, "the loop finished without ever draining queued telemetry"
+        )
+        self.assertEqual(
+            report["telemetry_pending"],
+            0,
+            "telemetry was still queued when the loop ended",
+        )
+
+
 class RunRecipeTest(unittest.TestCase):
     """The recipes in runs/ must only parameterize resume-safe settings.
 
@@ -1328,11 +1451,42 @@ class RunRecipeTest(unittest.TestCase):
     """
 
     def recipes(self) -> list[Path]:
+        """Only the recipes that launch a training run.
+
+        runs/ also holds tournament recipes -- they invoke vgo-tournament or
+        dense-curve.py, have no optimizer, and their VGO_ variables name
+        tournament flags rather than PipelineConfig fields. Both checks below
+        are about resuming a training run, so applying them to a tournament
+        asks a question that has no answer.
+        """
         directory = Path(__file__).resolve().parents[2] / "runs"
-        return sorted(directory.glob("*.sh"))
+        return sorted(
+            path
+            for path in directory.glob("*.sh")
+            if "vgo_training.rl_loop" in path.read_text(encoding="utf-8")
+        )
 
     def test_recipes_exist(self) -> None:
         self.assertTrue(self.recipes(), "runs/ has no recipes; a clone can run nothing")
+
+    def test_tournament_recipes_are_not_mistaken_for_training_runs(self) -> None:
+        # Guards the filter above: if a training recipe ever stopped naming the
+        # module, recipes() would silently drop it and both checks below would
+        # pass by testing nothing.
+        directory = Path(__file__).resolve().parents[2] / "runs"
+        every = sorted(directory.glob("*.sh"))
+        training = self.recipes()
+        self.assertTrue(training, "no training recipes found")
+        self.assertLess(
+            len(training), len(every), "no tournament recipes found; filter untested"
+        )
+        for path in set(every) - set(training):
+            with self.subTest(recipe=path.name):
+                text = path.read_text(encoding="utf-8")
+                self.assertTrue(
+                    "vgo-tournament" in text or "dense-curve.py" in text,
+                    f"{path.name} launches neither the trainer nor a tournament",
+                )
 
     def test_only_operational_fields_are_parameterized(self) -> None:
         for recipe in self.recipes():

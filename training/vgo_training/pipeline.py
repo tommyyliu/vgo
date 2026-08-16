@@ -4,7 +4,7 @@ import argparse
 import asyncio
 from collections.abc import AsyncIterator, Collection, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 import hashlib
 import json
 import math
@@ -56,6 +56,7 @@ OPERATIONAL_CONFIG_FIELDS = {
     "arena_actors",
     "telemetry_opponents",
     "telemetry_pairs",
+    "arena_komi",
     # Neither changes what is learned: one picks which checkpoints get rated,
     # the other is disk housekeeping. Both must be adjustable on a resume.
     "telemetry_every",
@@ -79,29 +80,29 @@ OPERATIONAL_CONFIG_FIELDS = {
     # launch.sh). Freezing the flag would only mean a run cannot adopt fp16
     # without starting over.
     "fp16",
-    # The promotion gate, like fp16, is a judgement rather than an obvious
-    # operational field: turning it off promotes every candidate, and which
-    # checkpoint generates plainly changes the data that follows. Two things
-    # decide it anyway.
+    # Removed on 2026-08-16, kept here because old runs stored them.
     #
-    # The gate is a measurement, and at --arena-pairs 8 it is a measurement
-    # with no power. Across shard-sweep-15000's twenty updates every arena's
-    # 95% interval on the candidate's score contains 0.5 -- not one of them
-    # resolved a difference. Scoring 0.55 over 16 games means winning 9, so
-    # under a candidate that is exactly as strong as the incumbent the gate
-    # promotes 40% of the time, and against one that truly scores 0.6 it
-    # rejects 28% of the time. Freezing that into run identity freezes in a
-    # coin flip; the four rejections at updates 7, 9, 11 and 16 stalled the
-    # generator on a stale checkpoint for an entire shard apiece on that
-    # evidence. Raise --arena-pairs before trusting a gate to mean anything.
+    # The promotion gate is gone: every candidate is now the next incumbent.
+    # It was a measurement with no power that cost real work when it fired.
+    # At --arena-pairs 8, scoring 0.55 over 16 games means winning 9, so a
+    # candidate exactly as strong as the incumbent promoted 40% of the time and
+    # one that truly scored 0.6 was rejected 28% of the time. Across
+    # shard-sweep-15000's twenty updates, every arena's 95% interval on the
+    # candidate's score contained 0.5 -- not one resolved a difference. Because
+    # the incumbent is both the training parent and the generator, each
+    # rejection made the next update retrain from the same checkpoint and
+    # generate another shard from it: ddrnet-attn-komi rejected 60 of 83
+    # overnight, advancing its lineage 23 times in 83 updates.
     #
-    # And the digest is not the only provenance. Every update writes its own
-    # `promotion_arena` block -- null when the gate is off -- alongside
-    # `accepted`, so which regime produced an update is recoverable per
-    # update, which is what the guard is really protecting. What must stay
-    # frozen is anything changing the content of a shard or a gradient:
-    # resolution, komi range, simulations, model shape, optimizer, replay
-    # window. Those are all still here.
+    # A gate that discards roughly a quarter of real improvements, and burns a
+    # shard whenever it does, is worse than no gate. Strength is now measured
+    # after the fact by the telemetry tournaments (--telemetry-every), which
+    # rate checkpoints without deciding anything.
+    #
+    # These two names stay in this set so that a run created while they were
+    # config fields still resumes: the digest is taken over non-operational
+    # fields, and a name absent from the config is simply absent from both
+    # sides of that comparison.
     "promotion_arena",
     "promotion_score",
 }
@@ -113,6 +114,19 @@ HISTORICAL_OPERATIONAL_FIELD_ADDITIONS = (
     frozenset({"inference_batch"}),
     frozenset({"promotion_arena", "promotion_score"}),
     frozenset({"inference_batch", "promotion_arena", "promotion_score"}),
+)
+# Fields that no longer exist. A removed field is the mirror image of a newly
+# operational one: the stored pipeline-config.json still carries it, this
+# version's config cannot, and a run whose digest was taken while it counted
+# toward identity must still resume.
+#
+# `maximum_truncation_rate` is the one that bites. promotion_arena and
+# promotion_score were already operational, so they were never in a digest, but
+# the truncation rate was pure identity -- it existed only to let the promotion
+# gate reject an arena that lost too many games to truncation, and it went with
+# the gate on 2026-08-16.
+REMOVED_CONFIG_FIELDS = frozenset(
+    {"promotion_arena", "promotion_score", "maximum_truncation_rate"}
 )
 
 
@@ -225,6 +239,12 @@ def compatible_config(value: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("komi_target_black_win_rate", 0.5)
     normalized.setdefault("komi_recenter_minimum_games", 256)
     normalized.setdefault("komi_recenter_maximum_step", 0.025)
+    # Drop fields this version no longer has, so a stored config is compared on
+    # the fields both sides actually understand. Bounded to a known list rather
+    # than "anything unrecognised": silently ignoring every unknown key would
+    # let a genuinely foreign config pass the identity check.
+    for removed in REMOVED_CONFIG_FIELDS:
+        normalized.pop(removed, None)
     return normalized
 
 
@@ -323,7 +343,18 @@ class ModelArtifact:
     checkpoint_sha256: str
     onnx_sha256: str
     parent_version: int | None
-    accepted: bool = True
+
+    @classmethod
+    def from_state(cls, value: dict[str, Any]) -> "ModelArtifact":
+        """Build from a stored dict, dropping fields this version no longer has.
+
+        State written before 2026-08-16 carries `accepted`, from the promotion
+        gate. The gate is gone and every model in `models` was accepted by
+        definition, so the key is dropped rather than migrated -- but it must
+        not reach the constructor, or resuming any older run raises TypeError.
+        """
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in value.items() if k in known})
 
     @classmethod
     def from_paths(
@@ -333,7 +364,6 @@ class ModelArtifact:
         checkpoint: Path,
         onnx: Path,
         parent_version: int | None,
-        accepted: bool = True,
     ) -> "ModelArtifact":
         return cls(
             version=version,
@@ -342,7 +372,6 @@ class ModelArtifact:
             checkpoint_sha256=file_sha256(checkpoint),
             onnx_sha256=file_sha256(onnx),
             parent_version=parent_version,
-            accepted=accepted,
         )
 
 
@@ -528,9 +557,6 @@ class PipelineConfig:
     report_every: int = 5
     validation_fraction: float = 0.1
     overlap_actor_learner: bool = True
-    promotion_arena: bool = False
-    promotion_score: float = 0.0
-    maximum_truncation_rate: float = 0.02
     # Concede once the side to move has been losing for resign_window
     # consecutive plies. Zero disables it. This belongs to run identity: it
     # changes which positions reach the shard.
@@ -566,6 +592,22 @@ class PipelineConfig:
     raster_kind: str = "semantic"
     resign_disable_fraction: float = 0.1
     arena_pairs: int = 16
+    # Komi every telemetry game is played at.
+    #
+    # vgo-arena's own default is 0.0, and the pipeline never overrode it, so
+    # every rating this loop produced before 2026-08-16 was measured at a komi
+    # where Black wins about 91% -- P(Black) = sigmoid(2.33 - 24.8*komi) on
+    # ddrnet-deep-komi data. Colour-swapped pairs then return one win each
+    # whatever the players are worth, which compresses every rating toward its
+    # neighbours and buries the signal in noise. With the komi range narrowed to
+    # sigma 0.03 it is worse than off-balance: 0.0 is outside the sampled range
+    # entirely, so the arena rated models on a game they never trained for.
+    #
+    # 0.104 is the measured balance point and also what the tournaments use, so
+    # telemetry Elo and tournament Elo are on one scale. It is deliberately a
+    # constant rather than the controller's live centre: a rating scale that
+    # moves with the thing it is measuring is not a scale.
+    arena_komi: float = 0.104
     arena_simulations: int = 256
     arena_actors: int = 32
     telemetry_opponents: int = 2
@@ -672,10 +714,6 @@ class PipelineConfig:
             raise ValueError("value weight must be nonnegative")
         if not 0.0 <= self.validation_fraction < 1.0:
             raise ValueError("validation fraction must be in [0, 1)")
-        if not 0.0 <= self.maximum_truncation_rate <= 1.0:
-            raise ValueError("maximum truncation rate must be in [0, 1]")
-        if not 0.0 <= self.promotion_score <= 1.0:
-            raise ValueError("promotion score must be in [0, 1]")
         if self.provider not in {"cpu", "cuda", "tensorrt"}:
             raise ValueError(f"unsupported inference provider: {self.provider}")
         if self.inference_device_id < 0:
@@ -692,10 +730,6 @@ class PipelineConfig:
             raise ValueError(
                 "initial checkpoint and initial ONNX model must be supplied together"
             )
-        if self.promotion_arena and self.promotion_score <= 0.0:
-            raise ValueError("a promotion arena requires a nonzero promotion score")
-        if not self.promotion_arena and self.promotion_score != 0.0:
-            raise ValueError("promotion score requires the promotion arena")
 
 
 @dataclass
@@ -1078,6 +1112,11 @@ class Pipeline:
                 # field became operational. Accept only digests produced by
                 # those known historical field sets; an arbitrary mismatch may
                 # be a foreign state file.
+                # `prior` is used as stored, still carrying any removed field,
+                # because that is what the old digest was taken over. The empty
+                # addition set covers a digest written under today's operational
+                # fields but while a since-removed field still counted toward
+                # identity, which is what removing one produces.
                 historical_digests = {
                     canonical_digest(
                         identity_config(
@@ -1085,7 +1124,8 @@ class Pipeline:
                             OPERATIONAL_CONFIG_FIELDS - additions,
                         )
                     )
-                    for additions in HISTORICAL_OPERATIONAL_FIELD_ADDITIONS
+                    for additions in
+                    (frozenset(),) + tuple(HISTORICAL_OPERATIONAL_FIELD_ADDITIONS)
                 }
                 if state.config_digest not in historical_digests:
                     raise ValueError(
@@ -1205,7 +1245,7 @@ class Pipeline:
     def incumbent(self) -> ModelArtifact | None:
         if not self.state.models:
             return None
-        return ModelArtifact(**self.state.models[-1])
+        return ModelArtifact.from_state(self.state.models[-1])
 
     def _rust_command(self, binary: str) -> list[str]:
         return [
@@ -1526,6 +1566,11 @@ class Pipeline:
             str(config.policy_resolution),
             "--radius",
             str(config.radius),
+            # vgo-arena defaults this to 0.0, which is not a balanced game and,
+            # since the range narrowed, not even inside the training
+            # distribution. See the note on PipelineConfig.arena_komi.
+            "--komi",
+            str(config.arena_komi),
             "--seed",
             str(seed),
             "--maximum-batch",
@@ -1984,49 +2029,6 @@ class Pipeline:
         if file_sha256(onnx) != digest:
             raise RuntimeError("ONNX checksum does not match its export report")
 
-    @staticmethod
-    def _promotion_decision(
-        arena: dict[str, Any],
-        minimum_score: float,
-        maximum_truncation_rate: float,
-    ) -> bool:
-        games = int(arena["games"])
-        completed = int(arena["completed"])
-        if games <= 0 or not 0 <= completed <= games:
-            raise ValueError("arena game counts are inconsistent")
-        return (
-            completed > 0
-            and (games - completed) / games <= maximum_truncation_rate
-            and float(arena["candidate_score"]) >= minimum_score
-        )
-
-    async def _gate_candidate(
-        self, update: int, update_path: Path
-    ) -> tuple[bool, dict[str, Any] | None]:
-        incumbent = self.incumbent
-        if not self.config.promotion_arena or incumbent is None:
-            return True, None
-        command = self.arena_command(
-            candidate=update_path / "candidate.onnx",
-            opponents=[Path(incumbent.onnx)],
-            seed=self.config.arena_seed + update * 10_003,
-            pairs=self.config.arena_pairs,
-        )
-        result = await self.runner.run(
-            command,
-            cwd=self.root,
-            log_prefix=self.output / "logs" / f"promotion-{update:06d}",
-        )
-        arena = result.final_json()
-        return (
-            self._promotion_decision(
-                arena,
-                self.config.promotion_score,
-                self.config.maximum_truncation_rate,
-            ),
-            arena,
-        )
-
     def _queue_telemetry(self, model: ModelArtifact) -> None:
         if self.config.telemetry_opponents <= 0:
             return
@@ -2037,7 +2039,7 @@ class Pipeline:
         if model.version % every != 0:
             return
         opponents = [
-            ModelArtifact(**value)
+            ModelArtifact.from_state(value)
             for value in self.state.models
             if int(value["version"]) < model.version
         ]
@@ -2085,45 +2087,36 @@ class Pipeline:
         if report.get("schema") != "vgo.pipeline-publication.v1":
             raise RuntimeError("unsupported model publication")
         update = int(report["update"])
-        model = ModelArtifact(**report["model"])
-        accepted = bool(report["accepted"])
+        model = ModelArtifact.from_state(report["model"])
         if model.version != update:
             raise RuntimeError("publication model version does not match its update")
-        if model.accepted != accepted:
-            raise RuntimeError("publication decision and model metadata disagree")
         if verify_model_files:
             if file_sha256(Path(model.checkpoint)) != model.checkpoint_sha256:
                 raise RuntimeError("published checkpoint checksum mismatch")
             if file_sha256(Path(model.onnx)) != model.onnx_sha256:
                 raise RuntimeError("published ONNX checksum mismatch")
-        accepted_existing = next(
+        # `rejected_models` is only read here, never appended to: the promotion
+        # gate is gone and every candidate is published. It stays in the state
+        # so a run that predates the removal keeps the record of what its gate
+        # threw away, and so replaying one of those publications on a resume is
+        # recognised as already committed rather than committed a second time.
+        existing = next(
             (
                 value
-                for value in self.state.models
+                for value in self.state.models + self.state.rejected_models
                 if int(value["version"]) == model.version
             ),
             None,
         )
-        rejected_existing = next(
-            (
-                value
-                for value in self.state.rejected_models
-                if int(value["version"]) == model.version
-            ),
-            None,
-        )
-        existing = accepted_existing or rejected_existing
         if existing is not None:
-            if existing != asdict(model) or bool(accepted_existing) != accepted:
+            stored = {k: v for k, v in existing.items() if k != "accepted"}
+            if stored != asdict(model):
                 raise RuntimeError(
                     f"model version {model.version} changed publication identity"
                 )
         else:
-            if accepted:
-                self.state.models.append(asdict(model))
-                self._queue_telemetry(model)
-            else:
-                self.state.rejected_models.append(asdict(model))
+            self.state.models.append(asdict(model))
+            self._queue_telemetry(model)
         self.state.updates_completed = max(
             self.state.updates_completed, update + 1
         )
@@ -2133,15 +2126,22 @@ class Pipeline:
         )
         self._save_state()
         self._report_resign_calibration()
-        return model if accepted else None
+        return model
 
     def _report_resign_calibration(self) -> None:
         """Pool the resignation counterfactual over the active replay window.
 
-        Each shard measures the rule on the ~10% of games exempt from it -- the
-        only games whose true result is known independently of the rule, since a
-        conceded game's outcome was assigned by the thing under test. But a
-        shard holds ~25 exempt games of which ~13 fire, so a single shard's
+        Each shard measures the rule on the games whose true result is known
+        independently of it. Under hard resignation that is only the ~10%
+        exempted by --resign-disable-fraction, since a conceded game's outcome
+        was assigned by the thing under test. Under soft resignation it is every
+        completed game: the concession lowers the search budget but the game
+        still plays to a real terminal state, so the outcome is the rule's to
+        predict, not to assert. The counter below reports whichever set applies
+        rather than assuming the holdout.
+
+        Pooling matters in both regimes. Under hard resignation a shard holds
+        ~25 measurable games of which ~13 fire, so a single shard's
         false-positive rate is nearly meaningless: measured across 30 shards it
         ranged 0% to 33% with a median of 8%, while the pooled rate was 9.7%.
 
@@ -2179,10 +2179,15 @@ class Pipeline:
 
         live_threshold = float(self.config.resign_threshold)
         live_window = int(self.config.resign_window)
-        exempt = max(entry[0] for entry in totals.values())
+        # Not "exempt games": that word described the --resign-disable-fraction
+        # holdout, and under soft resignation every completed game calibrates.
+        # Printing 582 "exempt" games from a run with disable_fraction 0.0 read
+        # as soft resign having failed to engage, when it was measuring the full
+        # shard exactly as intended.
+        calibrated = max(entry[0] for entry in totals.values())
         shards = len(self.state.replay[-self.config.replay_window :])
         print(
-            f"[resign] {shards} shards, {exempt} exempt games; "
+            f"[resign] {shards} shards, {calibrated} calibrated games; "
             f"false positives as threshold x window (* is live)",
             flush=True,
         )
@@ -2240,7 +2245,6 @@ class Pipeline:
                     "training and export disagree on the candidate checkpoint"
                 )
             warmup_report = await self._warm_inference(update, update_path)
-            accepted, arena = await self._gate_candidate(update, update_path)
         parent = self.incumbent
         model = ModelArtifact(
             version=update,
@@ -2249,7 +2253,6 @@ class Pipeline:
             checkpoint_sha256=str(export_report["checkpoint_sha256"]),
             onnx_sha256=str(export_report["onnx_sha256"]),
             parent_version=parent.version if parent else None,
-            accepted=accepted,
         )
         report = {
             "schema": "vgo.pipeline-publication.v1",
@@ -2258,8 +2261,6 @@ class Pipeline:
             "training": training_report,
             "export": export_report,
             "inference_warmup": warmup_report,
-            "promotion_arena": arena,
-            "accepted": accepted,
             "model": asdict(model),
             "wall_seconds": time.perf_counter() - started,
         }
@@ -2554,6 +2555,22 @@ class Pipeline:
                     learning.result()
                     learning = None
                     learning_through = None
+                    # Rate the checkpoint now rather than at the end of the
+                    # run. Queued telemetry used to wait for --drain-telemetry
+                    # after the final update, which was tolerable while the
+                    # promotion arena reported on every update; with the gate
+                    # removed this is the only strength signal the run
+                    # produces, and a 240-update run would have emitted none of
+                    # it for eighty hours while the queue grew.
+                    #
+                    # Under the GPU lease so it cannot run against a generator.
+                    # Cost is bounded by --telemetry-every: at every 5 with 2
+                    # opponents and 16 pairs it is 64 games per rated point,
+                    # against the 16-game arena that used to run on every
+                    # single update.
+                    if self.state.telemetry_pending:
+                        async with self._gpu_lease():
+                            await self._run_pending_telemetry()
             failed = False
         finally:
             active = [
@@ -2583,7 +2600,14 @@ class Pipeline:
             await self._drain_telemetry()
 
     async def _drain_telemetry(self) -> None:
+        # Entry point for --telemetry-only, where the pipeline was constructed
+        # fresh and its in-memory state is empty. Reloading here would discard
+        # anything a live run holds that is not yet on disk, so the loop calls
+        # _run_pending_telemetry directly instead.
         self.state = self._load_or_create_state(self._config_value)
+        await self._run_pending_telemetry()
+
+    async def _run_pending_telemetry(self) -> None:
         while self.state.telemetry_pending:
             first = self.state.telemetry_pending[0]
             candidate_version = int(first["candidate_version"])
@@ -2892,13 +2916,6 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
         default=True,
     )
     parser.add_argument(
-        "--promotion-arena",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
-    parser.add_argument("--promotion-score", type=float, default=0.0)
-    parser.add_argument("--maximum-truncation-rate", type=float, default=0.02)
-    parser.add_argument(
         "--resign-threshold",
         type=float,
         default=0.0,
@@ -3002,6 +3019,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--arena-actors", type=int, default=32)
     parser.add_argument("--telemetry-opponents", type=int, default=2)
     parser.add_argument("--telemetry-pairs", type=int, default=16)
+    parser.add_argument("--arena-komi", type=float, default=0.104)
     parser.add_argument(
         "--telemetry-every",
         type=int,

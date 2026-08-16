@@ -2,7 +2,7 @@
 # Run the whole RL loop small, to prove a machine works.
 #
 # Every stage a real run depends on -- generation, training, ONNX export,
-# TensorRT warmup, the promotion arena, shard retirement -- with the settings
+# TensorRT warmup, the telemetry arena, shard retirement -- with the settings
 # turned down until it finishes in minutes instead of hours. Passing means the
 # box is ready; failing here costs a few minutes instead of discovering the same
 # problem partway through an overnight job.
@@ -61,7 +61,6 @@ started=$(date +%s)
   --inference-batch 16 --inference-delay-ms 1 --inference-slots 1 \
   --provider "$provider" --fp16 --warm-inference \
   --overlap-actor-learner --retire-shards \
-  --promotion-arena --promotion-score 0.55 \
   --arena-pairs 2 --arena-simulations 32 \
   --seed 424242 --arena-seed 424243 ) > "$output.log" 2>&1 || {
     echo >&2
@@ -107,8 +106,8 @@ if "onnx" not in runtimes.values():
 
 if not list((run / "logs").glob("warmup-*.command.json")):
     failures.append("no TensorRT warmup ran")
-if not list((run / "logs").glob("promotion-*.command.json")):
-    failures.append("no promotion arena ran")
+if not list((run / "logs").glob("telemetry-*.command.json")):
+    failures.append("no telemetry arena ran -- the rating path is untested")
 
 for failure in failures:
     print(f"    FAIL {failure}", file=sys.stderr)
