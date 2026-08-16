@@ -69,13 +69,25 @@ const CHANNELS = 5;
 /// not measured, which is the open question here.
 const DEFAULT_LEAF_BATCH = 8;
 
-/// Fine cells per coarse sampling region, and not a free parameter: it must
-/// match how the model was trained or the policy head is read through the wrong
-/// sampler. Zero does not mean "no pooling", it means candidate moves come from
-/// a quasi-random sequence and the policy head stops guiding where the search
-/// looks at all. The search still returns legal moves either way, so getting
-/// this wrong is invisible except in playing strength. `vgo-serve-move` uses 4.
-const DEFAULT_COARSE_POOL = 4;
+/// Fine cells per coarse sampling region, when drawing candidate moves from the
+/// policy map. Sixteen is what every recipe in `runs/` uses -- for generation,
+/// for arenas and for tournaments -- so it is what the shipped models are
+/// searched with everywhere else.
+///
+/// Two ways to get this wrong, and neither is visible in the moves:
+///
+///   * **Zero** does not mean "no pooling". It means candidates come from a
+///     quasi-random sequence instead of the network's policy map, so the policy
+///     head stops guiding where the search looks at all.
+///   * **A different positive value** searches the same model through a
+///     different sampler than it is served through anywhere else. Not wrong in
+///     the way zero is wrong -- this is a search knob, not a property of the
+///     network -- but it makes browser play diverge from measured play for no
+///     reason.
+///
+/// The defaults in `vgo-serve-move` and `pipeline.py` were 4, which no run has
+/// used; that is where this constant was first copied from.
+const DEFAULT_COARSE_POOL = 16;
 
 /// Five seconds. Long enough to be worth the wait, short enough that a player
 /// does not think the page has hung, and around 3,200 simulations on a discrete

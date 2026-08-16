@@ -65,9 +65,16 @@ struct Arguments {
     /// it learned from, so this must match the export or the net plays blind.
     #[arg(long, default_value = "semantic")]
     raster_kind: RasterKind,
-    /// Fine cells per coarse sampling region. Must match how the model was
-    /// trained, or its policy head is read through the wrong sampler.
-    #[arg(long, default_value_t = 4)]
+    /// Fine cells per coarse sampling region, when drawing candidates from the
+    /// policy map. Zero falls back to the quasi-random candidate sequence and
+    /// stops the policy head guiding the search at all.
+    ///
+    /// Sixteen because that is what every recipe in `runs/` passes, for
+    /// generation and for arenas alike, so it is how these models are searched
+    /// everywhere their strength has been measured. The old default of 4 was
+    /// not: no run has used it, so serving a model here meant searching it
+    /// through a sampler nothing else uses.
+    #[arg(long, default_value_t = 16)]
     coarse_pool: usize,
     #[arg(long, default_value_t = 4)]
     leaf_batch: usize,
