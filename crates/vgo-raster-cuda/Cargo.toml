@@ -1,0 +1,25 @@
+[package]
+name = "vgo-raster-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Its own crate rather than a feature of vgo-raster, because vgo-raster is
+# `#![forbid(unsafe_code)]` and a kernel launch cannot be anything else. That
+# forbid covers 1300 lines of numeric code and is worth more than the
+# convenience of one manifest.
+
+[dependencies]
+vgo-core = { path = "../vgo-core" }
+vgo-raster = { path = "../vgo-raster" }
+# Driver API + NVRTC only; no cublas/curand. NVRTC compiles the kernel in-process
+# at startup, so no nvcc and no host compiler are needed -- which matters here,
+# since CUDA 13 rejects this box's GCC 16. fallback-dynamic-loading finds
+# libcuda/libnvrtc at runtime rather than requiring them at link time.
+cudarc = { version = "0.19", default-features = false, features = [
+    "driver", "nvrtc", "cuda-13000", "fallback-dynamic-loading", "std",
+] }
+
+[lib]
+path = "src/lib.rs"
