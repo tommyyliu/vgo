@@ -182,7 +182,7 @@ impl Child {
     }
 }
 
-struct Node {
+pub(crate) struct Node {
     position: Position,
     visits: u32,
     /// In-flight descents through this node; see `Child::virtual_visits`.
@@ -222,7 +222,11 @@ impl Node {
     /// The batched path evaluates a round of leaves together, so by the time a
     /// node is constructed its evaluation exists. Finished positions are built
     /// with `terminal` and never reach an evaluator.
-    fn from_evaluation(position: Position, evaluation: Evaluation, match_seed: u64) -> Self {
+    pub(crate) fn from_evaluation(
+        position: Position,
+        evaluation: Evaluation,
+        match_seed: u64,
+    ) -> Self {
         debug_assert_eq!(position.phase(), Phase::Playing);
         let sample_rng =
             crate::candidates::splitmix64(match_seed ^ crate::candidates::position_hash(&position));
@@ -288,7 +292,7 @@ impl Node {
         Ok(Self::from_evaluation(position, evaluation, match_seed))
     }
 
-    fn black_evaluation(&self) -> f64 {
+    pub(crate) fn black_evaluation(&self) -> f64 {
         let current_value = self
             .evaluation
             .as_ref()
@@ -691,7 +695,7 @@ fn run_batched_simulations(
 }
 
 /// The outcome of descending to a leaf without evaluating it.
-enum Descent {
+pub(crate) enum Descent {
     /// A position needing evaluation, reached by the recorded child path. The
     /// caller evaluates it with the rest of the leaf batch and returns the result
     /// through `back_up`.
@@ -716,7 +720,11 @@ enum Descent {
 /// back to back and their leaves evaluated as one batch. Each visited edge takes
 /// a virtual visit, which `back_up` releases. Every `descend` must be paired with
 /// exactly one `back_up` or the tree keeps a phantom in-flight visit forever.
-fn descend(node: &mut Node, config: SearchConfig, stats: &mut SearchStats) -> Descent {
+pub(crate) fn descend(
+    node: &mut Node,
+    config: SearchConfig,
+    stats: &mut SearchStats,
+) -> Descent {
     let mut path = Vec::new();
     let mut current = &mut *node;
     let mut depth = 0_u32;
@@ -787,7 +795,7 @@ fn descend(node: &mut Node, config: SearchConfig, stats: &mut SearchStats) -> De
 ///
 /// `expansion` supplies the evaluated node for a `Descent::Pending` leaf; a
 /// `Descent::Resolved` descent passes `None`.
-fn back_up(
+pub(crate) fn back_up(
     node: &mut Node,
     path: &[usize],
     black_value: f64,
@@ -919,6 +927,23 @@ pub fn search_at_ply(
             stats.simulations += 1;
         }
     }
+    Ok(assemble_result(
+        &root, position, config, match_seed, ply, stats,
+    ))
+}
+
+/// Turn a searched tree into a [`SearchResult`].
+///
+/// Shared by the batched and stepped drivers so selection cannot drift between
+/// them; the stepped path exists for browsers, where the caller owns the loop.
+pub(crate) fn assemble_result(
+    root: &Node,
+    position: &Position,
+    config: SearchConfig,
+    match_seed: u64,
+    ply: u32,
+    stats: SearchStats,
+) -> SearchResult {
     let children = root
         .children
         .iter()
@@ -950,12 +975,12 @@ pub fn search_at_ply(
         .first()
         .map(|index| children[*index].action)
         .expect("search produces at least the pass child");
-    Ok(SearchResult {
+    SearchResult {
         action: best,
         children,
         stats,
         order,
-    })
+    }
 }
 
 #[cfg(test)]
