@@ -303,7 +303,7 @@ pub fn settled_mask_by_bounded_distance(
     config: RasterConfig,
     oversample: usize,
 ) -> (Vec<bool>, usize) {
-    let (settled, _, tests) = masks_by_bounded_distance(position, config, oversample, false);
+    let (settled, _, tests) = masks_by_bounded_distance(position, config, oversample, true, false);
     (settled, tests)
 }
 
@@ -356,7 +356,7 @@ pub fn dead_zone_mask(
     config: RasterConfig,
     oversample: usize,
 ) -> (Vec<bool>, usize) {
-    let (_, dead, tests) = masks_by_bounded_distance(position, config, oversample, true);
+    let (_, dead, tests) = masks_by_bounded_distance(position, config, oversample, false, true);
     (dead, tests)
 }
 
@@ -371,7 +371,7 @@ pub fn settled_and_dead_zone(
     config: RasterConfig,
     oversample: usize,
 ) -> (Vec<bool>, Vec<bool>, usize) {
-    masks_by_bounded_distance(position, config, oversample, true)
+    masks_by_bounded_distance(position, config, oversample, true, true)
 }
 
 /// `settled`, and optionally the dead zone, from one pass over one field.
@@ -383,11 +383,12 @@ fn masks_by_bounded_distance(
     position: &Position,
     config: RasterConfig,
     oversample: usize,
+    want_settled: bool,
     want_dead_zone: bool,
 ) -> (Vec<bool>, Vec<bool>, usize) {
     let pixels = config.pixels();
     let stones = position.stones();
-    if stones.is_empty() && !want_dead_zone {
+    if (stones.is_empty() || !want_settled) && !want_dead_zone {
         return (vec![false; pixels], Vec::new(), 0);
     }
     let radius = position.radius();
@@ -429,7 +430,11 @@ fn masks_by_bounded_distance(
     } else {
         Vec::new()
     };
-    let mut mask = vec![false; pixels];
+    let mut mask = if want_settled {
+        vec![false; pixels]
+    } else {
+        Vec::new()
+    };
     let mut dead = if want_dead_zone {
         vec![false; pixels]
     } else {
@@ -457,7 +462,7 @@ fn masks_by_bounded_distance(
                     distance_to_legal_set(position, Point::new(x, y), Some(known)) > radius
                 };
             }
-            if stones.is_empty() {
+            if stones.is_empty() || !want_settled {
                 continue;
             }
 
