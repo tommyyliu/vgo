@@ -1664,9 +1664,16 @@ fn write_manifest(
     )?;
     writeln!(writer, "  \"channel_names\": [")?;
     let names: Vec<&str> = match config.raster_kind {
-        RasterKind::Semantic => CHANNELS.iter().map(|channel| channel.name).collect(),
+        // CHANNELS is a catalogue and is longer than the semantic layout, which
+        // is its first CHANNEL_COUNT entries.
+        RasterKind::Semantic => CHANNELS
+            .iter()
+            .take(vgo_raster::CHANNEL_COUNT)
+            .map(|channel| channel.name)
+            .collect(),
         RasterKind::Rgb => vec!["red", "green", "blue"],
-        RasterKind::Compact => vgo_raster::COMPACT_CHANNELS
+        kind => kind
+            .indices()
             .iter()
             .map(|&channel| CHANNELS[channel].name)
             .collect(),

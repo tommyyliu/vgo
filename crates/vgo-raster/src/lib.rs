@@ -10,7 +10,10 @@ pub use gpu::settled_mask_gpu;
 mod edt;
 mod policy;
 pub use policy::DensePolicy;
-pub use edt::{settled_mask_by_bounded_distance, settled_mask_by_distance};
+pub use edt::{
+    dead_zone_mask, settled_and_dead_zone, settled_mask_by_bounded_distance,
+    settled_mask_by_distance,
+};
 
 /// Stone count above which the distance-transform settled mask is worth its
 /// fixed cost. Measured crossover sits between 14 and 28 stones.
@@ -32,6 +35,15 @@ const DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS: f64 = 6.0;
 
 pub const CHANNEL_COUNT: usize = 12;
 
+/// Entries in [`CHANNELS`], which is a *catalogue* rather than a layout.
+///
+/// It is deliberately larger than [`CHANNEL_COUNT`]: the semantic raster is the
+/// first [`CHANNEL_COUNT`] of these, and later entries exist for layouts that
+/// name channels by index without the semantic writer emitting them. Growing
+/// this is safe; growing `CHANNEL_COUNT` is not, because that number is the
+/// semantic tensor's shape and is baked into inference frames and ONNX profiles.
+pub const CHANNEL_SPEC_COUNT: usize = 13;
+
 /// Channels written by [`rasterize_rgb_into`]: red, green, blue.
 pub const RGB_CHANNEL_COUNT: usize = 3;
 
@@ -42,6 +54,22 @@ pub const COMPACT_CHANNELS: [usize; 5] = [
     6,  // voronoi_ridge
     10, // settled
     11, // komi
+];
+
+/// Indices [`RasterKind::CompactDeadZone`] keeps: [`COMPACT_CHANNELS`] exactly,
+/// then the dead zone.
+///
+/// The order is load-bearing. Appending rather than inserting keeps the first
+/// five planes bit-identical to `Compact`, so a model trained on that layout
+/// warm-starts onto this one by widening its stem convolution and initialising
+/// only the sixth slice -- rather than relearning what every plane means.
+pub const COMPACT_DEAD_ZONE_CHANNELS: [usize; 6] = [
+    0,  // current_stones
+    1,  // opponent_stones
+    6,  // voronoi_ridge
+    10, // settled
+    11, // komi
+    12, // dead_zone
 ];
 pub const DATASET_MAGIC: [u8; 8] = *b"VGODATA1";
 pub const DATASET_VERSION: u32 = 2;
@@ -58,7 +86,7 @@ pub struct ChannelSpec {
     pub scale: ChannelScale,
 }
 
-pub const CHANNELS: [ChannelSpec; CHANNEL_COUNT] = [
+pub const CHANNELS: [ChannelSpec; CHANNEL_SPEC_COUNT] = [
     ChannelSpec {
         name: "current_stones",
         scale: ChannelScale::Unit,
@@ -107,6 +135,10 @@ pub const CHANNELS: [ChannelSpec; CHANNEL_COUNT] = [
         name: "komi",
         scale: ChannelScale::Signed,
     },
+    ChannelSpec {
+        name: "dead_zone",
+        scale: ChannelScale::Unit,
+    },
 ];
 
 /// Which channel layout a raster carries.
@@ -133,6 +165,22 @@ pub enum RasterKind {
     /// Komi joins them because a net that cannot see what it must win by
     /// cannot evaluate a position.
     Compact,
+    /// [`Compact`](Self::Compact), plus the dead zone the official rules
+    /// capture with.
+    ///
+    /// `settled` encodes *this* repository's capture rule -- a group lives
+    /// while some future stone can still take area from it. The rules at
+    /// `voronoigo.com` ask a different question: a group lives while a future
+    /// stone could still be placed touching its territory, and dies once that
+    /// territory is covered by the dead zone. That is a strictly more
+    /// aggressive rule, so a net given only `settled` has to infer the
+    /// condition it is actually judged by.
+    ///
+    /// Both planes are kept rather than one swapped for the other. They answer
+    /// different questions -- "can anyone take area from me" against "can
+    /// anyone reach me" -- and the second is nearly free once the first has
+    /// been computed, since both are thresholds on the same distance field.
+    CompactDeadZone,
 }
 
 impl RasterKind {
@@ -142,7 +190,24 @@ impl RasterKind {
             Self::Semantic => CHANNEL_COUNT,
             Self::Rgb => RGB_CHANNEL_COUNT,
             Self::Compact => COMPACT_CHANNELS.len(),
+            Self::CompactDeadZone => COMPACT_DEAD_ZONE_CHANNELS.len(),
         }
+    }
+
+    /// Which entries of [`CHANNELS`] this layout writes, in order.
+    #[must_use]
+    pub const fn indices(self) -> &'static [usize] {
+        match self {
+            Self::Semantic | Self::Rgb => &[],
+            Self::Compact => &COMPACT_CHANNELS,
+            Self::CompactDeadZone => &COMPACT_DEAD_ZONE_CHANNELS,
+        }
+    }
+
+    /// Whether this layout carries the `dead_zone` plane.
+    #[must_use]
+    pub const fn has_dead_zone(self) -> bool {
+        matches!(self, Self::CompactDeadZone)
     }
 
     #[must_use]
@@ -151,6 +216,7 @@ impl RasterKind {
             Self::Semantic => "semantic",
             Self::Rgb => "rgb",
             Self::Compact => "compact",
+            Self::CompactDeadZone => "compact-dead-zone",
         }
     }
 }
@@ -163,6 +229,7 @@ impl std::str::FromStr for RasterKind {
             "semantic" => Ok(Self::Semantic),
             "rgb" => Ok(Self::Rgb),
             "compact" => Ok(Self::Compact),
+            "compact-dead-zone" => Ok(Self::CompactDeadZone),
             _ => Err(format!("unsupported raster kind: {value}")),
         }
     }
@@ -318,6 +385,46 @@ pub fn rasterize_any_into(position: &Position, config: RasterConfig, data: &mut 
         RasterKind::Semantic => rasterize_into(position, config, data),
         RasterKind::Rgb => rasterize_rgb_into(position, config, data),
         RasterKind::Compact => rasterize_compact_into(position, config, data),
+        RasterKind::CompactDeadZone => rasterize_compact_dead_zone_into(position, config, data),
+    }
+}
+
+/// Writes the [`RasterKind::CompactDeadZone`] subset.
+///
+/// The first five planes are `Compact`'s, unchanged and in the same order, and
+/// the sixth is the dead zone.
+///
+/// Both masks come from **one** distance transform. That is not only an
+/// optimisation: the dead zone is a threshold on the distance to the legal set,
+/// so this kind has to build that field whatever happens, and once it exists
+/// `settled` is another threshold on it rather than a second computation.
+///
+/// One consequence to know about. `Compact` picks its `settled` implementation
+/// by stone count -- the per-stone geometric solve is faster below about twenty
+/// stones, the distance transform above -- while this kind always takes the
+/// distance transform, because it is already paying for it. The two
+/// implementations disagree on one or two pixels of 16384 at the boundary, so
+/// this layout's `settled` plane is not bit-identical to `Compact`'s on early
+/// positions. It is the same disagreement the `distance-settled` feature
+/// already introduces, and the distance transform measured *closer* to the
+/// definition, not further.
+pub fn rasterize_compact_dead_zone_into(
+    position: &Position,
+    config: RasterConfig,
+    data: &mut [f32],
+) {
+    let pixels = config.pixels();
+    assert_eq!(data.len(), COMPACT_DEAD_ZONE_CHANNELS.len() * pixels);
+    let (settled, dead_zone, _) = edt::settled_and_dead_zone(position, config, 1);
+
+    let compact = RasterConfig {
+        kind: RasterKind::Compact,
+        ..config
+    };
+    let (head, tail) = data.split_at_mut(COMPACT_CHANNELS.len() * pixels);
+    rasterize_compact_with_settled_into(position, compact, &settled, head);
+    for (target, dead) in tail.iter_mut().zip(&dead_zone) {
+        *target = f32::from(u8::from(*dead));
     }
 }
 
