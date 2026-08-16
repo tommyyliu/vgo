@@ -48,8 +48,24 @@ import initWasm, { Game } from '../vendor/vgo_wasm.js';
 /// fetches a file the host does not have.
 const INLINE_WASM_BASE64 = null;
 
-/// Production stone radius: stones are discs of 1/18 of the board.
+/// The official game's stone radius: `voronoigo.com` plays an 18-unit board
+/// with radius 1, so exactly 1/18 of the board.
+///
+/// **The models were not trained at this radius.** Every run so far used
+/// 39/700 = 0.05571..., which is 0.286% larger -- a board 17.95 stone-radii
+/// wide instead of 18. That number is not a game constant: it is the reference
+/// client's default radius slider sitting at 39 pixels on a 700-pixel board,
+/// which is where the recipes copied it from.
+///
+/// The default here is the game's value rather than the training value, because
+/// a host that omits `radius` means "the game", and a bot playing the real game
+/// slightly out of distribution is the lesser wrong. Hosts should send their own
+/// radius regardless.
 export const DEFAULT_RADIUS = 1 / 18;
+
+/// What every run in `runs/` has trained and measured at, for callers that want
+/// to reproduce a training position exactly rather than play the live game.
+export const TRAINING_RADIUS = 39 / 700;
 
 /// Raster the model reads, and the number of channels in it. Both are fixed by
 /// the exported network rather than chosen here.

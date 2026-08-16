@@ -110,7 +110,7 @@ matters more than speed; see *Known limits*.
 
 ```js
 {
-  radius: 1 / 18,      // stone radius. Default 1/18, which is what models train at
+  radius: 1 / 18,      // stone radius. Default 1/18 — but see the note below
   komi: 0.104,         // area spotted to White. Default 0 — see below
   toMove: 'B',         // 'B' | 'W' | 'black' | 'white'
   passes: 0,           // consecutive passes before this position. Default 0
@@ -121,6 +121,17 @@ matters more than speed; see *Known limits*.
 
 Coordinates are the **unit square**: the board is `[0,1] × [0,1]` however large
 it is drawn, so scale your own pixels and nothing here depends on the display.
+`voronoigo.com` uses an 18-unit board with radius 1, so divide its coordinates
+by `boardSize` and its radius becomes exactly 1/18.
+
+**The models were not trained at 1/18.** Every run so far used `39/700`, 0.286%
+larger — a board 17.95 stone-radii wide rather than 18. That is not a game
+constant; it is the reference client's radius slider sitting at its default of 39
+pixels on a 700-pixel board, which is where the training recipes took it from.
+`DEFAULT_RADIUS` is the game's value and `TRAINING_RADIUS` is the other one, so
+whichever you want you can name. Send your own `radius` and the question does not
+arise.
+
 Stone colours may be `c` or `color`, and `'B'`/`'W'` or `'black'`/`'white'` —
 this repository contains three implementations using two conventions, and making
 you translate would only buy an integration bug.
