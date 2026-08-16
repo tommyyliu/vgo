@@ -38,7 +38,7 @@
 //! the same seed. `stepped_search_matches_the_batched_search` in the tests
 //! below is what holds that true.
 
-use vgo_core::{Analysis, Phase, Position};
+use vgo_core::{Phase, Position};
 
 use crate::evaluator::{Evaluation, EvaluationError};
 use crate::mcts::{
@@ -344,12 +344,6 @@ pub fn drive(
         search.submit(evaluations)?;
     }
     Ok(())
-}
-
-/// Terminal value of a position, for callers that want to avoid a round trip.
-#[must_use]
-pub fn terminal_black_value(position: &Position) -> Option<f64> {
-    (position.phase() == Phase::Finished).then(|| Analysis::new(position).outcome.black_utility())
 }
 
 #[cfg(test)]

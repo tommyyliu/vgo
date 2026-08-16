@@ -117,20 +117,42 @@ impl OnnxBatchService {
                 let profiles = profile_shapes(config);
                 let cache = path_text(&cache_directory)?;
                 let timing_cache = path_text(&timing_directory)?;
+                let tensorrt = ep::TensorRT::default()
+                    .with_device_id(config.device_id)
+                    .with_fp16(config.fp16)
+                    .with_engine_cache(true)
+                    .with_engine_cache_path(cache)
+                    .with_timing_cache(true)
+                    .with_timing_cache_path(timing_cache)
+                    .with_profile_min_shapes(&profiles.minimum)
+                    .with_profile_opt_shapes(&profiles.optimum)
+                    .with_profile_max_shapes(&profiles.maximum);
+                // Knobs measured on this model 2026-08-16 and left at their
+                // defaults, so nobody re-measures them:
+                //
+                //   trt_builder_optimization_level 5   13,119 pos/s
+                //   trt_auxiliary_streams 1            13,462
+                //   trt_auxiliary_streams 0            13,078
+                //   default                            13,389
+                //
+                // All within noise. Batch and lane count are already at their
+                // optimum too: single-session inference saturates at ~11.7k
+                // pos/s by batch 16-32 (batch 48 and 64 are slower), and two
+                // broker lanes reach ~14.4k while three and four are *worse*
+                // -- 4.6ms of service time becomes 8.6 and 12.5, so the lanes
+                // contend rather than overlap.
+                //
+                // trt_cuda_graph_enable is deliberately absent. It panics here
+                // ("expected typeinfo_ptr to not be null") because ORT's
+                // CUDA-graph mode needs outputs bound to pre-allocated device
+                // buffers, while this path calls Run() and lets the allocator
+                // produce them. Using it means IoBinding plus a fixed batch
+                // shape; the upside is bounded by launch overhead, which
+                // batch-1 throughput puts at roughly 0.5ms of the 2.7ms
+                // batch-32 inference.
                 builder
                     .with_execution_providers([
-                        ep::TensorRT::default()
-                            .with_device_id(config.device_id)
-                            .with_fp16(config.fp16)
-                            .with_engine_cache(true)
-                            .with_engine_cache_path(cache)
-                            .with_timing_cache(true)
-                            .with_timing_cache_path(timing_cache)
-                            .with_profile_min_shapes(&profiles.minimum)
-                            .with_profile_opt_shapes(&profiles.optimum)
-                            .with_profile_max_shapes(&profiles.maximum)
-                            .build()
-                            .error_on_failure(),
+                        tensorrt.build().error_on_failure(),
                         cuda_provider(config.device_id),
                     ])
                     .map_err(|error| evaluation_error("register ONNX TensorRT provider", error))?

@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Pass through to vgo-raster; see rasterize_compact_into.
+distance-settled = ["vgo-raster/distance-settled"]
+default = []
+
 [dependencies]
 clap.workspace = true
 sha2 = "0.10"

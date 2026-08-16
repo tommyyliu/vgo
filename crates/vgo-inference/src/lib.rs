@@ -28,8 +28,8 @@ use std::{
 };
 
 use vgo_core::Position;
-use vgo_raster::{DensePolicy, RasterConfig, action_pixel, rasterize};
-use vgo_search::{Action, Evaluation, EvaluationError, Evaluator, FineGrid, Policy};
+use vgo_raster::{DensePolicy, RasterConfig, rasterize};
+use vgo_search::{Evaluation, EvaluationError, Evaluator};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TorchDevice {
