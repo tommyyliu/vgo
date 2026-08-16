@@ -137,9 +137,11 @@ struct GameSamples {
     /// no-op self-captures and 0% among games without one.
     reached_ply_cap: bool,
     /// Counterfactual resignation outcomes for this game, one entry per
-    /// candidate threshold. Only produced for games exempt from resignation,
-    /// which are the only ones whose true result is known independently of the
-    /// rule being measured.
+    /// candidate threshold. Produced for every game whose true result is known
+    /// independently of the rule being measured: under hard resignation only
+    /// the games exempted by `--resign-disable-fraction`, under soft
+    /// resignation all of them, since a soft concession plays on to a real
+    /// terminal state. See the note where this is populated.
     calibration: Vec<ResignTrial>,
 }
 
@@ -205,8 +207,10 @@ struct Config {
     ///
     /// Do not set this from intuition. A value head that is confidently wrong
     /// concedes won games, and the samples then carry the wrong label; measure
-    /// the false-positive rate on games exempted by --resign-disable-fraction
-    /// and pick a threshold that keeps it acceptable.
+    /// the false-positive rate from the shard's `resign_calibration` and pick a
+    /// threshold that keeps it acceptable. With `--resign-soft-simulations` set
+    /// that measurement covers every game; without it, only the ones exempted
+    /// by `--resign-disable-fraction`.
     #[arg(long, default_value_t = 0.0)]
     resign_threshold: f64,
     /// Consecutive plies that must all agree before conceding. One ply's root
@@ -327,7 +331,7 @@ const CALIBRATION_THRESHOLDS: [f64; 9] = [0.70, 0.80, 0.85, 0.90, 0.95, 0.98, 0.
 /// clears far less easily than one confident evaluation.
 const CALIBRATION_WINDOWS: [u32; 4] = [5, 8, 12, 16];
 
-/// What resignation would have done to one exempt game at one threshold.
+/// What resignation would have done to one calibrating game at one threshold.
 #[derive(Clone, Copy, Debug)]
 struct ResignTrial {
     threshold: f64,
@@ -355,10 +359,18 @@ struct ResignTrial {
 
 /// Replays the resign rule over a finished game at each candidate threshold.
 ///
-/// Only meaningful for games played to a real result, which is why this runs on
-/// the exempt set: the rule's error rate is how often it would have conceded
-/// for the eventual winner, and that is unknowable for a game the rule already
-/// ended.
+/// Only meaningful for games played to a real result: the rule's error rate is
+/// how often it would have conceded for the eventual winner, and that is
+/// unknowable for a game the rule already ended. That set is the exempt games
+/// under hard resignation and every game under soft, which is the condition the
+/// caller applies.
+///
+/// One caveat the counters cannot express: after a soft concession the rest of
+/// the game is searched at `--resign-soft-simulations`, so both the root values
+/// this replays and the outcome it scores against come from the cheaper search.
+/// A low error rate there is partly the rule agreeing with a playout it shaped.
+/// Games exempted by `--resign-disable-fraction` are the only ones measured at
+/// full strength throughout.
 fn calibration_trials(
     pending: &[PendingSample],
     _window: u32,
