@@ -93,7 +93,25 @@
         <select id="aiColor"><option value="W">white</option><option value="B">black</option></select>
       </label>
     </div>
-    <div class="row mut"><span>server</span><span><input id="aiUrl" value="http://127.0.0.1:8181/move" style="width:180px"></span></div>
+    <!-- Two backends, same search and same weights. `server` posts to
+         vgo-serve-move and runs on the machine's GPU; `in browser` runs the
+         identical Rust MCTS compiled to WebAssembly with the network on WebGPU,
+         and needs nothing installed. The server is the default because this
+         page is often opened straight off disk, where ES modules and WASM
+         cannot load at all. -->
+    <div class="row mut"><span>engine</span><span>
+      <select id="aiEngine">
+        <option value="server">server</option>
+        <option value="browser">in browser</option>
+      </select></span></div>
+    <div class="row mut" id="aiServerRow"><span>server</span><span><input id="aiUrl" value="http://127.0.0.1:8181/move" style="width:180px"></span></div>
+    <!-- A time budget, not a simulation count: the browser search stops when
+         the clock runs out and plays the best move it has, so the same setting
+         behaves sensibly on hardware it was never measured on. -->
+    <div class="row mut" id="aiBudgetRow" hidden title="how long the in-browser search may think before it must answer">
+      <span>think for</span>
+      <span><input type="number" id="aiBudget" min="0.2" max="120" step="0.5" value="5" style="width:70px"> s</span>
+    </div>
     <!-- Restricts you to the model's policy lattice. Off by default: at the
          current 128x128 policy a cell is ~1/14 of a stone diameter, so the
          lattice is finer than a click is precise and locking to it changes
@@ -746,22 +764,111 @@ document.getElementById('pass').onclick = () => {
 /* =========================================================================
    MODEL OPPONENT
 
-   `vgo-serve-move` runs the same MCTS and ONNX evaluator the arena scores with,
-   so the opponent here is exactly the model being rated rather than a separate
-   implementation that could drift. This side only serialises the position and
-   applies whatever move comes back; all search lives in Rust.
+   Two backends, and neither is a second implementation of the search. Both run
+   the MCTS in crates/vgo-search against the same exported weights, so the
+   opponent here is the model being rated rather than something that could
+   drift away from it.
 
-     cargo run --release -p vgo-selfplay --bin vgo-serve-move -- \
-       --model artifacts/<run>/iteration-NNN/model/candidate.onnx
+     server      POST to vgo-serve-move. Needs the repository and a GPU, and
+                 works from a file:// page.
+
+                   cargo run --release -p vgo-selfplay --bin vgo-serve-move -- \
+                     --model artifacts/<run>/iteration-NNN/model/candidate.onnx
+
+     in browser  The same Rust search compiled to WebAssembly, with the network
+                 on WebGPU. Needs nothing installed, but must be served over
+                 http -- see the module block near the end of this file.
+
+   Neither path re-implements anything. The server serialises the position and
+   applies the reply; the browser path hands the position to the WASM `Game`,
+   drives the search loop, and applies the move it returns.
    ========================================================================= */
 
 const $aiStatus = document.getElementById('aiStatus');
 const $aiReadout = document.getElementById('aiReadout');
+const $aiEngine = document.getElementById('aiEngine');
 let aiPending = false;
 
 function aiSay(text, readout) {
   $aiStatus.textContent = text;
   if (readout !== undefined) $aiReadout.textContent = readout;
+}
+
+/* Only one backend's controls are relevant at a time, and showing the server
+   URL while the browser engine is selected invites reporting a connection
+   problem for a request nobody is making. */
+function syncEngineControls() {
+  const browser = $aiEngine.value === 'browser';
+  document.getElementById('aiServerRow').hidden = browser;
+  document.getElementById('aiBudgetRow').hidden = !browser;
+}
+$aiEngine.onchange = () => { syncEngineControls(); aiSay('off', ''); };
+syncEngineControls();
+
+/* The in-browser engine, loaded once and kept.
+
+   Loading is deferred to the first move rather than done at startup: it fetches
+   a 33 MB model and compiles a WebGPU pipeline, which is a great deal of work
+   to do for a visitor who only wants to push stones around. */
+let browserEngine = null;
+// A per-session seed, so the search is reproducible within a page load and a
+// rematch is not a replay. Search is deterministic given a seed, which is worth
+// keeping: a game that can be reproduced can be diagnosed.
+const AI_SESSION_SEED = Math.floor(Math.random() * 0x7fffffff);
+
+async function browserEngineReady() {
+  if (browserEngine) return browserEngine;
+  const loader = window.VGO_BROWSER_ENGINE;
+  if (!loader) throw new Error('the in-browser engine module did not load');
+  browserEngine = await loader.load(text => aiSay(text));
+  return browserEngine;
+}
+
+/* Ask the WebAssembly search for a move.
+
+   The position is rebuilt from `state` each time rather than kept in step move
+   by move. It costs nothing next to the search, and it means the two rule
+   implementations are compared on every single move: `setStones` rejects a
+   position vgo-core considers unplayable, so a disagreement between game.js and
+   game.rs surfaces here as a refusal instead of as a quiet difference in what
+   the two think the board is. */
+async function browserModelMove() {
+  const { bot, Game } = await browserEngineReady();
+  const game = new Game(state.radius, state.komi);
+  game.setStones(
+    state.stones.map(s => ({ x: s.x, y: s.y, color: s.c === 'B' ? 'black' : 'white' })),
+    state.toMove === 'B' ? 'black' : 'white',
+    VGO.gameTree.ply(current));
+
+  const seconds = Number(document.getElementById('aiBudget').value);
+  const budgetMillis = (Number.isFinite(seconds) ? Math.max(0.2, seconds) : 5) * 1000;
+  const { move, simulations, elapsed } = await bot.chooseMove(game, {
+    budgetMillis,
+    seed: AI_SESSION_SEED ^ VGO.gameTree.ply(current),
+    onProgress: count => aiSay(`thinking... ${count}`),
+  });
+
+  aiSay('played',
+    `${simulations} simulations in ${(elapsed / 1000).toFixed(1)}s\n` +
+    `${(simulations / (elapsed / 1000)).toFixed(0)}/s · leaf batch ${bot.leafBatch}`);
+  // An empty move is a pass. The search returns the action, not a board: it is
+  // applied through the same path a human click takes, so the tree, undo and
+  // the SGF record cannot diverge from what was played.
+  if (move.length === 0) {
+    const before = snapshot();
+    const outcome = VGO.gameTree.pass(current, RULES);
+    if (!outcome.ok) return false;
+    pushUndo(before);
+    goTo(outcome.node);
+    flash('Model passed');
+    return true;
+  }
+  if (!placeStone(move[0], move[1])) {
+    aiSay('move rejected', `${move[0]}, ${move[1]}`);
+    return false;
+  }
+  draw();
+  return true;
 }
 
 async function requestModelMove() {
@@ -773,55 +880,72 @@ async function requestModelMove() {
   aiPending = true;
   aiSay('thinking...');
   try {
-    // text/plain keeps this a CORS "simple" request, so the browser sends it
-    // straight through with no preflight. Asking for application/json would
-    // force an OPTIONS round trip -- which the server does answer, but a
-    // preflight from a file:// page sends `Origin: null` and is the usual
-    // source of opaque CORS failures. The server parses the body by shape and
-    // never reads Content-Type.
-    const response = await fetch(document.getElementById('aiUrl').value, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain' },
-      body: JSON.stringify({
-        radius: state.radius,
-        // The model reads komi as a raster channel and its value head is
-        // trained against it, so omitting it here would have the model search
-        // a different game than the one on screen -- and silently, since the
-        // reply looks the same either way.
-        komi: state.komi,
-        toMove: state.toMove,
-        stones: state.stones.map(s => ({ x: s.x, y: s.y, c: s.c })),
-      }),
-    });
-    const reply = await response.json();
-    if (!response.ok) { aiSay('server error', reply.error || response.statusText); return false; }
-    const lines = (reply.candidates || []).slice(0, 5).map(c =>
-      `${c.pass ? 'pass' : c.x.toFixed(3) + ',' + c.y.toFixed(3)}  v=${c.visits}  ${c.value >= 0 ? '+' : ''}${c.value.toFixed(3)}`);
-    aiSay('played', lines.join('\n'));
-    if (reply.pass) {
-      const before = snapshot();
-      const outcome = VGO.gameTree.pass(current, RULES);
-      if (!outcome.ok) return false;
-      pushUndo(before);
-      goTo(outcome.node);
-      flash('Model passed');
-      return true;
-    }
-    if (!placeStone(reply.x, reply.y)) { aiSay('move rejected', `${reply.x}, ${reply.y}`); return false; }
-    draw();
-    return true;
+    return $aiEngine.value === 'browser' ? await browserModelMove() : await serverModelMove();
   } catch (error) {
-    // fetch throws the same opaque TypeError for a refused connection and for a
-    // blocked cross-origin response, so name both rather than guess.
-    aiSay('unreachable',
-      `${error && error.message || error}\n` +
-      `could not reach ${document.getElementById('aiUrl').value}\n` +
-      'start: cargo run --release -p vgo-selfplay --bin vgo-serve-move -- --model <path>\n' +
-      'if the server is running, check the host matches (127.0.0.1 vs localhost).');
+    aiSay('failed', explainAiFailure(error));
     return false;
   } finally {
     aiPending = false;
   }
+}
+
+/* Both backends fail opaquely in their own way, so name the likely causes
+   rather than pass the message through and leave the reader guessing. */
+function explainAiFailure(error) {
+  const message = (error && error.message) || String(error);
+  if ($aiEngine.value === 'browser') {
+    return `${message}\n` +
+      'the in-browser engine needs this page served over http, not opened from disk:\n' +
+      '  node client/serve.js   then   http://localhost:8123/reference/js-reference/voronoi_go.html\n' +
+      'it also needs the WASM build and the model:\n' +
+      '  see docs/CLIENT_BOT.md';
+  }
+  // fetch throws the same opaque TypeError for a refused connection and for a
+  // blocked cross-origin response, so name both rather than guess.
+  return `${message}\n` +
+    `could not reach ${document.getElementById('aiUrl').value}\n` +
+    'start: cargo run --release -p vgo-selfplay --bin vgo-serve-move -- --model <path>\n' +
+    'if the server is running, check the host matches (127.0.0.1 vs localhost).';
+}
+
+async function serverModelMove() {
+  // text/plain keeps this a CORS "simple" request, so the browser sends it
+  // straight through with no preflight. Asking for application/json would
+  // force an OPTIONS round trip -- which the server does answer, but a
+  // preflight from a file:// page sends `Origin: null` and is the usual
+  // source of opaque CORS failures. The server parses the body by shape and
+  // never reads Content-Type.
+  const response = await fetch(document.getElementById('aiUrl').value, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: JSON.stringify({
+      radius: state.radius,
+      // The model reads komi as a raster channel and its value head is
+      // trained against it, so omitting it here would have the model search
+      // a different game than the one on screen -- and silently, since the
+      // reply looks the same either way.
+      komi: state.komi,
+      toMove: state.toMove,
+      stones: state.stones.map(s => ({ x: s.x, y: s.y, c: s.c })),
+    }),
+  });
+  const reply = await response.json();
+  if (!response.ok) { aiSay('server error', reply.error || response.statusText); return false; }
+  const lines = (reply.candidates || []).slice(0, 5).map(c =>
+    `${c.pass ? 'pass' : c.x.toFixed(3) + ',' + c.y.toFixed(3)}  v=${c.visits}  ${c.value >= 0 ? '+' : ''}${c.value.toFixed(3)}`);
+  aiSay('played', lines.join('\n'));
+  if (reply.pass) {
+    const before = snapshot();
+    const outcome = VGO.gameTree.pass(current, RULES);
+    if (!outcome.ok) return false;
+    pushUndo(before);
+    goTo(outcome.node);
+    flash('Model passed');
+    return true;
+  }
+  if (!placeStone(reply.x, reply.y)) { aiSay('move rejected', `${reply.x}, ${reply.y}`); return false; }
+  draw();
+  return true;
 }
 
 document.getElementById('aiMove').onclick = () => { requestModelMove().then(maybeAutoReply); };
@@ -982,6 +1106,59 @@ setDocument(VGO.gameTree.create(VGO.model.createPosition({ radius:(+radEl.value)
   { x:.70, y:.65, c:'W' }, { x:.60, y:.78, c:'W' }, { x:.80, y:.45, c:'W' },
 ], toMove:'B' })));
 draw();
+</script>
+
+<!-- =========================================================================
+     THE IN-BROWSER ENGINE
+
+     Everything above is a classic script and cannot `import`, so the module
+     graph is loaded here and handed across through one global.
+
+     The import is dynamic rather than static for the same reason it lives in a
+     separate block: a static import that cannot resolve aborts the whole module,
+     and this page must keep working when the WASM has not been built, when the
+     model is absent, and when it is opened straight off disk -- all of which are
+     normal. The server engine needs none of this and must not go down with it.
+
+     Serve the repository root and open
+
+       node client/serve.js
+       http://localhost:8123/reference/js-reference/voronoi_go.html
+
+     What it loads, all under client/ and all build outputs rather than sources:
+
+       public/ort.all.min.mjs   onnxruntime-web, which supplies WebGPU
+       src/bot.js               the search-drives-inference loop
+       vendor/vgo_wasm.js       the Rust engine, via wasm-bindgen
+       public/model.onnx        the exported weights
+
+     docs/CLIENT_BOT.md has the build commands for the two that are generated.
+     ========================================================================= -->
+<script type="module">
+"use strict";
+// Relative to this document, since an inline module resolves against the page.
+const CLIENT = '../../client/';
+
+window.VGO_BROWSER_ENGINE = {
+  async load(say) {
+    say('loading engine...');
+    const [ort, bot] = await Promise.all([
+      import(CLIENT + 'public/ort.all.min.mjs'),
+      import(CLIENT + 'src/bot.js'),
+    ]);
+    say('loading model...');
+    // WebGPU first, WASM as the fallback. The gap is not small -- 1.6 ms per
+    // position against 42-47 -- so the fallback is a different experience
+    // rather than a slightly slower one, and is worth saying out loud when it
+    // is what you get.
+    const instance = await bot.Bot.create({
+      ort,
+      modelUrl: CLIENT + 'public/model.onnx',
+      executionProviders: ['webgpu', 'wasm'],
+    });
+    return { bot: instance, Game: bot.Game };
+  },
+};
 </script>
 </body>
 </html>

@@ -1,4 +1,10 @@
-// Static server for the demo and the WebGPU benchmark.
+// Static server for the client, the benchmark and the reference pages.
+//
+// Serves the repository root rather than client/, because the pages that use
+// the bot and the bot itself live in different trees: reference/js-reference/
+// imports ../../client/src/bot.js, and a server rooted at client/ cannot see
+// the importer. Rooting it here also gets the reference test pages served, which
+// they must be -- they load their modules over http and do not run from disk.
 //
 // Sets cross-origin isolation headers so `SharedArrayBuffer` -- and with it
 // multi-threaded WASM inference -- is available. That is the difference between
@@ -8,7 +14,9 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 
-const ROOT = new URL('.', import.meta.url).pathname;
+const ROOT = new URL('..', import.meta.url).pathname;
+// The client is the reference page; there is no second one to maintain.
+const PAGE = '/reference/js-reference/voronoi_go.html';
 const TYPES = {
   '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
   '.wasm': 'application/wasm', '.onnx': 'application/octet-stream',
@@ -26,7 +34,7 @@ createServer(async (request, response) => {
     response.writeHead(204, { 'Cross-Origin-Opener-Policy': 'same-origin' }).end();
     return;
   }
-  const path = join(ROOT, normalize(url.pathname === '/' ? '/public/index.html' : url.pathname));
+  const path = join(ROOT, normalize(url.pathname === '/' ? PAGE : url.pathname));
   try {
     const body = await readFile(path);
     console.log(`GET ${url.pathname} ${body.length}`);
@@ -40,4 +48,8 @@ createServer(async (request, response) => {
     console.log(`404 ${url.pathname}`);
     response.writeHead(404).end('not found');
   }
-}).listen(8123, () => console.log('http://localhost:8123/public/bench.html'));
+}).listen(8123, () => {
+  console.log(`http://localhost:8123${PAGE}`);
+  console.log('http://localhost:8123/client/public/bench.html   (inference benchmark)');
+  console.log('http://localhost:8123/reference/tests/engine-tests.html');
+});
