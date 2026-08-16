@@ -12,12 +12,15 @@
         doomed.add(i);
       }
     }
-    if (!doomed.size) return { position: position, count: 0 };
+    // Callers need the identities, not just the tally: telling a no-op
+    // placement from a genuine one turns on *which* stone died, not how many.
+    if (!doomed.size) return { position: position, count: 0, doomed: doomed };
     return {
       position: model.update(position, {
         stones: position.stones.filter(function (_, index) { return !doomed.has(index); }),
       }),
       count: doomed.size,
+      doomed: doomed,
     };
   }
 
@@ -46,7 +49,11 @@
     next = enemyRemoval.position;
     if (enemyRemoval.count) nextAnalysis = analysis.analyze(next);
 
-    let selfRemoval = { position: next, count: 0 };
+    // The placed stone was appended last and belongs to the mover, so it is
+    // never in the enemy removal; order-preserving removal leaves it last here.
+    const placedIndex = next.stones.length - 1;
+
+    let selfRemoval = { position: next, count: 0, doomed: new Set() };
     if (activeRules.selfCapture === "remove") {
       selfRemoval = removeSettled(next, nextAnalysis, mover);
       next = selfRemoval.position;
@@ -57,9 +64,21 @@
     // move: a lone stone with no liberties, self-captured on arrival, taking
     // nothing with it. Resetting the pass counter for it made it a *better*
     // stall than passing -- two passes end the game and score it, two no-op
-    // suicides end nothing -- and both sides learned to abuse that. Must match
-    // after_placement in crates/vgo-core/src/model.rs.
-    const changed = next.stones.length !== position.stones.length;
+    // suicides end nothing -- and both sides learned to abuse that.
+    //
+    // The board is unchanged exactly when the stone just placed is the only
+    // one removed. Stone counts do not state this -- they collide on every
+    // even trade, so a placement that captures one enemy stone reads as a
+    // no-op while having changed the board completely. Two such trades in a
+    // row ended games at an arbitrary point, scoring a position neither player
+    // had finished. Self-capture is legal and global here, so unlike in Go a
+    // static count does not imply a capture happened.
+    //
+    // Must match place in crates/vgo-core/src/game.rs.
+    const unchanged = enemyRemoval.count === 0
+      && selfRemoval.doomed.size === 1
+      && selfRemoval.doomed.has(placedIndex);
+    const changed = !unchanged;
     const passes = changed ? 0 : position.passes + 1;
     const finished = activeRules.ending === "two-passes" && passes >= 2;
     next = model.update(next, {

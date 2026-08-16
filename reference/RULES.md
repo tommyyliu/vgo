@@ -82,7 +82,13 @@ reference implementation warns when a move removes one or more friendly stones.
 ## 6. Passing and repetition
 
 - Passing changes no stones and gives the turn to the opponent.
-- A placement resets the consecutive-pass count.
+- A placement whose resolution leaves the stones exactly as they were is a
+  no-op placement, and counts as a pass. This happens exactly when the placed
+  stone is self-captured on arrival and no other stone is removed with it.
+- Every other placement resets the consecutive-pass count, including a
+  placement that removes exactly as many stones as it adds. Stone counts do not
+  decide this question: self-capture is legal here, so an unchanged count means
+  neither that a capture happened nor that the board stands still.
 - Two consecutive passes end the game. The current Voronoi area totals are the
   final scores; the larger score wins, and equal scores are a tie.
 - After the game ends, no further move or pass is allowed. Undo or Clear may be
