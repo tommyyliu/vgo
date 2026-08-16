@@ -779,9 +779,10 @@ document.getElementById('pass').onclick = () => {
                  on WebGPU. Needs nothing installed, but must be served over
                  http -- see the module block near the end of this file.
 
-   Neither path re-implements anything. The server serialises the position and
-   applies the reply; the browser path hands the position to the WASM `Game`,
-   drives the search loop, and applies the move it returns.
+   Neither path re-implements anything, and both are the same shape from here:
+   serialise the position, get a move back, apply it. The browser path calls
+   `createBot` from client/src/index.js -- the same API a host site embeds -- so
+   this page is also the thing that keeps that API honest.
    ========================================================================= */
 
 const $aiStatus = document.getElementById('aiStatus');
@@ -833,28 +834,38 @@ async function browserEngineReady() {
    game.rs surfaces here as a refusal instead of as a quiet difference in what
    the two think the board is. */
 async function browserModelMove() {
-  const { bot, Game } = await browserEngineReady();
-  const game = new Game(state.radius, state.komi);
-  game.setStones(
-    state.stones.map(s => ({ x: s.x, y: s.y, color: s.c === 'B' ? 'black' : 'white' })),
-    state.toMove === 'B' ? 'black' : 'white',
-    VGO.gameTree.ply(current));
-
+  const bot = await browserEngineReady();
   const seconds = Number(document.getElementById('aiBudget').value);
-  const budgetMillis = (Number.isFinite(seconds) ? Math.max(0.2, seconds) : 5) * 1000;
-  const { move, simulations, elapsed } = await bot.chooseMove(game, {
-    budgetMillis,
+  // The whole position, every time, rather than kept in step move by move. It
+  // costs nothing next to the search, and vgo-core re-validates it on the way
+  // in -- so a disagreement between game.js and the Rust rules surfaces as a
+  // refusal rather than as two engines quietly holding different boards.
+  //
+  // `passes` matters and is easy to omit: a search that thinks nobody has
+  // passed does not know that passing now would end the game, so it can neither
+  // pass to close out a win nor see that passing while behind loses. Note that
+  // the server backend above does *not* send it -- vgo-serve-move's protocol has
+  // no field for it, so that path still has this blind spot.
+  const { pass, x, y, simulations, elapsed } = await bot.chooseMove({
+    radius: state.radius,
+    komi: state.komi,
+    toMove: state.toMove,
+    stones: state.stones,
+    passes: state.passes,
+    ply: VGO.gameTree.ply(current),
+  }, {
+    thinkMillis: (Number.isFinite(seconds) ? Math.max(0.2, seconds) : 5) * 1000,
     seed: AI_SESSION_SEED ^ VGO.gameTree.ply(current),
     onProgress: count => aiSay(`thinking... ${count}`),
   });
 
   aiSay('played',
     `${simulations} simulations in ${(elapsed / 1000).toFixed(1)}s\n` +
-    `${(simulations / (elapsed / 1000)).toFixed(0)}/s · leaf batch ${bot.leafBatch}`);
-  // An empty move is a pass. The search returns the action, not a board: it is
-  // applied through the same path a human click takes, so the tree, undo and
-  // the SGF record cannot diverge from what was played.
-  if (move.length === 0) {
+    `${(simulations / (elapsed / 1000)).toFixed(0)}/s · leaf batch ${bot.info.leafBatch}`);
+  // The move is an action, not a board: it is applied through the same path a
+  // human click takes, so the tree, undo and the SGF record cannot diverge from
+  // what was played.
+  if (pass) {
     const before = snapshot();
     const outcome = VGO.gameTree.pass(current, RULES);
     if (!outcome.ok) return false;
@@ -863,8 +874,8 @@ async function browserModelMove() {
     flash('Model passed');
     return true;
   }
-  if (!placeStone(move[0], move[1])) {
-    aiSay('move rejected', `${move[0]}, ${move[1]}`);
+  if (!placeStone(x, y)) {
+    aiSay('move rejected', `${x}, ${y}`);
     return false;
   }
   draw();
@@ -894,6 +905,10 @@ async function requestModelMove() {
 function explainAiFailure(error) {
   const message = (error && error.message) || String(error);
   if ($aiEngine.value === 'browser') {
+    // The bot throws VgoBotError with a code. A position or game-state problem
+    // is about the board, not the deployment, so the setup advice below would
+    // send the reader off in the wrong direction entirely.
+    if (error && (error.code === 'invalid-position' || error.code === 'finished')) return message;
     return `${message}\n` +
       'the in-browser engine needs this page served over http, not opened from disk:\n' +
       '  node client/serve.js   then   http://localhost:8123/reference/js-reference/voronoi_go.html\n' +
@@ -1125,14 +1140,19 @@ draw();
        node client/serve.js
        http://localhost:8123/reference/js-reference/voronoi_go.html
 
-     What it loads, all under client/ and all build outputs rather than sources:
+     What it loads:
 
-       public/ort.all.min.mjs   onnxruntime-web, which supplies WebGPU
-       src/bot.js               the search-drives-inference loop
-       vendor/vgo_wasm.js       the Rust engine, via wasm-bindgen
-       public/model.onnx        the exported weights
+       client/public/ort.all.min.mjs   onnxruntime-web, which supplies WebGPU
+       client/src/index.js             the bot's public API
+       client/public/model.onnx        the exported weights
 
-     docs/CLIENT_BOT.md has the build commands for the two that are generated.
+     This uses `src/index.js` rather than the built `dist/vgo-bot.js` on purpose.
+     They are the same code -- the bundle is that file with the engine's WASM
+     inlined -- and importing the source means this page exercises the API a host
+     site integrates against, so it cannot rot unnoticed while still appearing to
+     work here. It also means no rebuild between editing the API and trying it.
+
+     docs/CLIENT_BOT.md has the build commands for the generated pieces.
      ========================================================================= -->
 <script type="module">
 "use strict";
@@ -1142,21 +1162,15 @@ const CLIENT = '../../client/';
 window.VGO_BROWSER_ENGINE = {
   async load(say) {
     say('loading engine...');
-    const [ort, bot] = await Promise.all([
+    const [ort, api] = await Promise.all([
       import(CLIENT + 'public/ort.all.min.mjs'),
-      import(CLIENT + 'src/bot.js'),
+      import(CLIENT + 'src/index.js'),
     ]);
     say('loading model...');
-    // WebGPU first, WASM as the fallback. The gap is not small -- 1.6 ms per
-    // position against 42-47 -- so the fallback is a different experience
-    // rather than a slightly slower one, and is worth saying out loud when it
-    // is what you get.
-    const instance = await bot.Bot.create({
-      ort,
-      modelUrl: CLIENT + 'public/model.onnx',
-      executionProviders: ['webgpu', 'wasm'],
-    });
-    return { bot: instance, Game: bot.Game };
+    // WebGPU first, WASM as the fallback, which is what createBot defaults to.
+    // The gap is not small -- 1.6 ms per position against 42-47 -- so the
+    // fallback is a different experience rather than a slightly slower one.
+    return api.createBot({ ort, modelUrl: CLIENT + 'public/model.onnx' });
   },
 };
 </script>

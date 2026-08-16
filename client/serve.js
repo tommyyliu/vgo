@@ -2,7 +2,7 @@
 //
 // Serves the repository root rather than client/, because the pages that use
 // the bot and the bot itself live in different trees: reference/js-reference/
-// imports ../../client/src/bot.js, and a server rooted at client/ cannot see
+// imports ../../client/src/index.js, and a server rooted at client/ cannot see
 // the importer. Rooting it here also gets the reference test pages served, which
 // they must be -- they load their modules over http and do not run from disk.
 //

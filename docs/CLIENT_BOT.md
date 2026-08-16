@@ -182,11 +182,74 @@ work and is not used either.
 **Phase 3 — WASM build. Done.** `crates/vgo-wasm` exposes `Game` and `Search`;
 `client/src/bot.js` drives the loop.
 
-**Phase 4 — packaging. Partly done.** The bot is wired into the reference client
-behind an engine selector, with the server backend as the default and the
-fallback. What is left is the embeddable form for the community site, and a
-difficulty setting — which should map to *time*, not simulation count, since
-that is the axis the search is now driven on.
+**Phase 4 — packaging. Done, apart from difficulty.** `client/dist/vgo-bot.js`
+is one 360 KB ES module with the engine's WASM inlined; see *Embedding* below.
+The bot is also wired into the reference client behind an engine selector, with
+the server backend as the default.
+
+What is left is a difficulty setting, which should map to *time*, not simulation
+count, since that is the axis the search is now driven on — with the caveat that
+equal time is unequal strength across machines, so a site running a ladder wants
+`maxSimulations` instead.
+
+## Embedding
+
+    npm --prefix client run build:wasm    # crates/vgo-wasm -> client/vendor/
+    npm --prefix client run build         # vendor/ + src/  -> client/dist/vgo-bot.js
+
+`client/examples/embed.html` is the smallest working integration and the smoke
+test for the bundle. The API is `client/src/index.js`, which is also what the
+reference client imports — deliberately, so the API a host integrates against is
+the one that gets exercised here and cannot rot while still appearing to work.
+
+```js
+import { createBot } from './vgo-bot.js';
+import * as ort from './ort.all.min.mjs';
+
+const bot = await createBot({ ort, modelUrl: '/vgo/model.onnx' });
+
+const move = await bot.chooseMove({
+  radius: 1 / 18, komi: 0.104, toMove: 'B', passes: 0,
+  stones: [{ x: 0.5, y: 0.5, c: 'B' }],
+}, { thinkMillis: 5000, signal, onProgress });
+// { pass: false, x: 0.41, y: 0.62, simulations: 3208, elapsed: 5012 }
+```
+
+The bot knows nothing about games — no board, no history, no turn tracking, no
+game-over. The host owns all of that and asks one question: given this position
+and this much time, what is the move?
+
+Three things a host has to serve, and only one is ours:
+
+| file | size | bundled? |
+|---|---|---|
+| `dist/vgo-bot.js` | ~360 KB | engine WASM inlined |
+| onnxruntime-web | ~810 KB + a backend `.wasm` it fetches | no |
+| the model | ~33 MB | no |
+
+The last two stay out on purpose. Both are large, cacheable, and already
+artefacts a host deploys deliberately; inlining them would turn a 360 KB module
+into a 60 MB one that cannot be cached apart from the code. Our WASM *is*
+inlined, because the failure it prevents is a page that loads the module and
+then 404s on a `.wasm` nobody remembered to copy.
+
+Two fields are easy to leave out and both change the game:
+
+- **`komi` defaults to 0**, which is honest — a record that does not mention it
+  was played at none — but it is a large handicap, not a neutral setting. At
+  komi 0 Black wins about nine games in ten. The balanced value measured on this
+  engine is 0.104, and it drifts as the models improve.
+- **`passes`** is how many consecutive passes precede the position. A search
+  that believes nobody has passed does not know that passing now would end the
+  game, so it can neither pass to close out a win nor see that passing while
+  behind hands over the result. A board full of stones does not carry this, so
+  the host must send it. **`vgo-serve-move` has the same blind spot** — its
+  protocol has no field for it — so the server backend still plays the endgame
+  without knowing whether a pass ends anything.
+
+Errors are all `VgoBotError` with a `code` (`unsupported`, `invalid-position`,
+`finished`, `aborted`, `inference`), so a host can tell a bad position from a
+missing model without matching on message text.
 
 ### One thing the wiring got wrong twice
 

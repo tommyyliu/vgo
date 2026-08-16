@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Browser bot for VGO. Rules and search are the same Rust self-play runs, compiled to WebAssembly.",
   "scripts": {
+    "build": "node build.js",
     "build:wasm": "cargo build -p vgo-wasm --profile wasm-release --target wasm32-unknown-unknown && wasm-bindgen --target web --no-typescript --out-dir vendor ../target/wasm32-unknown-unknown/wasm-release/vgo_wasm.wasm",
     "bench": "node bench/inference.js",
     "serve": "node serve.js"

@@ -15,6 +15,8 @@ __pycache__/
 /client/public/model.onnx
 /client/public/ort*.mjs
 /client/public/ort*.wasm
+# Built by client/build.js from vendor/ and src/.
+/client/dist/
 
 # Sweep workspace: 1.4 GB of shards, arena records and checkpoints. Its own
 # scripts live alongside them and are not tracked either, because they are

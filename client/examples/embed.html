@@ -1,0 +1,91 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>vgo-bot integration example</title>
+<!--
+  The smallest thing that uses the bundle, and the smoke test for it.
+
+  Deliberately has no board: drawing one is the host site's job and this is
+  about the seam. It builds a bot, asks for one move on a fixed position, and
+  prints what came back.
+
+    npm --prefix client run build:wasm && npm --prefix client run build
+    node client/serve.js
+    http://localhost:8123/client/examples/embed.html
+
+  Three files have to be reachable, and only one of them is ours:
+
+    ../dist/vgo-bot.js          this bundle, engine WASM inlined  (~360 KB)
+    ../public/ort.all.min.mjs   onnxruntime-web                   (~810 KB
+                                plus a backend .wasm it fetches itself)
+    ../public/model.onnx        the exported network              (~33 MB)
+
+  A host serves all three itself. The last two are not bundled because they are
+  large, cacheable, and already artefacts you deploy on purpose.
+-->
+<style>
+  body { font: 14px/1.6 system-ui, sans-serif; margin: 2rem; max-width: 46rem; }
+  pre { background: #f4f4f2; padding: 1rem; overflow-x: auto; }
+  .bad { color: #a12; }
+</style>
+
+<h1>vgo-bot</h1>
+<p>One move from a fixed position. Watch the console for progress.</p>
+<pre id="out">starting…</pre>
+
+<script type="module">
+import { createBot, VgoBotError, DEFAULT_RADIUS } from '../dist/vgo-bot.js';
+import * as ort from '../public/ort.all.min.mjs';
+
+const out = document.getElementById('out');
+const say = text => { out.textContent = text; };
+
+// Coordinates are the unit square whatever the board is drawn at, so a host
+// scales its own pixels and nothing here depends on the display.
+const position = {
+  radius: DEFAULT_RADIUS,
+  // Balanced as measured on this engine. Zero is the honest default for a
+  // record that does not mention komi, but it is a large handicap, not a
+  // neutral setting: at komi 0 Black wins about nine games in ten.
+  komi: 0.104,
+  toMove: 'W',
+  stones: [
+    { x: 0.30, y: 0.35, c: 'B' }, { x: 0.45, y: 0.30, c: 'B' }, { x: 0.40, y: 0.50, c: 'B' },
+    { x: 0.70, y: 0.65, c: 'W' }, { x: 0.60, y: 0.78, c: 'W' }, { x: 0.80, y: 0.45, c: 'W' },
+  ],
+  // How many consecutive passes precede this position. Worth sending: without
+  // it the search cannot know that passing now would end the game.
+  passes: 0,
+};
+
+try {
+  say('loading model…');
+  const bot = await createBot({ ort, modelUrl: '../public/model.onnx' });
+
+  // A search can be cancelled between rounds -- when the player takes a move
+  // back, or navigates away.
+  const controller = new AbortController();
+
+  const move = await bot.chooseMove(position, {
+    thinkMillis: 5000,
+    signal: controller.signal,
+    onProgress: (simulations, elapsed) =>
+      say(`thinking… ${simulations} simulations in ${(elapsed / 1000).toFixed(1)}s`),
+  });
+
+  say([
+    JSON.stringify(move, null, 2),
+    '',
+    `engine: ${JSON.stringify(bot.info)}`,
+    `rate:   ${(move.simulations / (move.elapsed / 1000)).toFixed(0)} simulations/s`,
+  ].join('\n'));
+  bot.dispose();
+} catch (error) {
+  out.className = 'bad';
+  // Every failure from the bot is a VgoBotError with a `code`, so a host can
+  // tell a bad position from a missing model without matching on message text.
+  say(error instanceof VgoBotError
+    ? `${error.code}: ${error.message}`
+    : `unexpected: ${error?.message ?? error}`);
+  throw error;
+}
+</script>
