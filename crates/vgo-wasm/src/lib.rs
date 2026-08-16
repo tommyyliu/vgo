@@ -147,9 +147,22 @@ impl Game {
         serde_wasm_bindgen::to_value(&stones).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
-    /// Replace the position wholesale, for loading a game from the server.
+    /// Replace the position wholesale, for loading a game from elsewhere.
+    ///
+    /// `passes` is how many consecutive passes precede this position, and is
+    /// not decoration. A search that believes nobody has passed does not know
+    /// that passing now would end the game: it cannot pass to close out a win,
+    /// and cannot see that passing while behind hands over the result. Hosts
+    /// that track their own pass count must pass it through, because a board
+    /// full of stones does not carry it.
     #[wasm_bindgen(js_name = setStones)]
-    pub fn set_stones(&mut self, stones: JsValue, to_move: &str, ply: u32) -> Result<(), JsValue> {
+    pub fn set_stones(
+        &mut self,
+        stones: JsValue,
+        to_move: &str,
+        ply: u32,
+        passes: u32,
+    ) -> Result<(), JsValue> {
         let views: Vec<StoneView> = serde_wasm_bindgen::from_value(stones)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let parsed = views
@@ -159,7 +172,8 @@ impl Game {
             })
             .collect::<Result<Vec<_>, JsValue>>()?;
         let position = Position::new(self.position.radius(), parsed, parse_colour(to_move)?)
-            .with_komi(self.position.komi());
+            .with_komi(self.position.komi())
+            .with_passes(passes);
         if !position.validate().is_playable() {
             return Err(JsValue::from_str("position is not playable"));
         }

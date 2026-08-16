@@ -77,6 +77,30 @@ impl Position {
         self
     }
 
+    /// The same position with `passes` consecutive passes already played.
+    ///
+    /// For reconstructing a position from an external record, where the stones
+    /// are known but the pass count is carried separately. It is not optional
+    /// information: a search that believes nobody has passed does not know that
+    /// passing now would end the game, so it cannot pass to close out a win and
+    /// cannot see that passing while behind loses on the spot. `new` starts at
+    /// zero, which is the assumption that reads as "no passes yet" and is wrong
+    /// exactly when the endgame starts.
+    ///
+    /// Two passes end the game, so that count moves the phase to
+    /// [`Phase::Finished`] and the turn stays with whoever was to move, matching
+    /// what playing the second pass would have produced.
+    #[must_use]
+    pub fn with_passes(mut self, passes: u32) -> Self {
+        self.consecutive_passes = passes;
+        self.phase = if passes >= 2 {
+            Phase::Finished
+        } else {
+            Phase::Playing
+        };
+        self
+    }
+
     #[must_use]
     pub const fn komi(&self) -> f64 {
         self.komi
@@ -239,7 +263,7 @@ impl Validation {
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, Position, Stone, ValidationIssue};
+    use super::{Color, Phase, Position, Stone, ValidationIssue};
 
     #[test]
     fn tangent_stones_are_playable() {
@@ -280,5 +304,31 @@ mod tests {
             position.validate().issues(),
             &[ValidationIssue::StoneOutsideBoard { index: 0 }]
         );
+    }
+
+    /// A reconstructed position must know how many passes it inherited, or the
+    /// search cannot see that passing ends the game. Two passes must also land
+    /// on the same state playing the second pass would have produced -- finished,
+    /// with the turn left where it was rather than handed over.
+    #[test]
+    fn a_reconstructed_position_carries_its_pass_count() {
+        let base = Position::new(0.1, Vec::new(), Color::Black);
+        assert_eq!(base.consecutive_passes(), 0);
+
+        let one = base.clone().with_passes(1);
+        assert_eq!(one.consecutive_passes(), 1);
+        assert_eq!(one.phase(), Phase::Playing);
+        assert_eq!(one.to_move(), Color::Black);
+
+        let two = base.clone().with_passes(2);
+        assert_eq!(two.phase(), Phase::Finished);
+        assert_eq!(two.to_move(), Color::Black);
+
+        // Reconstructing must agree with playing it out: one pass from `one`
+        // ends the game, and lands where `with_passes(2)` says it does.
+        let played = crate::pass(&one).expect("a pass is legal here").position;
+        assert_eq!(played.phase(), two.phase());
+        assert_eq!(played.consecutive_passes(), two.consecutive_passes());
+        assert_eq!(played.to_move(), two.to_move());
     }
 }
