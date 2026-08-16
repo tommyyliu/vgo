@@ -9,6 +9,10 @@ model, and the serving path — and records the load-bearing decisions with the
 measurements behind them, so you do not have to reconstruct them from a dozen
 files.
 
+**Want to put the bot on a website?** [`client/`](client/README.md) is a
+self-contained browser opponent: one 360 KB ES module with the engine compiled
+to WebAssembly, no server and no GPU to operate. `createBot`, then `chooseMove`.
+
 ## Repository areas
 
 - [`reference/`](reference/README.md) contains the clean, working JavaScript
@@ -28,6 +32,13 @@ files.
   progressive-widening MCTS, and [`crates/vgo-selfplay/`](crates/vgo-selfplay)
   owns complete playouts, the paired canary arena, model smoke tests, and demo
   trajectory generation.
+- [`client/`](client/README.md) is the embeddable browser bot: `crates/vgo-wasm`
+  compiled to WebAssembly plus the JavaScript that drives its search loop, built
+  into a single module a site can serve. Because inference is asynchronous in a
+  browser, the search hands its loop out
+  ([`SteppedSearch`](crates/vgo-search/src/stepped.rs)), which is also what lets
+  it think for a time budget rather than a fixed simulation count. Design notes
+  and measurements: [`docs/CLIENT_BOT.md`](docs/CLIENT_BOT.md).
 - [`training/`](training) owns Python model training, checkpoint export, replay
   loading, and the retained protocol-debug service. Rust self-play does not
   import it.
