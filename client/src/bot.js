@@ -41,10 +41,22 @@ const CHANNELS = 5;
 /// not measured, which is the open question here.
 const DEFAULT_LEAF_BATCH = 8;
 
-export class Bot {
-  #session; #ort; #policySize; #leafBatch; #inputName;
+/// Fine cells per coarse sampling region, and not a free parameter: it must
+/// match how the model was trained or the policy head is read through the wrong
+/// sampler. Zero -- which is what `SearchConfig::canary` defaults to -- does not
+/// mean "no pooling", it means candidate moves come from a quasi-random
+/// sequence and the policy head stops guiding where the search looks at all.
+/// The search still returns legal moves either way, so this is invisible except
+/// in playing strength. `vgo-serve-move` uses 4.
+const DEFAULT_COARSE_POOL = 4;
 
-  static async create({ ort, modelUrl, executionProviders, leafBatch = DEFAULT_LEAF_BATCH }) {
+export class Bot {
+  #session; #ort; #policySize; #leafBatch; #coarsePool; #inputName;
+
+  static async create({
+    ort, modelUrl, executionProviders,
+    leafBatch = DEFAULT_LEAF_BATCH, coarsePool = DEFAULT_COARSE_POOL,
+  }) {
     await init();
     const session = await ort.InferenceSession.create(modelUrl, {
       executionProviders,
@@ -54,6 +66,7 @@ export class Bot {
     bot.#session = session;
     bot.#ort = ort;
     bot.#leafBatch = leafBatch;
+    bot.#coarsePool = coarsePool;
     bot.#inputName = session.inputNames[0];
     // Read the policy width from the model rather than assuming it: the raster
     // and the policy grid are separate settings and have differed before.
@@ -68,8 +81,17 @@ export class Bot {
 
   get policySize() { return this.#policySize; }
   get leafBatch() { return this.#leafBatch; }
+  get coarsePool() { return this.#coarsePool; }
 
   /// Choose a move for the side to move, thinking for at most `budgetMillis`.
+  ///
+  /// The budget is checked before each round, not during one, so it means "start
+  /// no new round after this" rather than "answer by this". An in-flight
+  /// inference always finishes, and the overrun is one inference: invisible at
+  /// 12 ms per round on WebGPU, and seconds on a CPU fallback that is slow
+  /// enough to matter. Cancelling mid-inference is not available to us, and
+  /// throwing away a completed evaluation to hit a deadline exactly would be
+  /// paying for the wrong thing.
   ///
   /// Returns `{ move, simulations, elapsed }` where `move` is `[x, y]`, or `[]`
   /// for a pass. `onProgress` is called after each round so a UI can show that
@@ -78,7 +100,8 @@ export class Bot {
     // `seed` is u64 in Rust, which wasm-bindgen maps to BigInt: passing a
     // Number throws "Cannot convert ... to a BigInt". Coerce here so callers
     // can hand over an ordinary number.
-    const search = game.search(0x3fffffff, BigInt(seed), this.#policySize);
+    const search =
+      game.search(0x3fffffff, BigInt(seed), this.#policySize, this.#coarsePool, this.#leafBatch);
     const deadline = performance.now() + budgetMillis;
     const started = performance.now();
     let simulations = 0;

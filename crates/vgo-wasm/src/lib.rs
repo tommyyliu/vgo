@@ -7,35 +7,39 @@
 //! and the fix had to be found twice. Everything below is the same code
 //! self-play runs.
 //!
-//! ## What is settled and what is not
+//! ## The asynchronous seam
 //!
-//! Rules, scoring and rasterization are straightforward to expose: they are
-//! synchronous, pure, and already exactly what the client needs.
+//! Rules, scoring and rasterization expose directly: they are synchronous,
+//! pure, and already what the client needs.
 //!
-//! **Search is not**, and the shape of this crate's eventual API depends on a
-//! decision that has not been made. `vgo_search::search_with_evaluator` is
-//! synchronous — it takes `&dyn Evaluator` and runs to completion — while
-//! `session.run()` in onnxruntime-web is asynchronous. Three ways out, none
-//! free:
+//! Search is the one hard part. `vgo_search::search_at_ply` is synchronous — it
+//! takes `&dyn Evaluator` and runs to completion — while `session.run()` in
+//! onnxruntime-web returns a promise, and the thread that would block on it is
+//! the thread that must run the event loop to resolve it. Three ways across,
+//! and this crate takes the first:
 //!
-//!   1. **Stepped search.** Turn the search loop inside out so it yields a
-//!      batch of leaves, takes results back, and resumes. Cleanest at runtime,
-//!      no deployment constraints, but it means restructuring 1,573 lines of
-//!      MCTS.
-//!   2. **Asyncify** (`wasm-opt --asyncify`). No search changes at all; the
-//!      cost is roughly double the binary and a speed penalty on every call
-//!      that crosses the boundary.
+//!   1. **Stepped search**, `vgo_search::SteppedSearch`: turn the loop inside
+//!      out so it yields a batch of leaves, takes results back, and resumes.
+//!      Chosen. Nothing to deploy, and the caller owning the loop is what
+//!      allows a *time budget* instead of a fixed simulation count.
+//!   2. **Asyncify** (`wasm-opt --asyncify`). No search changes, at the cost of
+//!      roughly double the binary and a penalty on every boundary crossing.
 //!   3. **`Atomics.wait` on a `SharedArrayBuffer`,** search in one worker and
-//!      inference in another. Fastest, but requires COOP/COEP headers on the
-//!      host — a constraint on a community site nobody here controls.
+//!      inference in another. Fastest, but needs COOP/COEP on the host — a
+//!      constraint on a community site nobody here controls.
 //!
-//! [`search_naive`] below runs the real MCTS against the built-in evaluator, so
-//! search is proven to work under WASM before that decision is taken. It is not
-//! the bot; it is the evidence that the hard part is only the seam.
+//! The stepped path is proven identical to the batched one rather than assumed
+//! to be: `stepped_search_matches_the_batched_search` asserts bit-identical
+//! visits, priors and values across stone counts, leaf batches and seeds.
+//!
+//! [`Game::search_naive`] runs the real MCTS against the built-in evaluator with
+//! no network at all. It is not the bot -- without a policy the search has no
+//! prior worth speaking of -- but it is the weakest possible difficulty and a
+//! way to exercise the engine with nothing else present.
 
 use vgo_core::{Analysis, Color, Phase, Position, Stone, is_legal_placement, pass, place};
 use vgo_raster::{DensePolicy, RasterConfig, RasterKind, rasterize_any_into};
-use vgo_search::{Action, Evaluation, NaiveEvaluator, Policy, SearchConfig, SteppedSearch, search_at_ply};
+use vgo_search::{Action, Evaluation, NaiveEvaluator, SearchConfig, SteppedSearch, search_at_ply};
 use wasm_bindgen::prelude::*;
 
 /// Board radius and komi are per-game; everything else here is per-call.
@@ -184,11 +188,27 @@ impl Game {
     /// Begin a network-driven search that JavaScript drives.
     ///
     /// `policySize` is the model's policy output width, `resolution² + 1`.
+    ///
+    /// `coarsePool` and `leafBatch` are not optional in practice and must match
+    /// how the model is served elsewhere, because `SearchConfig::canary` is a
+    /// test default rather than a playing one and gets both wrong for this use:
+    ///
+    ///   * `coarse_pool = 0` makes the search draw candidate moves from the
+    ///     legacy quasi-random sequence instead of the network's own policy
+    ///     map. The search still plays legal moves, so nothing looks broken --
+    ///     it is simply no longer guided by the policy head, which is the part
+    ///     of the model that decides *where* to look. `vgo-serve-move` uses 4.
+    ///   * `leaf_batch = 1` evaluates one position per network call. Correct,
+    ///     and about eight times slower than it needs to be in a browser, where
+    ///     one inference costs roughly the same whether it carries 1 position
+    ///     or 8.
     pub fn search(
         &self,
         simulations: u32,
         seed: u64,
         policy_size: usize,
+        coarse_pool: usize,
+        leaf_batch: usize,
     ) -> Result<Search, JsValue> {
         if self.position.phase() != Phase::Playing {
             return Err(JsValue::from_str("cannot search a finished position"));
@@ -204,6 +224,8 @@ impl Game {
         }
         let mut config = SearchConfig::canary(simulations);
         config.temperature = 0.0;
+        config.coarse_pool = coarse_pool;
+        config.leaf_batch = leaf_batch.max(1);
         Ok(Search {
             inner: SteppedSearch::new(self.position.clone(), config, seed, self.ply),
             outstanding: 0,
@@ -240,7 +262,7 @@ impl Game {
 /// The loop lives in JS:
 ///
 /// ```js
-/// const search = game.search(simulations, seed);
+/// const search = game.search(simulations, seed, policySize, coarsePool, leafBatch);
 /// while (!search.finished) {
 ///   const batch = search.nextBatch(rasterSize);   // Float32Array, n * C*H*W
 ///   const { values, policies } = await infer(batch);
