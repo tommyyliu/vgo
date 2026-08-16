@@ -1,0 +1,184 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Play VGO</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 1.5rem; display: flex; gap: 1.5rem;
+         flex-wrap: wrap; align-items: flex-start; }
+  canvas { border: 1px solid #8886; border-radius: 4px; cursor: crosshair; touch-action: none; }
+  aside { min-width: 17rem; max-width: 22rem; }
+  button { font: inherit; padding: .35rem .8rem; margin-right: .4rem; }
+  select { font: inherit; }
+  #status { min-height: 3.2em; }
+  .muted { opacity: .65; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: .1rem .6rem; margin: .6rem 0; }
+  dt { opacity: .65; } dd { margin: 0; font-variant-numeric: tabular-nums; }
+</style>
+<canvas id="board" width="640" height="640"></canvas>
+<aside>
+  <h1 style="margin-top:0">Play VGO</h1>
+  <p class="muted">
+    Rules and search are the same Rust the self-play trainer runs, compiled to
+    WebAssembly. Inference is the trained network via WebGPU.
+  </p>
+  <p>
+    <label>Bot thinks for
+      <select id="budget">
+        <option value="500">0.5 s</option>
+        <option value="1500" selected>1.5 s</option>
+        <option value="3000">3 s</option>
+        <option value="5000">5 s</option>
+      </select>
+    </label>
+  </p>
+  <p>
+    <button id="pass">Pass</button>
+    <button id="undo" disabled title="not implemented yet">Undo</button>
+    <button id="restart">Restart</button>
+  </p>
+  <div id="status">loading…</div>
+  <dl id="stats"></dl>
+  <p class="muted" id="backend"></p>
+</aside>
+
+<script type="module">
+import * as ort from '../public/ort.all.min.mjs';
+import { Bot, Game, init } from '../src/bot.js';
+
+const RADIUS = 0.055714285714285716;   // production board: stones are ~1/18 of the side
+const KOMI = 0.104;                     // the measured balance point, 2026-08-16
+const canvas = document.getElementById('board');
+const context = canvas.getContext('2d');
+const status = document.getElementById('status');
+const stats = document.getElementById('stats');
+const backendLine = document.getElementById('backend');
+
+let game = null;
+let bot = null;
+let thinking = false;
+let lastMove = null;
+
+function scale() { return canvas.width; }
+
+function draw() {
+  const size = scale();
+  context.clearRect(0, 0, size, size);
+  const style = getComputedStyle(document.body);
+  context.fillStyle = style.getPropertyValue('color-scheme').includes('dark') ? '#2a2a2e' : '#f2e2c0';
+  context.fillRect(0, 0, size, size);
+
+  // The playable inset: a stone centre must be at least one radius from the edge.
+  context.strokeStyle = '#8884';
+  context.strokeRect(RADIUS * size, RADIUS * size, (1 - 2 * RADIUS) * size, (1 - 2 * RADIUS) * size);
+
+  for (const stone of game.stones()) {
+    context.beginPath();
+    context.arc(stone.x * size, stone.y * size, RADIUS * size, 0, Math.PI * 2);
+    context.fillStyle = stone.color === 'black' ? '#111' : '#fafafa';
+    context.fill();
+    context.strokeStyle = '#0006';
+    context.stroke();
+  }
+  if (lastMove) {
+    context.beginPath();
+    context.arc(lastMove[0] * size, lastMove[1] * size, RADIUS * size * 0.28, 0, Math.PI * 2);
+    context.fillStyle = '#e33';
+    context.fill();
+  }
+}
+
+function show(message) { status.innerHTML = message; }
+
+function refresh(extra = {}) {
+  const rows = {
+    'to move': game.finished ? '—' : game.toMove,
+    ply: game.ply,
+    ...extra,
+  };
+  if (game.finished) rows['black margin'] = game.blackMargin().toFixed(4);
+  stats.innerHTML = Object.entries(rows)
+    .map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+  draw();
+}
+
+async function botTurn() {
+  if (game.finished || thinking) return;
+  thinking = true;
+  const budget = Number(document.getElementById('budget').value);
+  show('bot is thinking…');
+  const seed = Math.floor(Math.random() * 2 ** 32);
+  const { move, simulations, elapsed } = await bot.chooseMove(game, {
+    budgetMillis: budget,
+    seed,
+    onProgress: (done) => show(`bot is thinking… ${done} simulations`),
+  });
+  if (move.length === 0) {
+    game.pass();
+    lastMove = null;
+    show('bot passed.');
+  } else {
+    game.place(move[0], move[1]);
+    lastMove = move;
+    show('your turn.');
+  }
+  refresh({ 'bot simulations': simulations, 'bot time': `${(elapsed / 1000).toFixed(2)} s` });
+  thinking = false;
+  if (game.finished) endGame();
+}
+
+function endGame() {
+  const margin = game.blackMargin();
+  const winner = margin > 0 ? 'Black' : margin < 0 ? 'White' : 'nobody';
+  show(`<b>Game over.</b> ${winner} leads by ${Math.abs(margin).toFixed(4)} before komi.`);
+}
+
+canvas.addEventListener('click', async (event) => {
+  if (thinking || game.finished || !bot) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = (event.clientX - rect.left) / rect.width;
+  const y = (event.clientY - rect.top) / rect.height;
+  if (!game.is_legal(x, y)) { show('illegal there — too close to a stone or the edge.'); return; }
+  if (!game.place(x, y)) { show('that placement was rejected.'); return; }
+  lastMove = [x, y];
+  refresh();
+  if (game.finished) { endGame(); return; }
+  await botTurn();
+});
+
+document.getElementById('pass').addEventListener('click', async () => {
+  if (thinking || game.finished || !bot) return;
+  game.pass();
+  lastMove = null;
+  refresh();
+  if (game.finished) { endGame(); return; }
+  await botTurn();
+});
+
+document.getElementById('restart').addEventListener('click', () => {
+  if (thinking) return;
+  game = new Game(RADIUS, KOMI);
+  lastMove = null;
+  show('your turn. You are Black.');
+  refresh();
+});
+
+show('loading engine…');
+try {
+  // The WebAssembly module must be up before any Game exists.
+  await init();
+  game = new Game(RADIUS, KOMI);
+  draw();
+  show('loading model…');
+  bot = await Bot.create({
+    ort,
+    modelUrl: '../public/model.onnx',
+    executionProviders: ['webgpu'],
+  });
+  backendLine.textContent =
+    `webgpu · leaf batch ${bot.leafBatch} · policy ${bot.policySize}`;
+  show('your turn. You are Black.');
+  refresh();
+} catch (error) {
+  show(`<b>could not start:</b> ${String(error).slice(0, 200)}`);
+}
+</script>

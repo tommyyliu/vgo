@@ -1,0 +1,90 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VGO client benchmark</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem; max-width: 46rem; }
+  table { border-collapse: collapse; margin: 1rem 0; }
+  th, td { padding: .3rem .8rem; border-bottom: 1px solid #ddd; text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  pre { background: #f6f6f6; padding: .8rem; overflow-x: auto; }
+</style>
+<h1>How many simulations fit in a move?</h1>
+<p>
+  The client's whole design depends on milliseconds per network evaluation in a
+  real browser. This measures it on whichever backend is available and reports
+  what a 5-second move budget buys.
+</p>
+<p id="status">starting…</p>
+<div id="results"></div>
+<script type="module">
+import * as ort from '../public/ort.all.min.mjs';
+
+const RASTER = 128, CHANNELS = 5, BUDGET = 5000;
+const BATCHES = [1, 2, 4, 8];
+const status = document.getElementById('status');
+const results = document.getElementById('results');
+
+function input(batch) {
+  const data = new Float32Array(batch * CHANNELS * RASTER * RASTER);
+  for (let i = 0; i < data.length; i += 1) data[i] = Math.random() < 0.06 ? 1 : 0;
+  return new ort.Tensor('float32', data, [batch, CHANNELS, RASTER, RASTER]);
+}
+
+async function measure(provider) {
+  const row = [];
+  let session;
+  try {
+    ort.env.wasm.numThreads = navigator.hardwareConcurrency ?? 4;
+    session = await ort.InferenceSession.create('../public/model.onnx', {
+      executionProviders: [provider], graphOptimizationLevel: 'all',
+    });
+  } catch (error) {
+    return { provider, error: String(error).slice(0, 160) };
+  }
+  for (const batch of BATCHES) {
+    const feeds = { [session.inputNames[0]]: input(batch) };
+    try {
+      for (let i = 0; i < 3; i += 1) await session.run(feeds);
+      const runs = batch >= 8 ? 5 : 12;
+      const started = performance.now();
+      for (let i = 0; i < runs; i += 1) await session.run(feeds);
+      const perInfer = (performance.now() - started) / runs;
+      const rounds = Math.floor(BUDGET / perInfer);
+      row.push({ batch, perInfer, perPosition: perInfer / batch, simulations: rounds * batch });
+    } catch (error) {
+      row.push({ batch, error: String(error).slice(0, 80) });
+    }
+  }
+  return { provider, row };
+}
+
+function render(all) {
+  results.innerHTML = all.map(({ provider, row, error }) => {
+    if (error) return `<h3>${provider}</h3><pre>${error}</pre>`;
+    const body = row.map((r) => r.error
+      ? `<tr><td>${r.batch}</td><td colspan="3">${r.error}</td></tr>`
+      : `<tr><td>${r.batch}</td><td>${r.perInfer.toFixed(1)}</td>` +
+        `<td>${r.perPosition.toFixed(2)}</td><td><b>${r.simulations}</b></td></tr>`).join('');
+    return `<h3>${provider}</h3><table><tr><th>batch</th><th>ms/infer</th>` +
+      `<th>ms/position</th><th>simulations in ${BUDGET / 1000}s</th></tr>${body}</table>`;
+  }).join('');
+}
+
+const all = [];
+for (const provider of ['webgpu', 'wasm']) {
+  status.textContent = `measuring ${provider}…`;
+  all.push(await measure(provider));
+  render(all);
+}
+status.textContent = `done. crossOriginIsolated=${self.crossOriginIsolated}, ` +
+  `hardwareConcurrency=${navigator.hardwareConcurrency}`;
+await fetch('/result', {
+  method: 'POST',
+  body: JSON.stringify({
+    isolated: self.crossOriginIsolated,
+    cores: navigator.hardwareConcurrency,
+    hasWebGPU: 'gpu' in navigator,
+    all,
+  }),
+}).catch(() => {});
+</script>

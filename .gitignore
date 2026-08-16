@@ -8,3 +8,10 @@ Screenshot*.png
 __pycache__/
 *.py[cod]
 .worktree/
+
+# Client build inputs and outputs that are fetched or generated, not authored.
+/client/node_modules/
+/client/vendor/
+/client/public/model.onnx
+/client/public/ort*.mjs
+/client/public/ort*.wasm

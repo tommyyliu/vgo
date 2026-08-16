@@ -1,0 +1,28 @@
+[package]
+name = "vgo-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The browser bot's Rust half. Exists so the client does not become a fourth
+# implementation of the rules: `game.rs` and `reference/src/engine/game.js`
+# already carry mutual "must match" comments, and they have diverged in practice
+# -- the even-trade bug, where a placement capturing exactly one stone read as a
+# pass and ended live games, had to be found and fixed on both sides.
+#
+# Depends only on rules, search and raster. Nothing here reaches into
+# generation or training: no resignation, no komi controller, no replay shards,
+# no telemetry.
+
+[dependencies]
+vgo-core = { path = "../vgo-core" }
+vgo-search = { path = "../vgo-search" }
+vgo-raster = { path = "../vgo-raster", features = ["distance-settled"] }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]

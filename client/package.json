@@ -1,0 +1,14 @@
+{
+  "name": "vgo-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser bot for VGO. Rules and search are the same Rust self-play runs, compiled to WebAssembly.",
+  "scripts": {
+    "bench": "node bench/inference.js",
+    "serve": "node serve.js"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.20.0"
+  }
+}

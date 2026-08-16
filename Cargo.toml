@@ -3,7 +3,9 @@ members = [
     "crates/vgo-core",
     "crates/vgo-inference",
     "crates/vgo-raster",
+    "crates/vgo-raster-cuda",
     "crates/vgo-search",
+    "crates/vgo-wasm",
     "crates/vgo-selfplay",
 ]
 resolver = "3"
@@ -21,3 +23,19 @@ clap = { version = "4.5", features = ["derive"] }
 codegen-units = 1
 lto = "thin"
 debug = true
+
+# Browser artifact. The release profile keeps `debug = true` because native
+# profiling wants symbols, and that alone makes the wasm 7.9 MB. Size is a
+# feature here -- the client is downloaded by people who came to play a game --
+# so this trades the symbols and some speed for bytes.
+#
+# `panic = "abort"` is safe for this crate: nothing catches unwinds, and every
+# fallible entry point returns Result to JavaScript rather than panicking.
+[profile.wasm-release]
+inherits = "release"
+debug = false
+strip = true
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
