@@ -94,6 +94,105 @@ document.getElementById('app').addEventListener('load', function () {
     assert(doc.getElementById('pvB').textContent === '', 'preview score outlived the pointer');
   });
 
+  test('komi is settable, rescores the record, and travels with it', function () {
+    const win = document.getElementById('app').contentWindow;
+    // A position Black leads on, so a large enough komi has to flip the result.
+    doc.getElementById('sgf').value =
+      '(;FF[4]GM[VGO]SZ[1]RA[0.05000]PL[B]' +
+      'AB[0.25000,0.25000][0.25000,0.75000][0.50000,0.50000]AW[0.85000,0.50000])';
+    doc.getElementById('load').click();
+    const komiEl = doc.getElementById('komi');
+    assert(Number(komiEl.value) === 0, 'a record without KM should load at komi zero');
+
+    doc.getElementById('pass').click();
+    doc.getElementById('pass').click();
+    assert(doc.getElementById('turn').textContent === 'Black wins',
+      'fixture must be a Black win at komi zero, got ' + doc.getElementById('turn').textContent);
+
+    // Rescoring reaches the finished position too: komi is a property of the
+    // game, so it applies to every node in the record at once.
+    doc.getElementById('undo').click();
+    doc.getElementById('undo').click();
+    komiEl.value = '0.5';
+    komiEl.dispatchEvent(new win.Event('change'));
+    doc.getElementById('pass').click();
+    doc.getElementById('pass').click();
+    assert(doc.getElementById('turn').textContent === 'White wins',
+      'komi above Black\'s lead did not hand the game to White');
+    assert(doc.getElementById('leadLabel').textContent === 'lead (komi-adjusted)',
+      'the lead row did not announce that komi is applied');
+
+    // The raw areas are untouched: komi moves the verdict, not the board.
+    assert(Number(doc.getElementById('scoreB').textContent.replace('%', '')) > 50,
+      'komi altered the reported area');
+
+    // It has to survive a save/load round trip, or the record scores two ways.
+    assert(doc.getElementById('sgf').value.includes('KM[0.5]'),
+      'komi did not reach the serialised record: ' + doc.getElementById('sgf').value);
+    doc.getElementById('load').click();
+    assert(Number(doc.getElementById('komi').value) === 0.5,
+      'a reloaded record lost its komi');
+
+    // Undo restores the previous komi, which only works because rescoring
+    // leaves the old tree alone rather than rewriting it in place.
+    doc.getElementById('clear').click();
+    komiEl.value = '0.1';
+    komiEl.dispatchEvent(new win.Event('change'));
+    doc.getElementById('undo').click();
+    assert(Number(doc.getElementById('komi').value) === 0.5,
+      'undo did not restore the prior komi, got ' + doc.getElementById('komi').value);
+  });
+
+  /* The model opponent, without a model.
+
+     Kept synchronous on purpose: the runner dumps the DOM at load, so anything
+     asserted after an await would never be read and the suite would report
+     RUNNING. It does not need to be async. Everything before the first `await`
+     in requestModelMove runs synchronously, so a stubbed fetch has already
+     recorded the request by the time the click returns -- and stubbing the
+     page's setTimeout collapses auto-reply's 50ms hand-off into the same tick.
+
+     The reply is a rejection so nothing is applied to the board: what is under
+     test is whether the client asks, and with which position. */
+  function withStubbedModel(win, body) {
+    const calls = [];
+    const realFetch = win.fetch, realTimeout = win.setTimeout;
+    win.fetch = function (url, options) {
+      calls.push(JSON.parse(options.body));
+      return Promise.resolve({
+        ok: false, statusText: 'stub', json: () => Promise.resolve({ error: 'stub' }),
+      });
+    };
+    win.setTimeout = function (fn) { fn(); return 0; };
+    try { body(calls); } finally { win.fetch = realFetch; win.setTimeout = realTimeout; }
+  }
+
+  test('auto-reply answers a human pass, and sends the komi it is scored at', function () {
+    const win = document.getElementById('app').contentWindow;
+    doc.getElementById('clear').click();
+    doc.getElementById('komi').value = '0.175';
+    doc.getElementById('komi').dispatchEvent(new win.Event('change'));
+    withStubbedModel(win, function (calls) {
+      doc.getElementById('aiColor').value = 'W';
+      // Assigned rather than clicked: setting `checked` fires no change event,
+      // so the pass is the only thing that can trigger a request here.
+      doc.getElementById('aiAuto').checked = true;
+      assert(doc.getElementById('turn').textContent === 'Black', 'expected Black to move');
+      assert(calls.length === 0, 'the model was asked before anything happened');
+
+      doc.getElementById('pass').click();
+      assert(calls.length === 1,
+        'passing did not ask the model for a reply (' + calls.length + ' requests)');
+      // Searching at a komi the board is not scored at returns a confident move
+      // for a different game, and the reply looks identical either way.
+      assert(calls[0].komi === 0.175,
+        'the request omitted or mangled komi: ' + JSON.stringify(calls[0]));
+      assert(calls[0].toMove === 'W', 'the request did not hand the model its own turn');
+      assert(Array.isArray(calls[0].stones), 'the request lost its position');
+      doc.getElementById('aiAuto').checked = false;
+    });
+  });
+
   const output = document.getElementById('result');
   if (failures.length) {
     output.dataset.status = 'fail';

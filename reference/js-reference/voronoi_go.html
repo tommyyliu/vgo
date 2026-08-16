@@ -73,6 +73,10 @@
                      <span id="barW" style="background:var(--stoneW)"></span></div>
     <div class="row mut"><span>stones (B / W)</span><span id="counts"></span></div>
     <div class="row mut"><span>captured this move</span><span><span id="captured"></span><span id="pvCaptured" class="pv"></span></span></div>
+    <!-- The two score rows stay raw area, so the panel always says what is
+         actually on the board. Komi only moves the verdict, and this row is
+         where that shows. -->
+    <div class="row mut"><span id="leadLabel">lead</span><span id="lead"></span></div>
     <div id="positionWarning" class="notice" hidden></div>
     <hr>
     <div style="display:flex; gap:8px; flex-wrap:wrap;">
@@ -123,6 +127,15 @@
     <hr>
     <div class="row mut"><span>stone radius</span><span id="radLbl"></span></div>
     <input type="range" id="rad" min="8" max="70" step="1" value="39">
+    <!-- Komi is a fraction of the board, not a stone count, because the score
+         it adjusts is one: 0.18 spots White eighteen percent of the board.
+         Measured over games played to the ply cap Black led by a median of
+         0.181, so the fair value is near there and zero is a large handicap
+         for White. -->
+    <div class="row mut" title="area spotted to White, as a fraction of the board; subtracted from Black's lead when scoring">
+      <span>komi (to White)</span>
+      <span><input type="number" id="komi" step="0.005" value="0" style="width:90px"></span>
+    </div>
     <hr>
     <div class="mut" style="font-size:12px">
       Rendered as SVG: cells, edges and stones are exact vectors — crisp at any
@@ -591,6 +604,13 @@ function updateHUD() {
   const nb = S.filter(s => s.c === 'B').length;
   document.getElementById('counts').textContent = nb + ' / ' + (S.length - nb);
   document.getElementById('captured').textContent = lastCaptured || '0';
+  // Signed so the row reads the same way as the verdict: positive is Black.
+  const lead = ab - aw - state.komi;
+  const leader = Math.abs(lead) <= 1e-12 ? 'level' : (lead > 0 ? 'B' : 'W');
+  document.getElementById('leadLabel').textContent =
+    state.komi ? 'lead (komi-adjusted)' : 'lead';
+  document.getElementById('lead').textContent =
+    leader === 'level' ? 'level' : COLORS[leader].name + ' +' + pct(Math.abs(lead));
   const t = document.getElementById('turn'), tl = document.getElementById('turnLabel');
   if (state.phase === 'finished') {
     const tie = A.result.tie, winner = A.result.winner;
@@ -717,6 +737,11 @@ document.getElementById('pass').onclick = () => {
   if (outcome.node.position.phase === 'finished') hover = null;
   goTo(outcome.node);
   if (state.phase === 'finished') flash('Final score — ' + document.getElementById('turn').textContent);
+  // Passing hands over the turn exactly like a placement does, so it owes the
+  // model an answer for the same reason. Without this the model sat waiting
+  // whenever the human passed, and the only way to get it moving again was to
+  // toggle auto-reply off and on.
+  maybeAutoReply();
 };
 /* =========================================================================
    MODEL OPPONENT
@@ -759,6 +784,11 @@ async function requestModelMove() {
       headers: { 'Content-Type': 'text/plain' },
       body: JSON.stringify({
         radius: state.radius,
+        // The model reads komi as a raster channel and its value head is
+        // trained against it, so omitting it here would have the model search
+        // a different game than the one on screen -- and silently, since the
+        // reply looks the same either way.
+        komi: state.komi,
         toMove: state.toMove,
         stones: state.stones.map(s => ({ x: s.x, y: s.y, c: s.c })),
       }),
@@ -810,8 +840,10 @@ document.getElementById('aiColor').onchange = maybeAutoReply;
 document.getElementById('undo').onclick  = () => undo(false);
 document.getElementById('clear').onclick = () => {
   pushUndo(snapshot());
+  // Komi survives Clear for the same reason the radius does: both describe the
+  // game you are set up to play, not the stones currently on the board.
   setDocument(VGO.gameTree.create(
-    VGO.model.createPosition({ radius:state.radius, stones:[], toMove:'B' })));
+    VGO.model.createPosition({ radius:state.radius, komi:state.komi, stones:[], toMove:'B' })));
   draw();
 };
 
@@ -904,6 +936,7 @@ function syncSliders() {
   document.getElementById('radLbl').textContent = label;
   cv.style.borderRadius = (Number.isFinite(pixels) ? Math.max(0, pixels) : 0) + 'px';
 }
+const komiEl = document.getElementById('komi');
 function syncControlsFromState() {
   const pixels = state.radius * SIZE;
   if (Number.isFinite(pixels)) {
@@ -911,8 +944,28 @@ function syncControlsFromState() {
     radEl.max = Math.max(70, Math.ceil(pixels));
     radEl.value = pixels;
   }
+  // Loading a record carries its komi, so the control has to follow the
+  // position rather than the other way round.
+  if (document.activeElement !== komiEl) komiEl.value = state.komi;
   syncSliders();
 }
+
+// Komi rescores every position in the record, but unlike the radius it does not
+// invalidate a single stone -- the moves stay legal and the tree keeps its
+// shape -- so the record survives the change and only its verdict moves.
+//
+// `change` rather than `input`: a number field reports every keystroke, so
+// typing "0.18" would rebuild the tree at 0, 0.1 and 0.18 and leave three undo
+// entries behind for one edit.
+komiEl.onchange = () => {
+  const komi = Number(komiEl.value) || 0;
+  komiEl.value = komi;                       // normalises "", "abc" and "0."
+  if (komi === state.komi) return;
+  pushUndo(snapshot());
+  const rescored = VGO.gameTree.rescore(tree, komi);
+  setDocument(rescored.root, rescored.map.get(current));
+  draw();
+};
 // Changing the radius rewrites the board every move was made on, so it starts a
 // new record from the position on screen rather than editing one in place.
 radEl.oninput = () => {

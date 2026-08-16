@@ -285,6 +285,41 @@
     assert(realMoves > 0, 'fixture must contain a real placement');
   });
 
+  test('komi shifts the winner and is carried through play', function () {
+    const stones = [{ x:0.25, y:0.5, c:'B' }, { x:0.75, y:0.5, c:'W' },
+                    { x:0.25, y:0.2, c:'B' }, { x:0.5, y:0.8, c:'B' }];
+    const plain = position(stones);
+    const scores = VGO.analysis.analyze(plain).scores;
+    const lead = scores.B - scores.W;
+    assert(lead > 0, 'fixture must have Black ahead, or it cannot show a shift');
+    assert(VGO.analysis.analyze(plain).result.winner === 'B', 'Black should lead at komi zero');
+
+    // Komi above Black's lead has to hand the game to White; the raw areas are
+    // untouched, because komi moves the verdict and not the board.
+    const compensated = VGO.model.update(plain, { komi: lead + 0.01 });
+    const after = VGO.analysis.analyze(compensated);
+    assert(after.result.winner === 'W', 'komi above Black\'s lead must make White the winner');
+    near(after.scores.B, scores.B, 1e-12);
+    near(after.scores.W, scores.W, 1e-12);
+    near(after.result.margin, 0.01, 1e-9);
+
+    // Carried, not reset: komi belongs to the game, not the ply.
+    const played = VGO.game.place(compensated, 0.5, 0.35);
+    assert(played.ok, played.reason);
+    near(played.position.komi, lead + 0.01, 1e-12);
+    near(VGO.game.pass(played.position).position.komi, lead + 0.01, 1e-12);
+  });
+
+  test('komi round-trips through VGO-SGF', function () {
+    const start = VGO.model.createPosition(
+      { radius:0.05, stones:[{ x:0.3, y:0.3, c:'B' }], toMove:'W', komi:-0.125 });
+    const text = VGO.sgf.serialize(start);
+    assert(/KM\[-0\.125\]/.test(text), 'KM was not written: ' + text);
+    near(VGO.sgf.parse(text).komi, -0.125, 1e-12);
+    // A record written before KM existed scores at zero, not at NaN.
+    near(VGO.sgf.parse('(;FF[4]GM[VGO]SZ[1]RA[0.05]PL[B]AB[0.5,0.5])').komi, 0, 1e-12);
+  });
+
   test('serialization round-trips and invalid diagrams stay identifiable', function () {
     const start = position([{ x:0.2, y:0.3, c:'B' }, { x:0.8, y:0.7, c:'W' }], { toMove:'W' });
     const roundTrip = VGO.sgf.parse(VGO.sgf.serialize(start));

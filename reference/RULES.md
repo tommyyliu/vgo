@@ -30,6 +30,10 @@ V_s(S) = { x in D : ||x-s|| <= ||x-t|| for every t in S }.
 - A group is a connected component of same-color stones under that adjacency.
 - A group's region is the union of its stones' cells.
 - A color's score is the total area of its stones' cells.
+- A game has a fixed komi, an area subtracted from Black's lead when the game
+  is scored. It is a fraction of the board, like the scores it adjusts, not a
+  stone count: komi `0.18` spots White eighteen percent of the board. Komi is
+  fixed for a game and is not changed by any move.
 
 ## 3. Legal placement centers
 
@@ -90,7 +94,8 @@ reference implementation warns when a move removes one or more friendly stones.
   decide this question: self-capture is legal here, so an unchanged count means
   neither that a capture happened nor that the board stands still.
 - Two consecutive passes end the game. The current Voronoi area totals are the
-  final scores; the larger score wins, and equal scores are a tie.
+  final scores. Black wins when `black - white - komi` is positive, White when
+  it is negative, and an exact zero is a tie.
 - After the game ends, no further move or pass is allowed. Undo or Clear may be
   used to return the reference implementation to an active position.
 - The reference rules currently impose no ko or repetition restriction.

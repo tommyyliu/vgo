@@ -46,7 +46,11 @@
     for (let i = 0; i < position.stones.length; i++) {
       scores[position.stones[i].c] += geometry.cells[i].area;
     }
-    const scoreDelta = scores.B - scores.W;
+    // Komi is subtracted from Black's lead, so a positive value compensates
+    // White for moving second. `scores` stays raw area -- the panel shows what
+    // is actually on the board -- and only the verdict is compensated. Must
+    // match Analysis::new in crates/vgo-core/src/analysis.rs.
+    const scoreDelta = scores.B - scores.W - position.komi;
     const winner = Math.abs(scoreDelta) <= N.comparisonEpsilon ? null : (scoreDelta > 0 ? "B" : "W");
 
     return {

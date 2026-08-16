@@ -134,6 +134,32 @@
     return null;
   }
 
+  /* Rescore a whole record at a new komi.
+
+     Komi belongs to the game rather than to a move, so it cannot be changed at
+     one node and left alone at the others -- every cached position has to move
+     together or the record scores two ways depending on where you stand in it.
+
+     Unlike a radius change this invalidates nothing: komi does not touch
+     legality, capture or settlement, so every move in the record stays legal
+     and the tree keeps its exact shape.
+
+     A fresh tree rather than an in-place rewrite, because callers hold node
+     references to undo with. Mutating the cached positions would reach back
+     through those references and rescore the history they were taken to
+     preserve, so undo would not restore the old komi. The returned map carries
+     old nodes to new ones, so a caller can keep its place. */
+  function rescore(root, komi) {
+    const map = new Map();
+    function clone(source, parent) {
+      const copy = node(source.move, model.update(source.position, { komi: komi }), parent);
+      map.set(source, copy);
+      for (const child of source.children) copy.children.push(clone(child, copy));
+      return copy;
+    }
+    return { root: clone(root, null), map: map };
+  }
+
   /* Rebuild a tree from a parsed record.
 
      Replaying is the only way to recover positions, because a record stores
@@ -165,6 +191,7 @@
   root.VGO.gameTree = Object.freeze({
     create: create,
     fromRecord: fromRecord,
+    rescore: rescore,
     play: play,
     pass: pass,
     path: path,

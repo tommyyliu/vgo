@@ -26,7 +26,11 @@
         .map(function (stone) { return "[" + format(stone.x) + "," + format(stone.y) + "]"; })
         .join("");
     }
-    let output = "(;FF[4]GM[VGO]SZ[1]RA[" + format(position.radius) + "]PL[" + position.toMove + "]";
+    // KM is always written, even at zero. Komi changes who won, so a record
+    // that omits it is a record two readers can score differently -- exactly
+    // the disagreement the field exists to prevent.
+    let output = "(;FF[4]GM[VGO]SZ[1]RA[" + format(position.radius) +
+      "]KM[" + format(position.komi) + "]PL[" + position.toMove + "]";
     const black = points("B"), white = points("W");
     if (black) output += "AB" + black;
     if (white) output += "AW" + white;
@@ -52,10 +56,14 @@
       });
     }
     const radiusMatch = /RA\[([-+0-9.eE]+)\]/.exec(text);
+    const komiMatch = /KM\[([-+0-9.eE]+)\]/.exec(text);
     const playerMatch = /PL\[([BW])\]/.exec(text);
     const fallback = defaults || {};
     return model.createPosition({
       radius: radiusMatch ? Number(radiusMatch[1]) : fallback.radius,
+      // A record written before KM existed scores at zero, which is what those
+      // games were actually played at.
+      komi: komiMatch ? Number(komiMatch[1]) : (fallback.komi || 0),
       stones: stones("AB", "B").concat(stones("AW", "W")),
       toMove: playerMatch ? playerMatch[1] : (fallback.toMove || "B"),
       passes: 0,

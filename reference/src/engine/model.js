@@ -24,6 +24,16 @@
       toMove: source.toMove === "W" ? "W" : "B",
       passes: Math.max(0, Math.floor(Number(source.passes) || 0)),
       phase: source.phase === "finished" ? "finished" : "playing",
+      // Area subtracted from Black's lead when the game is scored. Voronoi area
+      // is a fraction of the board, so komi is one too rather than a stone
+      // count: 0.18 means White is spotted eighteen percent of the board.
+      //
+      // Part of the position because it changes who won: the same stones under
+      // different komi have different winners, so a search, a shard, and a
+      // model that disagree about it are not playing the same game. `update`
+      // copies the position before applying changes, so it carries through
+      // every move without each call site remembering to pass it.
+      komi: Number(source.komi) || 0,
     });
   }
 

@@ -11,9 +11,14 @@
 //! The protocol is one route. POST /move with the position:
 //!
 //! ```json
-//! {"radius": 0.0556, "toMove": "B",
+//! {"radius": 0.0556, "toMove": "B", "komi": 0.18,
 //!  "stones": [{"x": 0.5, "y": 0.5, "c": "B"}]}
 //! ```
+//!
+//! `komi` is optional and defaults to zero. It is a fraction of the board, not
+//! a stone count, and the model reads it as a raster channel -- so a caller
+//! that scores at one komi and searches at another gets a confident move for a
+//! different game.
 //!
 //! and the reply is the chosen move plus what the search thought of it:
 //!
@@ -82,6 +87,7 @@ struct Arguments {
 #[derive(Debug)]
 struct Request {
     radius: f64,
+    komi: f64,
     to_move: Color,
     stones: Vec<Stone>,
 }
@@ -145,12 +151,25 @@ fn parse_request(body: &str) -> Result<Request, String> {
     if !radius.is_finite() || radius <= 0.0 || radius >= 0.5 {
         return Err("radius must be finite and between zero and one half".into());
     }
+    // Optional, defaulting to zero: a client written before komi existed still
+    // means komi zero, which is what those games were played at. A *malformed*
+    // komi is rejected rather than defaulted, because silently searching at
+    // zero when the caller asked for something else returns a confident move
+    // for a game nobody is playing.
+    let komi = match field(body, "komi") {
+        None => 0.0,
+        Some(text) => parse_number(text).ok_or("malformed \"komi\"")?,
+    };
+    if !komi.is_finite() {
+        return Err("komi must be finite".into());
+    }
     let to_move = field(body, "toMove")
         .or_else(|| field(body, "to_move"))
         .and_then(parse_color)
         .ok_or("missing or malformed \"toMove\"")?;
     Ok(Request {
         radius,
+        komi,
         to_move,
         stones: parse_stones(body),
     })
@@ -306,7 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         arguments.simulations,
         arguments.model.display()
     );
-    println!("POST /move with {{radius, toMove, stones:[{{x,y,c}}]}}");
+    println!("POST /move with {{radius, toMove, stones:[{{x,y,c}}], komi?}}");
 
     let mut request_index: u64 = 0;
     for stream in listener.incoming() {
@@ -350,7 +369,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
-        let position = Position::new(request.radius, request.stones, request.to_move);
+        let position =
+            Position::new(request.radius, request.stones, request.to_move).with_komi(request.komi);
         // A client can post a finished or self-inconsistent board; refuse both
         // here rather than let the search fail deep inside on it.
         if position.phase() != Phase::Playing {
@@ -416,6 +436,36 @@ mod tests {
         assert_eq!(request.stones.len(), 2);
         assert_eq!(request.stones[0].color, Color::Black);
         assert!((request.stones[1].x - 0.75).abs() < 1e-9);
+    }
+
+    /// Komi reaches the model as a raster channel its value head is trained
+    /// against, so a request that carries one and a search that ignores it are
+    /// playing different games -- and the reply looks identical either way,
+    /// which is what makes the omission worth a test.
+    #[test]
+    fn komi_is_read_when_present_and_zero_when_absent() {
+        let with = parse_request(
+            r#"{"radius":0.05,"komi":0.18,"toMove":"B","stones":[]}"#,
+        )
+        .expect("should parse");
+        assert!((with.komi - 0.18).abs() < 1e-9);
+
+        // A client written before komi existed means komi zero.
+        assert_eq!(parse_request(BODY).expect("should parse").komi, 0.0);
+
+        // Negative komi spots Black and is a legitimate setting, not a typo.
+        let negative =
+            parse_request(r#"{"radius":0.05,"komi":-0.125,"toMove":"B","stones":[]}"#)
+                .expect("should parse");
+        assert!((negative.komi + 0.125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_malformed_komi_is_rejected_rather_than_defaulted() {
+        // Defaulting here would search at zero while the caller scores at
+        // something else, and return a confident move for a game nobody plays.
+        assert!(parse_request(r#"{"radius":0.05,"komi":"wat","toMove":"B","stones":[]}"#).is_err());
+        assert!(parse_request(r#"{"radius":0.05,"komi":,"toMove":"B","stones":[]}"#).is_err());
     }
 
     #[test]

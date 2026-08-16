@@ -30,6 +30,44 @@
     );
   }
 
+  function near(actual, expected, tolerance) {
+    assert(Math.abs(actual - expected) <= tolerance,
+      'expected ' + actual + ' to be within ' + tolerance + ' of ' + expected);
+  }
+
+  test('rescoring a record keeps its shape and leaves the original alone', function () {
+    const tree = start();
+    const first = VGO.gameTree.play(tree, 0.5, 0.5);
+    assert(first.ok, first.reason);
+    const second = VGO.gameTree.play(first.node, 0.25, 0.25);
+    assert(second.ok, second.reason);
+    const branch = VGO.gameTree.play(first.node, 0.75, 0.75);
+    assert(branch.ok && branch.created, 'fixture needs a genuine branch');
+
+    const rescored = VGO.gameTree.rescore(tree, 0.2);
+    assert(VGO.gameTree.count(rescored.root) === VGO.gameTree.count(tree), 'tree shape changed');
+    // Every node moves together, or the record scores two ways depending on
+    // where you stand in it.
+    (function check(node) {
+      near(node.position.komi, 0.2, 1e-12);
+      node.children.forEach(check);
+    })(rescored.root);
+    // The original is untouched, which is what makes undo work: the undo stack
+    // holds references to these very nodes.
+    (function check(node) {
+      near(node.position.komi, 0, 1e-12);
+      node.children.forEach(check);
+    })(tree);
+    // Stones are preserved, so rescoring is not a rebuild in disguise.
+    assert(rescored.map.get(second.node).position.stones.length
+             === second.node.position.stones.length, 'rescoring changed the stones');
+    // A caller can keep its place, and distinct nodes stay distinct.
+    assert(rescored.map.get(second.node).move.x === second.node.move.x,
+      'the node map did not carry the current node across');
+    assert(rescored.map.get(branch.node) !== rescored.map.get(second.node),
+      'the node map collapsed two distinct nodes');
+  });
+
   test('a played move produces a child holding the resulting position', function () {
     const root = start();
     const step = VGO.gameTree.play(root, 0.5, 0.5);
@@ -108,19 +146,22 @@
     const text = VGO.sgf.serializeRecord(root);
     const position = VGO.sgf.parse(text);
     assert(position.stones.length === 0, 'the setup should be the empty starting board');
-    // VGO-SGF writes coordinates with five decimals, so 1/6 returns as 0.16667.
-    assert(Math.abs(position.radius - root.position.radius) < 1e-5, 'radius was lost');
+    assert(position.radius === root.position.radius, 'radius was lost');
   });
 
-  test('coordinates round-trip to the precision the format actually carries', function () {
+  test('coordinates round-trip exactly', function () {
     const root = start(0.1);
     VGO.gameTree.play(root, 1 / 3, 0.5);
     const rebuilt = VGO.gameTree.fromRecord(
       VGO.sgf.parseRecord(VGO.sgf.serializeRecord(root)), VGO.model.DEFAULT_RULES);
-    assert(rebuilt.rejected.length === 0, 'a five-decimal coordinate failed to replay');
+    assert(rebuilt.rejected.length === 0, 'a full-precision coordinate failed to replay');
     const stone = rebuilt.root.children[0].position.stones[0];
-    assert(Math.abs(stone.x - 1 / 3) < 1e-5, 'x drifted beyond the format precision');
-    assert(Math.abs(stone.x - 1 / 3) > 0, 'expected five-decimal rounding, not exactness');
+    // Exactly, not nearly. Legality turns on 1e-6 (SNAP_MARGIN) and 1e-7
+    // (coordinateEpsilon), so any rounding the format applies is large enough
+    // to make a saved position overlap on reload -- see `format` in vgo-sgf.js.
+    // A tolerance here would accept precisely the loss that rules it out.
+    assert(stone.x === 1 / 3, 'x did not survive the round trip exactly');
+    assert(stone.y === 0.5, 'y did not survive the round trip exactly');
   });
 
   test('a setup position survives a record round trip', function () {
