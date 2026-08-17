@@ -55,6 +55,12 @@ esac
 epochs="${VGO_EPOCHS:-12}"
 seed="${VGO_SEED:-1}"
 
+# Adam on everything, not the Muon/Adam hybrid. Muon leads early and loses:
+# over a full RL loop it was ahead until update 24 and Adam had overtaken by the
+# end, which an offline A/B did not predict -- it spends its value headroom
+# early. This is a supervised run short enough to sit entirely inside the window
+# where Muon looks better, which is exactly why it should not be used here.
+#
 # Matches artifacts/ddrnet-deep-komi, the run that produced the current model, so
 # the comparison is against a known architecture rather than the CLI's defaults.
 width="${VGO_WIDTH:-64}"
@@ -108,7 +114,7 @@ for kind in compact-pass compact-dead-zone; do
     --architecture ddrnet \
     --value-weight 2.0 \
     --learning-rate 0.001 \
-    --muon-learning-rate 0.01 \
+    --full-adam \
     --no-compile \
     2>&1 | tee "$arm/train.log"
 
