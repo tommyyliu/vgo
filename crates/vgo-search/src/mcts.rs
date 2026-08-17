@@ -151,6 +151,14 @@ impl SearchResult {
 
 struct Child {
     candidate: Candidate,
+    /// The rules refused this move, so it is not selectable.
+    ///
+    /// Marked rather than removed. `Descent` records a path as child *indices*
+    /// and `back_up` replays it later, so with leaf batching several paths are
+    /// outstanding at once -- removing a child shifts every index recorded after
+    /// it and the replay walks off the end of a shorter vector. Marking keeps
+    /// indices stable for the life of the node.
+    refused: bool,
     policy_logit: f64,
     prior: f64,
     /// Sampling probability beta = P_coarse * P_fine for coarse->fine candidates,
@@ -351,6 +359,7 @@ impl Node {
                     .expect("playable nodes are evaluated")
                     .policy_logit(candidate.action);
                 self.children.push(Child {
+                    refused: false,
                     candidate,
                     policy_logit,
                     prior: 0.0,
@@ -390,6 +399,7 @@ impl Node {
                 .expect("playable nodes are evaluated")
                 .policy_logit(Action::Pass);
             self.children.push(Child {
+                refused: false,
                 candidate: Candidate {
                     action: Action::Pass,
                     source: CandidateSource::Pass,
@@ -436,6 +446,7 @@ impl Node {
                 .expect("playable nodes are evaluated")
                 .policy_logit(action);
             self.children.push(Child {
+                refused: false,
                 candidate: Candidate {
                     action,
                     source: CandidateSource::AreaSequence,
@@ -463,6 +474,7 @@ impl Node {
         self.children
             .iter()
             .enumerate()
+            .filter(|(_, child)| !child.refused)
             .map(|(index, child)| {
                 // Virtual loss counts an in-flight descent as a visit that scored
                 // the worst possible value for the player to move. That both
@@ -505,7 +517,7 @@ impl Node {
 /// self-capture, so at worst every placement is discarded and the pass is
 /// chosen. Costs nothing under `Vgo`, where `try_apply` never refuses.
 fn select_playable_child(node: &mut Node, config: SearchConfig) -> Option<usize> {
-    while !node.children.is_empty() {
+    while node.children.iter().any(|child| !child.refused) {
         let index = node.select_child(config);
         // Already expanded, so the rules accepted it when it was expanded.
         if node.children[index].node.is_some() {
@@ -519,8 +531,7 @@ fn select_playable_child(node: &mut Node, config: SearchConfig) -> Option<usize>
         {
             return Some(index);
         }
-        node.children.remove(index);
-        normalize_priors(&mut node.children);
+        node.children[index].refused = true;
     }
     None
 }
@@ -985,9 +996,14 @@ pub(crate) fn assemble_result(
     ply: u32,
     stats: SearchStats,
 ) -> SearchResult {
+    // Refused children never leave the tree, so they must not leave the result
+    // either: a policy target listing a move the rules forbid would teach the
+    // network to propose it, and a caller reading `children` as the legal move
+    // list would offer one.
     let children = root
         .children
         .iter()
+        .filter(|child| !child.refused)
         .map(|child| ChildSummary {
             action: child.candidate.action,
             source: child.candidate.source,
@@ -1667,8 +1683,16 @@ mod tests {
                 continue;
             }
 
+            // Leaf batches above one are the case that matters. `Descent` records
+            // a path as child indices and `back_up` replays it after the batch
+            // returns, so several paths are outstanding at once -- which is what
+            // made an earlier version of this, that removed refused children
+            // instead of marking them, walk off the end of a shortened vector
+            // in production while every test here passed at leaf batch 1.
+            for leaf_batch in [1usize, 4, 8] {
             let mut config = SearchConfig::canary(64);
             config.temperature = 0.0;
+            config.leaf_batch = leaf_batch;
             let result = crate::search_at_ply(&position, config, seed, &crate::NaiveEvaluator, 0)
                 .expect("search");
 
@@ -1692,6 +1716,7 @@ mod tests {
                 result.children.iter().any(|c| matches!(c.action, Action::Place(_))),
                 "seed {seed}: the search kept no placements at all"
             );
+            }
         }
     }
 }
