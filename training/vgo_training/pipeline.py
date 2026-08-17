@@ -1845,6 +1845,10 @@ class Pipeline:
             "model_width": self.config.model_width,
             "blocks": self.config.blocks,
             "architecture": self.config.architecture,
+            # Which planes to render from each shard. Without it the learner
+            # falls back to the shard header, which cannot tell the two
+            # six-channel layouts apart and refuses rather than guessing.
+            "raster_kind": self.config.raster_kind,
             "variance_scaled": self.config.variance_scaled,
             "norm_groups": self.config.norm_groups,
             "context_attention_blocks": self.config.context_attention_blocks,

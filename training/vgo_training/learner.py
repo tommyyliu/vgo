@@ -343,8 +343,29 @@ class ReplayCache:
     ) -> None:
         self._loader = loader
         self._entries: dict[Path, PreparedReplayShard] = {}
+        self._raster_kind: str | None = None
         self.hits = 0
         self.misses = 0
+
+    def use_raster_kind(self, raster_kind: str | None) -> None:
+        """Render with `raster_kind` from here on, dropping anything else.
+
+        The kind belongs to the *update*, not to this object: one learner
+        process serves every update of a run, and each arrives with its own
+        config. Binding the loader once at construction reads the process
+        defaults instead, which are whatever the service started with -- for the
+        pipeline, nothing.
+
+        A cached shard was rendered under whichever kind was in force when it was
+        loaded, so a change invalidates the cache rather than being applied to
+        new entries only. In practice the kind is run identity and never changes
+        mid-run, which is exactly why a silent mismatch would go unnoticed.
+        """
+        if raster_kind == self._raster_kind:
+            return
+        self._raster_kind = raster_kind
+        self._entries.clear()
+        self._loader = partial(load_dataset, raster_kind=raster_kind)
 
     def get(self, path: str | Path, preparation_batch_size: int) -> PreparedReplayShard:
         resolved = Path(path).resolve(strict=True)
@@ -1134,11 +1155,10 @@ class PersistentLearner:
     ) -> None:
         self.defaults = defaults or LearnerConfig()
         self.defaults.validate()
-        # The cache's loader is `(path) -> dataset`, so the raster kind is bound
-        # here rather than threaded through every call that reaches it.
-        self.replay_cache = replay_cache or ReplayCache(
-            loader=partial(load_dataset, raster_kind=self.defaults.raster_kind)
-        )
+        self.replay_cache = replay_cache or ReplayCache()
+        # Only a seed. Each update carries its own config and calls
+        # `use_raster_kind` with it; see the note there.
+        self.replay_cache.use_raster_kind(self.defaults.raster_kind)
         self._log = log or (lambda message: print(message, file=sys.stderr, flush=True))
         self.model: nn.Module | None = None
         self.optimizer: torch.optim.Optimizer | None = None
@@ -1494,6 +1514,7 @@ class PersistentLearner:
 
         hits_before = self.replay_cache.hits
         misses_before = self.replay_cache.misses
+        self.replay_cache.use_raster_kind(config.raster_kind)
         window = self.replay_cache.window(request.datasets, config.batch_size)
         if config.ownership_weight == 0.0:
             # Release the targets the loss will not read. Done here rather than

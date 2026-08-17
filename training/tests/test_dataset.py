@@ -588,3 +588,46 @@ class RasterKindIsATrainingChoice(unittest.TestCase):
         self.assertEqual(
             learner.replay_cache._loader.keywords, {"raster_kind": "compact-dead-zone"}
         )
+
+
+class RasterKindReachesTheLearner(unittest.TestCase):
+    """The kind belongs to the update, not to the learner process.
+
+    `scripts/train-once.py` builds a `PersistentLearner` whose defaults already
+    carry the kind, so it worked. The pipeline runs one long-lived learner and
+    sends a fresh config per update, so a kind bound at construction is the
+    process defaults -- nothing -- and every update rendered by the header
+    instead. That reached production and killed a run after generation had
+    already succeeded.
+    """
+
+    def test_an_update_rebinds_the_cache(self) -> None:
+        from vgo_training.learner import ReplayCache
+
+        cache = ReplayCache()
+        cache.use_raster_kind("compact-dead-zone")
+        self.assertEqual(cache._loader.keywords, {"raster_kind": "compact-dead-zone"})
+
+        # A different kind must not leave shards rendered under the old one.
+        cache._entries[Path("/nonexistent")] = object()  # type: ignore[assignment]
+        cache.use_raster_kind("compact-pass")
+        self.assertEqual(cache._entries, {})
+        self.assertEqual(cache._loader.keywords, {"raster_kind": "compact-pass"})
+
+        # Re-stating the same kind is a no-op, so the cache survives an update.
+        cache._entries[Path("/nonexistent")] = object()  # type: ignore[assignment]
+        cache.use_raster_kind("compact-pass")
+        self.assertEqual(len(cache._entries), 1)
+
+    def test_the_pipeline_sends_the_raster_kind(self) -> None:
+        """The learner cannot use what the pipeline does not send."""
+        import inspect
+        from vgo_training import pipeline
+
+        source = inspect.getsource(pipeline)
+        self.assertIn(
+            '"raster_kind": self.config.raster_kind',
+            source,
+            "the training request must carry raster_kind, or the learner falls "
+            "back to the shard header and refuses six channels",
+        )
