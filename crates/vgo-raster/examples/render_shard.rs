@@ -89,6 +89,12 @@ fn main() {
         } else {
             Color::White
         };
+        // Immediately after to_move, and dropped here until the raster grew a
+        // plane that needed it. A record stores it, so a reader that rebuilds
+        // the position without it renders `previous_pass` as zero for every
+        // sample -- which trains a channel that is always off and then meets a
+        // live one at inference.
+        let passes = read_u32(&blob, base + 8 + komi_bytes + 1);
         let count = read_u32(&blob, base + count_at) as usize;
         let mut stones = Vec::with_capacity(count);
         for stone in 0..count {
@@ -96,7 +102,9 @@ fn main() {
             let colour = if blob[at + 16] == 0 { Color::Black } else { Color::White };
             stones.push(Stone::new(read_f64(&blob, at), read_f64(&blob, at + 8), colour));
         }
-        let position = Position::new(radius, stones, to_move).with_komi(komi);
+        let position = Position::new(radius, stones, to_move)
+            .with_komi(komi)
+            .with_passes(passes);
         rasterize_any_into(&position, config, &mut data);
         for value in &data {
             out.extend_from_slice(&value.to_le_bytes());
