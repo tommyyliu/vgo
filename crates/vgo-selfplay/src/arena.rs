@@ -12,7 +12,7 @@ use std::{
 };
 
 use clap::{ArgAction, Parser};
-use vgo_core::{Color, Outcome, Point, Position};
+use vgo_core::{Color, Outcome, Point, Position, Ruleset};
 use vgo_inference::{
     BatchedEvaluator, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
 };
@@ -82,6 +82,10 @@ struct Arguments {
     /// pair face the same game.
     #[arg(long, default_value_t = 0.0)]
     komi: f64,
+    /// Which rules to play. Must match the models being compared: a result
+    /// measured under one ruleset says nothing about play under the other.
+    #[arg(long, default_value = "vgo")]
+    ruleset: Ruleset,
     #[arg(long, default_value_t = 900_001)]
     seed: u64,
     #[arg(long, default_value_t = 8)]
@@ -223,7 +227,9 @@ fn play_game(
     let record_moves = arguments.sgf_directory.is_some();
     let mut moves: Vec<(Color, Option<Point>)> = Vec::new();
     let playout = run_playout(
-        Position::new(arguments.radius, Vec::new(), Color::Black).with_komi(arguments.komi),
+        Position::new(arguments.radius, Vec::new(), Color::Black)
+            .with_ruleset(arguments.ruleset)
+            .with_komi(arguments.komi),
         arguments.maximum_plies,
         |position, _| {
             let is_candidate = position.to_move() == candidate_color;

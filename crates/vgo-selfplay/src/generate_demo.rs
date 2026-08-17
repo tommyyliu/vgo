@@ -15,7 +15,7 @@ use std::{
 
 use clap::{ArgAction, Parser};
 use sha2::{Digest, Sha256};
-use vgo_core::{Analysis, Color, Position};
+use vgo_core::{Analysis, Color, Position, Ruleset};
 use vgo_inference::{
     BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, OnnxBatchService, OnnxProvider,
     OnnxServiceConfig,
@@ -255,6 +255,11 @@ struct Config {
     komi_high: f64,
     #[arg(long, default_value_t = 1.0 / 6.0)]
     radius: f64,
+    /// Which rules to play. `vgo` is this repository's, `official` is
+    /// voronoigo.com's -- see docs/OFFICIAL_RULES.md. Part of run identity: a
+    /// replay window mixing the two holds games from two different games.
+    #[arg(long, default_value = "vgo")]
+    ruleset: Ruleset,
     #[arg(long, default_value_t = 50_001)]
     seed: u64,
     #[arg(long, default_value_t = 4)]
@@ -646,7 +651,9 @@ fn generate_game(
     // argument -- neither can see the other's locals.
     let soft_from = std::cell::Cell::new(u32::MAX);
     let playout = run_playout_with_resignation(
-        Position::new(config.radius, Vec::new(), Color::Black).with_komi(sampled_komi(
+        Position::new(config.radius, Vec::new(), Color::Black)
+            .with_ruleset(config.ruleset)
+            .with_komi(sampled_komi(
             game_seed,
             config.komi_low,
             config.komi_high,

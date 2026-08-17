@@ -36,7 +36,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use vgo_core::{Color, Outcome, Position};
+use vgo_core::{Color, Outcome, Position, Ruleset};
 use vgo_inference::{
     BatchedEvaluator, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
 };
@@ -98,6 +98,10 @@ struct Arguments {
     radius: f64,
     #[arg(long, default_value_t = 0.034)]
     komi: f64,
+    /// Which rules to play. Must match the models being compared: a result
+    /// measured under one ruleset says nothing about play under the other.
+    #[arg(long, default_value = "vgo")]
+    ruleset: Ruleset,
     #[arg(long, default_value_t = 4)]
     leaf_batch: usize,
     #[arg(long, default_value_t = 64)]
@@ -251,7 +255,9 @@ fn play(
     // this stays bounded rather than retaining the whole game.
     let mut closing: VecDeque<Position> = VecDeque::with_capacity(ADJUDICATION_PLIES);
     let playout = run_playout(
-        Position::new(arguments.radius, Vec::new(), Color::Black).with_komi(arguments.komi),
+        Position::new(arguments.radius, Vec::new(), Color::Black)
+            .with_ruleset(arguments.ruleset)
+            .with_komi(arguments.komi),
         arguments.maximum_plies,
         |position, _| {
             let evaluator: &dyn Evaluator = match position.to_move() {

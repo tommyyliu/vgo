@@ -590,6 +590,13 @@ class PipelineConfig:
     komi_recenter_minimum_games: int = 256
     komi_recenter_maximum_step: float = 0.025
     raster_kind: str = "semantic"
+    # Which rules generation plays. "vgo" is this repository's, "official" is
+    # voronoigo.com's -- see docs/OFFICIAL_RULES.md.
+    #
+    # Run identity, deliberately not operational. A replay window that mixed the
+    # two would hold games from two different games, and a model rated across
+    # both would be rated on matches it could not have played.
+    ruleset: str = "vgo"
     resign_disable_fraction: float = 0.1
     arena_pairs: int = 16
     # Komi every telemetry game is played at.
@@ -1472,6 +1479,8 @@ class Pipeline:
             str(config.generation_simulations),
             "--coarse-pool",
             str(config.coarse_pool),
+            "--ruleset",
+            str(config.ruleset),
             "--temperature",
             str(config.temperature),
             "--temperature-plies",
@@ -1494,6 +1503,8 @@ class Pipeline:
             str(config.raster_kind),
             "--model-raster-kind",
             str(config.raster_kind),
+            "--ruleset",
+            str(config.ruleset),
             "--resign-disable-fraction",
             str(config.resign_disable_fraction),
             "--radius",
@@ -1554,6 +1565,8 @@ class Pipeline:
             str(config.arena_simulations),
             "--coarse-pool",
             str(config.coarse_pool),
+            "--ruleset",
+            str(config.ruleset),
             "--max-plies",
             str(config.maximum_plies),
             "--threads",
@@ -2965,6 +2978,15 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=0.025,
         help="largest change in the komi distribution's center per shard",
+    )
+    parser.add_argument(
+        "--ruleset",
+        choices=("vgo", "official"),
+        default="vgo",
+        help=(
+            "which rules generation plays. Run identity: a replay window mixing "
+            "the two holds games from two different games"
+        ),
     )
     parser.add_argument(
         "--raster-kind",

@@ -1,5 +1,11 @@
 /target/
 /artifacts/
+# The official-rules runs live in their own root, not a subdirectory of
+# artifacts/. scripts/build-dense-curve.py globs `artifacts/*/records.jsonl` and
+# fits one Bradley-Terry scale over everything it finds, so a run under a
+# different ruleset sitting inside artifacts/ would be pooled into an Elo scale
+# with models it has never played and could not play.
+/artifacts-official/
 /.idea/
 .venv/
 /.agents/

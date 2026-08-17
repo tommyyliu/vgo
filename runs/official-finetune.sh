@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Reinforcement learning under voronoigo.com's rules, seeded from the supervised
+# compact-dead-zone model.
+#
+#   ./runs/official-finetune.sh                          # -> artifacts-official/official-v1
+#   VGO_UPDATES=60 ./runs/official-finetune.sh           # longer
+#   ./runs/official-finetune.sh artifacts-official/foo   # somewhere else
+#
+# Run it from the project root. A relative output directory is pinned to the
+# invoking shell below, and the seed paths are derived from it; those paths are
+# part of run identity, so invoking from elsewhere makes the run unresumable.
+#
+# Do not name an output directory after an existing run. This installs its own
+# launch record there before anything else reads it, and doing that to a live
+# run destroys the only copy of how that run was started -- artifacts roots are
+# gitignored.
+#
+# ## Why a separate artifacts root
+#
+# `scripts/build-dense-curve.py` globs `artifacts/*/records.jsonl` and fits one
+# Bradley-Terry scale over everything it finds. A run under different rules
+# sitting inside `artifacts/` would be pooled into an Elo scale with models it
+# has never played and, under these rules, could not play. `artifacts-official/`
+# keeps that from happening by construction rather than by remembering.
+#
+# ## What is different about these rules
+#
+# Two things, both about capture, and docs/OFFICIAL_RULES.md has the derivations.
+#
+#   - A group lives while a stone could still be placed *touching* its territory,
+#     rather than while a future stone could take area from it. That is strictly
+#     the more aggressive rule: everything the official rules keep alive, ours
+#     keeps alive, and ours keeps some alive that theirs captures.
+#   - A move that would take only the mover's own stones is illegal. With no
+#     self-capture there is no no-op placement, so the rule counting one as a
+#     pass never fires here.
+#
+# The raster carries the matching capture field: `compact-dead-zone` is
+# `compact-pass` with `dead_zone` in slot 3 instead of `settled`, so the network
+# reads the predicate it is actually judged by.
+#
+# ## Why it is seeded rather than started cold
+#
+# A six-channel input cannot be warm-started into from a five-channel model, so
+# the supervised A/B exists to produce one. `--initial-checkpoint` and
+# `--initial-onnx` must be given together: on its own `--initial-replay` seeds
+# only the training window and generation still starts from noise.
+#
+# ## The radius changes here
+#
+# `--radius` is 1/18 exactly, which is what the real game uses: an 18-unit board
+# with stone radius 1. Every run so far used 39/700, 0.286% larger, which is not
+# a game constant at all -- it is the reference client's radius slider sitting at
+# its default of 39 pixels on a 700-pixel board, copied into the recipes from
+# there. A run aimed at the official rules should be played on the official
+# board, and this is the cheapest moment to stop carrying the artefact.
+#
+# It does mean the seed saw a slightly different board than this run plays on.
+# That is a smaller discrepancy than the rules change it is already absorbing.
+#
+# The seed learned from games played under *our* rules. It has seen the official
+# capture field but never a game decided by it, so early updates are as much
+# about unlearning as learning, and the first few arena results are not a
+# verdict on anything.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+output="${1:-$root/artifacts-official/official-v1}"
+case "$output" in
+  /*) ;;
+  *) output="$PWD/$output" ;;
+esac
+
+seed_checkpoint="${VGO_SEED_CHECKPOINT:-$root/artifacts/raster-ab/compact-dead-zone/candidate.pt}"
+seed_onnx="${VGO_SEED_ONNX:-$root/artifacts/raster-ab/compact-dead-zone/candidate.onnx}"
+updates="${VGO_UPDATES:-40}"
+
+for required in "$seed_checkpoint" "$seed_onnx"; do
+  if [ ! -e "$required" ]; then
+    echo "missing seed: $required" >&2
+    echo "run ./runs/raster-ab.sh first; it produces both" >&2
+    exit 1
+  fi
+done
+
+if [ -e "$output/launch.sh" ] && [ ! -e "$output/.official-finetune" ]; then
+  echo "refusing: $output looks like another run's directory" >&2
+  exit 1
+fi
+mkdir -p "$output"
+touch "$output/.official-finetune"
+install -m 0755 "${BASH_SOURCE[0]}" "$output/launch.sh"
+
+python="$root/training/.venv/bin/python"
+
+cd "$root/training"
+exec "$python" -m vgo_training.pipeline \
+  --output "$output" \
+  --updates "$updates" \
+  --initial-checkpoint "$seed_checkpoint" \
+  --initial-onnx "$seed_onnx" \
+  --ruleset official \
+  --raster-kind compact-dead-zone \
+  --architecture ddrnet \
+  --model-width 64 \
+  --blocks 16 \
+  --context-attention-blocks 1 \
+  --resolution 128 \
+  --policy-resolution 128 \
+  --radius 0.05555555555555555 \
+  --coarse-pool 16 \
+  --generation-simulations 3200 \
+  --leaf-batch 4 \
+  --samples-per-shard 1600 \
+  --replay-window 6 \
+  --training-epochs 10 \
+  --training-batch 256 \
+  --learning-rate 0.001 \
+  --value-weight 2.0 \
+  --full-adam \
+  --komi-low 0.017 \
+  --komi-high 0.137 \
+  --dynamic-komi \
+  --arena-komi 0.104 \
+  --telemetry-pairs 5 \
+  --actors 64 \
+  --inference-batch 32 \
+  2>&1 | tee -a "$output/run.log"
