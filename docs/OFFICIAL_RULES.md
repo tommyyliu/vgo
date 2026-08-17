@@ -69,36 +69,53 @@ inference wasted. Treating one as a pass instead would be wrong: it would invent
 a move the real client rejects, and a bot trained on it would propose moves the
 site refuses.
 
-## The gap in our own capture test
+## Testing only cell vertices is exact, for our rule
 
-`alive_groups_of` tests a group's cell **polygon vertices** and nothing else:
+`alive_groups_of` decides a group by walking its cells' polygon **vertices**,
+which looks like an approximation of a rule stated over the whole region. It
+is not one. Two facts make it exact, and neither survives into the official
+rule.
 
-```rust
-for &vertex in &cell.polygon {
-    if legal_set::escape_witness(position, vertex, stone_point, ...).is_some() { alive }
-}
-```
+**The alive set of one legal point, along a straight edge, is a half-line.**
+Put the edge on the `y` axis with the owning stone at perpendicular distance
+`d` and the foot at the origin, and write a legal point as `p = (a, b)`. The
+point `x = (0, y)` is alive through `p` when
 
-That is not the same as testing the region. The settled region of a stone is
-star-shaped about it, with a radial boundary `T(u)`; the cell's own boundary is
-`R(u)` along the same direction. The group is alive when `R(u) > T(u)` for some
-`u`, and the vertices only sample `u` at the polygon's corners. A cell whose
-corners are all settled can still have an unsettled point in the middle of an
-edge, whenever `T` happens to bulge outward at the corner directions and fall
-back between them.
+    F(y) = sqrt(d^2 + y^2) - sqrt(a^2 + (y - b)^2) > 0
 
-So **our shipped rule can call a group captured when the definition says it is
-alive.** How often has never been measured. It has stood since settlement was
-written, so whatever the rate is, it is our game — but it is the same class of
-incompleteness as the one below, and worth knowing about before trusting either
-implementation on a contrived position.
+Squaring and cancelling `y^2` turns that into `2by > a^2 + b^2 - d^2`, which is
+**linear in `y`**: a half-line upward for `b > 0`, downward for `b < 0`, and for
+`b = 0` the `y`-free condition `d^2 > a^2`, true everywhere or nowhere. A
+half-line, whole line or empty set containing an interior point of a segment
+contains one of its endpoints. A point is alive when *some* `p` makes it so, so
+the property passes to the union over `L`.
 
-`Ruleset::Official` inherits the shape and mitigates it with two extra tests: a
-legal-set vertex whose nearest stone is this one (so it lies inside the cell,
-decided exactly by nearest-stone rather than a polygon test), and a legal-set
-vertex within `r` of a cell edge. What neither covers is the closest approach
-between the *interior* of a cell edge and a *smooth arc* of `L`'s boundary, with
-no vertex extremal on either side.
+**Unsettled points stay unsettled outward.** The settled region of a stone is
+star-shaped about it: for `y = s + lambda(x - s)`,
+
+    dist(y, L) >= dist(x, L) - (1 - lambda)|x - s| >= lambda|x - s| = |y - s|
+
+So if any point of the cell is unsettled, the cell's own boundary point along
+that ray is unsettled too. That point lies on an edge, and by the lemma an
+endpoint of that edge is unsettled. Endpoints of edges are vertices.
+
+Both steps need the cell to be convex and to contain its stone, which a Voronoi
+cell clipped to a rectangular board is, and every edge to be straight, which
+bisectors and board edges are.
+
+Two measurements check the *implementation* against that result, and are not
+part of it: `examples/settled_vertex_gap.rs` found no disagreement between the
+vertex verdict and a 256-sample sweep of every edge over 136,122 cells, and a
+standalone randomised check of the lemma found no violation in 300,000 trials.
+
+**None of this transfers to `Ruleset::Official`.** Its question is whether the
+region *intersects* the legal set grown by `r` -- a set intersection, with no
+star-shapedness about the stone and no linear crossing. A cell edge can pass
+through the grown set with neither endpoint inside it, which is why both the
+reference implementation and ours add edge tests. Ours still misses the closest
+approach between the interior of an edge and a smooth arc of `L`'s boundary,
+where neither side is extremal at a vertex; the reference measures that exactly
+with `AliveZone::closest_distance`.
 
 ## Where the reference implementation is better
 
@@ -106,8 +123,8 @@ Recorded for a future revisit rather than as a to-do. None of it is urgent.
 
 - **Exact segment-to-set distance.** `AliveZone::closest_distance(edge)` measures
   a line segment against the alive zone's real outline — arcs included — which is
-  exactly the case our vertex-and-endpoint tests miss. This is the one that
-  would close the gap above, for both rulesets.
+  exactly the case our edge tests miss under `Official`. Our own rule needs
+  nothing here; it is proved exact above.
 - **Forced eyes as exact points.** The zone tracks isolated legal points
   explicitly, so a single remaining placement in the middle of a group's
   territory keeps it alive. Ours would find such a point only if it happens to be
