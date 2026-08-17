@@ -120,10 +120,11 @@ for kind in compact-dead-zone; do
   # Export now rather than later: the manifest records `raster_kind`, and a
   # serving path fed the wrong layout fails silently -- the channel count cannot
   # tell these two apart.
-  "$python" -m vgo_training.export_onnx \
-    --checkpoint "$arm/candidate.pt" \
-    --output "$arm/candidate.onnx" \
-    > "$arm/export.log" 2>&1
+  # From training/: `python -m vgo_training.export_onnx` needs the package on
+  # the path, and the repository root does not put it there.
+  ( cd "$root/training" && "$python" -m vgo_training.export_onnx \
+      --checkpoint "$arm/candidate.pt" \
+      --output "$arm/candidate.onnx" ) > "$arm/export.log" 2>&1
   echo "exported $arm/candidate.onnx"
 done
 
