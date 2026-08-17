@@ -1362,6 +1362,7 @@ fn io_error(error: std::io::Error) -> EvaluationError {
 mod tests {
     use super::*;
     use vgo_core::Color;
+    use vgo_search::Action;
 
     struct ConstantService {
         wrong_id: bool,

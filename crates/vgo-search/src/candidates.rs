@@ -9,6 +9,26 @@ pub enum Action {
 }
 
 impl Action {
+    /// Resolve this action, or report that the rules refuse it.
+    ///
+    /// `None` means exactly one thing: the move takes only the mover's own
+    /// stones and [`Ruleset::Official`](vgo_core::Ruleset::Official) forbids it.
+    /// That is not a bug in candidate generation -- whether a placement
+    /// self-captures cannot be known until it is resolved -- so the caller drops
+    /// the candidate and picks another. Every other rejection is still a panic,
+    /// because it means an illegal point reached the search.
+    pub fn try_apply(self, position: &Position) -> Option<vgo_core::MoveResult> {
+        if let Self::Place(point) = self {
+            if matches!(
+                place(position, point.x, point.y),
+                Err(vgo_core::MoveError::SelfCapture)
+            ) {
+                return None;
+            }
+        }
+        Some(self.apply(position))
+    }
+
     pub fn apply(self, position: &Position) -> vgo_core::MoveResult {
         match self {
             Self::Pass => pass(position).expect("pass candidate must be legal"),

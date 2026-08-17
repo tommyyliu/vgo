@@ -492,6 +492,39 @@ impl Node {
     }
 }
 
+/// Select a child, discarding any the rules turn out to refuse.
+///
+/// Under [`Ruleset::Official`](vgo_core::Ruleset::Official) a placement that
+/// takes only the mover's own stones is illegal, and nothing short of resolving
+/// the move can tell. So the check happens here, at the moment a child is first
+/// chosen -- which is also before the network ever sees the position, since
+/// resolution precedes evaluation. A refused candidate is removed outright
+/// rather than scored badly: it is not a bad move, it is not a move.
+///
+/// Terminates because the pass candidate is always present and `pass` cannot
+/// self-capture, so at worst every placement is discarded and the pass is
+/// chosen. Costs nothing under `Vgo`, where `try_apply` never refuses.
+fn select_playable_child(node: &mut Node, config: SearchConfig) -> Option<usize> {
+    while !node.children.is_empty() {
+        let index = node.select_child(config);
+        // Already expanded, so the rules accepted it when it was expanded.
+        if node.children[index].node.is_some() {
+            return Some(index);
+        }
+        if node.children[index]
+            .candidate
+            .action
+            .try_apply(&node.position)
+            .is_some()
+        {
+            return Some(index);
+        }
+        node.children.remove(index);
+        normalize_priors(&mut node.children);
+    }
+    None
+}
+
 fn normalize_priors(children: &mut [Child]) {
     let maximum = children
         .iter()
@@ -752,7 +785,13 @@ pub(crate) fn descend(
         }
 
         current.widen(config, stats);
-        let index = current.select_child(config);
+        let Some(index) = select_playable_child(current, config) else {
+            // Every placement here self-captures and the rules refuse them all,
+            // so only the pass remains -- and `select_playable_child` never
+            // discards that. Reaching this means the node has no children at
+            // all, which `widen` does not produce for a playable position.
+            unreachable!("a playable node always keeps its pass candidate");
+        };
         current.virtual_visits += 1;
         current.children[index].virtual_visits += 1;
         path.push(index);
@@ -853,7 +892,9 @@ fn simulate(
     }
 
     node.widen(config, stats);
-    let child_index = node.select_child(config);
+    let Some(child_index) = select_playable_child(node, config) else {
+        unreachable!("a playable node always keeps its pass candidate");
+    };
     let child = &mut node.children[child_index];
     let black_value = if let Some(child_node) = child.node.as_mut() {
         simulate(child_node, config, match_seed, evaluator, depth + 1, stats)?
@@ -1594,5 +1635,63 @@ mod tests {
         let error = search_with_evaluator(&position, SearchConfig::canary(1), 5, &FailingEvaluator)
             .expect_err("failing evaluator must abort search");
         assert_eq!(error, EvaluationError::new("expected failure"));
+    }
+
+    /// A search under the official rules never returns a move those rules
+    /// refuse, and still finds moves.
+    ///
+    /// The check that matters is the second half. Dropping refused candidates
+    /// could in principle strip a node down to its pass and quietly turn the bot
+    /// into one that only passes, so this asserts real placements come back.
+    #[test]
+    fn an_official_search_never_plays_a_refused_move() {
+        use vgo_core::{Ruleset, Stone};
+        let radius = 1.0 / 18.0;
+        for seed in [1u64, 5, 9] {
+            let mut stones = Vec::new();
+            let spacing = 2.0 * radius * 1.15;
+            for index in 0..24 {
+                let (row, column) = (index / 5, index % 5);
+                let x = 0.12 + column as f64 * spacing;
+                let y = 0.12 + row as f64 * spacing;
+                if x > 0.94 || y > 0.94 {
+                    break;
+                }
+                let colour = if index % 2 == 0 { Color::Black } else { Color::White };
+                stones.push(Stone::new(x, y, colour));
+            }
+            let position = Position::new(radius, stones, Color::Black)
+                .with_komi(0.104)
+                .with_ruleset(Ruleset::Official);
+            if !position.validate().is_playable() {
+                continue;
+            }
+
+            let mut config = SearchConfig::canary(64);
+            config.temperature = 0.0;
+            let result = crate::search_at_ply(&position, config, seed, &crate::NaiveEvaluator, 0)
+                .expect("search");
+
+            // Whatever it chose, the rules must accept it.
+            if let Action::Place(point) = result.action {
+                assert!(
+                    vgo_core::place(&position, point.x, point.y).is_ok(),
+                    "seed {seed}: search returned a move the official rules refuse"
+                );
+            }
+            // And every surviving child must be a move too.
+            for child in &result.children {
+                if let Action::Place(point) = child.action {
+                    assert!(
+                        vgo_core::place(&position, point.x, point.y).is_ok(),
+                        "seed {seed}: a refused move survived as a candidate"
+                    );
+                }
+            }
+            assert!(
+                result.children.iter().any(|c| matches!(c.action, Action::Place(_))),
+                "seed {seed}: the search kept no placements at all"
+            );
+        }
     }
 }

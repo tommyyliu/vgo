@@ -1,12 +1,18 @@
 use std::collections::HashSet;
 
-use crate::{Analysis, Color, Phase, Position, Settlement, Stone, legal_set};
+use crate::{Analysis, Color, Phase, Position, Ruleset, Settlement, Stone, legal_set};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MoveError {
     Finished,
     InvalidPosition,
     IllegalPlacement,
+    /// The move would take only the mover's own stones.
+    ///
+    /// [`Ruleset::Official`] only. Under [`Ruleset::Vgo`] self-capture is legal
+    /// and global, and a placement that leaves the board exactly as it was is a
+    /// pass rather than an error.
+    SelfCapture,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +112,18 @@ pub fn place(position: &Position, x: f64, y: f64) -> Result<MoveResult, MoveErro
     // in Go a static count does not imply a capture happened.
     //
     // Must match `place` in reference/src/engine/game.js.
+    // Under the official rules a move that removes only the mover's stones is
+    // rejected outright, so the question below never arises there: with no
+    // self-capture there is no placement that leaves the board unchanged, and
+    // nothing for the pass rule to catch.
+    //
+    // "Only its own" is the whole condition. A move that takes enemy stones is
+    // legal even when it also kills friendlies -- the enemy is resolved first
+    // and dies first, exactly as here -- so this tests the enemy count rather
+    // than the self count.
+    if position.ruleset() == Ruleset::Official && enemy_count == 0 && self_count > 0 {
+        return Err(MoveError::SelfCapture);
+    }
     let unchanged =
         enemy_count == 0 && self_doomed.len() == 1 && self_doomed.contains(&placed_index);
     let changed = !unchanged;
@@ -288,7 +306,102 @@ mod tests {
     #[test]
     fn a_no_op_self_capture_counts_as_a_pass() {
         use crate::{Point, Stone, legal_set_vertices, nearest_legal_placement};
-        let position = Position::new(
+        let position = no_op_position();
+        assert!(position.validate().is_playable());
+        // Classify by the board itself, never by its stone count. An earlier
+        // version of this test asked whether the count had changed -- the same
+        // predicate the implementation used -- so it agreed with any behaviour
+        // that predicate produced and could not fail on the bug it guarded.
+        let before: Vec<Stone> = position.stones().to_vec();
+        let mut no_ops = 0;
+        let mut real_moves = 0;
+        for vertex in legal_set_vertices(&position) {
+            let snapped = nearest_legal_placement(&position, Point::new(vertex.x, vertex.y));
+            if !snapped.legal {
+                continue;
+            }
+            let Ok(result) = place(&position, snapped.point.x, snapped.point.y) else {
+                continue;
+            };
+            if result.position.stones() == before.as_slice() {
+                no_ops += 1;
+                assert_eq!(
+                    result.position.consecutive_passes(),
+                    1,
+                    "a placement that left the board identical must count as a pass"
+                );
+            } else {
+                real_moves += 1;
+                assert_eq!(
+                    result.position.consecutive_passes(),
+                    0,
+                    "a placement that changed the board must reset the pass count, \
+                     even when it removes as many stones as it adds"
+                );
+            }
+        }
+        assert!(no_ops > 0, "fixture must contain a no-op placement");
+        assert!(real_moves > 0, "fixture must contain a real placement");
+    }
+
+    /// Ply 42 of a real game: Black to play (0.121094, 0.714844), which
+    /// captures the white stone at (0.07421875, 0.60546875).
+    fn even_trade_position() -> Position {
+        Position::new(
+            0.055714285714285716,
+            vec![
+                Stone::new(0.519531, 0.496094, Color::Black),
+                Stone::new(0.53515625, 0.71484375, Color::White),
+                Stone::new(0.378906, 0.519531, Color::Black),
+                Stone::new(0.59765625, 0.23828125, Color::White),
+                Stone::new(0.660156, 0.488281, Color::Black),
+                Stone::new(0.36328125, 0.25390625, Color::White),
+                Stone::new(0.347656, 0.667969, Color::Black),
+                Stone::new(0.37890625, 0.81640625, Color::White),
+                Stone::new(0.230469, 0.792969, Color::Black),
+                Stone::new(0.24155634060202594, 0.9038455992765371, Color::White),
+                Stone::new(0.113281, 0.886719, Color::Black),
+                Stone::new(0.69140625, 0.70703125, Color::White),
+                Stone::new(0.769531, 0.613281, Color::Black),
+                Stone::new(0.8440734679885532, 0.6961059349829543, Color::White),
+                Stone::new(0.917969, 0.589844, Color::Black),
+                Stone::new(0.9442857142857143, 0.7448279240914601, Color::White),
+                Stone::new(0.261719, 0.417969, Color::Black),
+                Stone::new(0.18359375, 0.28515625, Color::White),
+                Stone::new(0.097656, 0.371094, Color::Black),
+                Stone::new(0.74609375, 0.26953125, Color::White),
+                Stone::new(0.097656, 0.207031, Color::Black),
+                Stone::new(0.1815156102469017, 0.1336544699785221, Color::White),
+                Stone::new(0.089844, 0.066406, Color::Black),
+                Stone::new(0.36328125, 0.08203125, Color::White),
+                Stone::new(0.792969, 0.402344, Color::Black),
+                Stone::new(0.89453125, 0.33984375, Color::White),
+                Stone::new(0.442074, 0.332699, Color::Black),
+                Stone::new(0.4864982006504679, 0.23050780769204193, Color::White),
+                Stone::new(0.894531, 0.451273, Color::Black),
+                Stone::new(0.4431630138148883, 0.6105672604713251, Color::White),
+                Stone::new(0.832031, 0.121094, Color::Black),
+                Stone::new(0.5396564125988921, 0.3864969752419616, Color::White),
+                Stone::new(0.199219, 0.605469, Color::Black),
+                Stone::new(0.07421875, 0.60546875, Color::White),
+                Stone::new(0.792969, 0.886719, Color::Black),
+                Stone::new(0.66796875, 0.88671875, Color::White),
+                Stone::new(0.628906, 0.082031, Color::Black),
+                Stone::new(0.7226365745353382, 0.14228984819701174, Color::White),
+                Stone::new(0.472656, 0.917969, Color::Black),
+                Stone::new(0.6839238463317968, 0.3794157673984005, Color::White),
+                Stone::new(0.113281, 0.488281, Color::Black),
+                Stone::new(0.6589316771545608, 0.5997038436377342, Color::White),
+            ],
+            Color::Black,
+        )
+    }
+
+    /// Lifted from a real shard rather than constructed: a constructed
+    /// position silently had no legal no-op at all and the test passed
+    /// without exercising anything. Here 8 of 20 legal placements are no-ops.
+    fn no_op_position() -> Position {
+        Position::new(
             0.055714285714285716,
             vec![
                 Stone::new(0.52734375, 0.55859375, Color::Black),
@@ -339,42 +452,7 @@ mod tests {
                 Stone::new(0.9282210508939471, 0.7704696349592104, Color::White),
             ],
             Color::Black,
-        );
-        assert!(position.validate().is_playable());
-        // Classify by the board itself, never by its stone count. An earlier
-        // version of this test asked whether the count had changed -- the same
-        // predicate the implementation used -- so it agreed with any behaviour
-        // that predicate produced and could not fail on the bug it guarded.
-        let before: Vec<Stone> = position.stones().to_vec();
-        let mut no_ops = 0;
-        let mut real_moves = 0;
-        for vertex in legal_set_vertices(&position) {
-            let snapped = nearest_legal_placement(&position, Point::new(vertex.x, vertex.y));
-            if !snapped.legal {
-                continue;
-            }
-            let Ok(result) = place(&position, snapped.point.x, snapped.point.y) else {
-                continue;
-            };
-            if result.position.stones() == before.as_slice() {
-                no_ops += 1;
-                assert_eq!(
-                    result.position.consecutive_passes(),
-                    1,
-                    "a placement that left the board identical must count as a pass"
-                );
-            } else {
-                real_moves += 1;
-                assert_eq!(
-                    result.position.consecutive_passes(),
-                    0,
-                    "a placement that changed the board must reset the pass count, \
-                     even when it removes as many stones as it adds"
-                );
-            }
-        }
-        assert!(no_ops > 0, "fixture must contain a no-op placement");
-        assert!(real_moves > 0, "fixture must contain a real placement");
+        )
     }
 
     /// The bug this pins: a placement that captures exactly one enemy stone
@@ -388,54 +466,7 @@ mod tests {
     /// (0.07421875, 0.60546875).
     #[test]
     fn an_even_trade_is_not_a_pass() {
-        let position = Position::new(
-            0.055714285714285716,
-            vec![
-                Stone::new(0.519531, 0.496094, Color::Black),
-                Stone::new(0.53515625, 0.71484375, Color::White),
-                Stone::new(0.378906, 0.519531, Color::Black),
-                Stone::new(0.59765625, 0.23828125, Color::White),
-                Stone::new(0.660156, 0.488281, Color::Black),
-                Stone::new(0.36328125, 0.25390625, Color::White),
-                Stone::new(0.347656, 0.667969, Color::Black),
-                Stone::new(0.37890625, 0.81640625, Color::White),
-                Stone::new(0.230469, 0.792969, Color::Black),
-                Stone::new(0.24155634060202594, 0.9038455992765371, Color::White),
-                Stone::new(0.113281, 0.886719, Color::Black),
-                Stone::new(0.69140625, 0.70703125, Color::White),
-                Stone::new(0.769531, 0.613281, Color::Black),
-                Stone::new(0.8440734679885532, 0.6961059349829543, Color::White),
-                Stone::new(0.917969, 0.589844, Color::Black),
-                Stone::new(0.9442857142857143, 0.7448279240914601, Color::White),
-                Stone::new(0.261719, 0.417969, Color::Black),
-                Stone::new(0.18359375, 0.28515625, Color::White),
-                Stone::new(0.097656, 0.371094, Color::Black),
-                Stone::new(0.74609375, 0.26953125, Color::White),
-                Stone::new(0.097656, 0.207031, Color::Black),
-                Stone::new(0.1815156102469017, 0.1336544699785221, Color::White),
-                Stone::new(0.089844, 0.066406, Color::Black),
-                Stone::new(0.36328125, 0.08203125, Color::White),
-                Stone::new(0.792969, 0.402344, Color::Black),
-                Stone::new(0.89453125, 0.33984375, Color::White),
-                Stone::new(0.442074, 0.332699, Color::Black),
-                Stone::new(0.4864982006504679, 0.23050780769204193, Color::White),
-                Stone::new(0.894531, 0.451273, Color::Black),
-                Stone::new(0.4431630138148883, 0.6105672604713251, Color::White),
-                Stone::new(0.832031, 0.121094, Color::Black),
-                Stone::new(0.5396564125988921, 0.3864969752419616, Color::White),
-                Stone::new(0.199219, 0.605469, Color::Black),
-                Stone::new(0.07421875, 0.60546875, Color::White),
-                Stone::new(0.792969, 0.886719, Color::Black),
-                Stone::new(0.66796875, 0.88671875, Color::White),
-                Stone::new(0.628906, 0.082031, Color::Black),
-                Stone::new(0.7226365745353382, 0.14228984819701174, Color::White),
-                Stone::new(0.472656, 0.917969, Color::Black),
-                Stone::new(0.6839238463317968, 0.3794157673984005, Color::White),
-                Stone::new(0.113281, 0.488281, Color::Black),
-                Stone::new(0.6589316771545608, 0.5997038436377342, Color::White),
-            ],
-            Color::Black,
-        );
+        let position = even_trade_position();
         assert!(position.validate().is_playable());
         let before = position.stones().len();
 
@@ -484,6 +515,66 @@ mod tests {
         assert_eq!(
             place(&second.position, 0.5, 0.5).unwrap_err(),
             MoveError::Finished
+        );
+    }
+
+    /// The same board, the same move, two rulesets, two outcomes.
+    ///
+    /// Reuses the no-op fixture: a lone stone self-captured on arrival, taking
+    /// nothing with it. Under our rules that is a pass, which is what stops it
+    /// being a better stall than passing. Under the official rules the move is
+    /// simply not available.
+    #[test]
+    fn the_official_rules_reject_a_self_capture_our_rules_call_a_pass() {
+        use crate::{Point, Ruleset, legal_set_vertices, nearest_legal_placement};
+        let ours = no_op_position();
+        assert!(ours.validate().is_playable());
+        let theirs = ours.clone().with_ruleset(Ruleset::Official);
+
+        let mut found = false;
+        for vertex in legal_set_vertices(&ours) {
+            let snapped = nearest_legal_placement(&ours, Point::new(vertex.x, vertex.y));
+            if !snapped.legal {
+                continue;
+            }
+            let Ok(mine) = place(&ours, snapped.point.x, snapped.point.y) else {
+                continue;
+            };
+            if mine.position.stones() != ours.stones() {
+                continue; // a real move under either ruleset
+            }
+            found = true;
+            assert_eq!(
+                mine.position.consecutive_passes(),
+                1,
+                "our rules count a no-op placement as a pass"
+            );
+            assert!(
+                matches!(
+                    place(&theirs, snapped.point.x, snapped.point.y),
+                    Err(MoveError::SelfCapture)
+                ),
+                "the official rules refuse the same move"
+            );
+        }
+        assert!(found, "fixture must contain a no-op placement");
+    }
+
+    /// A move that takes enemy stones stays legal under the official rules even
+    /// when it kills friendlies too. The enemy is resolved first and dies first,
+    /// so "only its own" is a statement about the enemy count.
+    #[test]
+    fn the_official_rules_allow_a_capture_that_also_costs_the_mover() {
+        use crate::Ruleset;
+        // The even-trade fixture: black captures one white stone.
+        let position = even_trade_position().with_ruleset(Ruleset::Official);
+        assert!(position.validate().is_playable());
+        let result = place(&position, 0.121094, 0.714844).expect("a capture is legal");
+        assert_eq!(result.captured, 1);
+        assert_eq!(
+            result.position.consecutive_passes(),
+            0,
+            "a capture is a move under either ruleset"
         );
     }
 }

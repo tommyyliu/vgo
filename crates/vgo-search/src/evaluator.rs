@@ -4,6 +4,12 @@ use vgo_core::{GameEvent, Position, planar_length};
 
 use crate::{Action, FineGrid};
 
+/// Logit for a move the rules refuse outright, as `Ruleset::Official` refuses a
+/// self-capture. Large enough to sit below any legal move, finite so a softmax
+/// over an all-refused set still normalises -- which cannot happen anyway, since
+/// pass is always a candidate and never self-captures.
+const REFUSED_MOVE_LOGIT: f64 = 64.0;
+
 const SELF_CAPTURE_LOGIT_PENALTY: f64 = 24.0;
 
 pub trait Policy: Send + Sync {
@@ -118,7 +124,13 @@ impl Policy for NaivePolicy {
                 .map(|stone| planar_length(point.x - stone.x, point.y - stone.y))
                 .fold(f64::INFINITY, f64::min)
         };
-        let transition = action.apply(&self.position);
+        // Under the official rules this move may not exist at all. Scoring it
+        // far below any legal move is the honest prior, and the search drops it
+        // on selection regardless -- but it must not be resolved with `apply`,
+        // which panics on a move the rules refuse.
+        let Some(transition) = action.try_apply(&self.position) else {
+            return -REFUSED_MOVE_LOGIT;
+        };
         let self_captures = transition
             .events
             .iter()
