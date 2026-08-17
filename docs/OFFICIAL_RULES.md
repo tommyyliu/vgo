@@ -82,10 +82,29 @@ side of every such bisector, and
 
     settled region of s  =  intersection over p in L of { x : |x - s| <= |x - p| }
 
-An intersection of half-planes is **convex**. A Voronoi cell clipped to a
-rectangular board is convex too, so it is the convex hull of its corners -- and a
-convex set containing every corner contains their hull. A cell whose corners are
-all settled is therefore settled entirely, and checking corners misses nothing.
+From there, two routes, and the shorter one needs less.
+
+**Via convexity.** An intersection of half-planes is convex; a Voronoi cell
+clipped to a rectangular board is convex too, so it is the hull of its corners;
+and a convex set containing every corner contains their hull.
+
+**Via linearity, which assumes nothing about the cell.** A half-plane is
+`{ f > c }` for a linear `f`, and a linear functional on a polygon attains its
+maximum at a vertex. So a half-plane that meets a bounded polygon at all contains
+one of its vertices. If any point of the cell is taken by `p`, then `p`'s
+half-plane meets the cell, so it contains a corner, so that corner is taken.
+
+The second is the one to remember: it needs neither the cell's convexity nor the
+settled region's, so it would survive a board whose edges were not straight lines
+or a cell that had been clipped into something awkward.
+
+Either way, a cell whose corners are all settled is settled entirely, and
+checking corners misses nothing.
+
+**Groups, not just cells.** The union of a connected group's cells can be badly
+non-convex, which is why `alive_groups_of` walks cells rather than group regions.
+It does not need to do better: any point of the union lies in one of the cells,
+and that cell is where the argument above finds its corner.
 
 That also corrects `AXIOMS.md`'s A16, which records each `R_s` as star-shaped
 about `s`. True, but weaker than the fact: it is convex. The radial solve in
