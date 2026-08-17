@@ -1484,8 +1484,13 @@ class RunRecipeTest(unittest.TestCase):
             with self.subTest(recipe=path.name):
                 text = path.read_text(encoding="utf-8")
                 self.assertTrue(
-                    "vgo-tournament" in text or "dense-curve.py" in text,
-                    f"{path.name} launches neither the trainer nor a tournament",
+                    "vgo-tournament" in text
+                    or "dense-curve.py" in text
+                    # A one-off supervised run: no loop, no arena, so it names
+                    # neither the pipeline module nor a tournament.
+                    or "train-once.py" in text,
+                    f"{path.name} launches neither the trainer, a tournament, "
+                    "nor a one-off training run",
                 )
 
     def test_only_operational_fields_are_parameterized(self) -> None:

@@ -1,7 +1,8 @@
 """Compact storage for the resident state planes.
 
 Three of the five compact channels are strictly binary and `komi` is constant
-across its plane, so a dense fp16 tensor spends 160 KB per sample on data that
+across its plane -- and the six-plane layouts add `previous_pass`, which is
+both, so it costs one fp16 per sample rather than a bit plane -- so a dense fp16 tensor spends 160 KB per sample on data that
 needs 38 KB. This packs the binary planes to bits and komi to one scalar, and
 expands them again per batch.
 
@@ -23,21 +24,59 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-# Compact channel order, from `COMPACT_CHANNELS` in crates/vgo-raster/src/lib.rs.
+@dataclass(frozen=True)
+class Layout:
+    """How one raster layout's planes divide into storage classes.
+
+    `binary` planes hold only 0.0 or 1.0 and survive a bit round trip.
+    `scalar` planes are constant across the plane, so one value per sample
+    reconstructs them. `continuous` keeps full precision.
+    """
+
+    channels: int
+    binary: tuple[int, ...]
+    scalar: tuple[int, ...]
+    continuous: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        covered = sorted((*self.binary, *self.scalar, *self.continuous))
+        if covered != list(range(self.channels)):
+            raise ValueError(f"layout does not classify every plane exactly once: {covered}")
+
+
+# Keyed by channel count, from the `COMPACT*_CHANNELS` lists in
+# crates/vgo-raster/src/lib.rs.
+#
+# The six-plane layouts -- `compact-pass` and `compact-dead-zone` -- share an
+# entry, and that is sound rather than a shortcut: they differ only in *which*
+# capture predicate sits in slot 3, and both are binary, so the storage classes
+# are identical. `_validate` checks the structure it assumes on the data itself,
+# so a layout that ever stopped fitting falls back to dense rather than being
+# silently corrupted.
+#
+# `previous_pass` is a scalar rather than a bit plane. It is binary, but it is
+# also constant across the plane, and one fp16 beats 2 KB of bits.
+_LAYOUTS: dict[int, Layout] = {
+    # current_stones, opponent_stones, voronoi_ridge, settled, komi
+    5: Layout(channels=5, binary=(0, 1, 3), scalar=(4,), continuous=(2,)),
+    # ..., komi, previous_pass
+    6: Layout(channels=6, binary=(0, 1, 3), scalar=(4, 5), continuous=(2,)),
+}
+
+# The compact planes by name, for readers and for tests. The six-plane layouts
+# keep these positions and add `previous_pass` at 5.
 CURRENT_STONES = 0
 OPPONENT_STONES = 1
 VORONOI_RIDGE = 2
 SETTLED = 3
 KOMI = 4
-
-# Channels that only ever hold 0.0 or 1.0, and so survive a bit round trip.
-BINARY_CHANNELS = (CURRENT_STONES, OPPONENT_STONES, SETTLED)
-# Constant across its plane: one value per sample, broadcast on expand.
-SCALAR_CHANNELS = (KOMI,)
-# Everything else keeps full precision.
-CONTINUOUS_CHANNELS = (VORONOI_RIDGE,)
+PREVIOUS_PASS = 5
 
 COMPACT_CHANNEL_COUNT = 5
+COMPACT_LAYOUT = _LAYOUTS[COMPACT_CHANNEL_COUNT]
+BINARY_CHANNELS = COMPACT_LAYOUT.binary
+SCALAR_CHANNELS = COMPACT_LAYOUT.scalar
+CONTINUOUS_CHANNELS = COMPACT_LAYOUT.continuous
 
 
 class PackingUnsupported(ValueError):
@@ -55,9 +94,10 @@ class PackedStates:
 
     bits: torch.Tensor  # (samples, len(BINARY_CHANNELS), ceil(pixels/8)) uint8
     continuous: torch.Tensor  # (samples, len(CONTINUOUS_CHANNELS), H, W) fp16
-    scalars: torch.Tensor  # (samples, len(SCALAR_CHANNELS)) fp16
+    scalars: torch.Tensor  # (samples, len(layout.scalar)) fp16
     height: int
     width: int
+    layout: Layout = COMPACT_LAYOUT
 
     @property
     def samples(self) -> int:
@@ -65,12 +105,12 @@ class PackedStates:
 
     @property
     def channels(self) -> int:
-        return COMPACT_CHANNEL_COUNT
+        return self.layout.channels
 
     @property
     def shape(self) -> tuple[int, int, int, int]:
         """The shape `expand` produces, so callers can size buffers."""
-        return (self.samples, COMPACT_CHANNEL_COUNT, self.height, self.width)
+        return (self.samples, self.layout.channels, self.height, self.width)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -85,7 +125,7 @@ class PackedStates:
     def expand(
         self, rows: torch.Tensor | None = None, out: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Reconstruct dense `[rows, 5, H, W]` fp16 planes.
+        """Reconstruct dense `[rows, channels, H, W]` fp16 planes.
 
         `rows` selects a subset, which is how the batch stager uses this: the
         bit expansion then runs over one batch rather than the whole window.
@@ -101,7 +141,7 @@ class PackedStates:
         device = bits.device
         if out is None:
             out = torch.empty(
-                (count, COMPACT_CHANNEL_COUNT, self.height, self.width),
+                (count, self.layout.channels, self.height, self.width),
                 dtype=self.continuous.dtype,
                 device=device,
             )
@@ -110,14 +150,14 @@ class PackedStates:
         offsets = torch.arange(8, device=device, dtype=torch.uint8)
         unpacked = torch.bitwise_and(
             bits.unsqueeze(-1) >> offsets, 1
-        ).view(count, len(BINARY_CHANNELS), -1)[:, :, :pixels]
-        for slot, channel in enumerate(BINARY_CHANNELS):
+        ).view(count, len(self.layout.binary), -1)[:, :, :pixels]
+        for slot, channel in enumerate(self.layout.binary):
             out[:, channel] = unpacked[:, slot].view(
                 count, self.height, self.width
             ).to(out.dtype)
-        for slot, channel in enumerate(CONTINUOUS_CHANNELS):
+        for slot, channel in enumerate(self.layout.continuous):
             out[:, channel] = continuous[:, slot]
-        for slot, channel in enumerate(SCALAR_CHANNELS):
+        for slot, channel in enumerate(self.layout.scalar):
             out[:, channel] = scalars[:, slot].view(count, 1, 1).expand(
                 count, self.height, self.width
             )
@@ -130,6 +170,7 @@ class PackedStates:
             scalars=self.scalars.to(device),
             height=self.height,
             width=self.width,
+            layout=self.layout,
         )
 
 
@@ -147,27 +188,29 @@ def is_packable(states: np.ndarray | torch.Tensor) -> bool:
     return True
 
 
-def _validate(states: np.ndarray | torch.Tensor) -> None:
+def _validate(states: np.ndarray | torch.Tensor) -> Layout:
     if states.ndim != 4:
         raise PackingUnsupported("states must be [samples, channels, height, width]")
-    if states.shape[1] != COMPACT_CHANNEL_COUNT:
+    layout = _LAYOUTS.get(states.shape[1])
+    if layout is None:
         raise PackingUnsupported(
-            f"packing expects {COMPACT_CHANNEL_COUNT} compact channels, "
-            f"got {states.shape[1]}"
+            f"no packing layout for {states.shape[1]} channels; known: "
+            f"{sorted(_LAYOUTS)}"
         )
     tensor = _as_tensor(states)
-    for channel in BINARY_CHANNELS:
+    for channel in layout.binary:
         plane = tensor[:, channel]
         if not bool(((plane == 0) | (plane == 1)).all()):
             raise PackingUnsupported(
                 f"channel {channel} is not binary and cannot be packed to bits"
             )
-    for channel in SCALAR_CHANNELS:
+    for channel in layout.scalar:
         plane = tensor[:, channel].reshape(tensor.shape[0], -1)
         if not bool((plane.amin(dim=1) == plane.amax(dim=1)).all()):
             raise PackingUnsupported(
                 f"channel {channel} is not constant across its plane"
             )
+    return layout
 
 
 def _as_tensor(states: np.ndarray | torch.Tensor) -> torch.Tensor:
@@ -177,14 +220,14 @@ def _as_tensor(states: np.ndarray | torch.Tensor) -> torch.Tensor:
 
 
 def pack(states: np.ndarray | torch.Tensor) -> PackedStates:
-    """Pack dense `[samples, 5, H, W]` planes. Raises if the layout does not fit."""
-    _validate(states)
+    """Pack dense planes. Raises if the layout does not fit."""
+    layout = _validate(states)
     tensor = _as_tensor(states)
     samples, _, height, width = tensor.shape
     pixels = height * width
 
-    binary = tensor[:, list(BINARY_CHANNELS)].reshape(
-        samples, len(BINARY_CHANNELS), pixels
+    binary = tensor[:, list(layout.binary)].reshape(
+        samples, len(layout.binary), pixels
     )
     # numpy packs bits big-endian by default; expand reads little-endian, so
     # ask for the matching order rather than reversing it on the hot path.
@@ -193,10 +236,10 @@ def pack(states: np.ndarray | torch.Tensor) -> PackedStates:
             binary.to(torch.uint8).cpu().numpy(), axis=-1, bitorder="little"
         )
     )
-    continuous = tensor[:, list(CONTINUOUS_CHANNELS)].to(torch.float16).clone()
+    continuous = tensor[:, list(layout.continuous)].to(torch.float16).clone()
     scalars = (
-        tensor[:, list(SCALAR_CHANNELS)]
-        .reshape(samples, len(SCALAR_CHANNELS), pixels)[:, :, 0]
+        tensor[:, list(layout.scalar)]
+        .reshape(samples, len(layout.scalar), pixels)[:, :, 0]
         .to(torch.float16)
         .clone()
     )
@@ -206,6 +249,7 @@ def pack(states: np.ndarray | torch.Tensor) -> PackedStates:
         scalars=scalars,
         height=height,
         width=width,
+        layout=layout,
     )
 
 
@@ -222,7 +266,7 @@ def conformance_error(
     reference = _as_tensor(states).to(torch.float16)
     restored = pack(states).expand()
     report: dict[str, float] = {}
-    for channel in range(COMPACT_CHANNEL_COUNT):
+    for channel in range(_as_tensor(states).shape[1]):
         difference = (restored[:, channel].float() - reference[:, channel].float())
         report[f"channel_{channel}"] = float(difference.abs().max().item())
     return report

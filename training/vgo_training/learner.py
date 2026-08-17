@@ -1364,7 +1364,16 @@ class PersistentLearner:
             if compiled:
                 torch.set_float32_matmul_precision("high")
                 torch.backends.cudnn.benchmark = True
-                model.compile()
+                # Not available on every interpreter -- torch refuses outright
+                # on Python 3.14+ -- and it is an optimisation, not a
+                # correctness requirement. Losing it should cost speed, not the
+                # run, so this reports and carries on rather than raising hours
+                # into a job.
+                try:
+                    model.compile()
+                except (RuntimeError, AttributeError) as error:
+                    self._log(f"[learner] torch.compile unavailable, continuing: {error}")
+                    compiled = False
             optimizer = _build_optimizer(model, config, self._log)
             if config.restore_optimizer and checkpoint.get("optimizer_state_dict") is not None:
                 try:
