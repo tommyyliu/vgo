@@ -504,18 +504,24 @@ impl Node {
     }
 }
 
-/// Select a child, discarding any the rules turn out to refuse.
+/// Select a child the rules will actually allow.
 ///
 /// Under [`Ruleset::Official`](vgo_core::Ruleset::Official) a placement that
 /// takes only the mover's own stones is illegal, and nothing short of resolving
-/// the move can tell. So the check happens here, at the moment a child is first
-/// chosen -- which is also before the network ever sees the position, since
-/// resolution precedes evaluation. A refused candidate is removed outright
-/// rather than scored badly: it is not a bad move, it is not a move.
+/// the move can tell -- so candidate generation cannot filter these out and the
+/// check has to happen here, when a child is first chosen.
+///
+/// It costs nothing. The search was going to resolve that move anyway to build
+/// the child position, and that already happens before the network sees
+/// anything, so a refused candidate never reaches inference. A child that is
+/// already expanded skips the check, because the rules accepted it when it was
+/// expanded. Under `Vgo` `try_apply` never refuses, so this is one branch.
+///
+/// A refused child is **marked, not removed** -- see [`Child::refused`]. It is
+/// then never selected again, and never appears in the assembled result.
 ///
 /// Terminates because the pass candidate is always present and `pass` cannot
-/// self-capture, so at worst every placement is discarded and the pass is
-/// chosen. Costs nothing under `Vgo`, where `try_apply` never refuses.
+/// self-capture, so at worst every placement is marked and the pass is chosen.
 fn select_playable_child(node: &mut Node, config: SearchConfig) -> Option<usize> {
     while node.children.iter().any(|child| !child.refused) {
         let index = node.select_child(config);
