@@ -94,35 +94,39 @@ install -m 0755 "${BASH_SOURCE[0]}" "$output/launch.sh"
 python="$root/training/.venv/bin/python"
 
 cd "$root/training"
-exec "$python" -m vgo_training.pipeline \
+exec "$python" -m vgo_training.rl_loop \
   --output "$output" \
   --updates "$updates" \
   --initial-checkpoint "$seed_checkpoint" \
   --initial-onnx "$seed_onnx" \
   --ruleset official \
   --raster-kind compact-dead-zone \
-  --architecture ddrnet \
-  --model-width 64 \
-  --blocks 16 \
-  --context-attention-blocks 1 \
-  --resolution 128 \
-  --policy-resolution 128 \
+  --architecture ddrnet --norm-groups 8 --model-width 64 --blocks 16 \
+  --context-attention-blocks 1 --attention-heads 8 \
+  --resolution 128 --policy-resolution 128 \
   --radius 0.05555555555555555 \
-  --coarse-pool 16 \
-  --generation-simulations 3200 \
-  --leaf-batch 4 \
-  --samples-per-shard 1600 \
-  --replay-window 6 \
-  --training-epochs 10 \
-  --training-batch 256 \
-  --learning-rate 0.001 \
-  --value-weight 2.0 \
+  --coarse-pool 16 --generation-simulations 3200 \
+  --temperature 1.0 --temperature-plies 30 --maximum-plies 70 \
+  --resign-target-false-positive 0.02 --resign-soft-simulations 1200 \
+  --resign-window 5 --resign-minimum-ply 20 --resign-disable-fraction 0.0 \
+  --samples-per-shard 1600 --shards-per-update 1 --replay-window 6 \
+  --komi-low 0.017 --komi-high 0.137 \
+  --dynamic-komi --komi-target-black-win-rate 0.5 \
+  --komi-recenter-minimum-games 256 --komi-recenter-maximum-step 0.025 \
+  --training-epochs 10 --training-batch 256 \
+  --learning-rate 0.001 --warm-learning-rate 0.001 --value-weight 2.0 \
+  --ownership-weight 0.0 --recency-decay 1.0 --drain-tail \
+  --concurrent-generators 1 \
+  --schedule cosine --warmup-epochs 0 --compile --restore-optimizer \
   --full-adam \
-  --komi-low 0.017 \
-  --komi-high 0.137 \
-  --dynamic-komi \
-  --arena-komi 0.104 \
-  --telemetry-pairs 5 \
-  --actors 64 \
-  --inference-batch 32 \
+  --training-device cuda --training-threads "${VGO_TRAINING_THREADS:-4}" \
+  --report-every 1 --validation-fraction 0.1 \
+  --actors "${VGO_ACTORS:-64}" --arena-actors "${VGO_ARENA_ACTORS:-${VGO_ACTORS:-64}}" \
+  --leaf-batch 4 \
+  --inference-batch 32 --inference-delay-ms 1 \
+  --inference-slots "${VGO_SLOTS:-2}" \
+  --provider tensorrt --fp16 --warm-inference \
+  --overlap-actor-learner --retire-shards \
+  --arena-komi 0.104 --telemetry-pairs 5 \
+  --seed 30100001 --arena-seed 30105001 \
   2>&1 | tee -a "$output/run.log"

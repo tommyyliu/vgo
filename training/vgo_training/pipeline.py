@@ -1503,8 +1503,6 @@ class Pipeline:
             str(config.raster_kind),
             "--model-raster-kind",
             str(config.raster_kind),
-            "--ruleset",
-            str(config.ruleset),
             "--resign-disable-fraction",
             str(config.resign_disable_fraction),
             "--radius",
