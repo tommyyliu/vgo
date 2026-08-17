@@ -1364,11 +1364,16 @@ class PersistentLearner:
             if compiled:
                 torch.set_float32_matmul_precision("high")
                 torch.backends.cudnn.benchmark = True
-                # Not available on every interpreter -- torch refuses outright
-                # on Python 3.14+ -- and it is an optimisation, not a
-                # correctness requirement. Losing it should cost speed, not the
-                # run, so this reports and carries on rather than raising hours
-                # into a job.
+                # An optimisation, not a correctness requirement, so losing it
+                # should cost speed rather than the run -- this reports and
+                # carries on instead of raising hours into a job.
+                #
+                # It is worth checking *which* torch raised before working
+                # around a refusal. Torch declines outright on interpreters it
+                # has not caught up to, and this box has two installs: 2.9.1 on
+                # the system interpreter, which refuses Python 3.14, and 2.13.0
+                # in training/.venv, which compiles on it fine. A script run
+                # through its shebang finds the first.
                 try:
                     model.compile()
                 except (RuntimeError, AttributeError) as error:

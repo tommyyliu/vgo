@@ -115,7 +115,6 @@ for kind in compact-pass compact-dead-zone; do
     --value-weight 2.0 \
     --learning-rate 0.001 \
     --full-adam \
-    --no-compile \
     2>&1 | tee "$arm/train.log"
 
   # Export now rather than later: the manifest records `raster_kind`, and a
