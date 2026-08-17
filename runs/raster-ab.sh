@@ -98,7 +98,7 @@ echo "training on ${#shards[@]} shards"
 # interpreter, which on this box has a different torch entirely.
 python="$root/training/.venv/bin/python"
 
-for kind in compact-pass compact-dead-zone; do
+for kind in compact-dead-zone; do
   arm="$output/$kind"
   mkdir -p "$arm"
   echo "=== $kind ==="

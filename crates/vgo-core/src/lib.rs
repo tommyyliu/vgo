@@ -15,7 +15,7 @@ pub use legal_set::{
     nearest as nearest_legal_placement,
     nearest_with as nearest_legal_placement_with, vertices as legal_set_vertices,
 };
-pub use model::{Color, Phase, Position, Stone, Validation, ValidationIssue};
+pub use model::{Color, Phase, Position, Ruleset, Stone, Validation, ValidationIssue};
 pub use settled::SettledRegion;
 pub use numeric::{COORDINATE_EPSILON, length as planar_length};
 pub use voronoi::{Cell, Edge, EdgeSource, Geometry, Point};

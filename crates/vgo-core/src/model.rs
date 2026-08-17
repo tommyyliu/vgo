@@ -30,6 +30,64 @@ impl Stone {
     }
 }
 
+/// Which rules a position is played and scored under.
+///
+/// The two differ in one predicate and one prohibition, and both are about
+/// capture. Everything else -- the board, the Voronoi partition, area scoring,
+/// two passes ending the game -- is shared.
+///
+/// This is part of a position because it changes which stones are on the board
+/// after a move. A search, a shard and a model that disagree about it are not
+/// playing the same game, for the same reason komi is carried here.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Ruleset {
+    /// This repository's rules. A group lives while some future stone could
+    /// still take area from it: some legal centre is strictly closer to a point
+    /// of its region than the stone that currently owns that point. Self-capture
+    /// is legal and global, and a placement that leaves the board exactly as it
+    /// was counts as a pass.
+    #[default]
+    Vgo,
+    /// The rules at voronoigo.com. A group lives while a stone could still be
+    /// placed *touching* its territory: some legal centre is within one radius
+    /// of its region. Self-capture is illegal when the move would take only the
+    /// mover's own stones.
+    ///
+    /// Strictly the more aggressive capture rule of the two, which is not
+    /// obvious and is worth the derivation. If a legal centre `p` lies within
+    /// `r` of a point `x`, then `d_S(x) >= d_S(p) - ||x - p|| >= 2r - r = r >=
+    /// ||x - p||`, so `p` challenges `x` and [`Vgo`](Self::Vgo) calls the group
+    /// alive too. The converse fails: `p` can be `3r` from a large cell and
+    /// still take area from it, which is the "keep a group alive while it can
+    /// connect out" case that only this repository's rules allow.
+    ///
+    /// With self-capture illegal there is no no-op placement, so the rule that
+    /// counts one as a pass never fires.
+    Official,
+}
+
+impl Ruleset {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vgo => "vgo",
+            Self::Official => "official",
+        }
+    }
+}
+
+impl std::str::FromStr for Ruleset {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "vgo" => Ok(Self::Vgo),
+            "official" => Ok(Self::Official),
+            other => Err(format!("unknown ruleset: {other}")),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
     Playing,
@@ -55,6 +113,9 @@ pub struct Position {
     /// different komi score differently, so a search, a shard, and a model
     /// that disagree about it are not playing the same game.
     komi: f64,
+    /// Which rules resolve a move here. See [`Ruleset`]; carried for the same
+    /// reason komi is, because it changes the position a move produces.
+    ruleset: Ruleset,
 }
 
 impl Position {
@@ -67,7 +128,20 @@ impl Position {
             consecutive_passes: 0,
             phase: Phase::Playing,
             komi: 0.0,
+            ruleset: Ruleset::Vgo,
         }
+    }
+
+    /// The same position played under `ruleset`.
+    #[must_use]
+    pub fn with_ruleset(mut self, ruleset: Ruleset) -> Self {
+        self.ruleset = ruleset;
+        self
+    }
+
+    #[must_use]
+    pub const fn ruleset(&self) -> Ruleset {
+        self.ruleset
     }
 
     /// The same position scored with `komi` subtracted from Black's lead.
@@ -211,6 +285,7 @@ impl Position {
             },
             // Carried, not reset: komi belongs to the game, not the ply.
             komi: self.komi,
+            ruleset: self.ruleset,
         }
     }
 
@@ -232,6 +307,7 @@ impl Position {
                 Phase::Playing
             },
             komi: self.komi,
+            ruleset: self.ruleset,
         }
     }
 }

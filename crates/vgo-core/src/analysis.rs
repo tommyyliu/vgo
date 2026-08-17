@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{Color, Point, Position, Validation, legal_set, numeric, voronoi};
+use crate::{Color, Point, Position, Ruleset, Validation, legal_set, numeric, voronoi};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Score {
@@ -91,16 +91,81 @@ fn alive_groups_of(
         }
         let stone = position.stones()[stone_index];
         let stone_point = Point::new(stone.x, stone.y);
-        for &vertex in &cell.polygon {
-            if legal_set::escape_witness(position, vertex, stone_point, Some(legal_vertices))
-                .is_some()
-            {
-                alive_groups.insert(group);
-                break;
+        let alive = match position.ruleset() {
+            Ruleset::Vgo => cell.polygon.iter().any(|&vertex| {
+                legal_set::escape_witness(position, vertex, stone_point, Some(legal_vertices))
+                    .is_some()
+            }),
+            Ruleset::Official => {
+                official_cell_is_alive(position, stone_index, cell, legal_vertices)
             }
+        };
+        if alive {
+            alive_groups.insert(group);
         }
     }
     alive_groups
+}
+
+/// Whether a cell survives under [`Ruleset::Official`]: can a stone still be
+/// placed touching it?
+///
+/// A stone covers a disc of one radius about its centre, so the cell is
+/// reachable exactly when some legal centre lies within `r` of it -- that is,
+/// when `dist(cell, L) <= r`. Three tests, because the distance from a polygon
+/// to a set is not the distance from its vertices to that set, and each covers
+/// a way the two can be close that the others miss:
+///
+/// 1. **A cell vertex within `r` of the legal set.** The common case.
+/// 2. **A legal-set vertex within `r` of the cell.** Catches a legal region
+///    poking into a large cell whose own vertices are all far away -- a forced
+///    eye in the middle of someone's territory is exactly this, and it is the
+///    shape that decides whether a big group lives.
+/// 3. **A cell *edge* passing within `r` of a legal vertex.** The nearest pair
+///    of points between two convex-ish sets need not be a vertex on either
+///    side; without this a long edge sliding past a legal region reads as far
+///    from it.
+///
+/// Every test is exact in f64 and none samples a grid: this decides captures,
+/// so an approximation here is a different game rather than a slightly wrong
+/// picture.
+fn official_cell_is_alive(
+    position: &Position,
+    stone_index: usize,
+    cell: &voronoi::Cell,
+    legal_vertices: &[Point],
+) -> bool {
+    let radius = position.radius();
+    if cell
+        .polygon
+        .iter()
+        .any(|&vertex| legal_set::distance(position, vertex, Some(legal_vertices)) <= radius)
+    {
+        return true;
+    }
+    let stones = position.stones();
+    legal_vertices.iter().any(|&legal| {
+        // Inside this cell? A point belongs to a stone's cell exactly when that
+        // stone is its nearest, so this needs no polygon test and stays exact.
+        let mut nearest = stone_index;
+        let mut best = f64::INFINITY;
+        for (index, stone) in stones.iter().enumerate() {
+            let distance = numeric::length(legal.x - stone.x, legal.y - stone.y);
+            if distance < best {
+                best = distance;
+                nearest = index;
+            }
+        }
+        if nearest == stone_index {
+            return true;
+        }
+        // Otherwise, close enough to reach across the boundary.
+        cell.polygon
+            .iter()
+            .zip(cell.polygon.iter().cycle().skip(1))
+            .take(cell.polygon.len())
+            .any(|(&a, &b)| numeric::distance_to_segment(legal, a, b) <= radius)
+    })
 }
 
 fn settled_from(geometry: &voronoi::Geometry, alive_groups: &HashSet<usize>) -> HashSet<usize> {
