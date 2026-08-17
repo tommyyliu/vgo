@@ -108,6 +108,16 @@ def export(arguments: argparse.Namespace) -> dict[str, object]:
         ],
         "model": {
             "architecture": str(checkpoint.get("architecture", "flat")),
+            # Which planes this network expects, carried so a serving path can
+            # rasterize the way it was trained. `channels` above says how many;
+            # it does not say what they mean, and two layouts share a width --
+            # `compact-pass` and `compact-dead-zone` are both six planes and
+            # differ in the capture predicate. Feeding the wrong one is a
+            # silent failure at inference, unlike in training, where the shape
+            # check catches most of it.
+            #
+            # Null for a checkpoint trained before the field existed.
+            "raster_kind": checkpoint.get("raster_kind"),
             "width": model_width,
             "blocks": blocks,
             "parameters": sum(parameter.numel() for parameter in model.parameters()),

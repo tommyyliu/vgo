@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 from concurrent.futures import Future, ThreadPoolExecutor
+from functools import partial
 from dataclasses import asdict, dataclass, fields, replace
 import json
 import math
@@ -70,6 +71,18 @@ class LearnerConfig:
     model_width: int = 32
     blocks: int = 3
     architecture: str = "flat"
+    # Which planes the network reads. A property of the *model*, not of the
+    # data: a position shard stores the game, and the raster is rendered at load
+    # time, so two runs over the same shards can train different encodings.
+    #
+    # It has to be configured rather than inferred. The shard header records
+    # what generation happened to be set to, which stopped identifying a layout
+    # the moment two shared a width -- `compact-pass` and `compact-dead-zone`
+    # are both six planes and differ only in which capture predicate they
+    # carry, so the count cannot tell them apart and a wrong guess feeds a model
+    # a plane meaning something else. None keeps the old header-derived
+    # behaviour, for runs that predate the question.
+    raster_kind: str | None = None
     # Fixed-variance init plus He-scale convs (ddrnet). Changes the computed
     # function, so it is recorded in the checkpoint and cannot be toggled on a
     # warm start.
@@ -1121,7 +1134,11 @@ class PersistentLearner:
     ) -> None:
         self.defaults = defaults or LearnerConfig()
         self.defaults.validate()
-        self.replay_cache = replay_cache or ReplayCache()
+        # The cache's loader is `(path) -> dataset`, so the raster kind is bound
+        # here rather than threaded through every call that reaches it.
+        self.replay_cache = replay_cache or ReplayCache(
+            loader=partial(load_dataset, raster_kind=self.defaults.raster_kind)
+        )
         self._log = log or (lambda message: print(message, file=sys.stderr, flush=True))
         self.model: nn.Module | None = None
         self.optimizer: torch.optim.Optimizer | None = None
@@ -1273,6 +1290,23 @@ class PersistentLearner:
                     policy_resolution,
                 ):
                     raise ValueError("initial checkpoint does not match replay tensor shape")
+                # The shape check above does not cover this. Two layouts can
+                # share a width and differ in what a plane *means* --
+                # `compact-pass` and `compact-dead-zone` are both six planes and
+                # disagree only on the capture predicate -- so a swap between
+                # them passes every dimension test and quietly feeds the loaded
+                # weights a channel trained to mean something else.
+                parent_kind = checkpoint.get("raster_kind")
+                if (
+                    config.raster_kind is not None
+                    and parent_kind is not None
+                    and parent_kind != config.raster_kind
+                ):
+                    raise ValueError(
+                        f"initial checkpoint was trained on raster kind "
+                        f"{parent_kind!r}, cannot warm start into "
+                        f"{config.raster_kind!r}"
+                    )
                 metadata = {
                     "channels": window.channels,
                     "height": window.height,
@@ -1281,6 +1315,7 @@ class PersistentLearner:
                     "model_width": int(checkpoint["model_width"]),
                     "blocks": int(checkpoint["blocks"]),
                     "architecture": str(checkpoint.get("architecture", "flat")),
+                    "raster_kind": config.raster_kind or parent_kind,
                     # Follows the parent, not the config: the K constants are
                     # part of the function the loaded weights were trained for,
                     # so a warm start cannot switch this on or off.
@@ -1318,6 +1353,7 @@ class PersistentLearner:
                     "model_width": config.model_width,
                     "blocks": config.blocks,
                     "architecture": config.architecture,
+                    "raster_kind": config.raster_kind,
                     "variance_scaled": config.variance_scaled,
                     "norm_groups": config.norm_groups,
                     "context_attention_blocks": config.context_attention_blocks,

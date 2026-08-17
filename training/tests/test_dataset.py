@@ -549,3 +549,42 @@ class V4PositionShardTests(unittest.TestCase):
             )
             self.assertEqual(float(dataset.states[0, 9].mean()), 0.0)
             self.assertEqual(float(dataset.states[2, 9].mean()), 1.0)
+
+
+class RasterKindIsATrainingChoice(unittest.TestCase):
+    """The raster belongs to the model, not to the shard.
+
+    A position shard stores the game, so which planes a network reads is decided
+    by whatever is being trained. These pin the part that is easy to get wrong:
+    the header's channel count is what *generation* was configured with, and it
+    stopped identifying a layout once two of them shared a width.
+    """
+
+    def test_the_channel_count_cannot_identify_a_six_plane_layout(self) -> None:
+        from vgo_training.dataset import RASTER_CHANNELS, _LEGACY_KIND_BY_CHANNELS
+
+        self.assertEqual(RASTER_CHANNELS["compact-pass"], 6)
+        self.assertEqual(RASTER_CHANNELS["compact-dead-zone"], 6)
+        # So the legacy reverse map must not claim to know which one 6 means.
+        self.assertNotIn(6, _LEGACY_KIND_BY_CHANNELS)
+
+    def test_an_unknown_kind_is_refused_by_name(self) -> None:
+        from vgo_training.dataset import load_dataset
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "shard.vgo"
+            path.write_bytes(b"\0" * 64)
+            with self.assertRaises(ValueError) as caught:
+                load_dataset(path, raster_kind="compact-deadzone")
+            self.assertIn("unknown raster kind", str(caught.exception))
+
+    def test_the_learner_binds_the_kind_into_its_loader(self) -> None:
+        from vgo_training.learner import LearnerConfig, PersistentLearner
+
+        learner = PersistentLearner(
+            defaults=LearnerConfig(raster_kind="compact-dead-zone")
+        )
+        # Bound rather than threaded: the cache's loader is `(path) -> dataset`.
+        self.assertEqual(
+            learner.replay_cache._loader.keywords, {"raster_kind": "compact-dead-zone"}
+        )

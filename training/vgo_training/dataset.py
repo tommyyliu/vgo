@@ -50,9 +50,27 @@ def policy_capacity(version: int) -> int:
 CHANNEL_COUNT = 10
 
 # Built by `cargo build --release -p vgo-raster --example render_shard`.
-# Channel count -> the raster kind that produces it. The shard header records
-# the count, so the kind never has to be configured separately.
-_RASTER_KINDS = {3: "rgb", 5: "compact", 12: "semantic"}
+
+# Raster kind -> how many planes it writes. Mirrors `RasterKind::channels` in
+# crates/vgo-raster/src/lib.rs, which is the source of truth.
+RASTER_CHANNELS = {
+    "semantic": 12,
+    "rgb": 3,
+    "compact": 5,
+    "compact-pass": 6,
+    "compact-dead-zone": 6,
+}
+
+# The reverse, for shards loaded without a configured kind.
+#
+# This is a legacy convenience, not a lookup to extend. A shard stores positions
+# rather than pictures, so which raster to render is a training-time choice and
+# belongs to the model -- the header's channel count records what *generation*
+# happened to be configured with, which is a different question and stopped
+# being a usable proxy the moment two layouts shared a width. `compact-pass` and
+# `compact-dead-zone` are both six planes and differ in the capture predicate,
+# so nothing here can tell them apart, and nothing should try: pass the kind.
+_LEGACY_KIND_BY_CHANNELS = {3: "rgb", 5: "compact", 12: "semantic"}
 
 _RUST_RENDERER = (
     Path(__file__).resolve().parents[2] / "target/release/examples/render_shard"
@@ -294,6 +312,7 @@ def _render_states(
     channels: int,
     height: int,
     width: int,
+    raster_kind: str | None = None,
 ) -> np.ndarray:
     """Renders a shard's positions, preferring the Rust rasterizer.
 
@@ -307,9 +326,22 @@ def _render_states(
     So when the Rust renderer is available and the caller wants channels the
     port does not implement, shell out to it. The port still serves the ten
     channels it was written for, which keeps older runs loading unchanged.
+
+    A configured `raster_kind` always takes the Rust path, even at ten channels.
+    The port renders a layout no `RasterKind` produces any more -- the semantic
+    raster is twelve planes now -- so `CHANNEL_COUNT` here is the port's own
+    capability rather than a kind, and matching it is not a reason to prefer it
+    over the layout the caller asked for.
     """
-    if channels == CHANNEL_COUNT:
-        return rasterize_records(records, channels, height, width)
+    if raster_kind is None:
+        if channels == CHANNEL_COUNT:
+            return rasterize_records(records, channels, height, width)
+        raster_kind = _LEGACY_KIND_BY_CHANNELS.get(channels)
+        if raster_kind is None:
+            raise ValueError(
+                f"no raster kind was configured and {channels} channels does not "
+                "identify one; pass raster_kind"
+            )
     binary = _RUST_RENDERER
     if not binary.exists():
         raise ValueError(
@@ -325,7 +357,7 @@ def _render_states(
                 str(path),
                 str(destination),
                 str(width),
-                _RASTER_KINDS[channels],
+                raster_kind,
             ],
             check=True,
             capture_output=True,
@@ -558,6 +590,7 @@ def _load_replay_v4(
     width: int,
     policy_size: int,
     version: int = REPLAY_VERSION,
+    raster_kind: str | None = None,
 ) -> tuple[np.ndarray, ...]:
     """Loads a position shard, rendering each state at load time.
 
@@ -577,7 +610,7 @@ def _load_replay_v4(
     if int(np.asarray(records["stone_count"]).max(initial=0)) > V4_STONE_CAPACITY:
         raise ValueError("replay record claims more stones than the capacity")
 
-    states = _render_states(path, records, channels, height, width)
+    states = _render_states(path, records, channels, height, width, raster_kind)
     policies, masks, visits, beta, proposal_counts = _expand_sparse_policy(
         records, samples, policy_size
     )
@@ -675,20 +708,66 @@ def _load_replay(
     )
 
 
-def load_dataset(path: str | Path) -> RasterDataset:
+def _reject_stored_raster_mismatch(raster_kind: str | None, channels: int) -> None:
+    """Guards the formats that really do store planes.
+
+    v3 and legacy shards contain rendered pixels, so their channel count is a
+    fact about the file rather than a choice. Asking for a different layout
+    cannot be honoured and must not be silently ignored -- the caller would get
+    a model fed planes it was not trained on, which is the failure this whole
+    parameter exists to prevent.
+    """
+    if raster_kind is None:
+        return
+    stored = RASTER_CHANNELS[raster_kind]
+    if stored != channels:
+        raise ValueError(
+            f"this shard stores {channels} rendered channels, so it cannot be "
+            f"read as {raster_kind!r} ({stored} channels). Only position shards "
+            "(v4 and later) let the raster be chosen at training time."
+        )
+
+
+def load_dataset(path: str | Path, *, raster_kind: str | None = None) -> RasterDataset:
+    """Loads a shard, rendering its positions with `raster_kind`.
+
+    The raster is a **training-time choice and a property of the model**, not of
+    the data: a position shard stores the game, and which planes a network reads
+    is decided by whatever is being trained. Pass the kind.
+
+    `None` falls back to reading the header's channel count, which is a legacy
+    convenience for shards and tests that predate the question. It cannot be
+    relied on -- `compact-pass` and `compact-dead-zone` are both six planes and
+    differ in which capture predicate they carry, so the count identifies
+    neither.
+    """
+    # Checked before the file is touched: a misspelled kind is the caller's
+    # mistake, and reporting it as a bad shard sends the reader to the wrong
+    # place entirely.
+    if raster_kind is not None and raster_kind not in RASTER_CHANNELS:
+        raise ValueError(
+            f"unknown raster kind {raster_kind!r}; expected one of "
+            f"{sorted(RASTER_CHANNELS)}"
+        )
     path = Path(path).resolve(strict=True)
     magic, version, samples, channels, height, width, policy_size = _read_header(path)
     if magic == REPLAY_MAGIC:
         _validate_manifest(path)
         if version >= 4:
+            # The header's count describes what generation was configured with,
+            # which is a different question from what this training run wants.
+            if raster_kind is not None:
+                channels = RASTER_CHANNELS[raster_kind]
             arrays = _load_replay_v4(
-                path, samples, channels, height, width, policy_size, version
+                path, samples, channels, height, width, policy_size, version, raster_kind
             )
         else:
+            _reject_stored_raster_mismatch(raster_kind, channels)
             arrays = _load_replay(
                 path, version, samples, channels, height, width, policy_size
             )
     else:
+        _reject_stored_raster_mismatch(raster_kind, channels)
         arrays = _load_legacy(path, samples, channels, height, width, policy_size)
     (
         states,

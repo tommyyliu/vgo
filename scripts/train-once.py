@@ -3,8 +3,8 @@
 
 `train_demo.py`'s CLI is a thin adapter over `LearnerConfig` / `PersistentLearner`
 that only forwards a subset of fields -- notably not `norm_groups`,
-`ownership_weight`, or `raster_kind`/`resolution` (the latter two are inferred
-from the dataset itself, not configured). This calls the same
+`ownership_weight`, or `raster_kind` (`resolution` is still taken from the
+dataset itself rather than configured). This calls the same
 `PersistentLearner.update` used by the RL loop and `train_demo.py`, with full
 field coverage, so a checkpoint's architecture and loss weights can be matched
 exactly instead of falling back to `LearnerConfig` defaults.
@@ -54,6 +54,19 @@ def main() -> None:
     parser.add_argument("--model-width", type=int, default=96)
     parser.add_argument("--blocks", type=int, default=16)
     parser.add_argument("--architecture", default="ddrnet")
+    parser.add_argument(
+        "--raster-kind",
+        default=None,
+        choices=("semantic", "compact", "compact-pass", "compact-dead-zone", "rgb"),
+        help=(
+            "which planes to render from each shard. A property of the model "
+            "rather than of the data: shards store positions, so the raster is "
+            "produced at load time and two runs over the same shards can train "
+            "different encodings. Omit to fall back to the shard header, which "
+            "cannot distinguish compact-pass from compact-dead-zone -- both are "
+            "six planes and differ only in the capture predicate"
+        ),
+    )
     parser.add_argument("--norm-groups", type=int, default=8)
     parser.add_argument(
         "--context-attention-blocks",
@@ -94,6 +107,7 @@ def main() -> None:
         model_width=arguments.model_width,
         blocks=arguments.blocks,
         architecture=arguments.architecture,
+        raster_kind=arguments.raster_kind,
         context_attention_blocks=arguments.context_attention_blocks,
         attention_heads=arguments.attention_heads,
         norm_groups=arguments.norm_groups,
