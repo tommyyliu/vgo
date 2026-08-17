@@ -72,49 +72,37 @@ site refuses.
 ## Testing only cell vertices is exact, for our rule
 
 `alive_groups_of` decides a group by walking its cells' polygon **vertices**,
-which looks like an approximation of a rule stated over the whole region. It
-is not one. Two facts make it exact, and neither survives into the official
-rule.
+which looks like an approximation of a rule stated over the whole region. It is
+not one, and the reason is two lines once the distances are dropped.
 
-**The alive set of one legal point, along a straight edge, is a half-line.**
-Put the edge on the `y` axis with the owning stone at perpendicular distance
-`d` and the foot at the origin, and write a legal point as `p = (a, b)`. The
-point `x = (0, y)` is alive through `p` when
+A point `x` is taken by a legal point `p` when `|x - p| < |x - s|` -- when it is
+closer to `p` than to our stone. That is one side of the perpendicular bisector
+of `s` and `p`: **a half-plane**. So `x` is *settled* when it is on our stone's
+side of every such bisector, and
 
-    F(y) = sqrt(d^2 + y^2) - sqrt(a^2 + (y - b)^2) > 0
+    settled region of s  =  intersection over p in L of { x : |x - s| <= |x - p| }
 
-Squaring and cancelling `y^2` turns that into `2by > a^2 + b^2 - d^2`, which is
-**linear in `y`**: a half-line upward for `b > 0`, downward for `b < 0`, and for
-`b = 0` the `y`-free condition `d^2 > a^2`, true everywhere or nowhere. A
-half-line, whole line or empty set containing an interior point of a segment
-contains one of its endpoints. A point is alive when *some* `p` makes it so, so
-the property passes to the union over `L`.
+An intersection of half-planes is **convex**. A Voronoi cell clipped to a
+rectangular board is convex too, so it is the convex hull of its corners -- and a
+convex set containing every corner contains their hull. A cell whose corners are
+all settled is therefore settled entirely, and checking corners misses nothing.
 
-**Unsettled points stay unsettled outward.** The settled region of a stone is
-star-shaped about it: for `y = s + lambda(x - s)`,
+That also corrects `AXIOMS.md`'s A16, which records each `R_s` as star-shaped
+about `s`. True, but weaker than the fact: it is convex. The radial solve in
+`settled.rs` only needs star-shapedness, so nothing there is wrong -- but a
+future reader deriving bounds from A16 is leaving something on the table.
 
-    dist(y, L) >= dist(x, L) - (1 - lambda)|x - s| >= lambda|x - s| = |y - s|
+`examples/settled_vertex_gap.rs` checks that the code implements this, over
+136,122 cells against a 256-sample sweep of every edge. It is a test of the
+implementation, not an argument for the theorem.
 
-So if any point of the cell is unsettled, the cell's own boundary point along
-that ray is unsettled too. That point lies on an edge, and by the lemma an
-endpoint of that edge is unsettled. Endpoints of edges are vertices.
-
-Both steps need the cell to be convex and to contain its stone, which a Voronoi
-cell clipped to a rectangular board is, and every edge to be straight, which
-bisectors and board edges are.
-
-Two measurements check the *implementation* against that result, and are not
-part of it: `examples/settled_vertex_gap.rs` found no disagreement between the
-vertex verdict and a 256-sample sweep of every edge over 136,122 cells, and a
-standalone randomised check of the lemma found no violation in 300,000 trials.
-
-**None of this transfers to `Ruleset::Official`.** Its question is whether the
-region *intersects* the legal set grown by `r` -- a set intersection, with no
-star-shapedness about the stone and no linear crossing. A cell edge can pass
-through the grown set with neither endpoint inside it, which is why both the
-reference implementation and ours add edge tests. Ours still misses the closest
-approach between the interior of an edge and a smooth arc of `L`'s boundary,
-where neither side is extremal at a vertex; the reference measures that exactly
+**None of it transfers to `Ruleset::Official`.** Its question is whether the
+region comes within `r` of a legal point -- a distance band with curved edges,
+not a half-plane. Nothing is convex, nothing is an intersection of slices, and a
+cell edge really can dip into the band with both its corners outside. That is
+why its extra edge tests are necessary, and why the case ours still misses --
+the closest approach between the interior of an edge and a smooth arc of `L`'s
+boundary -- is real there and vacuous here. The reference measures it exactly
 with `AliveZone::closest_distance`.
 
 ## Where the reference implementation is better
