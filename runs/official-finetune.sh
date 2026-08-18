@@ -91,6 +91,24 @@ seed_checkpoint="${VGO_SEED_CHECKPOINT:-$root/artifacts/raster-ab/compact-dead-z
 seed_onnx="${VGO_SEED_ONNX:-$root/artifacts/raster-ab/compact-dead-zone/candidate.onnx}"
 updates="${VGO_UPDATES:-40}"
 
+# Shards to fill the replay window with before the first update, space
+# separated. Without them the window ramps 1, 2, 3... and the earliest updates
+# train on a fraction of a normal one: measured on official-v2, the four updates
+# with a partial window rated -178, -77, -125 and -147 against the seed while
+# every later update scattered around zero.
+#
+# Copy the shards in rather than pointing at another run's replay directory.
+# Retirement compresses a shard and deletes the uncompressed original, so
+# `--initial-replay` aimed at a live run rewrites that run's data as
+# housekeeping.
+#
+# They must be *official-rules* shards. Seeding from a vgo-rules run would put
+# games in the window whose policy targets include self-captures, which are
+# illegal here -- teaching the net to propose moves the rules refuse. That is
+# also why there was nothing to seed the first run with, and why the second one
+# can be seeded from the first.
+seed_replay="${VGO_SEED_REPLAY:-}"
+
 for required in "$seed_checkpoint" "$seed_onnx"; do
   if [ ! -e "$required" ]; then
     echo "missing seed: $required" >&2
@@ -115,6 +133,7 @@ exec "$python" -m vgo_training.rl_loop \
   --updates "$updates" \
   --initial-checkpoint "$seed_checkpoint" \
   --initial-onnx "$seed_onnx" \
+  ${seed_replay:+--initial-replay $seed_replay} \
   --ruleset official \
   --raster-kind compact-dead-zone \
   --architecture ddrnet --norm-groups 8 --model-width 64 --blocks 16 \
