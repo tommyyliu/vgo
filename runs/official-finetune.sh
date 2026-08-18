@@ -58,6 +58,22 @@
 # It does mean the seed saw a slightly different board than this run plays on.
 # That is a smaller discrepancy than the rules change it is already absorbing.
 #
+# ## One epoch per update, not ten
+#
+# Every working recipe in runs/ trains for a single epoch per update, and the
+# first attempt at this run used ten -- carried over from the supervised A/B,
+# where ten is right because the data is fixed and more passes are free.
+#
+# In the loop each update sees about 560 games, and ten passes over that with an
+# 8.2M-parameter model memorises them. Measured on artifacts-official/official-v1
+# at update 22: training value_mae 0.026 against validation 0.252, and validation
+# policy_kl climbing 0.798 -> 0.888 -> 0.910 -> 0.952 across updates 0, 6, 12 and
+# 22 while training loss fell throughout. Every update was rated below the seed
+# it started from, ending 510 Elo down after 24 of them.
+#
+# The signature to watch for is that divergence, not the training curve, which
+# looked healthy the whole way down.
+#
 # The seed learned from games played under *our* rules. It has seen the official
 # capture field but never a game decided by it, so early updates are as much
 # about unlearning as learning, and the first few arena results are not a
@@ -65,7 +81,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-output="${1:-$root/artifacts-official/official-v1}"
+output="${1:-$root/artifacts-official/official-v2}"
 case "$output" in
   /*) ;;
   *) output="$PWD/$output" ;;
@@ -113,7 +129,7 @@ exec "$python" -m vgo_training.rl_loop \
   --komi-low 0.017 --komi-high 0.137 \
   --dynamic-komi --komi-target-black-win-rate 0.5 \
   --komi-recenter-minimum-games 256 --komi-recenter-maximum-step 0.025 \
-  --training-epochs 10 --training-batch 256 \
+  --training-epochs 1 --training-batch 256 \
   --learning-rate 0.001 --warm-learning-rate 0.001 --value-weight 2.0 \
   --ownership-weight 0.0 --recency-decay 1.0 --drain-tail \
   --concurrent-generators 1 \
