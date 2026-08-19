@@ -67,7 +67,10 @@ _LAYOUTS: dict[int, Layout] = {
     # `connections` is signed rather than binary -- +1 for the mover's, -1 for
     # the opponent's -- so it keeps full precision. Everything else splits as
     # before.
-    8: Layout(channels=8, binary=(0, 1, 3, 4), scalar=(6, 7), continuous=(2, 5)),
+    # ..., settled, dead_zone, current_connections, opponent_connections, komi,
+    # previous_pass. Six binary planes: splitting connections by side rather than
+    # signing them is what keeps them packable, 2 bits against fp16's 16.
+    9: Layout(channels=9, binary=(0, 1, 3, 4, 5, 6), scalar=(7, 8), continuous=(2,)),
 }
 
 # The compact planes by name, for readers and for tests. The six-plane layouts

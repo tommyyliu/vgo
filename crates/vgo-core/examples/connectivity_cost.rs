@@ -38,6 +38,15 @@ fn fixture(count: usize, radius: f64, seed: u64) -> Position {
     Position::new(radius, stones, Color::Black).with_komi(0.104)
 }
 
+fn segments_cross(p: (f64, f64), q: (f64, f64), r: (f64, f64), s: (f64, f64)) -> bool {
+    let side = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    };
+    let (d1, d2) = (side(r, s, p), side(r, s, q));
+    let (d3, d4) = (side(p, q, r), side(p, q, s));
+    (d1 * d2 < 0.0) && (d3 * d4 < 0.0)
+}
+
 fn main() {
     let radius = 1.0 / 18.0;
     println!(
@@ -89,6 +98,38 @@ fn main() {
             per(connected), seconds / positions as f64 * 1e3
         );
     }
+    // Do connection lines of opposite colours ever cross? That is the claim
+    // that decides whether one signed plane would lose information or merely
+    // waste space.
+    let mut crossings = 0usize;
+    let mut positions = 0usize;
+    for &count in &[20usize, 28, 40, 52] {
+        for seed in 1..=60u64 {
+            let position = fixture(count, radius, seed * 7 + count as u64);
+            if !position.validate().is_playable() || position.stones().len() < count / 2 {
+                continue;
+            }
+            positions += 1;
+            let stones = position.stones().to_vec();
+            let pairs = connected_pairs(&position);
+            for (i, &(a, b)) in pairs.iter().enumerate() {
+                for &(c, d) in &pairs[i + 1..] {
+                    if stones[a].color == stones[c].color {
+                        continue;
+                    }
+                    if segments_cross(
+                        (stones[a].x, stones[a].y), (stones[b].x, stones[b].y),
+                        (stones[c].x, stones[c].y), (stones[d].x, stones[d].y),
+                    ) {
+                        crossings += 1;
+                    }
+                }
+            }
+        }
+    }
+    println!();
+    println!("opposite-colour connection lines crossing: {crossings} over {positions} positions");
+
     println!();
     println!("'geometry' is pairs that reach the two-placement search, which rebuilds");
     println!("the Voronoi diagram. Everything else is a distance test.");

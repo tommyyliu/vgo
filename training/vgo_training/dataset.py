@@ -59,7 +59,7 @@ RASTER_CHANNELS = {
     "compact": 5,
     "compact-pass": 6,
     "compact-dead-zone": 6,
-    "compact-connected": 8,
+    "compact-connected": 9,
 }
 
 # The reverse, for shards loaded without a configured kind.
