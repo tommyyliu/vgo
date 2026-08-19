@@ -89,6 +89,21 @@ fn main() {
     names.push("dead_zone");
     out.extend(theirs[3 * pixels..4 * pixels].iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8));
 
+    // The connection planes come from the nine-channel layout, whose slots 5
+    // and 6 are the mover's connections and the opponent's.
+    let mut connected = vec![0.0_f32; 9 * pixels];
+    rasterize_any_into(
+        &position,
+        RasterConfig::square_of(resolution, RasterKind::CompactConnected),
+        &mut connected,
+    );
+    for (slot, name) in [(5usize, "current_connections"), (6, "opponent_connections")] {
+        names.push(name);
+        out.extend(connected[slot * pixels..(slot + 1) * pixels]
+            .iter()
+            .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8));
+    }
+
     fs::write(format!("{prefix}.bin"), &out).expect("write planes");
 
     let stone_json: Vec<String> = stones
