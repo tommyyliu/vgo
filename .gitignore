@@ -6,6 +6,9 @@
 # different ruleset sitting inside artifacts/ would be pooled into an Elo scale
 # with models it has never played and could not play.
 /artifacts-official/
+# Control runs: the official-rules config with one variable changed, so they
+# must not pool into either scale. Same reasoning as artifacts-official/.
+/artifacts-control/
 /.idea/
 .venv/
 /.agents/
