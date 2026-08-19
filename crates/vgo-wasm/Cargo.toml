@@ -18,7 +18,7 @@ rust-version.workspace = true
 [dependencies]
 vgo-core = { path = "../vgo-core" }
 vgo-search = { path = "../vgo-search" }
-vgo-raster = { path = "../vgo-raster", features = ["distance-settled"] }
+vgo-raster = { path = "../vgo-raster" }
 wasm-bindgen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = "0.6"

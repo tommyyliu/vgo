@@ -17,7 +17,6 @@ pub use edt::{
 
 /// Stone count above which the distance-transform settled mask is worth its
 /// fixed cost. Measured crossover sits between 14 and 28 stones.
-#[cfg(feature = "distance-settled")]
 const DISTANCE_SETTLED_MINIMUM_STONES: usize = 20;
 
 /// Grid cells per stone radius below which the distance-transform mask is not
@@ -30,7 +29,6 @@ const DISTANCE_SETTLED_MINIMUM_STONES: usize = 20;
 /// with the definition on 0 pixels, while a 48² raster (2.67) disagreed on
 /// **9.16%**. Six is chosen between those two points with margin toward the
 /// safe side; it is calibrated, not derived.
-#[cfg(feature = "distance-settled")]
 const DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS: f64 = 6.0;
 
 pub const CHANNEL_COUNT: usize = 12;
@@ -462,31 +460,37 @@ pub fn rasterize_compact_six_into(position: &Position, config: RasterConfig, dat
 #[must_use]
 pub fn settled_for_raster(position: &Position, config: RasterConfig) -> Vec<bool> {
     // Dispatch on stone count. The distance-transform form pays a fixed
-    // O(pixels) cost and wins only once the per-stone solve's O(n²) exceeds it:
+    // O(pixels) cost and wins only once the per-stone solve's O(n^2) exceeds it:
     // measured 0.5x at 14 stones, 2.8x at 28, 7.2x at 52. Real shards are not
     // all late-game -- the corpus this was tuned against runs min 0, mean 26.2
     // stones -- so always taking it gave back a third of the gain on early
     // positions.
-    #[cfg(feature = "distance-settled")]
+    //
+    // This used to sit behind a `distance-settled` feature, off by default,
+    // "pending an A/B on real shards". The A/B never happened and the flag
+    // never moved, so every run since paid the quadratic path. Two things
+    // settle it without one:
+    //
+    //   * The distance-transform form is *closer* to the definition, not
+    //     merely faster. `bounded_distance_agrees_with_the_definition` pins it
+    //     at zero wrong pixels; the per-stone solve walks a contour at 1/128
+    //     tolerance and is wrong on one or two of 16384.
+    //   * A build-time flag that changes a network input is worse than a
+    //     config field, because nothing records it. A resumed run could render
+    //     different inputs than it trained on and the identity check would see
+    //     nothing.
+    //
+    // So the fast path is simply the path now, and there is no flag to forget.
+    let cells_per_radius = config.width.min(config.height) as f64 * position.radius();
+    if position.stones().len() >= DISTANCE_SETTLED_MINIMUM_STONES
+        && cells_per_radius >= DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS
     {
-        let cells_per_radius =
-            config.width.min(config.height) as f64 * position.radius();
-        if position.stones().len() >= DISTANCE_SETTLED_MINIMUM_STONES
-            && cells_per_radius >= DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS
-        {
-            return edt::settled_mask_by_bounded_distance(position, config, 1).0;
-        }
+        return edt::settled_mask_by_bounded_distance(position, config, 1).0;
     }
     settled_mask(position, config)
 }
 
 pub fn rasterize_compact_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
-    // `distance-settled` swaps the O(pixels·n²) per-stone solve for the
-    // distance-transform formulation in edt.rs: 2.8x at the median stone count
-    // and 7.2x at the maximum, agreeing with the definition on every fixture
-    // tested while the default disagrees on one or two pixels of 16384. Behind
-    // a feature because it changes a network input, so it wants an A/B on real
-    // shards before it becomes the default.
     let settled = settled_for_raster(position, config);
     rasterize_compact_with_predicate_into(position, config, &settled, data);
 }

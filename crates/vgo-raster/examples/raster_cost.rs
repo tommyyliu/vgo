@@ -12,7 +12,7 @@ use vgo_core::{Color, Position, Stone};
 use vgo_raster::{
     CHANNEL_COUNT, COMPACT_CHANNELS, COMPACT_PASS_CHANNELS, RasterConfig, RasterKind,
     dead_zone_mask, rasterize_compact_six_into, rasterize_compact_with_predicate_into,
-    rasterize_into, settled_mask, settled_mask_by_bounded_distance,
+    rasterize_any_into, rasterize_into, settled_mask_by_bounded_distance,
 };
 
 fn fixture(count: usize, radius: f64, seed: u64) -> Position {
@@ -91,9 +91,10 @@ fn main() {
             rasterize_into(&position, semantic, &mut wide);
             black_box(&wide);
         });
+        // The production path: `rasterize_any_into` -> `settled_for_raster`,
+        // which now dispatches on stone count instead of on a feature flag.
         let b = time(|| {
-            let mask = settled_mask(&position, compact);
-            rasterize_compact_with_predicate_into(&position, compact, &mask, &mut five);
+            rasterize_any_into(&position, compact, &mut five);
             black_box(&five);
         });
         let c = time(|| {
@@ -155,7 +156,7 @@ fn main() {
     }
 
     println!();
-    println!("compact      = today's production default: per-stone geometric `settled`.");
+    println!("compact      = production: settled_for_raster, dispatching on stone count.");
     println!("compact-edt  = the same five planes with `settled` from the distance transform");
     println!("               (the `distance-settled` feature).");
     println!("compact+dead = six planes, both masks from one distance transform.");

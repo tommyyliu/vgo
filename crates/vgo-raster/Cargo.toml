@@ -9,8 +9,6 @@ rust-version.workspace = true
 default = []
 # wgpu/WGSL: the browser path (docs/CLIENT_BOT.md).
 gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
-# Settled channel via distance transforms; see rasterize_compact_into.
-distance-settled = []
 
 
 [dependencies]
