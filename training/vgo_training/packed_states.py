@@ -61,6 +61,13 @@ _LAYOUTS: dict[int, Layout] = {
     5: Layout(channels=5, binary=(0, 1, 3), scalar=(4,), continuous=(2,)),
     # ..., komi, previous_pass
     6: Layout(channels=6, binary=(0, 1, 3), scalar=(4, 5), continuous=(2,)),
+    # current_stones, opponent_stones, voronoi_ridge, settled, dead_zone,
+    # connections, komi, previous_pass.
+    #
+    # `connections` is signed rather than binary -- +1 for the mover's, -1 for
+    # the opponent's -- so it keeps full precision. Everything else splits as
+    # before.
+    8: Layout(channels=8, binary=(0, 1, 3, 4), scalar=(6, 7), continuous=(2, 5)),
 }
 
 # The compact planes by name, for readers and for tests. The six-plane layouts

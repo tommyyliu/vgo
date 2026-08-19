@@ -2992,7 +2992,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--raster-kind",
-        choices=("semantic", "compact", "compact-pass", "compact-dead-zone", "rgb"),
+        choices=("semantic", "compact", "compact-pass", "compact-dead-zone", "compact-connected", "rgb"),
         default="semantic",
         help=(
             "channel layout. compact is four channels plus komi; compact-pass "

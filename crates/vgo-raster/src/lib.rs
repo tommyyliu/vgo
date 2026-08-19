@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use vgo_core::{Color, Position, SettledRegion, legal_set_vertices};
+use vgo_core::{Color, Point, Position, SettledRegion, legal_set_vertices};
 
 #[cfg(feature = "gpu")]
 mod gpu;
@@ -40,7 +40,7 @@ pub const CHANNEL_COUNT: usize = 12;
 /// name channels by index without the semantic writer emitting them. Growing
 /// this is safe; growing `CHANNEL_COUNT` is not, because that number is the
 /// semantic tensor's shape and is baked into inference frames and ONNX profiles.
-pub const CHANNEL_SPEC_COUNT: usize = 13;
+pub const CHANNEL_SPEC_COUNT: usize = 14;
 
 /// Channels written by [`rasterize_rgb_into`]: red, green, blue.
 pub const RGB_CHANNEL_COUNT: usize = 3;
@@ -79,6 +79,26 @@ pub const COMPACT_PASS_CHANNELS: [usize; 6] = [
 /// other with every other input plane keeping its meaning and its weights. It
 /// also makes the comparison between the two rulesets a one-plane A/B rather
 /// than a change of representation.
+/// Indices [`RasterKind::CompactConnected`] keeps.
+///
+/// Both capture fields and the connection lines. `settled` returned after being
+/// dropped from the six-plane official layout, where it was cut on the grounds
+/// that it is the wrong capture predicate there -- true, and beside the point.
+/// It is also the only plane that says which board can still change hands, which
+/// is ownership rather than legality and is worth knowing under either ruleset.
+/// The cost argument for dropping it did not survive either: the raster was
+/// already four times faster than production, so there was budget for both.
+pub const COMPACT_CONNECTED_CHANNELS: [usize; 8] = [
+    0,  // current_stones
+    1,  // opponent_stones
+    6,  // voronoi_ridge
+    10, // settled           <- can anyone still take our area
+    12, // dead_zone         <- can anyone still reach us
+    13, // connections       <- which of our stones cannot be split apart
+    11, // komi
+    9,  // previous_pass
+];
+
 pub const COMPACT_DEAD_ZONE_CHANNELS: [usize; 6] = [
     0,  // current_stones
     1,  // opponent_stones
@@ -155,6 +175,10 @@ pub const CHANNELS: [ChannelSpec; CHANNEL_SPEC_COUNT] = [
         name: "dead_zone",
         scale: ChannelScale::Unit,
     },
+    ChannelSpec {
+        name: "connections",
+        scale: ChannelScale::Signed,
+    },
 ];
 
 /// Which channel layout a raster carries.
@@ -200,11 +224,19 @@ pub enum RasterKind {
     /// aggressive rule, so a net given only `settled` has to infer the
     /// condition it is actually judged by.
     ///
-    /// `settled` is dropped rather than kept alongside. It is the wrong
+    /// `settled` is dropped rather than kept alongside. See
+    /// [`CompactConnected`](Self::CompactConnected), which puts it back. It is the wrong
     /// predicate here, and it is not a cheap passenger: measured at 128 square,
     /// it is 60-80% of the raster's cost, so carrying it for a ruleset that does
     /// not use it would more than double the price of every position.
     CompactDeadZone,
+    /// Both capture fields, plus which same-colour stones cannot be split.
+    ///
+    /// A Voronoi diagram shows who owns what but not what is *safe*: whether an
+    /// enemy pair can be wedged between two of your stones is a two-placement
+    /// search, and nothing in the other planes exposes it. This is the plane a
+    /// player reads off the board and the network otherwise has to infer.
+    CompactConnected,
 }
 
 impl RasterKind {
@@ -216,6 +248,7 @@ impl RasterKind {
             Self::Compact => COMPACT_CHANNELS.len(),
             Self::CompactPass => COMPACT_PASS_CHANNELS.len(),
             Self::CompactDeadZone => COMPACT_DEAD_ZONE_CHANNELS.len(),
+            Self::CompactConnected => COMPACT_CONNECTED_CHANNELS.len(),
         }
     }
 
@@ -227,6 +260,7 @@ impl RasterKind {
             Self::Compact => &COMPACT_CHANNELS,
             Self::CompactPass => &COMPACT_PASS_CHANNELS,
             Self::CompactDeadZone => &COMPACT_DEAD_ZONE_CHANNELS,
+            Self::CompactConnected => &COMPACT_CONNECTED_CHANNELS,
         }
     }
 
@@ -244,6 +278,7 @@ impl RasterKind {
             Self::Compact => "compact",
             Self::CompactPass => "compact-pass",
             Self::CompactDeadZone => "compact-dead-zone",
+            Self::CompactConnected => "compact-connected",
         }
     }
 }
@@ -258,6 +293,7 @@ impl std::str::FromStr for RasterKind {
             "compact" => Ok(Self::Compact),
             "compact-pass" => Ok(Self::CompactPass),
             "compact-dead-zone" => Ok(Self::CompactDeadZone),
+            "compact-connected" => Ok(Self::CompactConnected),
             _ => Err(format!("unsupported raster kind: {value}")),
         }
     }
@@ -415,6 +451,88 @@ pub fn rasterize_any_into(position: &Position, config: RasterConfig, data: &mut 
         RasterKind::Compact => rasterize_compact_into(position, config, data),
         RasterKind::CompactPass | RasterKind::CompactDeadZone => {
             rasterize_compact_six_into(position, config, data);
+        }
+        RasterKind::CompactConnected => rasterize_compact_connected_into(position, config, data),
+    }
+}
+
+/// Writes [`RasterKind::CompactConnected`]: both capture fields, the connection
+/// lines, and the two scalars.
+///
+/// `settled` and the dead zone are two thresholds on one distance field, so they
+/// cost one transform between them rather than two.
+pub fn rasterize_compact_connected_into(
+    position: &Position,
+    config: RasterConfig,
+    data: &mut [f32],
+) {
+    let pixels = config.pixels();
+    assert_eq!(data.len(), COMPACT_CONNECTED_CHANNELS.len() * pixels);
+    let (settled, dead_zone, _) = edt::settled_and_dead_zone(position, config, 1);
+
+    let compact = RasterConfig {
+        kind: RasterKind::Compact,
+        ..config
+    };
+    // Slots 0-2 and the settled predicate come from the five-plane writer; komi
+    // lands in its slot 4 and is then overwritten below, which costs one fill
+    // and keeps this from restating the geometry.
+    rasterize_compact_with_predicate_into(
+        position,
+        compact,
+        &settled,
+        &mut data[..COMPACT_CHANNELS.len() * pixels],
+    );
+    for (target, dead) in data[4 * pixels..5 * pixels].iter_mut().zip(&dead_zone) {
+        *target = f32::from(u8::from(*dead));
+    }
+    connections_into(position, config, &mut data[5 * pixels..6 * pixels]);
+    let mover_komi = match position.to_move() {
+        Color::Black => position.komi() as f32,
+        Color::White => -position.komi() as f32,
+    };
+    data[6 * pixels..7 * pixels].fill(mover_komi);
+    data[7 * pixels..8 * pixels].fill(f32::from(position.consecutive_passes() > 0));
+}
+
+/// Paints the connection lines: `+1` for the mover's, `-1` for the opponent's.
+///
+/// Signed rather than two planes because the sign is the whole distinction and a
+/// third value costs nothing. Drawn as a segment between the two stone centres,
+/// which is what the shape means -- the pair holds that line against any wedge.
+///
+/// Width is one raster cell. The line exists to be *seen* by a convolution, so
+/// it wants to be thin and continuous rather than a corridor: at this radius a
+/// thicker line would start covering the stones it connects.
+fn connections_into(position: &Position, config: RasterConfig, plane: &mut [f32]) {
+    plane.fill(0.0);
+    let stones = position.stones();
+    let mover = position.to_move();
+    let half = 1.0 / config.width.min(config.height) as f64;
+    for (a, b) in vgo_core::connected_pairs(position) {
+        let (first, second) = (stones[a], stones[b]);
+        let value = if first.color == mover { 1.0_f32 } else { -1.0 };
+        let low_x = (first.x.min(second.x) - half) * config.width as f64;
+        let high_x = (first.x.max(second.x) + half) * config.width as f64;
+        let low_y = (first.y.min(second.y) - half) * config.height as f64;
+        let high_y = (first.y.max(second.y) + half) * config.height as f64;
+        let columns = (low_x.floor().max(0.0) as usize)
+            ..=(high_x.ceil() as usize).min(config.width - 1);
+        let rows =
+            (low_y.floor().max(0.0) as usize)..=(high_y.ceil() as usize).min(config.height - 1);
+        for row in rows {
+            let y = (row as f64 + 0.5) / config.height as f64;
+            for column in columns.clone() {
+                let x = (column as f64 + 0.5) / config.width as f64;
+                let distance = vgo_core::distance_to_segment(
+                    Point::new(x, y),
+                    Point::new(first.x, first.y),
+                    Point::new(second.x, second.y),
+                );
+                if distance <= half {
+                    plane[row * config.width + column] = value;
+                }
+            }
         }
     }
 }
@@ -1847,5 +1965,72 @@ mod tests {
             let same = ours[range.clone()] == theirs[range];
             assert_eq!(same, slot != 3, "slot {slot} sameness");
         }
+    }
+
+    /// The connections plane paints something, signs it by side, and stays
+    /// inside the board.
+    #[test]
+    fn the_connections_plane_signs_by_side_and_paints_lines() {
+        // Two black stones close enough to be uncuttable outright, and two
+        // white ones likewise, so both signs appear.
+        let radius = 1.0 / 18.0;
+        let position = Position::new(
+            radius,
+            vec![
+                Stone::new(0.30, 0.30, Color::Black),
+                Stone::new(0.30 + 2.4 * radius, 0.30, Color::Black),
+                Stone::new(0.70, 0.70, Color::White),
+                Stone::new(0.70 + 2.4 * radius, 0.70, Color::White),
+            ],
+            Color::Black,
+        );
+        assert!(position.validate().is_playable());
+        let config = RasterConfig::square_of(128, RasterKind::CompactConnected);
+        let pixels = config.pixels();
+        let mut data = vec![f32::NAN; config.channels() * pixels];
+        super::rasterize_any_into(&position, config, &mut data);
+
+        let plane = &data[5 * pixels..6 * pixels];
+        let positive = plane.iter().filter(|v| **v > 0.5).count();
+        let negative = plane.iter().filter(|v| **v < -0.5).count();
+        assert!(positive > 0, "the mover's connection must be painted");
+        assert!(negative > 0, "the opponent's connection must be painted");
+        assert!(
+            plane.iter().all(|v| (-1.0..=1.0).contains(v)),
+            "the plane is signed unit"
+        );
+        // Black is to move, so black's line is the positive one. Swap the turn
+        // and the signs must swap with it -- the planes are mover-relative.
+        let flipped = Position::new(radius, position.stones().to_vec(), Color::White);
+        let mut other = vec![f32::NAN; config.channels() * pixels];
+        super::rasterize_any_into(&flipped, config, &mut other);
+        let flipped_plane = &other[5 * pixels..6 * pixels];
+        assert_eq!(
+            flipped_plane.iter().filter(|v| **v > 0.5).count(),
+            negative,
+            "swapping the turn must swap which connection is positive"
+        );
+    }
+
+    /// Every plane of the eight-channel layout is what its name says.
+    #[test]
+    fn the_connected_layout_carries_every_plane_it_names() {
+        let names: Vec<&str> = RasterKind::CompactConnected
+            .indices()
+            .iter()
+            .map(|&i| CHANNELS[i].name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "current_stones", "opponent_stones", "voronoi_ridge",
+                "settled", "dead_zone", "connections", "komi", "previous_pass",
+            ]
+        );
+        // The first four match `compact`, so a compact model still warm-starts.
+        assert_eq!(
+            &RasterKind::CompactConnected.indices()[..3],
+            &COMPACT_CHANNELS[..3]
+        );
     }
 }

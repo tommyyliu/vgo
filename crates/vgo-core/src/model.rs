@@ -238,6 +238,18 @@ impl Position {
         Validation { issues }
     }
 
+    /// The same position with a different stone list, keeping radius, komi,
+    /// ruleset, turn and pass count.
+    ///
+    /// Public for the connectivity search, which asks what the board would look
+    /// like with a hypothetical enemy stone on it. That is a question about
+    /// geometry rather than a move, so it must not go through `place` -- no
+    /// capture resolution, no turn change, no pass accounting.
+    #[must_use]
+    pub fn with_stones_public(&self, stones: Vec<Stone>) -> Self {
+        self.with_stones(stones)
+    }
+
     pub(crate) fn with_stones(&self, stones: Vec<Stone>) -> Self {
         let mut next = self.clone();
         next.stones = stones;
