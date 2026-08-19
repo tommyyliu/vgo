@@ -631,3 +631,49 @@ class RasterKindReachesTheLearner(unittest.TestCase):
             "the training request must carry raster_kind, or the learner falls "
             "back to the shard header and refuses six channels",
         )
+
+
+class LegalityMaskKnowsItsLayout(unittest.TestCase):
+    """The clearance slot is a property of the layout, not of its width.
+
+    `full_legal_policy_masks` used to decide by `shape[1] <= 7`, meaning "narrower
+    than semantic, so no clearance channel". That held while every compact layout
+    was under seven planes. `compact-connected` has nine and took the semantic
+    branch, reading slot 7 -- `komi`, a constant -- as a legality field.
+    """
+
+    def test_only_semantic_layouts_claim_a_clearance_slot(self) -> None:
+        from vgo_training.dataset import RASTER_CHANNELS
+        from vgo_training.train_demo import LEGAL_CLEARANCE_SLOT
+
+        # 10 is the legacy width `rasterize_records` renders and also carries it.
+        self.assertEqual(LEGAL_CLEARANCE_SLOT.get(10), 7)
+        for kind, width in RASTER_CHANNELS.items():
+            if kind == "semantic":
+                self.assertEqual(
+                    LEGAL_CLEARANCE_SLOT.get(width),
+                    7,
+                    "semantic carries legal_clearance at slot 7",
+                )
+            else:
+                self.assertIsNone(
+                    LEGAL_CLEARANCE_SLOT.get(width),
+                    f"{kind} has no clearance channel, so it must fall back to "
+                    "the stored candidate mask",
+                )
+
+    def test_the_slot_matches_the_rust_layout(self) -> None:
+        """Cross-language: the slot must name `legal_clearance` in the engine."""
+        import re
+        from pathlib import Path
+        from vgo_training.train_demo import LEGAL_CLEARANCE_SLOT
+
+        source = (Path(__file__).resolve().parents[2]
+                  / "crates/vgo-raster/src/lib.rs").read_text(encoding="utf-8")
+        names = re.findall(r'ChannelSpec \{\s*name: "([a-z_]+)",', source)
+        for width, slot in LEGAL_CLEARANCE_SLOT.items():
+            self.assertEqual(
+                names[slot], "legal_clearance",
+                f"width {width} points at slot {slot}, which the engine calls "
+                f"{names[slot]!r}",
+            )

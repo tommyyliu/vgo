@@ -16,6 +16,28 @@ from .model import MODEL_ARCHITECTURES, build_model
 
 LEGAL_CLEARANCE_CHANNEL = 7
 
+# Which slot holds `legal_clearance`, keyed by how many channels a layout has.
+#
+# Only the semantic layout carries it. Every compact layout leaves it out and
+# uses its stored candidate mask instead, which is what the five- and
+# six-channel layouts have always done.
+#
+# Keyed on the layout rather than on `shape[1] <= LEGAL_CLEARANCE_CHANNEL`,
+# which is what this replaces. That test read "narrower than semantic, so it has
+# no clearance channel" -- true while every compact layout was under seven
+# planes, and silently false the moment one was not. `compact-connected` has
+# nine, so it took the semantic branch and read slot 7 as clearance when slot 7
+# is `komi`: a constant plane, thresholded into a legality mask, which cost its
+# first training run a policy_kl of 1.90 against 0.65 for the arms beside it.
+#
+# A width absent here falls back to the stored mask, which is always sound.
+# Both semantic widths carry it at the same slot: 12 is the engine's layout and
+# 10 is the legacy one `rasterize_records` still renders in Python.
+LEGAL_CLEARANCE_SLOT: dict[int, int] = {
+    10: LEGAL_CLEARANCE_CHANNEL,
+    12: LEGAL_CLEARANCE_CHANNEL,
+}
+
 # The eight symmetries of the square: (number of 90-degree rotations, flip?).
 DIHEDRAL_TRANSFORMS = tuple((rotations, flip) for flip in (False, True) for rotations in range(4))
 
@@ -204,11 +226,12 @@ def full_legal_policy_masks(
     if explored_masks.shape[0] != states.shape[0]:
         raise ValueError("policy mask batch does not match states")
     placement_cells = explored_masks.shape[1] - 1
-    if states.shape[1] <= LEGAL_CLEARANCE_CHANNEL:
-        # Only synthetic/legacy fixtures lack the semantic legal-clearance
-        # channel. Their stored candidate mask is the best available contract.
+    slot = LEGAL_CLEARANCE_SLOT.get(states.shape[1])
+    if slot is None:
+        # No clearance channel in this layout: the stored candidate mask is the
+        # contract, as it is for every compact layout.
         return explored_masks.bool()
-    clearance = states[:, LEGAL_CLEARANCE_CHANNEL].unsqueeze(1)
+    clearance = states[:, slot].unsqueeze(1)
     raster_cells = states.shape[2] * states.shape[3]
     if placement_cells != raster_cells:
         side = int(round(placement_cells**0.5))
