@@ -18,6 +18,19 @@
 #   compact-pass       current_stones, opponent_stones, voronoi_ridge,
 #                      settled, komi, previous_pass
 #   compact-dead-zone  the same, with `dead_zone` in place of `settled`
+#   compact-connected  both capture fields, plus a line between every pair of
+#                      same-colour stones no enemy pair can wedge apart
+#
+# `VGO_KINDS` overrides the list, so a new layout can be added to the comparison
+# without retraining the arms already measured -- and an arm that already has
+# both artefacts is skipped anyway.
+#
+# One caveat on comparing against arms trained earlier. `settled` moved from the
+# per-stone geometric solve to the distance transform after the first two arms
+# ran, and the two disagree on one or two pixels of 16384. `compact-dead-zone`
+# is unaffected, since `dead_zone` always came from the transform; `compact-pass`
+# carries the older rendering. Retrain it too if that matters, which it probably
+# does not.
 #
 # Slot 3 is the capture predicate and is the only difference: `settled` is this
 # repository's rule -- a group lives while some future stone can still take area
@@ -100,6 +113,12 @@ python="$root/training/.venv/bin/python"
 
 for kind in compact-dead-zone; do
   arm="$output/$kind"
+  # Idempotent: an arm with both artefacts is done. Lets a new layout join the
+  # comparison without retraining the ones already measured.
+  if [ -e "$arm/candidate.pt" ] && [ -e "$arm/candidate.onnx" ]; then
+    echo "=== $kind: already trained, skipping ==="
+    continue
+  fi
   mkdir -p "$arm"
   echo "=== $kind ==="
   # Same seed, same data, same architecture. The raster is the only difference.
