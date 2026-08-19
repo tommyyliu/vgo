@@ -1,17 +1,10 @@
 # Semantic Raster Representation
 
-> **Channel count is out of date.** This document describes 10 channels; the
-> semantic layout is now **12** (`CHANNEL_COUNT` in `crates/vgo-raster/src/lib.rs`,
-> which adds `settled` and `komi`), and production runs the **5-channel compact**
-> layout (`COMPACT_CHANNELS`): `current_stones`, `opponent_stones`,
-> `voronoi_ridge`, `settled`, `komi`. The channel *semantics* and the sampling
-> contract below are still correct. See [`OVERVIEW.md`](OVERVIEW.md) §4.
-
 ## Contract
 
 `vgo-raster` converts an exact `Position` into a player-relative contiguous
-`f32` tensor with shape `[10, height, width]`. It samples the center of every
-pixel:
+`f32` tensor with shape `[channels, height, width]`, where `channels` is set by
+the layout. It samples the center of every pixel:
 
 ```text
 x = (column + 0.5) / width
@@ -25,6 +18,13 @@ tensor.
 
 ## Channels
 
+`CHANNELS` in `crates/vgo-raster/src/lib.rs` is a **catalogue**, not a layout: it
+holds every channel any layout can name, and a layout is a list of indices into
+it. That is why `CHANNEL_SPEC_COUNT` (15) is larger than `CHANNEL_COUNT` (12,
+the semantic tensor's width) -- growing the catalogue is safe, growing the
+semantic width is not, because that number is baked into inference frames and
+ONNX profile shapes.
+
 | Index | Name | Range | Definition |
 |---:|---|---:|---|
 | 0 | `current_stones` | `[0, 1]` | Pixel center lies inside a current-player disk. |
@@ -34,19 +34,61 @@ tensor.
 | 4 | `current_distance` | `[0, 1]` | Distance to nearest current stone, divided by `4r` and clipped. |
 | 5 | `opponent_distance` | `[0, 1]` | Distance to nearest opponent stone, divided by `4r` and clipped. |
 | 6 | `voronoi_ridge` | `[0, 1]` | `1 - (d2 - d1) / r`, clipped; bright where the two nearest sites tie. |
-| 7 | `legal_clearance` | `[-1, 1]` | Signed clearance from board inset and all `2r` exclusion disks, divided by `r`. |
+| 7 | `legal_clearance` | `[-1, 1]` | Signed clearance from board inset and all `2r` exclusion disks, divided by `r`. Not the distance to the legal set: it is the slack on the *nearest violated constraint*, so it bounds that distance from below rather than giving it. |
 | 8 | `radius` | `(0, 1)` | Constant plane containing normalized diameter `2r`. |
-| 9 | `previous_pass` | `[0, 1]` | Constant plane indicating one immediately preceding pass. |
+| 9 | `previous_pass` | `[0, 1]` | Constant plane, `1` when the last move was a pass. Two passes end the game, so a live position is only ever at zero or one -- this is the pass state, not a summary of it. |
+| 10 | `settled` | `[0, 1]` | This repository's capture predicate: no legal centre can get strictly closer to the point than the stone that owns it. Reads as *can anyone still take this area*. |
+| 11 | `komi` | `[-1, 1]` | Constant plane, signed for the side to move. |
+| 12 | `dead_zone` | `[0, 1]` | voronoigo.com's capture predicate: `dist(x, L) > r`, where no stone can be placed covering the point. Reads as *can anyone still reach this area*. Strictly contains `settled`; see [`OFFICIAL_RULES.md`](OFFICIAL_RULES.md). |
+| 13 | `current_connections` | `[0, 1]` | A one-cell line between each pair of current-player stones that no enemy pair can wedge apart. |
+| 14 | `opponent_connections` | `[0, 1]` | The same for the opponent. |
 
-The exact simulator remains authoritative. The raster is the single
-model-facing state used for training, replay, inference, policy coordinates,
-and diagnostics.
+Two of these are constant across the board -- `komi` and `previous_pass` -- and
+`radius` is a third. They are planes only because the network is a convolution
+stack with no other way to receive a scalar.
 
-Raster resolution is independent of stone radius. The active throughput canary
-uses radius `1/6`, which has a small 3x3-like effective game size, sampled at
-128x128. This deliberately exercises the memory and convolution pipeline at a
-resolution representative of larger future games without increasing the early
-self-play search space.
+The stone and connection planes are **relative to the side to move**, not black
+and white, which is why no "whose turn" channel exists.
+
+## Layouts
+
+A layout names its channels by index. `RasterKind::indices()` is the list;
+`raster_kind` is configured at training time and travels with the model (see
+[`OVERVIEW.md`](OVERVIEW.md)), because a shard stores positions rather than
+pictures and the raster is rendered at load.
+
+| Kind | Ch | Channels |
+|---|---:|---|
+| `semantic` | 12 | the first twelve of the catalogue |
+| `rgb` | 3 | the board as a player sees it; no derived fields |
+| `compact` | 5 | `current_stones`, `opponent_stones`, `voronoi_ridge`, `settled`, `komi` |
+| `compact-pass` | 6 | `compact` + `previous_pass` |
+| `compact-dead-zone` | 6 | `compact-pass` with `dead_zone` in place of `settled` |
+| `compact-connected` | 9 | both capture fields, both connection planes, and the two scalars |
+
+`compact-pass` and `compact-dead-zone` differ in exactly one slot, which is
+deliberate: slot 3 is *the capture predicate*, so a model crosses between
+rulesets by reinitialising one input slice, and comparing the two rulesets is a
+one-plane A/B rather than a change of representation. A test asserts it.
+
+`compact-connected` breaks that symmetry on purpose. `settled` is the wrong
+capture predicate under the official rules, but it is also the only plane that
+says which board can still change hands, which is ownership rather than legality
+and is worth having under either ruleset.
+
+### Cost
+
+At 128 square, milliseconds per position, one thread:
+
+| layout | mean over 0-52 stones | 28 stones | 52 stones |
+|---|---:|---:|---:|
+| `semantic` 12ch | 0.70 | 0.81 | 1.27 |
+| `compact` 5ch | 0.37 | 0.51 | 0.77 |
+| `compact-dead-zone` 6ch | 0.35 | 0.36 | 0.60 |
+
+`settled` and `dead_zone` are two thresholds on one distance field, so a layout
+carrying both pays for one transform. `crates/vgo-raster/examples/raster_cost.rs`
+is the measurement.
 
 ## Numeric precision
 
