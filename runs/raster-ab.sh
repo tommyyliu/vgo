@@ -111,7 +111,7 @@ echo "training on ${#shards[@]} shards"
 # interpreter, which on this box has a different torch entirely.
 python="$root/training/.venv/bin/python"
 
-for kind in compact-dead-zone; do
+for kind in ${VGO_KINDS:-compact-pass compact-dead-zone compact-connected}; do
   arm="$output/$kind"
   # Idempotent: an arm with both artefacts is done. Lets a new layout join the
   # comparison without retraining the ones already measured.
