@@ -16,7 +16,11 @@ import { readFile } from 'node:fs/promises';
 
 const BUDGET_MS = Number(process.argv[2] ?? 5000);
 const RASTER = 128;
-const CHANNELS = 5;
+// Six, not five: models since `compact-pass` carry the pass plane. The number
+// only sets the size of the dummy input here, so a stale value does not change
+// what is measured -- but it does change the bytes uploaded per inference, and
+// this benchmark exists to measure exactly that.
+const CHANNELS = 6;
 // MCTS asks for a whole leaf round at once, so these are the batch sizes that
 // actually occur. 1 is the root evaluation.
 const BATCHES = [1, 2, 4, 8, 16];

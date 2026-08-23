@@ -67,10 +67,21 @@ export const DEFAULT_RADIUS = 1 / 18;
 /// to reproduce a training position exactly rather than play the live game.
 export const TRAINING_RADIUS = 39 / 700;
 
-/// Raster the model reads, and the number of channels in it. Both are fixed by
-/// the exported network rather than chosen here.
+/// Raster size the model reads, fixed by the exported network rather than
+/// chosen here.
 const RASTER = 128;
-const CHANNELS = 5;
+
+/// Channel layout the model reads. `compact-pass` is the five compact planes
+/// plus "the previous move was a pass", and is what every model since that
+/// plane was added is trained on.
+///
+/// This has to match the export. A shape mismatch onnxruntime rejects outright;
+/// what it cannot catch is two layouts of the same width -- `compact-pass` and
+/// `compact-dead-zone` are both six planes and differ in the capture predicate,
+/// so the wrong one loads cleanly and plays blind. `createBot` checks the width
+/// it produces against the model's own input and refuses a mismatch, which
+/// catches every case except that one.
+const DEFAULT_RASTER_KIND = 'compact-pass';
 
 /// Leaf batch. Measured in Chrome on a discrete GPU: one inference costs
 /// ~10-13 ms almost regardless of how many positions are in it, so per-position
@@ -251,6 +262,9 @@ async function resolveOrt(options) {
 ///   leafBatch           positions per inference. Default 8.
 ///   coarsePool          policy sampling factor. Default 4. See above; this is
 ///                       a property of the trained model, not a preference.
+///   rasterKind          channel layout the model reads. Default
+///                       'compact-pass'. A property of the export, not a
+///                       preference; see DEFAULT_RASTER_KIND.
 export async function createBot(options = {}) {
   const { modelUrl, modelBuffer } = options;
   if (!modelUrl && !modelBuffer) {
@@ -267,18 +281,61 @@ export async function createBot(options = {}) {
   } catch (error) {
     throw new VgoBotError('inference', `could not load the model: ${error?.message ?? error}`, error);
   }
-  return new Bot(ort, session, options);
+  // Ask the engine how wide this layout is, and check it against the model.
+  // Getting this wrong is otherwise discovered on the first move, several
+  // seconds of model download later, as an opaque shape error from onnxruntime.
+  const rasterKind = options.rasterKind ?? DEFAULT_RASTER_KIND;
+  let channels;
+  try {
+    const probe = new Game(DEFAULT_RADIUS, 0, rasterKind);
+    channels = probe.rasterChannels();
+  } catch (error) {
+    throw new VgoBotError('unsupported', `unknown rasterKind ${JSON.stringify(rasterKind)}`, error);
+  }
+  const declared = modelChannels(session);
+  if (declared !== null && declared !== channels) {
+    throw new VgoBotError(
+      'unsupported',
+      `the model takes ${declared} channels but ${rasterKind} produces ${channels}. ` +
+      'Pass the rasterKind this model was exported with.',
+    );
+  }
+  return new Bot(ort, session, options, channels);
+}
+
+/// The model's declared input channel count, or null when the session does not
+/// expose one. Older onnxruntime-web builds have no `inputMetadata`, and a
+/// dynamic dimension comes back as a string, so both are treated as "unknown"
+/// rather than as a mismatch -- this check refuses a model it can prove wrong,
+/// never one it merely cannot read.
+function modelChannels(session) {
+  const meta = session.inputMetadata;
+  if (!meta) return null;
+  const name = session.inputNames[0];
+  // Matched by name rather than by position: the states tensor is the input the
+  // bot feeds, and nothing guarantees a model lists it first.
+  const entries = Array.isArray(meta) ? meta : Object.values(meta);
+  const input = entries.find((entry) => entry?.name === name) ?? entries[0];
+  if (input?.isTensor === false) return null;
+  const dims = input?.shape ?? input?.dims;
+  if (!Array.isArray(dims) || dims.length !== 4) return null;
+  // A symbolic dimension arrives as a string; only a concrete positive number
+  // is proof of anything.
+  return typeof dims[1] === 'number' && dims[1] > 0 ? dims[1] : null;
 }
 
 class Bot {
-  #ort; #session; #inputName; #policySize; #leafBatch; #coarsePool; #disposed = false;
+  #ort; #session; #inputName; #policySize; #leafBatch; #coarsePool;
+  #rasterKind; #channels; #disposed = false;
 
-  constructor(ort, session, options) {
+  constructor(ort, session, options, channels) {
     this.#ort = ort;
     this.#session = session;
     this.#inputName = session.inputNames[0];
     this.#leafBatch = Math.max(1, Math.floor(options.leafBatch ?? DEFAULT_LEAF_BATCH));
     this.#coarsePool = Math.max(0, Math.floor(options.coarsePool ?? DEFAULT_COARSE_POOL));
+    this.#rasterKind = options.rasterKind ?? DEFAULT_RASTER_KIND;
+    this.#channels = channels;
     this.#policySize = null;
   }
 
@@ -292,7 +349,8 @@ class Bot {
       leafBatch: this.#leafBatch,
       coarsePool: this.#coarsePool,
       raster: RASTER,
-      channels: CHANNELS,
+      rasterKind: this.#rasterKind,
+      channels: this.#channels,
     };
   }
 
@@ -333,10 +391,14 @@ class Bot {
       seed = Math.floor(Math.random() * 0x7fffffff),
       signal,
       onProgress,
+      // Return what the root actually considered alongside the move. Off by
+      // default: it is a debugging view, and a host that does not ask for it
+      // should not pay to serialize ~90 candidates per move.
+      includeCandidates = false,
     } = options;
 
     const parsed = readPosition(position);
-    const game = new Game(parsed.radius, parsed.komi);
+    const game = new Game(parsed.radius, parsed.komi, this.#rasterKind);
     try {
       game.setStones(parsed.stones, parsed.toMove, parsed.ply, parsed.passes);
     } catch (error) {
@@ -367,7 +429,7 @@ class Bot {
       if (signal?.aborted) throw new VgoBotError('aborted', 'the search was aborted');
       const batch = search.nextBatch(RASTER);
       if (batch.length === 0) break;
-      const count = batch.length / (CHANNELS * RASTER * RASTER);
+      const count = batch.length / (this.#channels * RASTER * RASTER);
       const outputs = await this.#run(batch, count);
       search.submit(
         toFloat32(outputs.values.data),
@@ -378,20 +440,31 @@ class Bot {
     }
     if (signal?.aborted) throw new VgoBotError('aborted', 'the search was aborted');
 
+    // Read the candidates before `best`, which consumes the search.
+    //
+    // These are the moves the search could choose between, not just the one it
+    // picked. Candidates are sampled from the policy rather than enumerated, so
+    // a placement the network rates near zero is never proposed and never
+    // searched: a move missing from this list was never seen at all, which is a
+    // different failure from being seen and misjudged.
+    const candidates = includeCandidates ? search.candidates() : undefined;
+
     // `best` is callable before the budget is spent: stopping on a deadline is
     // the intended use, not an error.
     const move = search.best();
     const elapsed = performance.now() - started;
-    return move.length === 0
+    const result = move.length === 0
       ? { pass: true, simulations, elapsed }
       : { pass: false, x: move[0], y: move[1], simulations, elapsed };
+    if (candidates) result.candidates = candidates;
+    return result;
   }
 
   async #run(batch, count) {
     try {
       return await this.#session.run({
         [this.#inputName]:
-          new this.#ort.Tensor('float32', batch, [count, CHANNELS, RASTER, RASTER]),
+          new this.#ort.Tensor('float32', batch, [count, this.#channels, RASTER, RASTER]),
       });
     } catch (error) {
       throw new VgoBotError('inference', `the model failed to run: ${error?.message ?? error}`, error);
@@ -399,7 +472,7 @@ class Bot {
   }
 
   async #probePolicySize() {
-    const empty = new Float32Array(CHANNELS * RASTER * RASTER);
+    const empty = new Float32Array(this.#channels * RASTER * RASTER);
     const outputs = await this.#run(empty, 1);
     return outputs.policy_logits.dims.at(-1);
   }

@@ -47,9 +47,21 @@ use wasm_bindgen::prelude::*;
 pub struct Game {
     position: Position,
     ply: u32,
+    raster_kind: RasterKind,
 }
 
 /// One stone, as the client sees it. Colours are absolute, unlike the raster.
+/// One root candidate, as the UI sees it. `x`/`y` are absent for a pass.
+#[derive(serde::Serialize)]
+pub struct CandidateView {
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub visits: u32,
+    pub prior: f64,
+    pub value: f64,
+    pub proposals: u32,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct StoneView {
     pub x: f64,
@@ -61,12 +73,40 @@ pub struct StoneView {
 #[wasm_bindgen]
 impl Game {
     /// An empty board.
+    ///
+    /// `rasterKind` names the channel layout the model reads and defaults to
+    /// `compact-pass`, which is what every model since the pass plane was added
+    /// is trained on. It has to match the export: a network given a layout it
+    /// did not learn reads a different meaning off each plane and plays blind.
+    /// Unlike a shape mismatch, which onnxruntime rejects, that failure is
+    /// silent whenever the two layouts happen to share a width -- `compact-pass`
+    /// and `compact-dead-zone` are both six planes.
     #[wasm_bindgen(constructor)]
-    pub fn new(radius: f64, komi: f64) -> Game {
-        Game {
+    pub fn new(radius: f64, komi: f64, raster_kind: Option<String>) -> Result<Game, JsValue> {
+        let raster_kind = match raster_kind {
+            Some(name) => name
+                .parse::<RasterKind>()
+                .map_err(|error| JsValue::from_str(&error))?,
+            None => RasterKind::CompactPass,
+        };
+        Ok(Game {
             position: Position::new(radius, Vec::new(), Color::Black).with_komi(komi),
             ply: 0,
-        }
+            raster_kind,
+        })
+    }
+
+    /// The layout this game rasterizes, as its canonical name.
+    #[wasm_bindgen(js_name = rasterKind)]
+    pub fn raster_kind(&self) -> String {
+        self.raster_kind.as_str().to_string()
+    }
+
+    /// Planes the layout writes, so the host does not hardcode a channel count
+    /// that changes with the layout.
+    #[wasm_bindgen(js_name = rasterChannels)]
+    pub fn raster_channels(&self) -> usize {
+        self.raster_kind.channels()
     }
 
     /// Place a stone for the side to move.
@@ -193,7 +233,7 @@ impl Game {
         if size == 0 {
             return Err(JsValue::from_str("raster size must be positive"));
         }
-        let config = RasterConfig::square_of(size, RasterKind::Compact);
+        let config = RasterConfig::square_of(size, self.raster_kind);
         let mut data = vec![0.0_f32; config.channels() * config.pixels()];
         rasterize_any_into(&self.position, config, &mut data);
         Ok(data)
@@ -240,10 +280,30 @@ impl Game {
         config.temperature = 0.0;
         config.coarse_pool = coarse_pool;
         config.leaf_batch = leaf_batch.max(1);
+        // Progressive widening at 4.0 rather than SearchConfig's 2.0, which is
+        // measurably far too narrow. Same model both seats, only this
+        // differing, 120 games per arm: +232 Elo at 800 simulations (114
+        // candidates against 57) and +183 at 3200 (227 against 114). The gain
+        // arrives entirely between 2.0 and 4.0 and then plateaus out to at
+        // least 32.0, so this is the cheap end of a wide basin rather than a
+        // peak. Below it the drop is steep -- 1.0 is -338, 0.5 is -708.
+        //
+        // Not exposed as a parameter: the browser stores no shards, so unlike
+        // generation it is not bounded by the replay record's 128-cell
+        // capacity, and there is no reason for a host to want it lower.
+        config.widening_coefficient = 4.0;
+        // The cap has to clear what the coefficient asks for, or raising the
+        // coefficient does nothing and the arm silently reverts to the narrow
+        // one. `canary` caps at 96, which 4.0 reaches by 576 simulations -- so
+        // every browser search long enough to matter would have been pinned
+        // there. 321 is what generation and the arenas that measured the gain
+        // use, and it clears 4.0 out to 6400 simulations.
+        config.maximum_candidates = 321;
         Ok(Search {
             inner: SteppedSearch::new(self.position.clone(), config, seed, self.ply),
             outstanding: 0,
             policy_size,
+            raster_kind: self.raster_kind,
         })
     }
 
@@ -294,6 +354,7 @@ pub struct Search {
     /// Size of the last batch handed out, so `submit` can check the counts.
     outstanding: usize,
     policy_size: usize,
+    raster_kind: RasterKind,
 }
 
 #[wasm_bindgen]
@@ -305,7 +366,7 @@ impl Search {
         if size == 0 {
             return Err(JsValue::from_str("raster size must be positive"));
         }
-        let config = RasterConfig::square_of(size, RasterKind::Compact);
+        let config = RasterConfig::square_of(size, self.raster_kind);
         let stride = config.channels() * config.pixels();
         let batch = self.inner.next_batch();
         self.outstanding = batch.len();
@@ -368,6 +429,48 @@ impl Search {
     #[wasm_bindgen(getter)]
     pub fn simulations(&self) -> u32 {
         self.inner.simulations()
+    }
+
+    /// Everything the root actually considered, for drawing the search.
+    ///
+    /// One entry per candidate: `{ x, y, visits, prior, value, proposals }`.
+    /// `visits` is how much search the move received, `prior` the network's
+    /// belief before searching, and `value` the searched score **from Black's
+    /// side** -- negate it when White is to move, which is easy to forget and
+    /// silently inverts every reading.
+    ///
+    /// The useful question this answers is not which move was chosen but which
+    /// were *available* to choose. Candidates are sampled from the policy
+    /// rather than enumerated, so a placement the network rates near zero is
+    /// never proposed and never searched -- it cannot be found however long the
+    /// search runs. A move that beats the bot and does not appear here was
+    /// never seen, which is a different failure from being seen and misjudged.
+    ///
+    /// Callable mid-search; the picture only sharpens as simulations land.
+    pub fn candidates(&self) -> Result<JsValue, JsValue> {
+        let children = self
+            .inner
+            .root_candidates()
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let views: Vec<CandidateView> = children
+            .iter()
+            .map(|child| {
+                let (x, y) = match child.action {
+                    Action::Place(point) => (Some(point.x), Some(point.y)),
+                    Action::Pass => (None, None),
+                };
+                CandidateView {
+                    x,
+                    y,
+                    visits: child.visits,
+                    prior: child.prior,
+                    value: child.black_value,
+                    proposals: child.proposal_count,
+                }
+            })
+            .collect();
+        serde_wasm_bindgen::to_value(&views)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// The chosen move as `[x, y]`, or an empty array for a pass.

@@ -89,11 +89,22 @@ slower fallback. `serve.js` sets both, for development.
 | `executionProviders` | `['webgpu','wasm']` | ORT takes the first that initialises |
 | `leafBatch` | 8 | positions per inference |
 | `coarsePool` | 16 | how candidates are drawn from the policy map |
+| `rasterKind` | `'compact-pass'` | channel layout the model reads; a property of the export |
 | `wasm` | inlined | override for the engine binary; only needed in unusual hosting |
 
 Expensive, and worth doing once when a board loads rather than when a player
 asks for a move: it fetches tens of megabytes of model and compiles a WebGPU
 pipeline.
+
+**`rasterKind` must match the export.** `compact-pass` -- the five compact planes
+plus "the previous move was a pass" -- is what every model since that plane was
+added is trained on, and is the default. Older exports are five-channel
+`compact`. `createBot` compares the width the layout produces against the
+model's own declared input and refuses a mismatch, so the usual failure is a
+clear error at load rather than a bad bot. The case it cannot catch is two
+layouts of the same width: `compact-pass` and `compact-dead-zone` are both six
+planes and differ in the capture predicate, so passing the wrong one there loads
+cleanly and plays blind.
 
 **Leave `coarsePool` alone unless you know why you are changing it.** Zero is not
 "off" — it makes the search draw candidate moves from a quasi-random sequence
