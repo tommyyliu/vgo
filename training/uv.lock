@@ -674,6 +674,21 @@ wheels = [
 ]
 
 [[package]]
+name = "ranger21"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/26/f0/3bd216824a741604b07b7c81e4c1f2d94674b5ec7bc1f38e3dd67ab61abc/ranger21-0.1.0.tar.gz", hash = "sha256:a78b702e142376172fdc02669861e7eb6cae93aa0c965dea344626c004d4a7e1", size = 28337, upload-time = "2024-02-11T22:49:59.133Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/05/8a/9ee1f0b0da5df10f0d4eb2f19cc69e3f185b23c4f00f4812da5d2f8a2695/ranger21-0.1.0-py3-none-any.whl", hash = "sha256:017cfd33853ec8d7b9ba2372de922b26c6111801b5bb1ec5d03b68609183980f", size = 24496, upload-time = "2024-02-11T22:49:57.303Z" },
+]
+
+[[package]]
 name = "setuptools"
 version = "83.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -809,6 +824,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+optimizers = [
+    { name = "ranger21" },
+]
 plots = [
     { name = "matplotlib" },
 ]
@@ -823,9 +841,10 @@ requires-dist = [
     { name = "onnx", specifier = ">=1.19.0" },
     { name = "onnxruntime-gpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=1.28.0" },
     { name = "onnxscript", specifier = ">=0.5.0" },
+    { name = "ranger21", marker = "extra == 'optimizers'", specifier = ">=0.1.0" },
     { name = "tensorrt-cu13-libs", marker = "(sys_platform == 'linux' and extra == 'tensorrt') or (sys_platform == 'win32' and extra == 'tensorrt')", specifier = "==10.16.1.11" },
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.13.0" },
     { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=2.13.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "triton-windows", marker = "sys_platform == 'win32'", specifier = ">=3.7,<3.8" },
 ]
-provides-extras = ["plots", "tensorrt"]
+provides-extras = ["plots", "tensorrt", "optimizers"]

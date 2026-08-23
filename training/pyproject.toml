@@ -31,6 +31,11 @@ plots = [
 tensorrt = [
     "tensorrt-cu13-libs==10.16.1.11; sys_platform == 'win32' or sys_platform == 'linux'",
 ]
+# Alternative optimizers, for A/Bs against Adam and Muon. Kept optional because
+# ranger21 pulls a plotting stack of its own, and no production recipe uses it.
+optimizers = [
+    "ranger21>=0.1.0",
+]
 
 [tool.uv.sources]
 torch = [

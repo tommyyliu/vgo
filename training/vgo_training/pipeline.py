@@ -507,6 +507,32 @@ class PipelineConfig:
     generation_simulations: int = 256
     maximum_plies: int = 256
     coarse_pool: int = 4
+    # Progressive widening: a node wants `coefficient * visits^0.5` candidates.
+    #
+    # SearchConfig's 2.0 is far too narrow. Measured with the same model on both
+    # seats and only this differing, 120 games per arm: +232 Elo at 800
+    # simulations and +183 at 3200, where it takes the root from 114 candidates
+    # to 227. The gain arrives between 2.0 and 4.0 then plateaus out to at least
+    # 32.0, so 4.0 is the cheap end of a wide basin rather than a peak.
+    #
+    # Left at the old default here so existing runs resume unchanged; a recipe
+    # that wants the gain asks for it, and `maximum_candidates` has to move with
+    # it or the ceiling clips the formula straight back down.
+    widening_coefficient: float = 2.0
+    # Ceiling on candidates per node, capping progressive widening.
+    #
+    # Only ever holds widening back -- above what the formula asks for it does
+    # nothing at all. It also sizes the replay record: 227 draws touch ~151
+    # distinct cells, and v7 writes a capacity to match.
+    maximum_candidates: int = 96
+    # Uniform mass mixed into the root's candidate proposal, in [0, 1).
+    #
+    # Candidates are sampled from the policy, so a placement it rates near zero
+    # is never proposed, never searched, and never enters the target -- from
+    # which the next policy learns the same blind spot. This floors that rate,
+    # as Dirichlet noise does for AlphaZero, at the root because that is where
+    # the target comes from. Off by default: it changes what self-play explores.
+    root_exploration_noise: float = 0.0
     temperature: float = 1.0
     temperature_plies: int = 30
     actors: int = 64
@@ -688,6 +714,12 @@ class PipelineConfig:
             raise ValueError("warmup epochs must be nonnegative")
         if self.replay_window < self.shards_per_update:
             raise ValueError("replay window must hold at least one update quantum")
+        if not math.isfinite(self.widening_coefficient) or self.widening_coefficient <= 0:
+            raise ValueError("widening coefficient must be positive")
+        if self.maximum_candidates <= 0:
+            raise ValueError("maximum candidates must be positive")
+        if not 0.0 <= self.root_exploration_noise < 1.0:
+            raise ValueError("root exploration noise must be in [0, 1)")
         if self.coarse_pool < 0 or self.coarse_pool > self.policy_resolution:
             raise ValueError("coarse pool must fit within the policy resolution")
         if self.policy_resolution > self.resolution:
@@ -1479,6 +1511,12 @@ class Pipeline:
             str(config.generation_simulations),
             "--coarse-pool",
             str(config.coarse_pool),
+            "--widening-coefficient",
+            str(config.widening_coefficient),
+            "--maximum-candidates",
+            str(config.maximum_candidates),
+            "--root-exploration-noise",
+            str(config.root_exploration_noise),
             "--ruleset",
             str(config.ruleset),
             "--temperature",
@@ -1563,6 +1601,13 @@ class Pipeline:
             str(config.arena_simulations),
             "--coarse-pool",
             str(config.coarse_pool),
+            # Rate the search the run actually uses. A telemetry arena at the
+            # default widening would describe a configuration this run never
+            # plays, and widening is worth ~+183 Elo at production simulations.
+            "--widening-coefficient",
+            str(config.widening_coefficient),
+            "--maximum-candidates",
+            str(config.maximum_candidates),
             "--ruleset",
             str(config.ruleset),
             "--max-plies",
@@ -2791,6 +2836,9 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generation-simulations", type=int, default=256)
     parser.add_argument("--maximum-plies", type=int, default=256)
     parser.add_argument("--coarse-pool", type=int, default=4)
+    parser.add_argument("--widening-coefficient", type=float, default=2.0)
+    parser.add_argument("--maximum-candidates", type=int, default=96)
+    parser.add_argument("--root-exploration-noise", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--temperature-plies", type=int, default=30)
     parser.add_argument("--actors", type=int, default=64)

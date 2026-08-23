@@ -48,6 +48,13 @@ def main() -> None:
     parser.add_argument("--muon-learning-rate", type=float, default=0.01)
     parser.add_argument("--full-adam", action="store_true",
                         help="put every parameter on Adam instead of Muon-on-trunk")
+    parser.add_argument(
+        "--optimizer", choices=("adam", "muon", "ranger21"), default=None,
+        help="overrides --full-adam when given. ranger21 needs the optional "
+        "'optimizers' dependency group and runs with its own warmup/warmdown "
+        "off, so --schedule drives every arm and the comparison is about the "
+        "optimizer rather than about two different learning-rate curves",
+    )
     parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--value-weight", type=float, default=2.0)
     parser.add_argument("--ownership-weight", type=float, default=0.0)
@@ -126,6 +133,7 @@ def main() -> None:
         augment=arguments.augment,
         muon_learning_rate=arguments.muon_learning_rate,
         full_adam=arguments.full_adam,
+        optimizer=arguments.optimizer,
     )
 
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
