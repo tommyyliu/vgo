@@ -12,13 +12,18 @@ use std::fs;
 use vgo_core::{Color, Position, Stone};
 use vgo_raster::{RasterConfig, RasterKind, rasterize_any_into};
 
-const HEADER: usize = 32;
+// v7 appended the policy capacity, so its header is one u32 longer.
+const HEADER_V6: usize = 32;
+const HEADER_V7: usize = 36;
+
+const fn header_size(version: u32) -> usize {
+    if version >= 7 { HEADER_V7 } else { HEADER_V6 }
+}
 const STONE: usize = 8 + 8 + 1;
 const STONE_CAPACITY: usize = 128;
-// Slots per record, which v6 widened from 64 so deeper search can record every
-// cell it touched. Must match `POLICY_CAPACITY` in
-// crates/vgo-selfplay/src/replay_stream.rs and `policy_capacity` in
-// training/vgo_training/dataset.py.
+// Slots per record. v4 held 64 and v6 held 128, both fixed constants three
+// files had to agree on. v7 writes the capacity into its header instead, so
+// this covers only the older shards.
 const POLICY_CAPACITY_V4: usize = 64;
 const POLICY_CAPACITY_V6: usize = 128;
 
@@ -28,6 +33,13 @@ const fn policy_capacity(version: u32) -> usize {
     } else {
         POLICY_CAPACITY_V4
     }
+}
+
+/// Bytes per stored policy cell. v7 repacked it from 20 to 12 by dropping the
+/// policy -- which is the normalised visit counts -- and narrowing the index
+/// and proposal counter.
+const fn cell_bytes(version: u32) -> usize {
+    if version >= 7 { 12 } else { 20 }
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> u32 {
@@ -52,8 +64,8 @@ fn main() {
     let blob = fs::read(&source).expect("read shard");
     let version = read_u32(&blob, 8);
     assert!(
-        (4..=6).contains(&version),
-        "expected replay version 4, 5 or 6, found {version}"
+        (4..=7).contains(&version),
+        "expected replay version 4 through 7, found {version}"
     );
     let samples = read_u32(&blob, 12) as usize;
 
@@ -62,11 +74,17 @@ fn main() {
     let stones_at = 8 + komi_bytes + 1 + 4 + 1 + 4;
     let count_at = 8 + komi_bytes + 1 + 4 + 1;
 
-    let stride = (blob.len() - HEADER) / samples;
+    let header = header_size(version);
+    let capacity = if version >= 7 {
+        read_u32(&blob, 32) as usize
+    } else {
+        policy_capacity(version)
+    };
+    let stride = (blob.len() - header) / samples;
     let expected = stones_at
         + STONE_CAPACITY * STONE
         + 4
-        + policy_capacity(version) * (4 + 4 + 4 + 4 + 4)
+        + capacity * cell_bytes(version)
         + 4 + 4 + 8 + 4 + 8;
     assert_eq!(
         stride, expected,
@@ -81,7 +99,7 @@ fn main() {
     let mut data = vec![0.0_f32; channels * pixels];
 
     for index in 0..samples {
-        let base = HEADER + index * stride;
+        let base = header + index * stride;
         let radius = read_f64(&blob, base);
         let komi = if version >= 5 { read_f64(&blob, base + 8) } else { 0.0 };
         let to_move = if blob[base + 8 + komi_bytes] == 0 {

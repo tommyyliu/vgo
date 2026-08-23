@@ -28,7 +28,20 @@ pub(crate) const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
 // v5 adds komi to each record. It is part of the position -- the same stones
 // under different komi have different winners -- so a shard that omits it
 // cannot reconstruct the game it stored.
-pub(crate) const REPLAY_VERSION: u32 = 6;
+// v7 makes the policy capacity a header field rather than a constant, and
+// repacks each cell from 20 bytes to 12. `policy` is dropped: it is exactly
+// `visits / sum(visits)` -- verified to 0.0 across 13,877 rows including every
+// pass entry -- so storing it was a redundancy costing four bytes a cell.
+// `index` fits u16 (policy_size is 16,385) and `proposal_counts` fits u16
+// (observed max 92 of 96 draws, and it scales with the draw budget, so u8 would
+// overflow the moment widening opens up). `visits` stays u32 rather than u16 so
+// the simulation budget is not silently capped at 65,535.
+//
+// The capacity moves into the header because widening is now a run-level
+// choice: a run at coefficient 4 touches ~152 cells and one at 8 touches ~215,
+// and a global constant would have to be sized for the widest run anyone might
+// make, padding every other shard to match.
+pub(crate) const REPLAY_VERSION: u32 = 7;
 
 /// Stones a v4 record can hold. One stone per ply at most, and the longest
 /// observed game was 88 plies.
@@ -41,7 +54,20 @@ pub(crate) const STONE_CAPACITY: usize = 128;
 // record -- and each record pads to a fixed capacity, so deeper search needs
 // more slots. Readers derive capacity from the shard version, so v4 and v5
 // shards still load. Must match `policy_capacity` in training/vgo_training/dataset.py.
-pub(crate) const POLICY_CAPACITY: usize = 128;
+
+/// Bytes per stored policy cell in v7: index u16, visits u32, beta f32,
+/// proposal_counts u16.
+pub(crate) const V7_CELL_BYTES: usize = 12;
+
+/// Policy cells dropped because a node's search outgrew the shard's capacity.
+///
+/// Zero for every run so far: at the default widening a node touches 68.6 cells
+/// on average and 97 at most. It becomes reachable when widening is opened up,
+/// which is the point of tracking it -- truncation trades target fidelity for a
+/// shard that still writes, and that trade should be visible in the manifest
+/// rather than inferred later from a policy target that looks oddly narrow.
+pub(crate) static CELLS_DROPPED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) struct LabeledSample {
     /// The position itself. A shard records state, not a picture of it.
@@ -86,6 +112,9 @@ pub(crate) struct PublishedReplay {
 /// record is written and remains compatible with the existing memory-mapped v3
 /// loader.
 pub(crate) struct ReplayStream {
+    /// Policy slots each record pads to, written into the header so readers do
+    /// not have to infer it from the version.
+    policy_capacity: usize,
     final_path: PathBuf,
     temporary_path: PathBuf,
     writer: Option<BufWriter<HashingWriter>>,
@@ -110,6 +139,7 @@ impl ReplayStream {
         raster: RasterConfig,
         policy_size: usize,
         examples_limit: usize,
+        policy_capacity: usize,
     ) -> io::Result<Self> {
         let samples_u32 = u32::try_from(target_samples).map_err(|_| {
             io::Error::new(
@@ -160,10 +190,12 @@ impl ReplayStream {
             height_u32,
             width_u32,
             policy_u32,
+            u32::try_from(policy_capacity).expect("policy capacity fits in u32"),
         ] {
             writer.write_all(&value.to_le_bytes())?;
         }
         Ok(Self {
+            policy_capacity,
             final_path: path.to_path_buf(),
             temporary_path,
             writer: Some(writer),
@@ -222,11 +254,13 @@ impl ReplayStream {
             }
             self.first_game_id.get_or_insert(sample.game);
             self.last_game_id = Some(sample.game);
+            let capacity = self.policy_capacity;
             write_sample(
                 self.writer
                     .as_mut()
                     .expect("writer exists until publication"),
                 &sample,
+                capacity,
             )?;
             self.samples_written += 1;
         }
@@ -396,7 +430,11 @@ fn write_f32(writer: &mut impl Write, value: f32) -> io::Result<()> {
 /// Both variable parts are padded to a capacity so records stay fixed-size and
 /// the Python loader can memory-map the file. Unused slots are zeroed and the
 /// live counts precede them.
-fn write_sample(writer: &mut impl Write, sample: &LabeledSample) -> io::Result<()> {
+fn write_sample(
+    writer: &mut impl Write,
+    sample: &LabeledSample,
+    capacity: usize,
+) -> io::Result<()> {
     let position = &sample.position;
     let stones = position.stones();
     if stones.len() > STONE_CAPACITY {
@@ -435,27 +473,56 @@ fn write_sample(writer: &mut impl Write, sample: &LabeledSample) -> io::Result<(
                 || sample.proposal_counts[index] != 0
         })
         .collect();
-    if touched.len() > POLICY_CAPACITY {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "search touched {} policy cells, exceeding the v4 capacity of {POLICY_CAPACITY}",
-                touched.len()
-            ),
-        ));
-    }
+    // Wider search can touch more cells than a record holds. Failing here would
+    // throw away a whole shard partway through, so keep the cells carrying the
+    // most search signal and drop the rest: visits first, then how often the
+    // cell was proposed. What goes is the tail the policy target barely weighs
+    // -- cells proposed once and never visited -- and the loss is recorded
+    // rather than silent, because a shard quietly losing its widest positions
+    // would look exactly like a shard that never searched them.
+    let mut dropped = 0_usize;
+    let touched: Vec<usize> = if touched.len() > capacity {
+        dropped = touched.len() - capacity;
+        let selected = sample.selected_action as usize;
+        let mut ranked = touched;
+        ranked.sort_unstable_by(|&a, &b| {
+            // The played move is kept whatever its visit count. Under a
+            // positive temperature the move is *sampled* from the visit
+            // distribution rather than taken as its argmax, so the action
+            // actually played can sit deep in the tail -- and a record whose
+            // selected action is missing from its own mask is rejected at load,
+            // which takes the whole shard with it.
+            let a_selected = a == selected;
+            let b_selected = b == selected;
+            b_selected
+                .cmp(&a_selected)
+                .then_with(|| {
+                    sample.visits[b]
+                        .partial_cmp(&sample.visits[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| sample.proposal_counts[b].cmp(&sample.proposal_counts[a]))
+        });
+        ranked.truncate(capacity);
+        // The reader walks these in ascending index order.
+        ranked.sort_unstable();
+        ranked
+    } else {
+        touched
+    };
+    CELLS_DROPPED.fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
     writer.write_all(&(touched.len() as u32).to_le_bytes())?;
     for &index in &touched {
-        writer.write_all(&(index as u32).to_le_bytes())?;
-        write_f32(writer, sample.policy[index])?;
-        write_f32(writer, sample.visits[index])?;
+        // v7 layout, 12 bytes. `policy` is not stored: it is exactly
+        // `visits / sum(visits)` and the reader derives it.
+        writer.write_all(&(index as u16).to_le_bytes())?;
+        writer.write_all(&(sample.visits[index] as u32).to_le_bytes())?;
         write_f32(writer, sample.beta[index])?;
-        writer.write_all(&sample.proposal_counts[index].to_le_bytes())?;
+        let proposals = u16::try_from(sample.proposal_counts[index]).unwrap_or(u16::MAX);
+        writer.write_all(&proposals.to_le_bytes())?;
     }
-    for _ in touched.len()..POLICY_CAPACITY {
-        for _ in 0..5 {
-            writer.write_all(&0u32.to_le_bytes())?;
-        }
+    for _ in touched.len()..capacity {
+        writer.write_all(&[0u8; V7_CELL_BYTES])?;
     }
 
     write_f32(writer, sample.value)?;
@@ -505,9 +572,13 @@ mod tests {
     use vgo_raster::RasterConfig;
 
     use super::{
-        LabeledSample, POLICY_CAPACITY, REPLAY_MAGIC, REPLAY_VERSION, ReplayStream,
+        LabeledSample, REPLAY_MAGIC, REPLAY_VERSION, ReplayStream, V7_CELL_BYTES,
         STONE_CAPACITY, temporary_path,
     };
+
+    /// Policy slots the test shards pad to. Arbitrary and small: the point is
+    /// that the capacity is per-shard now, not that it matches any real run.
+    const TEST_CAPACITY: usize = 32;
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -554,7 +625,7 @@ mod tests {
         let raster = RasterConfig::square(2);
         let policy_size = raster.pixels() + 1;
         let mut stream =
-            ReplayStream::create(&path, 3, raster, policy_size, 2).expect("create replay");
+            ReplayStream::create(&path, 3, raster, policy_size, 2, TEST_CAPACITY).expect("create replay");
 
         assert_eq!(
             stream
@@ -577,14 +648,15 @@ mod tests {
         assert!(!temporary_path(&path).exists());
 
         let bytes = fs::read(&path).expect("read replay");
-        // A v5 record is the position at STONE_CAPACITY, the sparse policy at
-        // POLICY_CAPACITY, and the trailing scalars -- fixed size regardless of
-        // how many stones or cells are actually live. The leading f64s are
-        // radius and komi.
+        // A v7 record is the position at STONE_CAPACITY, the sparse policy at
+        // the shard's own capacity, and the trailing scalars -- fixed size
+        // regardless of how many stones or cells are actually live. The leading
+        // f64s are radius and komi. The header gained a seventh u32 for the
+        // capacity, so it is 36 bytes rather than 32.
         let position_bytes = 8 + 8 + 1 + 4 + 1 + 4 + STONE_CAPACITY * (8 + 8 + 1);
-        let policy_bytes = 4 + POLICY_CAPACITY * (4 * 4 + 4);
+        let policy_bytes = 4 + TEST_CAPACITY * V7_CELL_BYTES;
         let record_bytes = position_bytes + policy_bytes + 28;
-        assert_eq!(bytes.len(), 32 + 3 * record_bytes);
+        assert_eq!(bytes.len(), 36 + 3 * record_bytes);
         assert_eq!(&bytes[..8], &REPLAY_MAGIC);
         assert_eq!(
             u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
@@ -602,7 +674,7 @@ mod tests {
         let raster = RasterConfig::square(2);
         let policy_size = raster.pixels() + 1;
         let mut stream =
-            ReplayStream::create(&path, 2, raster, policy_size, 0).expect("create replay");
+            ReplayStream::create(&path, 2, raster, policy_size, 0, TEST_CAPACITY).expect("create replay");
         stream
             .write_game(vec![sample(1, 0)])
             .expect("write partial replay");
@@ -617,7 +689,7 @@ mod tests {
         assert!(!temporary_path(&path).exists());
 
         File::create(&path).expect("reserve published path");
-        let error = match ReplayStream::create(&path, 1, raster, policy_size, 0) {
+        let error = match ReplayStream::create(&path, 1, raster, policy_size, 0, TEST_CAPACITY) {
             Ok(_) => panic!("published path cannot be overwritten"),
             Err(error) => error,
         };
@@ -631,7 +703,7 @@ mod tests {
         let raster = RasterConfig::square(2);
         let policy_size = raster.pixels() + 1;
         let mut stream =
-            ReplayStream::create(&path, 1, raster, policy_size, 0).expect("create replay");
+            ReplayStream::create(&path, 1, raster, policy_size, 0, TEST_CAPACITY).expect("create replay");
         stream.write_game(vec![sample(4, 0)]).expect("write replay");
         let published = stream.publish().expect("publish replay");
 
