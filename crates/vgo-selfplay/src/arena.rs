@@ -95,10 +95,16 @@ struct Arguments {
     #[arg(long)]
     opponent_root_exploration_noise: Option<f64>,
     /// Leaves evaluated together per simulation round; above one a single game
-    /// keeps that many evaluations in flight. Both seats must use the same value
-    /// for a fair comparison, since it changes which nodes get explored.
+    /// keeps that many evaluations in flight. It changes which nodes get
+    /// explored, so both seats want the same value -- except when the width
+    /// itself is what is being measured, which is what the opponent override
+    /// below is for.
     #[arg(long, default_value_t = 1)]
     leaf_batch: usize,
+    /// Leaf batch for the opponent seat. Defaults to `--leaf-batch`, so leaving
+    /// it unset keeps the seats identical.
+    #[arg(long)]
+    opponent_leaf_batch: Option<usize>,
     #[arg(long = "max-plies", default_value_t = 48)]
     maximum_plies: u32,
     #[arg(long, default_value_t = 8)]
@@ -316,12 +322,17 @@ fn play_game(
                     .opponent_root_exploration_noise
                     .unwrap_or(arguments.root_exploration_noise)
             };
+            let leaf_batch = if is_candidate {
+                arguments.leaf_batch
+            } else {
+                arguments.opponent_leaf_batch.unwrap_or(arguments.leaf_batch)
+            };
             search_with_evaluator(
                 position,
                 search_config(
                     simulations,
                     arguments.coarse_pool,
-                    arguments.leaf_batch,
+                    leaf_batch,
                     candidates,
                     widening,
                     noise,

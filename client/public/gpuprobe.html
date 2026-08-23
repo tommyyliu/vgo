@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><title>gpu probe</title>
+<script type="module">
+const out = { hasGpu: 'gpu' in navigator };
+try {
+  const a = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  out.adapter = a ? 'yes' : 'null';
+  if (a) {
+    out.info = a.info ? { vendor: a.info.vendor, arch: a.info.architecture } : null;
+    const d = await a.requestDevice();
+    out.device = !!d;
+  }
+} catch (e) { out.error = String(e).slice(0, 160); }
+await fetch('/result', { method: 'POST', body: JSON.stringify(out) });
+</script>
