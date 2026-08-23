@@ -78,6 +78,30 @@ struct Arguments {
     coarse_pool: usize,
     #[arg(long, default_value_t = 4)]
     leaf_batch: usize,
+    /// Coefficient on progressive widening: a node wants
+    /// `coefficient * visits^0.5` candidates.
+    ///
+    /// 4.0 rather than `SearchConfig`'s 2.0, which is measurably far too narrow.
+    /// Same model both seats, only this differing, 120 games per arm:
+    ///
+    ///     800 sims   coef 4.0 (114 cands) vs 2.0 (57)    +232 Elo
+    ///    3200 sims   coef 4.0 (227 cands) vs 2.0 (114)   +183 Elo
+    ///
+    /// The whole gain arrives between 2.0 and 4.0 and then plateaus out to at
+    /// least 32.0, so 4.0 is the cheap end of a wide basin rather than a peak
+    /// to be hit precisely. Below it the fall is steep: 1.0 is -338 and 0.5 is
+    /// -708.
+    ///
+    /// Serving does not write shards, so nothing here is bounded by the replay
+    /// record's 128-cell capacity. Generation still runs at 2.0 for exactly
+    /// that reason -- 227 draws touch ~152 cells and would be truncated on the
+    /// way to disk.
+    #[arg(long, default_value_t = 4.0)]
+    widening_coefficient: f64,
+    /// Ceiling on root candidates, which must clear
+    /// `widening_coefficient * sqrt(simulations)` or the coefficient is inert.
+    #[arg(long, default_value_t = 321)]
+    maximum_candidates: usize,
     #[arg(long, default_value = "tensorrt")]
     provider: OnnxProvider,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
@@ -239,21 +263,28 @@ fn move_json(result: &vgo_search::SearchResult, to_move: Color) -> String {
         .find(|child| child.action == result.action)
         .map(|child| (child.visits, orient(child.black_value)))
         .unwrap_or((0, 0.0));
+    // Every candidate, not a top-slice. A caller drawing what the search
+    // considered needs the whole set: the interesting part is which legal
+    // ground got no candidate at all, and a truncated list makes explored
+    // regions look unexplored. Around ninety entries in the opening, a few
+    // kilobytes, on a local development route.
     let candidates = children
         .iter()
-        .take(8)
         .map(|child| match child.action {
             Action::Pass => format!(
-                "{{\"pass\":true,\"visits\":{},\"value\":{:.4}}}",
+                "{{\"pass\":true,\"visits\":{},\"value\":{:.4},\"prior\":{:.5}}}",
                 child.visits,
-                orient(child.black_value)
+                orient(child.black_value),
+                child.prior
             ),
             Action::Place(point) => format!(
-                "{{\"pass\":false,\"x\":{:.6},\"y\":{:.6},\"visits\":{},\"value\":{:.4}}}",
+                "{{\"pass\":false,\"x\":{:.6},\"y\":{:.6},\"visits\":{},\"value\":{:.4},\"prior\":{:.5},\"proposals\":{}}}",
                 point.x,
                 point.y,
                 child.visits,
-                orient(child.black_value)
+                orient(child.black_value),
+                child.prior,
+                child.proposal_count
             ),
         })
         .collect::<Vec<_>>()
@@ -321,6 +352,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = SearchConfig::canary(arguments.simulations);
     config.coarse_pool = arguments.coarse_pool;
     config.leaf_batch = arguments.leaf_batch.max(1);
+    config.widening_coefficient = arguments.widening_coefficient;
+    // The cap has to clear what the coefficient asks for. `canary` caps at 96,
+    // which 4.0 reaches by 576 simulations -- so at the default 1600, and at
+    // every count a human would actually play against, the coefficient was
+    // doing nothing and this server was quietly serving the narrow arm whose
+    // cost the flag above documents as -232 Elo. 321 is what the arenas that
+    // measured the gain use, and it clears 4.0 out to 6400 simulations.
+    config.maximum_candidates = arguments.maximum_candidates;
     // A human opponent wants the search's best move, not a draw from it.
     config.temperature = 0.0;
     config.temperature_plies = 0;

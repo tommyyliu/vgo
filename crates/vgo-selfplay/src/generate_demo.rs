@@ -33,7 +33,8 @@ use vgo_selfplay::{
 mod replay_stream;
 
 use replay_stream::{
-    LabeledSample, PublishedReplay, REPLAY_VERSION, ReplayStream, sync_parent_directory,
+    CELLS_DROPPED, LabeledSample, PublishedReplay, REPLAY_VERSION, ReplayStream,
+    sync_parent_directory,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -192,6 +193,53 @@ struct Config {
     /// Fine cells per coarse sampling region; zero uses legacy candidates.
     #[arg(long, default_value_t = 0)]
     coarse_pool: usize,
+    /// Most candidates a node may hold, capping progressive widening.
+    ///
+    /// Widening wants `2 * sqrt(visits)`, so this ceiling binds at the root
+    /// from 3200 simulations upward: the formula asks for 114 there, 161 at
+    /// 6400 and 227 at 12800, and gets 96 every time. Above 3200 sims every
+    /// extra playout therefore buys depth on a fixed menu rather than a wider
+    /// one, which is what the measured returns show -- 1600->3200 was +147 Elo
+    /// and widened 81->96, while 3200->6400 was +61 and widened nothing.
+    ///
+    /// The hard ceiling is the replay record: it stores at most
+    /// POLICY_CAPACITY (128) distinct cells including pass, and a shard whose
+    /// search touches more fails to write. Duplicate draws collapse -- 96
+    /// candidates touch 71.7 cells on average and 97 at most -- so there is
+    /// real headroom, but not enough to let the formula run free. Raising this
+    /// past the format needs a record version bump, not just a bigger number.
+    #[arg(long, default_value_t = 96)]
+    maximum_candidates: usize,
+    /// Uniform mass mixed into the root's candidate proposal, in [0, 1).
+    ///
+    /// Candidates are sampled from the policy, so a placement the network rates
+    /// near zero is never proposed, never searched, and never appears in the
+    /// target -- from which the next policy learns the same blind spot. This
+    /// floors the rate at which underrated moves get looked at, the way
+    /// Dirichlet noise does for AlphaZero, and applies at the root because that
+    /// is where the target comes from.
+    ///
+    /// `beta` is taken from the mixture, so the importance correction stays
+    /// exact and no target maths changes.
+    ///
+    /// Zero by default. It changes what self-play explores, so it belongs to a
+    /// run's identity rather than arriving silently in a rebuild.
+    #[arg(long, default_value_t = 0.0)]
+    root_exploration_noise: f64,
+    /// Coefficient on progressive widening: a node wants
+    /// `coefficient * visits^0.5` candidates.
+    ///
+    /// `SearchConfig`'s 2.0 is measurably far too narrow. Same model both
+    /// seats, only this differing, 120 games per arm: +232 Elo at 800
+    /// simulations and +183 at 3200, where it takes the root from 114
+    /// candidates to 227. The gain arrives between 2.0 and 4.0 and then
+    /// plateaus out to at least 32.0, so 4.0 is the cheap end of a wide basin.
+    ///
+    /// Generation is the one path where this costs storage: 227 draws touch
+    /// ~151 distinct cells, and the record's capacity is sized from
+    /// `--maximum-candidates` accordingly. Raise them together.
+    #[arg(long, default_value_t = 2.0)]
+    widening_coefficient: f64,
     /// Softmax temperature on root visit counts for the opening plies. Zero is
     /// deterministic argmax, which makes every game from a given position
     /// identical; a positive value is what gives self-play its diversity.
@@ -561,13 +609,40 @@ fn search_config(
     temperature: f64,
     temperature_plies: u32,
     leaf_batch: usize,
+    maximum_candidates: usize,
+    root_exploration_noise: f64,
+    widening_coefficient: f64,
 ) -> SearchConfig {
     let mut config = SearchConfig::canary(simulations);
     config.coarse_pool = coarse_pool;
     config.temperature = temperature;
     config.temperature_plies = temperature_plies;
     config.leaf_batch = leaf_batch.max(1);
+    config.maximum_candidates = maximum_candidates.max(config.initial_candidates);
+    config.root_exploration_noise = root_exploration_noise;
+    config.widening_coefficient = widening_coefficient;
     config
+}
+
+/// Policy slots a record needs for a given draw budget.
+///
+/// Provisioned for the worst case -- every draw landing on a distinct cell --
+/// rather than projected from a collision model. An earlier version modelled it
+/// from measured collisions (79.6 draws touching 68.6 cells, inverting to an
+/// effective pool of ~259) and sized 321 draws at 224 slots. That dropped
+/// 109,111 cells in one shard: the model was fitted on runs with no exploration
+/// noise, and mixing uniform mass into the proposal flattens it so collisions
+/// become rare and distinct cells approach the draw count. A model of one
+/// regime sized a record for a different one.
+///
+/// The cost of over-provisioning is zero-padding on disk. The cost of
+/// under-provisioning is silently truncated policy targets, so this errs the
+/// cheap way.
+fn replay_capacity_for(maximum_candidates: usize, policy_size: usize) -> usize {
+    // Every candidate plus pass.
+    let wanted = maximum_candidates.saturating_add(1).max(64);
+    let rounded = wanted.div_ceil(32) * 32;
+    rounded.min(policy_size)
 }
 
 fn validate_config(config: &Config) -> Result<(), &'static str> {
@@ -590,6 +665,12 @@ fn validate_config(config: &Config) -> Result<(), &'static str> {
     }
     if config.inference_slots == 0 {
         return Err("--inference-slots must be positive");
+    }
+    if !(0.0..1.0).contains(&config.root_exploration_noise) {
+        return Err("--root-exploration-noise must be in [0, 1)");
+    }
+    if !(config.widening_coefficient.is_finite() && config.widening_coefficient > 0.0) {
+        return Err("--widening-coefficient must be positive and finite");
     }
     if config.device_id < 0 {
         return Err("--device-id must be nonnegative");
@@ -626,6 +707,9 @@ fn generate_game(
         config.temperature,
         config.temperature_plies,
         config.leaf_batch,
+        config.maximum_candidates,
+        config.root_exploration_noise,
+        config.widening_coefficient,
     );
     let game_seed = config.seed.wrapping_add(game_index);
     let mut pending = Vec::new();
@@ -944,12 +1028,19 @@ fn generate_to_dataset(
         .unwrap_or_else(|| (config.samples as u64).saturating_mul(8));
     let raster = RasterConfig::square_of(config.resolution, config.raster_kind);
     let policy_size = config.policy_resolution * config.policy_resolution + 1;
+    // Slots per record. Draws collapse -- an effective pool of ~259 cells means
+    // 227 draws touch ~152 distinct ones -- so sizing this from the draw budget
+    // directly would waste half of every record. A little headroom over the
+    // projection absorbs positions that collide less than average; anything
+    // past it is truncated lowest-visit-first and counted in the manifest.
+    let policy_capacity = replay_capacity_for(config.maximum_candidates, policy_size);
     let mut replay = ReplayStream::create(
         dataset_path,
         config.samples,
         raster,
         policy_size,
         config.examples,
+        policy_capacity,
     )?;
     let next_game = Arc::new(AtomicU64::new(0));
     let stopped = Arc::new(AtomicBool::new(false));
@@ -1445,6 +1536,11 @@ fn write_manifest(
         writer,
         "    \"samples_generated_by_received_games\": {},",
         report.samples_generated_by_received_games
+    )?;
+    writeln!(
+        writer,
+        "    \"policy_cells_dropped\": {},",
+        CELLS_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
     )?;
     writeln!(
         writer,
@@ -1974,6 +2070,11 @@ fn main() -> std::io::Result<()> {
     )?;
     writeln!(
         output,
+        "    \"policy_cells_dropped\": {},",
+        CELLS_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+    )?;
+    writeln!(
+        output,
         "    \"serialization_truncated_samples\": {},",
         report.serialization_truncated_samples
     )?;
@@ -2404,7 +2505,7 @@ mod tests {
 
     #[test]
     fn coarse_sampling_is_applied_to_search_config() {
-        let configured = search_config(37, 8, 1.0, 30, 1);
+        let configured = search_config(37, 8, 1.0, 30, 1, 96, 0.0, 2.0);
         assert_eq!(configured.simulations, 37);
         assert_eq!(configured.coarse_pool, 8);
         assert_eq!(configured.temperature, 1.0);

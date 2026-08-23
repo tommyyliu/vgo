@@ -258,6 +258,7 @@ fn main() {
         simulations: 32,
         initial_candidates: 4,
         maximum_candidates: 32,
+        root_exploration_noise: 0.0,
         widening_coefficient: 2.0,
         widening_exponent: 0.5,
         exploration: 1.5,

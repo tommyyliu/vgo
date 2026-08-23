@@ -56,6 +56,44 @@ struct Arguments {
     /// Fine cells per coarse sampling region; zero uses legacy candidates.
     #[arg(long, default_value_t = 0)]
     coarse_pool: usize,
+    /// Most candidates a node may hold, capping progressive widening.
+    ///
+    /// Widening wants `2 * sqrt(visits)`, so the default 96 binds at the root
+    /// from 3200 simulations up. Breadth costs almost nothing -- evaluations
+    /// scale with simulations, not candidates -- so this redistributes the same
+    /// visits over more moves rather than buying more of them.
+    #[arg(long, default_value_t = 96)]
+    maximum_candidates: usize,
+    /// Candidate ceiling for the opponent seat, when it should differ. Pair it
+    /// with an equal `--simulations` on both sides to ask what the breadth /
+    /// depth split is worth at a fixed compute budget.
+    #[arg(long)]
+    opponent_maximum_candidates: Option<usize>,
+    /// Coefficient on progressive widening: a node wants
+    /// `coefficient * visits^exponent` candidates.
+    ///
+    /// This, not `--maximum-candidates`, is the knob that explores *wider* than
+    /// the default. The ceiling can only hold widening back -- raising it above
+    /// what the formula asks for changes nothing, because the formula never
+    /// requests more than its own value, so both seats run an identical search
+    /// and the match is 50% by construction. Sweeping this instead gives both
+    /// sides of the breadth/depth curve.
+    #[arg(long, default_value_t = 2.0)]
+    widening_coefficient: f64,
+    /// Widening coefficient for the opponent seat, when it should differ.
+    #[arg(long)]
+    opponent_widening_coefficient: Option<f64>,
+    /// Uniform mass mixed into the root's candidate proposal, in [0, 1).
+    ///
+    /// Floors the rate at which moves the policy has written off get proposed.
+    /// Rating it here measures the cost in *play*; whether it helps is a
+    /// question about the training targets it diversifies, which only a
+    /// generate-and-train comparison can answer.
+    #[arg(long, default_value_t = 0.0)]
+    root_exploration_noise: f64,
+    /// Root exploration noise for the opponent seat, when it should differ.
+    #[arg(long)]
+    opponent_root_exploration_noise: Option<f64>,
     /// Leaves evaluated together per simulation round; above one a single game
     /// keeps that many evaluations in flight. Both seats must use the same value
     /// for a fair comparison, since it changes which nodes get explored.
@@ -145,8 +183,18 @@ fn load_model(
     )
 }
 
-fn search_config(simulations: u32, coarse_pool: usize, leaf_batch: usize) -> SearchConfig {
+fn search_config(
+    simulations: u32,
+    coarse_pool: usize,
+    leaf_batch: usize,
+    maximum_candidates: usize,
+    widening_coefficient: f64,
+    root_exploration_noise: f64,
+) -> SearchConfig {
     let mut config = SearchConfig::canary(simulations);
+    config.maximum_candidates = maximum_candidates.max(config.initial_candidates);
+    config.widening_coefficient = widening_coefficient;
+    config.root_exploration_noise = root_exploration_noise;
     config.coarse_pool = coarse_pool;
     config.leaf_batch = leaf_batch.max(1);
     config
@@ -247,9 +295,37 @@ fn play_game(
                     .opponent_simulations
                     .unwrap_or(arguments.simulations)
             };
+            let candidates = if is_candidate {
+                arguments.maximum_candidates
+            } else {
+                arguments
+                    .opponent_maximum_candidates
+                    .unwrap_or(arguments.maximum_candidates)
+            };
+            let widening = if is_candidate {
+                arguments.widening_coefficient
+            } else {
+                arguments
+                    .opponent_widening_coefficient
+                    .unwrap_or(arguments.widening_coefficient)
+            };
+            let noise = if is_candidate {
+                arguments.root_exploration_noise
+            } else {
+                arguments
+                    .opponent_root_exploration_noise
+                    .unwrap_or(arguments.root_exploration_noise)
+            };
             search_with_evaluator(
                 position,
-                search_config(simulations, arguments.coarse_pool, arguments.leaf_batch),
+                search_config(
+                    simulations,
+                    arguments.coarse_pool,
+                    arguments.leaf_batch,
+                    candidates,
+                    widening,
+                    noise,
+                ),
                 seed,
                 evaluator,
             )
@@ -566,7 +642,7 @@ mod tests {
 
     #[test]
     fn coarse_sampling_is_applied_to_search_config() {
-        let configured = search_config(19, 8, 1);
+        let configured = search_config(19, 8, 1, 96, 2.0, 0.0);
         assert_eq!(configured.simulations, 19);
         assert_eq!(configured.coarse_pool, 8);
     }
