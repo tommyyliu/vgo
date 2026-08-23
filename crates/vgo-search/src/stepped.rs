@@ -207,11 +207,12 @@ impl SteppedSearch {
                 let evaluation = evaluations.pop().ok_or_else(|| {
                     EvaluationError::new("the root needs exactly one evaluation")
                 })?;
-                let root = Box::new(Node::from_evaluation(
+                let mut root = Box::new(Node::from_evaluation(
                     self.position.clone(),
                     evaluation,
                     self.match_seed,
                 ));
+                root.mark_root();
                 self.outstanding.clear();
                 self.stage = Stage::Ready {
                     root,
@@ -314,6 +315,34 @@ impl SteppedSearch {
             self.stats,
         )
         .action)
+    }
+
+    /// The root's explored candidates, without consuming the search.
+    ///
+    /// What the search actually considered, as opposed to what it chose. A move
+    /// absent from this list was never proposed by the policy, so no amount of
+    /// searching could have found it -- which is the distinction a caller
+    /// wanting to *see* the search needs, and one that `best_action` hides.
+    ///
+    /// # Errors
+    /// If no simulations have run yet.
+    pub fn root_candidates(&self) -> Result<Vec<crate::ChildSummary>, EvaluationError> {
+        let root = match &self.stage {
+            Stage::Ready { root, .. } | Stage::Finished { root } => root,
+            Stage::Round { root, .. } => root,
+            Stage::Root => {
+                return Err(EvaluationError::new("the root has not been evaluated yet"));
+            }
+        };
+        Ok(assemble_result(
+            root,
+            &self.position,
+            self.config,
+            self.match_seed,
+            self.ply,
+            self.stats,
+        )
+        .children)
     }
 
     /// Simulations completed so far, for a caller pacing against a deadline.

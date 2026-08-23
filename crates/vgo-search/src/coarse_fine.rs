@@ -185,12 +185,47 @@ pub fn sample_candidates(
     count: usize,
     rng: impl FnMut() -> f64,
 ) -> Vec<CandidateSample> {
-    sample_candidates_with(grid, count, rng, |row, col| grid.placement_at(row, col))
+    sample_candidates_with(grid, count, 0.0, rng, |row, col| grid.placement_at(row, col))
+}
+
+/// Sample candidates with `noise` uniform mass mixed into the proposal.
+///
+/// The policy's softmax decides which placements get proposed at all, so a
+/// move it rates near zero is never drawn however long the search runs.
+/// Blending in a uniform component over the *legal* cells floors that rate,
+/// which is the role Dirichlet noise plays in AlphaZero -- adapted to a sampler
+/// rather than an enumeration, since blending into priors would only reshuffle
+/// visits among candidates already drawn.
+///
+/// The returned `beta` is the probability under the mixture, not under the
+/// softmax, so the importance correction on the policy target stays exact.
+#[must_use]
+pub fn sample_candidates_noisy(
+    grid: &FineGrid,
+    count: usize,
+    noise: f64,
+    rng: impl FnMut() -> f64,
+) -> Vec<CandidateSample> {
+    sample_candidates_with(grid, count, noise, rng, |row, col| {
+        grid.placement_at(row, col)
+    })
+}
+
+/// Blend a distribution with the uniform one over the same support.
+fn mix_uniform(probs: &mut [f64], noise: f64) {
+    if noise <= 0.0 || probs.is_empty() {
+        return;
+    }
+    let uniform = 1.0 / probs.len() as f64;
+    for p in probs.iter_mut() {
+        *p = (1.0 - noise) * *p + noise * uniform;
+    }
 }
 
 fn sample_candidates_with(
     grid: &FineGrid,
     count: usize,
+    noise: f64,
     mut rng: impl FnMut() -> f64,
     mut placement_at: impl FnMut(usize, usize) -> Point,
 ) -> Vec<CandidateSample> {
@@ -208,7 +243,8 @@ fn sample_candidates_with(
     if coarse_cells.is_empty() {
         return Vec::new();
     }
-    let coarse_probs = softmax(coarse_cells.iter().map(|&(_, _, m)| m));
+    let mut coarse_probs = softmax(coarse_cells.iter().map(|&(_, _, m)| m));
+    mix_uniform(&mut coarse_probs, noise);
 
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
@@ -229,7 +265,8 @@ fn sample_candidates_with(
                 }
             }
         }
-        let fine_probs = softmax(fine.iter().map(|&(_, _, v)| v));
+        let mut fine_probs = softmax(fine.iter().map(|&(_, _, v)| v));
+        mix_uniform(&mut fine_probs, noise);
         let fi = sample_index(&fine_probs, rng());
         let (row, col, _) = fine[fi];
         let p_fine = fine_probs[fi];
@@ -459,7 +496,7 @@ mod tests {
         grid.logits[snapped_index] = 20.0;
         let random_values = vec![0.13, 0.73, 0.41, 0.89, 0.27, 0.61];
         let expected =
-            sample_candidates_with(&grid, 64, stream(random_values.clone()), |row, col| {
+            sample_candidates_with(&grid, 64, 0.0, stream(random_values.clone()), |row, col| {
                 expected_placement[row * width + col]
             });
         let actual = sample_candidates(&grid, 64, stream(random_values));
@@ -688,5 +725,50 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod noise_tests {
+    use super::*;
+
+    #[test]
+    fn mixing_uniform_preserves_normalisation() {
+        for noise in [0.0, 0.1, 0.25, 0.9] {
+            let mut probs = vec![0.7, 0.2, 0.09, 0.01];
+            mix_uniform(&mut probs, noise);
+            let total: f64 = probs.iter().sum();
+            assert!(
+                (total - 1.0).abs() < 1e-12,
+                "noise {noise} left the mass at {total}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixing_floors_the_tail_without_reordering() {
+        // The point of the noise is that a cell the policy has written off
+        // still gets proposed sometimes -- and that it does not overturn the
+        // policy's ranking while doing so.
+        let mut probs = vec![0.97, 0.02, 0.009, 0.001];
+        let before = probs.clone();
+        mix_uniform(&mut probs, 0.25);
+        assert!(
+            probs[3] > before[3] * 10.0,
+            "the tail should be lifted substantially, {} -> {}",
+            before[3],
+            probs[3]
+        );
+        for pair in probs.windows(2) {
+            assert!(pair[0] > pair[1], "the policy's ordering must survive");
+        }
+    }
+
+    #[test]
+    fn zero_noise_is_exactly_the_policy() {
+        let mut probs = vec![0.5, 0.3, 0.2];
+        let before = probs.clone();
+        mix_uniform(&mut probs, 0.0);
+        assert_eq!(probs, before, "the default must not perturb anything");
     }
 }

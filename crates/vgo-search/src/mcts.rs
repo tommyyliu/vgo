@@ -13,6 +13,26 @@ pub struct SearchConfig {
     pub widening_coefficient: f64,
     pub widening_exponent: f64,
     pub exploration: f64,
+    /// Uniform mass mixed into the root's candidate proposal, in [0, 1).
+    ///
+    /// Candidates are *sampled* from the policy rather than enumerated, so a
+    /// placement the network rates near zero is never proposed and never
+    /// searched -- and the training target is the root visit distribution, so
+    /// the next policy learns the same blind spot. That is a fixed point a
+    /// self-play loop can sit in indefinitely.
+    ///
+    /// Mixing uniform mass into the proposal puts a floor under the rate at
+    /// which underrated moves get looked at, which is what Dirichlet noise does
+    /// for AlphaZero. It is applied at the root only, for the same reason
+    /// AlphaZero does: that is where the target comes from, and noising deeper
+    /// nodes would weaken the search without diversifying anything learned.
+    ///
+    /// `beta` is recomputed from the mixture, so the importance correction the
+    /// policy target relies on stays exact.
+    ///
+    /// Zero disables it, which is the default: this changes what gets explored
+    /// and so belongs to a run's identity rather than arriving silently.
+    pub root_exploration_noise: f64,
     pub maximum_depth: u32,
     /// Coarse pool factor for coarse->fine candidate sampling. When > 0 and the
     /// policy exposes a fine grid, candidates are drawn from the net's own map
@@ -49,6 +69,7 @@ impl SearchConfig {
             widening_coefficient: 2.0,
             widening_exponent: 0.5,
             exploration: 1.5,
+            root_exploration_noise: 0.0,
             maximum_depth: 64,
             coarse_pool: 0,
             temperature: 0.0,
@@ -216,6 +237,9 @@ pub(crate) struct Node {
     /// Building a fine grid computes legality for every policy cell. Cache both
     /// success and absence so progressive widening never repeats that work.
     fine_grid: FineGridCache,
+    /// Whether this node is the search root. Only the root takes exploration
+    /// noise, so the flag has to survive being moved into the tree.
+    is_root: bool,
 }
 
 enum FineGridCache {
@@ -252,6 +276,7 @@ impl Node {
             proposal_draws: 0,
             coarse_budget: None,
             fine_grid: FineGridCache::Uninitialized,
+            is_root: false,
         }
     }
 
@@ -273,6 +298,7 @@ impl Node {
             proposal_draws: 0,
             coarse_budget: None,
             fine_grid: FineGridCache::Unavailable,
+            is_root: false,
         }
     }
 
@@ -298,6 +324,14 @@ impl Node {
         stats.evaluations += 1;
         let evaluation = evaluator.evaluate(&position)?;
         Ok(Self::from_evaluation(position, evaluation, match_seed))
+    }
+
+    /// Mark this node as the search root, so it takes exploration noise.
+    ///
+    /// Set by whoever builds the root rather than inferred, because a node has
+    /// no view of the tree it will be placed in.
+    pub(crate) fn mark_root(&mut self) {
+        self.is_root = true;
     }
 
     pub(crate) fn black_evaluation(&self) -> f64 {
@@ -335,7 +369,17 @@ impl Node {
                     .map_or(FineGridCache::Unavailable, FineGridCache::Ready);
             }
             if matches!(self.fine_grid, FineGridCache::Ready(_)) {
-                self.widen_coarse_fine(desired, stats);
+                // Root only. The training target is the root visit
+                // distribution, so that is where diversifying the proposal
+                // changes what gets learned; noising deeper nodes would spend
+                // simulations on worse moves without widening anything the
+                // loop trains on.
+                let noise = if self.is_root {
+                    config.root_exploration_noise.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                self.widen_coarse_fine(desired, noise, stats);
                 self.coarse_budget = Some(desired);
                 normalize_priors(&mut self.children);
                 return;
@@ -383,7 +427,10 @@ impl Node {
     /// multiplicity on the existing child rather than triggering a retry. Each
     /// child's exact sampling probability beta is recorded, and pass is always
     /// available.
-    fn widen_coarse_fine(&mut self, desired: usize, stats: &mut SearchStats) {
+    /// `noise` is uniform mass mixed into the proposal; see
+    /// [`SearchConfig::root_exploration_noise`]. Passed in rather than read
+    /// from the config here because only the root takes it.
+    fn widen_coarse_fine(&mut self, desired: usize, noise: f64, stats: &mut SearchStats) {
         let FineGridCache::Ready(grid) = &self.fine_grid else {
             unreachable!("coarse-to-fine widening requires a cached grid");
         };
@@ -424,7 +471,8 @@ impl Node {
             rng = crate::candidates::splitmix64(rng);
             crate::candidates::unit_f64(rng)
         };
-        let samples = crate::coarse_fine::sample_candidates(grid, draw_count, &mut next);
+        let samples =
+            crate::coarse_fine::sample_candidates_noisy(grid, draw_count, noise, &mut next);
         self.sample_rng = rng;
         for sample in samples {
             self.proposal_draws += 1;
@@ -977,6 +1025,7 @@ pub fn search_at_ply(
     );
     let mut stats = SearchStats::default();
     let mut root = Node::new(position.clone(), None, match_seed, evaluator, &mut stats)?;
+    root.mark_root();
     if config.leaf_batch > 1 {
         run_batched_simulations(&mut root, config, match_seed, evaluator, &mut stats)?;
     } else {
