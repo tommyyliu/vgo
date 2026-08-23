@@ -11,6 +11,7 @@ import subprocess
 
 if TYPE_CHECKING:
     from .packed_states import PackedStates
+    from .packed_policy import PackedPolicy
 import tempfile
 
 import numpy as np
@@ -26,8 +27,8 @@ REPLAY_MAGIC = b"VGORPLY1"
 #
 # Older records synthesize unavailable fields so replay windows can span schema
 # versions. REPLAY_VERSION is the version the current generator writes.
-REPLAY_VERSION = 6
-REPLAY_VERSIONS = (1, 2, 3, 4, 5, 6)
+REPLAY_VERSION = 7
+REPLAY_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
 
 # v4 stores the position and a sparse policy instead of a rendered raster.
 # These capacities are the writer's, in crates/vgo-selfplay/src/replay_stream.rs,
@@ -43,7 +44,12 @@ V6_POLICY_CAPACITY = 128
 
 
 def policy_capacity(version: int) -> int:
-    """Policy slots per record for a replay version."""
+    """Policy slots per record for a replay version.
+
+    v7 shards carry their own capacity in the header and never reach here; this
+    covers v4 through v6, whose capacity was a constant the writer and reader
+    had to keep in sync by hand.
+    """
     return V6_POLICY_CAPACITY if version >= 6 else V4_POLICY_CAPACITY
 
 
@@ -77,6 +83,13 @@ _RUST_RENDERER = (
     Path(__file__).resolve().parents[2] / "target/release/examples/render_shard"
 )
 HEADER = struct.Struct("<8s6I")
+# v7 appends the shard's policy capacity, so the record size is a property of
+# the file rather than of the reader's version table. Widening is a run-level
+# choice now -- 227 draws touch ~151 cells and 453 touch ~214 -- and a single
+# constant would have to be sized for the widest run anyone might make, padding
+# every other shard to match. Older headers stop at HEADER.size and take their
+# capacity from `policy_capacity()`.
+HEADER_V7 = struct.Struct("<8s7I")
 
 
 @dataclass(frozen=True)
@@ -186,6 +199,13 @@ class PreparedRasterDataset:
     # holds an empty view kept for its dtype and channel count, and callers
     # wanting rows expand this instead. See vgo_training/packed_states.py.
     packed_states: "PackedStates | None" = None
+    # Policy targets and legal masks, compactly. Once states are packed and
+    # ownership released these are the whole window: measured on a real shard,
+    # 65,540 bytes of dense float32 target that is 99.67% zeros, plus 16,385
+    # bytes of mask held one byte per bit. `policies` and `policy_masks` then
+    # keep empty views for their shapes, and callers wanting rows expand this.
+    # See vgo_training/packed_policy.py.
+    packed_policy: "PackedPolicy | None" = None
 
     @property
     def samples(self) -> int:
@@ -208,12 +228,26 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_header(path: Path) -> tuple[bytes, int, int, int, int, int, int]:
+def _read_header(path: Path) -> tuple[bytes, int, int, int, int, int, int, int]:
+    """Header fields, with the policy capacity last.
+
+    Pre-v7 headers do not carry a capacity, so it is filled in from the version
+    table and the tuple keeps one shape for every caller.
+    """
     with path.open("rb") as stream:
-        header = stream.read(HEADER.size)
-    if len(header) != HEADER.size:
+        header = stream.read(HEADER_V7.size)
+    if len(header) < HEADER.size:
         raise ValueError("dataset header is truncated")
-    magic, version, samples, channels, height, width, policy_size = HEADER.unpack(header)
+    magic, version, samples, channels, height, width, policy_size = HEADER.unpack(
+        header[: HEADER.size]
+    )
+    capacity = 0
+    if magic == REPLAY_MAGIC and version >= 7:
+        if len(header) != HEADER_V7.size:
+            raise ValueError("v7 dataset header is truncated")
+        capacity = HEADER_V7.unpack(header)[-1]
+        if capacity == 0:
+            raise ValueError("v7 header declares a zero policy capacity")
     if magic not in (MAGIC, REPLAY_MAGIC):
         raise ValueError(f"unexpected dataset magic: {magic!r}")
     if magic == MAGIC:
@@ -238,7 +272,16 @@ def _read_header(path: Path) -> tuple[bytes, int, int, int, int, int, int]:
             )
         if side > min(height, width):
             raise ValueError("placement grid must not exceed the raster resolution")
-    return magic, version, samples, channels, height, width, policy_size
+    return (
+        magic,
+        version,
+        samples,
+        channels,
+        height,
+        width,
+        policy_size,
+        capacity or policy_capacity(version),
+    )
 
 
 def _validate_manifest(path: Path) -> None:
@@ -495,7 +538,9 @@ def rasterize_records(
     return out.reshape(samples, CHANNEL_COUNT * height * width)
 
 
-def _v4_record_dtype(policy_size: int, version: int = REPLAY_VERSION) -> np.dtype:
+def _v4_record_dtype(
+    policy_size: int, version: int = REPLAY_VERSION, capacity: int | None = None
+) -> np.dtype:
     """Fixed-size v4 record: position, sparse policy, scalars.
 
     Both variable-length parts pad to a capacity so records stay memory-mappable;
@@ -523,8 +568,22 @@ def _v4_record_dtype(policy_size: int, version: int = REPLAY_VERSION) -> np.dtyp
             ("touched", "<u4"),
             (
                 "cells",
+                # v7 repacks the cell from 20 bytes to 12 and drops `policy`,
+                # which is exactly `visits / sum(visits)` -- verified to 0.0
+                # across 13,877 rows including every pass entry -- so the reader
+                # derives it. `index` fits u16 against a 16,385-cell grid;
+                # `proposal_counts` needs u16 because a concentrated cell took
+                # 92 of 96 draws and that scales with the budget; `visits` stays
+                # u32 so the simulation count is not capped at 65,535.
                 np.dtype(
                     [
+                        ("index", "<u2"),
+                        ("visits", "<u4"),
+                        ("beta", "<f4"),
+                        ("proposal_counts", "<u2"),
+                    ]
+                    if version >= 7
+                    else [
                         ("index", "<u4"),
                         ("policy", "<f4"),
                         ("visits", "<f4"),
@@ -532,7 +591,7 @@ def _v4_record_dtype(policy_size: int, version: int = REPLAY_VERSION) -> np.dtyp
                         ("proposal_counts", "<u4"),
                     ]
                 ),
-                (policy_capacity(version),),
+                (capacity if version >= 7 and capacity else policy_capacity(version),),
             ),
             ("value", "<f4"),
             ("selected_action", "<u4"),
@@ -560,8 +619,8 @@ def _expand_sparse_policy(
 
     counts = np.asarray(records["touched"], dtype=np.int64)
     cells = records["cells"]
-    # The dtype was built for this shard's version, so its width is the
-    # capacity -- v4/v5 hold 64 cells and v6 holds 128.
+    # The dtype was built for this shard, so its width is the capacity -- v4/v5
+    # hold 64, v6 holds 128, and v7 holds whatever its header declared.
     capacity = cells.shape[1]
     if int(counts.max(initial=0)) > capacity:
         raise ValueError("replay record claims more touched cells than the capacity")
@@ -575,12 +634,48 @@ def _expand_sparse_policy(
     columns = np.asarray(cells["index"], dtype=np.int64)[live]
     if columns.size and int(columns.max()) >= policy_size:
         raise ValueError("replay cell index is outside the policy tensor")
-    policies[rows, columns] = np.asarray(cells["policy"])[live]
     masks[rows, columns] = 1.0
     visits[rows, columns] = np.asarray(cells["visits"])[live]
+    if "policy" in (cells.dtype.names or ()):
+        policies[rows, columns] = np.asarray(cells["policy"])[live]
+    else:
+        # v7 does not store the policy: it is the visit distribution, and
+        # keeping both meant four redundant bytes in every cell. Rows whose
+        # visits are all zero stay zero rather than dividing by it.
+        totals = visits.sum(axis=1, keepdims=True)
+        np.divide(visits, totals, out=policies, where=totals > 0)
     beta[rows, columns] = np.asarray(cells["beta"])[live]
     proposal_counts[rows, columns] = np.asarray(cells["proposal_counts"])[live]
     return policies, masks, visits, beta, proposal_counts
+
+
+def header_size(version: int) -> int:
+    """Bytes before the first record.
+
+    v7 appended the policy capacity, so its header is one u32 longer. Reading a
+    v7 shard at the old offset shifts every record by four bytes and fails as a
+    size mismatch, which is the good outcome -- but only because the length
+    check runs first.
+    """
+    return HEADER_V7.size if version >= 7 else HEADER.size
+
+
+def _sparse_policies(cells: np.ndarray) -> np.ndarray:
+    """Per-cell policy for a sparse block, stored or derived.
+
+    v7 records the visit counts and nothing else, because the policy was exactly
+    their normalisation -- confirmed to 0.0 across 13,877 rows. Rows with no
+    visits normalise to zero rather than dividing by it; a search that recorded
+    no visits has no distribution to express.
+    """
+    names = cells.dtype.names or ()
+    if "policy" in names:
+        return cells["policy"].astype(np.float32)
+    visits = cells["visits"].astype(np.float32)
+    totals = visits.sum(axis=1, keepdims=True)
+    out = np.zeros_like(visits)
+    np.divide(visits, totals, out=out, where=totals > 0)
+    return out
 
 
 def _load_replay_v4(
@@ -592,6 +687,7 @@ def _load_replay_v4(
     policy_size: int,
     version: int = REPLAY_VERSION,
     raster_kind: str | None = None,
+    capacity: int | None = None,
 ) -> tuple[np.ndarray, ...]:
     """Loads a position shard, rendering each state at load time.
 
@@ -599,14 +695,14 @@ def _load_replay_v4(
     produced here and the layout is a training-time choice rather than a
     property of the data -- see docs/POSITION_SHARDS.md.
     """
-    record_dtype = _v4_record_dtype(policy_size, version)
-    expected_bytes = HEADER.size + samples * record_dtype.itemsize
+    record_dtype = _v4_record_dtype(policy_size, version, capacity)
+    expected_bytes = header_size(version) + samples * record_dtype.itemsize
     if path.stat().st_size != expected_bytes:
         raise ValueError(
             f"replay size mismatch: expected {expected_bytes}, got {path.stat().st_size}"
         )
     records = np.memmap(
-        path, dtype=record_dtype, mode="r", offset=HEADER.size, shape=(samples,)
+        path, dtype=record_dtype, mode="r", offset=header_size(version), shape=(samples,)
     )
     if int(np.asarray(records["stone_count"]).max(initial=0)) > V4_STONE_CAPACITY:
         raise ValueError("replay record claims more stones than the capacity")
@@ -666,7 +762,7 @@ def _load_replay(
         ("seed", "<u8"),
     ]
     record_dtype = np.dtype(fields, align=False)
-    expected_bytes = HEADER.size + samples * record_dtype.itemsize
+    expected_bytes = header_size(version) + samples * record_dtype.itemsize
     if path.stat().st_size != expected_bytes:
         raise ValueError(
             f"replay size mismatch: expected {expected_bytes}, got {path.stat().st_size}"
@@ -675,7 +771,7 @@ def _load_replay(
         path,
         dtype=record_dtype,
         mode="r",
-        offset=HEADER.size,
+        offset=header_size(version),
         shape=(samples,),
     )
     policies = np.array(records["policy"], copy=True)
@@ -751,7 +847,9 @@ def load_dataset(path: str | Path, *, raster_kind: str | None = None) -> RasterD
             f"{sorted(RASTER_CHANNELS)}"
         )
     path = Path(path).resolve(strict=True)
-    magic, version, samples, channels, height, width, policy_size = _read_header(path)
+    magic, version, samples, channels, height, width, policy_size, capacity = _read_header(
+        path
+    )
     if magic == REPLAY_MAGIC:
         _validate_manifest(path)
         if version >= 4:
@@ -760,7 +858,15 @@ def load_dataset(path: str | Path, *, raster_kind: str | None = None) -> RasterD
             if raster_kind is not None:
                 channels = RASTER_CHANNELS[raster_kind]
             arrays = _load_replay_v4(
-                path, samples, channels, height, width, policy_size, version, raster_kind
+                path,
+                samples,
+                channels,
+                height,
+                width,
+                policy_size,
+                version,
+                raster_kind,
+                capacity,
             )
         else:
             _reject_stored_raster_mismatch(raster_kind, channels)
@@ -870,7 +976,8 @@ def load_dataset(path: str | Path, *, raster_kind: str | None = None) -> RasterD
         ),
         sparse=None if sparse_cells is None else SparsePolicy(
             indices=torch.from_numpy(sparse_cells["index"].astype(np.int64)),
-            policies=torch.from_numpy(sparse_cells["policy"].astype(np.float32)),
+            # v7 drops the stored policy; it is the normalised visit counts.
+            policies=torch.from_numpy(_sparse_policies(sparse_cells)),
             visits=torch.from_numpy(sparse_cells["visits"].astype(np.float32)),
             betas=torch.from_numpy(sparse_cells["beta"].astype(np.float32)),
             proposal_counts=torch.from_numpy(

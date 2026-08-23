@@ -25,6 +25,10 @@ from .dataset import (
 )
 from .model import MODEL_ARCHITECTURES, build_model
 from .packed_states import is_packable, pack as pack_states
+from .packed_policy import (
+    is_packable as is_policy_packable,
+    pack as pack_policy,
+)
 from .recency import row_weights
 from .serve import load_model
 from .train_demo import (
@@ -116,6 +120,14 @@ class LearnerConfig:
     # and puts every parameter on Adam at `learning_rate`.
     muon_learning_rate: float = 0.01
     full_adam: bool = False
+    # Overrides the `full_adam` pair when set, so every existing recipe keeps
+    # its meaning. "ranger21" is AdamW plus lookahead, gradient centralization,
+    # adaptive gradient clipping, norm loss and stable weight decay -- a bundle,
+    # so a win by it does not isolate which of those did the work. Its own
+    # warmup and warmdown are switched off in `_build_optimizer`, which leaves
+    # `schedule` driving every arm and makes the comparison about the optimizer
+    # rather than about two different learning-rate curves.
+    optimizer: str | None = None
     threads: int = 4
     device: str = "cuda"
     precision: str = "float32"
@@ -153,6 +165,12 @@ class LearnerConfig:
             raise ValueError(f"unknown training precision: {self.precision!r}")
         if self.schedule not in ("wsd", "cosine"):
             raise ValueError(f"unknown learning-rate schedule: {self.schedule!r}")
+        if self.optimizer is not None and self.optimizer not in (
+            "adam",
+            "muon",
+            "ranger21",
+        ):
+            raise ValueError(f"unknown optimizer: {self.optimizer!r}")
         if self.warmup_epochs < 0:
             raise ValueError("warmup epochs must be nonnegative")
         if not 0.0 <= self.decay_fraction <= 1.0:
@@ -333,6 +351,28 @@ def _pack_states(dataset: RasterDataset) -> RasterDataset:
     )
 
 
+def _pack_policy(dataset: RasterDataset) -> RasterDataset:
+    """Replace a shard's dense policy targets and masks with the packed form.
+
+    These dominate the window once states are packed and ownership is released:
+    a dense float32 target that is 99.67% zeros, and a boolean mask at one byte
+    per cell. `policies` and `policy_masks` are left as zero-sample views so
+    anything reading their width still works -- `apply_dihedral` takes the
+    policy resolution from `policies.shape[1]` -- and the stager expands only
+    the rows a batch needs.
+    """
+    if dataset.packed_policy is not None or not is_policy_packable(
+        dataset.policies, dataset.policy_masks
+    ):
+        return dataset
+    return replace(
+        dataset,
+        policies=dataset.policies[:0].clone(),
+        policy_masks=dataset.policy_masks[:0].clone(),
+        packed_policy=pack_policy(dataset.policies, dataset.policy_masks),
+    )
+
+
 class ReplayCache:
     """In-memory cache of validated, prepared immutable replay shards."""
 
@@ -393,6 +433,9 @@ class ReplayCache:
         # 4.2x less; the stager expands only the rows a batch needs, at 0.04%
         # of a training step. Layouts without that structure keep dense states.
         prepared = _pack_states(prepared)
+        # The targets are the rest of the window once states are packed: dense
+        # float32 that is 99.67% zeros, plus a mask at one byte per bit.
+        prepared = _pack_policy(prepared)
         entry = PreparedReplayShard(
             path=resolved,
             digest=digest,
@@ -863,21 +906,32 @@ class BatchStager:
                 packed.expand(
                     part.rows, out=slot.host[0][offset : offset + part_count]
                 )
-            for source, target in zip(
-                (
-                    dataset.policies,
-                    dataset.policy_masks,
-                    dataset.values,
-                ),
-                slot.host[1:],
-                strict=False,
-            ):
-                torch.index_select(
-                    source,
-                    0,
-                    part.rows,
-                    out=target[offset : offset + part_count],
+            # Targets may be held packed for the same reason as states: the
+            # dense form is a float32 tensor that is 99.67% zeros plus a mask
+            # at one byte per bit. See vgo_training/packed_policy.py.
+            packed_targets = getattr(dataset, "packed_policy", None)
+            if packed_targets is None:
+                sources = (dataset.policies, dataset.policy_masks)
+                for source, target in zip(sources, slot.host[1:3], strict=False):
+                    torch.index_select(
+                        source,
+                        0,
+                        part.rows,
+                        out=target[offset : offset + part_count],
+                    )
+            else:
+                packed_targets.expand_policies(
+                    part.rows, slot.host[1][offset : offset + part_count]
                 )
+                packed_targets.expand_masks(
+                    part.rows, slot.host[2][offset : offset + part_count]
+                )
+            torch.index_select(
+                dataset.values,
+                0,
+                part.rows,
+                out=slot.host[3][offset : offset + part_count],
+            )
             # Ownership separately: a shard predating `final_stones` has none,
             # and zeroing the destination slice is far cheaper than materialising
             # a zero source of `samples x policy_size` to index into.
@@ -896,6 +950,8 @@ class BatchStager:
                 spec.transform,
                 dataset.height,
                 dataset.width,
+                # `policies` may be a zero-sample view when the targets are
+                # packed; its width survives, which is all this needs.
                 int(round((dataset.policies.shape[1] - 1) ** 0.5)),
                 int(round((dataset.policies.shape[1] - 1) ** 0.5)),
             )
@@ -1115,8 +1171,31 @@ def _build_optimizer(
     Muon landed used. Otherwise 2D+ weights that are not an output head go to
     Muon: the heads are 1x1 convs and thin linears, which are rank-degenerate
     and so meaningless to orthogonalize, and norm weights are 1D.
+
+    `config.optimizer`, when set, overrides that pair by name so an A/B can
+    select an arm without recipes having to know about `full_adam`.
     """
-    if config.full_adam:
+    choice = config.optimizer or ("adam" if config.full_adam else "muon")
+
+    if choice == "ranger21":
+        # Ranger21 schedules its own warmup and warmdown from num_epochs and
+        # num_batches_per_epoch, and refuses to construct without them. Both are
+        # switched off here so `schedule` still drives the rate, which is what
+        # keeps an optimizer A/B from silently comparing two different curves;
+        # with scheduling off the counts are unused, so the epoch count is
+        # passed for its logging and the batch count is nominal.
+        from ranger21 import Ranger21
+
+        return Ranger21(
+            model.parameters(),
+            lr=config.learning_rate,
+            num_epochs=max(1, config.epochs),
+            num_batches_per_epoch=1,
+            use_warmup=False,
+            warmdown_active=False,
+        )
+
+    if choice == "adam":
         return torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
     from .muon import HybridMuon
