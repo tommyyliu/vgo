@@ -140,6 +140,7 @@
     <label class="ck"><input type="checkbox" id="ovLock" checked> settled (uninteractable) shading</label>
     <label class="ck"><input type="checkbox" id="ovFree"> legal-placement mask</label>
     <label class="ck"><input type="checkbox" id="ovIds"> stone ids</label>
+    <label class="ck" title="what the bot's last search actually considered: dots sized by visits, and shading over legal ground it never proposed a move in"><input type="checkbox" id="ovSearch"> bot exploration</label>
     <label class="ck"><input type="checkbox" id="ovSnap" checked> snap to nearest legal spot</label>
     <label class="ck"><input type="checkbox" id="ovPreview" checked> preview hovered move</label>
     <hr>
@@ -376,6 +377,7 @@ function renderBoard() {
   // 2. legal-placement mask (debug), then settled region — both under the edges
   if (opt('ovFree')) svg += freeMaskSVG();
   if (opt('ovLock')) svg += settledSVG();
+  if (opt('ovSearch')) svg += searchSVG();
 
   // 3. cell boundaries — soft between same-group cells, hard between groups
   if (opt('ovBounds')) {
@@ -403,6 +405,73 @@ function renderBoard() {
 }
 
 // Legal-placement mask (debug): the one intentionally raster overlay.
+/* Draw what the bot's last search considered.
+   Two layers, because the interesting part is the absence rather than the
+   presence. Shading covers legal ground no candidate landed near: MCTS samples
+   its candidates from the policy instead of enumerating moves, so a placement
+   the network rates near zero is never proposed and never searched. A move that
+   beats the bot from a shaded region was never seen -- a different failure from
+   being seen and misjudged, and not one more thinking time would fix.
+   Dots are the candidates, area proportional to visits, so the eye reads search
+   effort rather than count. Hollow rings are proposed-but-unvisited: the search
+   drew them and never spent a simulation there. */
+function searchSVG() {
+  if (!LAST_SEARCH) return '';
+  const cands = LAST_SEARCH.list;
+  if (!cands.length) return '';
+  const r = state.radius, R2 = r * r;
+  const moverKey = LAST_SEARCH.mover;                       // captured when the search ran
+  const mover = COLORS[moverKey];
+
+  // Layer 1: legal ground no candidate would have covered. MCTS samples its
+  // candidates from the policy instead of enumerating moves, so a placement the
+  // network rates near zero is never proposed and never searched. A move that
+  // beats the bot from in here was never seen -- a different failure from being
+  // seen and misjudged, and not one more thinking time would fix.
+  const K = 160;
+  const off = document.createElement('canvas'); off.width = K; off.height = K;
+  const c2 = off.getContext('2d'), img = c2.createImageData(K, K), px = img.data;
+  for (let i = 0; i < K * K; i++) {
+    const bx = ((i % K) + 0.5) / K, by = (((i / K) | 0) + 0.5) / K, j = i * 4;
+    if (!isLegalPlacement(bx, by)) { px[j + 3] = 0; continue; }
+    let seen = false;
+    for (const k of cands) {
+      const dx = k.x - bx, dy = k.y - by;
+      if (dx * dx + dy * dy < R2) { seen = true; break; }
+    }
+    px[j] = 190; px[j + 1] = 60; px[j + 2] = 60; px[j + 3] = seen ? 0 : 52;
+  }
+  c2.putImageData(img, 0, 0);
+  let out = `<image href="${off.toDataURL()}" x="0" y="0" width="1" height="1" preserveAspectRatio="none"/>`;
+
+  // Layer 2: every candidate as the stone it would actually be, at true radius.
+  // Overlap is the point -- two candidates closer than a radius are nearly the
+  // same move, and drawing them at size makes that visible rather than implied.
+  //
+  // Opacity carries visits, so the eye reads where search effort went. The rim
+  // carries the value from *this mover's* side: `value` is Black's, so White's
+  // turn flips it. Green means the search liked the resulting position.
+  const top = Math.max(1, ...cands.map(k => k.visits));
+  const ordered = [...cands].sort((a, b) => a.visits - b.visits);   // busiest drawn last
+  for (const k of ordered) {
+    const share = k.visits / top;
+    const v = Math.max(-1, Math.min(1, k.value));   // already from the mover's side
+    const rim = k.visits === 0 ? '#8a94a0'
+      : `hsl(${Math.round(120 * (v + 1) / 2)} 70% 55%)`;
+    const tip = k.visits === 0
+      ? `proposed, never searched\nprior ${(k.prior * 100).toFixed(1)}%`
+      : `${k.visits} visits (${(share * 100).toFixed(0)}% of best)\n` +
+        `value ${v >= 0 ? '+' : ''}${v.toFixed(3)} for ${mover.name}\n` +
+        `prior ${(k.prior * 100).toFixed(1)}%  ·  ${k.proposals} draw${k.proposals === 1 ? '' : 's'}`;
+    out += `<circle cx="${f(k.x)}" cy="${f(k.y)}" r="${f(r)}" ` +
+      `fill="${mover.stone}" fill-opacity="${(0.05 + 0.45 * share).toFixed(3)}" ` +
+      `stroke="${rim}" stroke-opacity="${k.visits === 0 ? 0.35 : 0.85}" ` +
+      `stroke-width="${k.visits === 0 ? 1 : 1.6}" ${NSS}>` +
+      `<title>${tip}</title></circle>`;
+  }
+  return out;
+}
+
 function freeMaskSVG() {
   const K = 256;
   const off = document.createElement('canvas'); off.width = K; off.height = K;
@@ -812,6 +881,15 @@ syncEngineControls();
    a 33 MB model and compiles a WebGPU pipeline, which is a great deal of work
    to do for a visitor who only wants to push stones around. */
 let browserEngine = null;
+/* The last search's root candidates, for the exploration overlay.
+   Held rather than recomputed: the search is seconds long, and the question the
+   overlay answers -- did it even look here? -- is about the move just played.
+
+   The mover is captured with them. `state.toMove` advances the moment the move
+   lands and again on the reply, so deriving the colour at draw time would tint
+   the candidates wrong and invert every value one ply later. */
+let LAST_SEARCH = null;      // { list, mover } or null
+
 // A per-session seed, so the search is reproducible within a page load and a
 // rematch is not a replay. Search is deterministic given a seed, which is worth
 // keeping: a game that can be reproduced can be diagnosed.
@@ -846,7 +924,7 @@ async function browserModelMove() {
   // pass to close out a win nor see that passing while behind loses. Note that
   // the server backend above does *not* send it -- vgo-serve-move's protocol has
   // no field for it, so that path still has this blind spot.
-  const { pass, x, y, simulations, elapsed } = await bot.chooseMove({
+  const { pass, x, y, simulations, elapsed, candidates } = await bot.chooseMove({
     radius: state.radius,
     komi: state.komi,
     toMove: state.toMove,
@@ -857,11 +935,22 @@ async function browserModelMove() {
     thinkMillis: (Number.isFinite(seconds) ? Math.max(0.2, seconds) : 5) * 1000,
     seed: AI_SESSION_SEED ^ VGO.gameTree.ply(current),
     onProgress: count => aiSay(`thinking... ${count}`),
+    // Only when the overlay is on: ~90 candidates per move is real work to
+    // serialize, and a game played without the overlay should not pay for it.
+    includeCandidates: opt('ovSearch'),
   });
+  // The wasm bindings report `value` from Black's side; orient it here so both
+  // backends store the same convention and the overlay never has to ask.
+  const flip = state.toMove === 'B' ? 1 : -1;
+  LAST_SEARCH = candidates
+    ? { list: candidates.filter(c => c.x != null).map(c => ({ ...c, value: flip * c.value })),
+        mover: state.toMove }
+    : null;
 
   aiSay('played',
     `${simulations} simulations in ${(elapsed / 1000).toFixed(1)}s\n` +
-    `${(simulations / (elapsed / 1000)).toFixed(0)}/s · leaf batch ${bot.info.leafBatch}`);
+    `${(simulations / (elapsed / 1000)).toFixed(0)}/s · leaf batch ${bot.info.leafBatch}` +
+    (LAST_SEARCH ? `\n${LAST_SEARCH.list.length} candidates considered` : ''));
   // The move is an action, not a board: it is applied through the same path a
   // human click takes, so the tree, undo and the SGF record cannot diverge from
   // what was played.
@@ -946,6 +1035,12 @@ async function serverModelMove() {
   });
   const reply = await response.json();
   if (!response.ok) { aiSay('server error', reply.error || response.statusText); return false; }
+  // vgo-serve-move already orients `value` to the side that moved, so unlike
+  // the browser path this needs no sign flip -- LAST_SEARCH always holds values
+  // from the mover's side whichever backend produced them.
+  LAST_SEARCH = reply.candidates?.length
+    ? { list: reply.candidates.filter(c => !c.pass), mover: state.toMove }
+    : null;
   const lines = (reply.candidates || []).slice(0, 5).map(c =>
     `${c.pass ? 'pass' : c.x.toFixed(3) + ',' + c.y.toFixed(3)}  v=${c.visits}  ${c.value >= 0 ? '+' : ''}${c.value.toFixed(3)}`);
   aiSay('played', lines.join('\n'));
@@ -1056,7 +1151,15 @@ window.addEventListener('keydown', event => {
   event.preventDefault();
 });
 
-for (const id of ['ovRegions', 'ovBounds', 'ovLock', 'ovFree', 'ovIds']) document.getElementById(id).onchange = () => { renderBoard(); draw(); };
+for (const id of ['ovRegions', 'ovBounds', 'ovLock', 'ovFree', 'ovIds', 'ovSearch']) document.getElementById(id).onchange = () => { renderBoard(); draw(); };
+/* The overlay draws the *last* search, and candidates are only requested when
+   the box is already ticked, so ticking it after a move shows nothing until the
+   next one. Say so, rather than rendering an empty board and looking broken. */
+document.getElementById('ovSearch').addEventListener('change', event => {
+  if (event.target.checked && !LAST_SEARCH) {
+    aiSay('exploration', 'nothing recorded yet — let the bot play a move with this on');
+  }
+});
 document.getElementById('ovSnap').onchange = () => draw();
 document.getElementById('ovPreview').onchange = () => draw();
 
