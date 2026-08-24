@@ -27,7 +27,7 @@
 //! toward reporting too much settled. `resolution` oversamples the mask to
 //! shrink that; `examples/settled_edt.rs` measures what it costs.
 
-use vgo_core::{COORDINATE_EPSILON, Point, Position, distance_to_legal_set, legal_set_vertices};
+use vgo_core::{no_legal_point_closer_than, COORDINATE_EPSILON, Point, Position, distance_to_legal_set, legal_set_vertices};
 
 use crate::RasterConfig;
 
@@ -441,11 +441,42 @@ fn masks_by_bounded_distance(
         Vec::new()
     };
     let mut exact_tests = 0usize;
+    // The nearest stone, a row at a time, stones outside and pixels inside.
+    //
+    // This loop is 85% of `settled`, and `settled` is ~80% of the raster, so its
+    // shape is most of what rasterization costs. Asked per pixel -- by scanning
+    // the stone list, or by looking it up in a spatial grid -- it does not
+    // vectorize, and a grid additionally pays cell arithmetic and indirection at
+    // every pixel. Written this way the inner loop is a flat min over contiguous
+    // f64, which is the shape the autovectorizer handles. It is also the
+    // structure the four non-`settled` planes already use, and they compute two
+    // minima for both colours in a fraction of what this cost for one.
+    let row_width = config.width;
+    let mut column_xs = vec![0.0f64; row_width];
+    for (column, x) in column_xs.iter_mut().enumerate() {
+        *x = (column as f64 + 0.5) / row_width as f64;
+    }
+    let mut nearest_squares = vec![f64::INFINITY; row_width];
     for row in 0..config.height {
         let y = (row as f64 + 0.5) / config.height as f64;
         let fine_row = (row * scale + scale / 2).min(fine_height - 1);
+        if want_settled && !stones.is_empty() {
+            nearest_squares.fill(f64::INFINITY);
+            for stone in stones {
+                let dy = y - stone.y;
+                let dy_square = dy * dy;
+                let stone_x = stone.x;
+                // Zipped rather than indexed, and `min` rather than a branch:
+                // both are what let this compile to a flat vector min with no
+                // bounds checks in the loop.
+                for (nearest, &x) in nearest_squares.iter_mut().zip(column_xs.iter()) {
+                    let dx = x - stone_x;
+                    *nearest = dx.mul_add(dx, dy_square).min(*nearest);
+                }
+            }
+        }
         for column in 0..config.width {
-            let x = (column as f64 + 0.5) / config.width as f64;
+            let x = column_xs[column];
             let fine_column = (column * scale + scale / 2).min(fine_width - 1);
             let sampled = squared[fine_row * fine_width + fine_column].sqrt() * spacing;
 
@@ -466,15 +497,7 @@ fn masks_by_bounded_distance(
                 continue;
             }
 
-            let mut nearest_squared = f64::INFINITY;
-            for stone in stones {
-                let (dx, dy) = (x - stone.x, y - stone.y);
-                let distance = dx.mul_add(dx, dy * dy);
-                if distance < nearest_squared {
-                    nearest_squared = distance;
-                }
-            }
-            let nearest = nearest_squared.sqrt();
+            let nearest = nearest_squares[column].sqrt();
 
             mask[row * config.width + column] = if nearest <= sampled - slack {
                 true
@@ -483,7 +506,7 @@ fn masks_by_bounded_distance(
             } else {
                 exact_tests += 1;
                 let known = vertices.get_or_insert_with(|| legal_set_vertices(position));
-                nearest <= distance_to_legal_set(position, Point::new(x, y), Some(known))
+                no_legal_point_closer_than(position, Point::new(x, y), nearest, Some(known))
             };
         }
     }

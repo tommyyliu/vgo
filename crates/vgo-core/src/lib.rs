@@ -17,7 +17,8 @@ pub use game::{GameEvent, MoveError, MoveResult, pass, place};
 pub use legal_set::{
     Nearest, contains as is_legal_placement, distance as distance_to_legal_set,
     nearest as nearest_legal_placement,
-    nearest_with as nearest_legal_placement_with, vertices as legal_set_vertices,
+    nearest_with as nearest_legal_placement_with, none_closer_than as no_legal_point_closer_than,
+    vertices as legal_set_vertices,
 };
 pub use model::{Color, Phase, Position, Ruleset, Stone, Validation, ValidationIssue};
 pub use settled::SettledRegion;

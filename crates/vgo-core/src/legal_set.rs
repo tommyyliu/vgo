@@ -44,16 +44,44 @@ fn visit_candidates(
     known_vertices: Option<&[Point]>,
     mut visit: impl FnMut(Point) -> bool,
 ) -> bool {
+    visit_candidates_within(position, point, None, known_vertices, &mut visit)
+}
+
+/// [`visit_candidates`], skipping stones whose candidate cannot land within
+/// `threshold` of `point`.
+///
+/// A stone contributes the point one diameter from it along the ray to the
+/// query, so that candidate sits `|radial - diameter|` from the query. A stone
+/// farther than `threshold + diameter` therefore cannot produce anything within
+/// `threshold`, and skipping it also skips the O(stones) legality check that
+/// would have screened it -- which is what makes the whole call quadratic.
+///
+/// Only sound for a caller asking whether *anything* is within `threshold`.
+/// [`distance`] passes `None` because it needs the true minimum, which any
+/// skipped stone could hold.
+fn visit_candidates_within(
+    position: &Position,
+    point: Point,
+    threshold: Option<f64>,
+    known_vertices: Option<&[Point]>,
+    visit: &mut impl FnMut(Point) -> bool,
+) -> bool {
     if contains(position, point.x, point.y) && visit(point) {
         return true;
     }
     let radius = position.radius();
     let diameter = 2.0 * radius;
 
+    let stone_reach = threshold.map(|t| t + diameter);
     for stone in position.stones() {
         let dx = point.x - stone.x;
         let dy = point.y - stone.y;
         let radial_distance = numeric::length(dx, dy);
+        if let Some(reach) = stone_reach {
+            if radial_distance >= reach {
+                continue;
+            }
+        }
         let directions: &[(f64, f64)] = if radial_distance < numeric::EDGE_EPSILON {
             &[(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
         } else {
@@ -179,6 +207,29 @@ pub fn vertices(position: &Position) -> Vec<Point> {
 }
 
 #[must_use]
+/// Whether every legal point is at least `threshold` from `point`.
+///
+/// The same question [`distance`] answers, asked as a predicate so it can stop
+/// early. Callers testing `threshold <= distance(..)` do not need the minimum,
+/// only whether anything beats it, and the first candidate that does ends the
+/// search -- where `distance` must visit every candidate to be sure it has the
+/// smallest.
+///
+/// That matters because the candidate set is not small: one entry per stone,
+/// each screened by an O(stones) legality check, so a single call is quadratic
+/// in the stone count. Measured inside the settled mask at 240 stones, the exact
+/// tests were 6.5 ms of a 10 ms raster -- 65% of it, for 477 pixels out of
+/// 147,456.
+pub fn none_closer_than(
+    position: &Position,
+    point: Point,
+    threshold: f64,
+    known_vertices: Option<&[Point]>,
+) -> bool {
+    let mut visit = |candidate: Point| point.distance(candidate) < threshold;
+    !visit_candidates_within(position, point, Some(threshold), known_vertices, &mut visit)
+}
+
 pub fn distance(position: &Position, point: Point, known_vertices: Option<&[Point]>) -> f64 {
     let mut best = f64::INFINITY;
     visit_candidates(position, point, known_vertices, |candidate| {
@@ -411,6 +462,56 @@ pub(crate) fn escape_witness(
 
 #[cfg(test)]
 mod tests {
+    use super::none_closer_than;
+
+    fn threshold_lattice(count: usize, radius: f64) -> Position {
+        let spacing = 2.0 * radius * 1.05;
+        let per_row = ((0.88_f64 / spacing).floor() as usize).max(1);
+        let mut stones = Vec::new();
+        for index in 0..count {
+            let (row, column) = (index / per_row, index % per_row);
+            let x = radius + 0.02 + column as f64 * spacing;
+            let y = radius + 0.02 + row as f64 * spacing;
+            if x > 1.0 - radius || y > 1.0 - radius {
+                break;
+            }
+            stones.push(Stone {
+                x,
+                y,
+                color: if index % 2 == 0 { Color::Black } else { Color::White },
+            });
+        }
+        Position::new(radius, stones, Color::Black)
+    }
+
+    /// `none_closer_than` prunes stones `distance` must visit, so the two can
+    /// only be trusted together: the predicate must agree with the exact
+    /// minimum at every threshold, including right at it.
+    #[test]
+    fn the_predicate_agrees_with_the_exact_distance() {
+        for (radius, count) in [(1.0 / 18.0, 28usize), (1.0 / 18.0, 52), (1.0 / 36.0, 240)] {
+            let position = threshold_lattice(count, radius);
+            let known = vertices(&position);
+            for row in 0..24 {
+                for column in 0..24 {
+                    let point = Point::new(
+                        (column as f64 + 0.5) / 24.0,
+                        (row as f64 + 0.5) / 24.0,
+                    );
+                    let exact = distance(&position, point, Some(&known));
+                    for scale in [0.25, 0.5, 0.9, 1.0, 1.1, 2.0] {
+                        let threshold = exact * scale;
+                        assert_eq!(
+                            none_closer_than(&position, point, threshold, Some(&known)),
+                            threshold <= exact,
+                            "{count} stones, point {point:?}, threshold {threshold} vs exact {exact}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     use crate::{Color, Point, Position, Stone};
 
     use super::{contains, distance, nearest, nearest_with, vertices};
