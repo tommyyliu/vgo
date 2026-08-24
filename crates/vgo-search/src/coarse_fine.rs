@@ -14,7 +14,7 @@
 //! we return so the training side can importance-correct the target.
 
 use vgo_core::{
-    Point, Position, is_legal_placement, legal_set_vertices, nearest_legal_placement_with,
+    COORDINATE_EPSILON, Point, Position, is_inside_legal_inset, legal_set_vertices, nearest_legal_placement_with,
 };
 
 /// A sampled placement candidate and the probability it was drawn with.
@@ -84,15 +84,40 @@ impl FineGrid {
         let half_diagonal =
             0.5 * ((1.0 / width as f64).powi(2) + (1.0 / height as f64).powi(2)).sqrt();
         let exclusion = 2.0 * position.radius();
+        // Exactly `clear_of_stones`'s threshold, so the two agree bit for bit.
+        let minimum = exclusion - COORDINATE_EPSILON;
+        let minimum_squared = minimum * minimum;
         let half_x = 0.5 / width as f64;
         let half_y = 0.5 / height as f64;
+        // Distance to the nearest stone, for every cell, scattered rather than
+        // searched.
+        //
+        // Both predicates below are `nearest^2 >= threshold^2` for a threshold
+        // under `2r` -- legality wants `2r - epsilon`, the boundary band wants
+        // `2r - half_diagonal`. Asked per cell against every stone that is
+        // O(cells * stones), and a grid is built per *node*, so it is multiplied
+        // by the simulation count on every move. Measured at 128 square: 1.0 ms
+        // at 28 stones and 8.6 ms at 255, which on a standard board is seconds
+        // per move and was why a multi-radius shard produced no games at all.
+        //
+        // A stone can only bring a cell under `2r`, so scattering its own
+        // neighbourhood touches about `16 r^2` of the grid and the total is
+        // `stones * 16 r^2 * cells`. Stone count goes as `1/r^2`, so that
+        // product is constant: O(cells), whatever the board size. Cells no
+        // stone reaches keep infinity, which satisfies both thresholds exactly
+        // as an untouched cell should.
+        let nearest_squared = nearest_stone_squares(position, width, height, exclusion);
         for row in 0..height {
             for col in 0..width {
                 let point = cell_center(row, col, width, height);
                 let idx = row * width + col;
-                let placement_override = if is_legal_placement(position, point.x, point.y) {
+                let nearest = nearest_squared[idx];
+                let placement_override = if is_inside_legal_inset(position, point.x, point.y)
+                    && nearest >= minimum_squared
+                {
                     None
-                } else if straddles_boundary(position, point, exclusion, half_diagonal) {
+                } else if straddles_boundary_at(position, point, nearest, exclusion, half_diagonal)
+                {
                     let snapped =
                         nearest_legal_placement_with(position, point, Some(&known_vertices));
                     let inside = snapped.legal
@@ -286,6 +311,76 @@ fn sample_candidates_with(
 /// only have legal area within its own cell if it sits within half a cell
 /// diagonal of that stone's exclusion circle; deeper than that, every point in
 /// the cell is excluded too. Board-edge exclusion is treated the same way.
+/// Squared distance to the nearest stone per cell, or infinity beyond `reach`.
+///
+/// Only correct for callers comparing against a threshold at or below `reach`,
+/// which is what makes the bounded scatter sound: a cell no stone comes within
+/// `reach` of keeps infinity, and infinity satisfies any such threshold just as
+/// its true distance would.
+fn nearest_stone_squares(
+    position: &Position,
+    width: usize,
+    height: usize,
+    reach: f64,
+) -> Vec<f64> {
+    let mut nearest = vec![f64::INFINITY; width * height];
+    if reach <= 0.0 {
+        return nearest;
+    }
+    for stone in position.stones() {
+        // Cells whose centre can lie within `reach` of this stone.
+        let low_col = (((stone.x - reach) * width as f64 - 0.5).ceil()).max(0.0) as usize;
+        let low_row = (((stone.y - reach) * height as f64 - 0.5).ceil()).max(0.0) as usize;
+        let high_col =
+            (((stone.x + reach) * width as f64 - 0.5).floor()).max(0.0) as usize;
+        let high_row =
+            (((stone.y + reach) * height as f64 - 0.5).floor()).max(0.0) as usize;
+        for row in low_row..=high_row.min(height - 1) {
+            let y = (row as f64 + 0.5) / height as f64;
+            let dy = y - stone.y;
+            let dy_squared = dy * dy;
+            let base = row * width;
+            for col in low_col..=high_col.min(width - 1) {
+                let x = (col as f64 + 0.5) / width as f64;
+                let dx = x - stone.x;
+                let squared = dx.mul_add(dx, dy_squared);
+                let slot = &mut nearest[base + col];
+                if squared < *slot {
+                    *slot = squared;
+                }
+            }
+        }
+    }
+    nearest
+}
+
+/// [`straddles_boundary`] with the stone distance already in hand.
+fn straddles_boundary_at(
+    position: &Position,
+    point: Point,
+    nearest_squared: f64,
+    exclusion: f64,
+    half_diagonal: f64,
+) -> bool {
+    let radius = position.radius();
+    let edge_slack = (point.x - radius)
+        .min(1.0 - radius - point.x)
+        .min(point.y - radius)
+        .min(1.0 - radius - point.y);
+    if edge_slack < -half_diagonal {
+        return false;
+    }
+    let threshold = exclusion - half_diagonal;
+    if threshold <= 0.0 {
+        return true;
+    }
+    nearest_squared >= threshold * threshold
+}
+
+/// The original per-cell predicate, kept as the reference the scattered path is
+/// tested against. Production goes through `straddles_boundary_at`, which takes
+/// the stone distance already computed for the whole grid.
+#[cfg(test)]
 fn straddles_boundary(
     position: &Position,
     point: Point,
@@ -348,9 +443,103 @@ fn sample_index(probs: &[f64], u: f64) -> usize {
 }
 
 #[cfg(test)]
+mod scatter_tests {
+    use vgo_core::{Color, Point, Position, Stone, is_legal_placement, legal_set_vertices,
+                   nearest_legal_placement_with};
+
+    use super::{FineGrid, straddles_boundary};
+
+    fn lattice(count: usize, radius: f64, seed: u64) -> Position {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let spacing = 2.0 * radius * 1.06;
+        let per_row = ((0.88_f64 / spacing).floor() as usize).max(1);
+        let jitter = (spacing - 2.0 * radius) * 0.4;
+        let mut stones = Vec::new();
+        for index in 0..count {
+            let (row, col) = (index / per_row, index % per_row);
+            let x = radius + 0.02 + col as f64 * spacing + (next() - 0.5) * jitter;
+            let y = radius + 0.02 + row as f64 * spacing + (next() - 0.5) * jitter;
+            if x > 1.0 - radius || y > 1.0 - radius {
+                break;
+            }
+            stones.push(Stone {
+                x,
+                y,
+                color: if index % 2 == 0 { Color::Black } else { Color::White },
+            });
+        }
+        Position::new(radius, stones, Color::Black)
+    }
+
+    /// The reference: the per-cell scan the scatter replaced. Kept here so the
+    /// optimisation is pinned to the definition rather than to itself.
+    fn reference_legal(position: &Position, width: usize, height: usize) -> Vec<bool> {
+        let radius = position.radius();
+        let exclusion = 2.0 * radius;
+        let half_diagonal =
+            0.5 * ((1.0 / width as f64).powi(2) + (1.0 / height as f64).powi(2)).sqrt();
+        let known = legal_set_vertices(position);
+        let (half_x, half_y) = (0.5 / width as f64, 0.5 / height as f64);
+        let mut legal = vec![false; width * height];
+        for row in 0..height {
+            for col in 0..width {
+                let point = Point::new(
+                    (col as f64 + 0.5) / width as f64,
+                    (row as f64 + 0.5) / height as f64,
+                );
+                if is_legal_placement(position, point.x, point.y) {
+                    legal[row * width + col] = true;
+                } else if straddles_boundary(position, point, exclusion, half_diagonal) {
+                    let snapped = nearest_legal_placement_with(position, point, Some(&known));
+                    if snapped.legal
+                        && (snapped.point.x - point.x).abs() <= half_x
+                        && (snapped.point.y - point.y).abs() <= half_y
+                    {
+                        legal[row * width + col] = true;
+                    }
+                }
+            }
+        }
+        legal
+    }
+
+    /// A faster legality mask that disagrees anywhere is a different game: the
+    /// search would propose moves the rules refuse, or refuse moves they allow.
+    #[test]
+    fn the_scattered_grid_matches_the_per_cell_scan() {
+        for (radius, count) in [
+            (1.0 / 18.0, 0usize),
+            (1.0 / 18.0, 1),
+            (1.0 / 18.0, 28),
+            (1.0 / 18.0, 52),
+            (1.0 / 38.0, 120),
+            (1.0 / 38.0, 300),
+        ] {
+            let position = lattice(count, radius, 19);
+            let grid = FineGrid::build(&position, 64, 64, 16, |_, _| 0.0);
+            let expected = reference_legal(&position, 64, 64);
+            let actual = grid.legal.clone();
+            assert_eq!(
+                actual,
+                expected,
+                "1/{} with {} stones",
+                (1.0 / radius).round(),
+                position.stones().len()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use vgo_core::{Color, Position, Stone};
+    use vgo_core::{Color, Position, Stone, is_legal_placement};
 
     fn empty_board() -> Position {
         Position::new(1.0 / 6.0, Vec::new(), Color::Black)
