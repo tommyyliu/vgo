@@ -1469,6 +1469,39 @@ class RunRecipeTest(unittest.TestCase):
     def test_recipes_exist(self) -> None:
         self.assertTrue(self.recipes(), "runs/ has no recipes; a clone can run nothing")
 
+    def test_board_mix_reaches_the_generator(self) -> None:
+        """A mix that never reaches the command line is a run at one radius."""
+        from vgo_training.pipeline import PipelineConfig
+
+        config = PipelineConfig(
+            output="unused",
+            board_mix=("50:38", "25:18", "25:18-50"),
+            ply_sample_rate=0.2,
+        )
+        config.validate()
+        self.assertEqual(config.board_mix, ("50:38", "25:18", "25:18-50"))
+        self.assertAlmostEqual(config.komi_area_coefficient, 0.104 * 324.0)
+
+    def test_board_mix_refuses_small_boards(self) -> None:
+        """The komi law is fitted above 18 units and does not hold below it."""
+        from vgo_training.pipeline import PipelineConfig
+
+        for bad in ("50:9", "25:10-40", "50:38:extra", "0:38"):
+            with self.subTest(spec=bad):
+                config = PipelineConfig(output="unused", board_mix=(bad,))
+                with self.assertRaises(ValueError):
+                    config.validate()
+
+    def test_ply_sample_rate_is_a_fraction(self) -> None:
+        from vgo_training.pipeline import PipelineConfig
+
+        for bad in (0.0, -0.5, 1.5):
+            with self.subTest(rate=bad):
+                config = PipelineConfig(output="unused", ply_sample_rate=bad)
+                with self.assertRaises(ValueError):
+                    config.validate()
+        PipelineConfig(output="unused", ply_sample_rate=1.0).validate()
+
     def test_tournament_recipes_are_not_mistaken_for_training_runs(self) -> None:
         # Guards the filter above: if a training recipe ever stopped naming the
         # module, recipes() would silently drop it and both checks below would

@@ -405,6 +405,179 @@ class KomiRangeDecision:
     games: int
 
 
+def fit_komi_power_law(
+    games: Sequence[tuple[float, float, float]],
+    target_black_win_rate: float,
+    exponents: Sequence[float] = tuple(i / 20.0 for i in range(20, 61)),
+) -> tuple[float, float] | None:
+    """Fit ``balanced_komi(r) = alpha * r**beta``, estimating ``beta`` too.
+
+    Returns ``(alpha, beta)``.
+
+    Do not assume the exponent. The tempting prior is 2: komi compensates about
+    one stone's worth of area, stone area goes as ``r^2``, so komi as a fraction
+    of the board should too. Go says otherwise. Komi there is roughly constant
+    in *points* -- 7.5 on 19x19, 5.5-7 on 9x9 -- which is 2.1% of the board
+    against 6.8-8.6%, so as a fraction it shrinks with board size but by less
+    than the area does. Taking those numbers literally, komi in points goes as
+    ``N^0.19``, and komi as a fraction as ``r^1.62``. Between 1/18 and 1/38 that
+    is 0.032 against 0.023 -- a 39% error in balanced komi at the standard
+    board, which would tilt every game played there.
+
+    So ``beta`` is estimated rather than chosen. For a fixed ``beta`` the model
+    is a two-parameter logistic in ``u = komi / r**beta``, which the existing
+    solver handles; the exponent is then chosen by profile likelihood over a
+    grid. Cheap -- a few dozen refits of a problem that already converges in
+    milliseconds -- and it needs no nonlinear solver.
+
+    Working in ``u`` also fixes the slope: a komi difference of 0.01 is decisive
+    on a small board and trivial on a large one, and dividing by ``r**beta``
+    puts both on the same scale, which is what makes one logistic fit them all.
+    """
+
+    if len(games) < 8 or not 0.0 < target_black_win_rate < 1.0:
+        return None
+    radii = [radius for _, radius, _ in games]
+    if min(radii) <= 0.0 or max(radii) / min(radii) < 1.05:
+        return None  # one board size: the exponent is not identified
+    target_logit = math.log(target_black_win_rate / (1.0 - target_black_win_rate))
+
+    best: tuple[float, float, float] | None = None  # (log likelihood, alpha, beta)
+    for beta in exponents:
+        scaled = [
+            (komi / radius**beta, outcome) for komi, radius, outcome in games
+        ]
+        fit = fit_komi_balance(scaled, target_black_win_rate)
+        if fit is None:
+            continue
+        # Log likelihood of this exponent, at its own best (alpha, slope).
+        intercept = target_logit - fit.slope * fit.target_komi
+        total = 0.0
+        for u, outcome in scaled:
+            logit = intercept + fit.slope * u
+            probability = (
+                1.0 / (1.0 + math.exp(-logit))
+                if logit >= 0.0
+                else math.exp(logit) / (1.0 + math.exp(logit))
+            )
+            probability = min(max(probability, 1.0e-12), 1.0 - 1.0e-12)
+            total += outcome * math.log(probability) + (1.0 - outcome) * math.log(
+                1.0 - probability
+            )
+        if best is None or total > best[0]:
+            best = (total, fit.target_komi, beta)
+    if best is None:
+        return None
+    _, alpha, beta = best
+    return (alpha, beta) if math.isfinite(alpha) and alpha > 0.0 else None
+
+
+def fit_komi_balance_by_radius(
+    games: Sequence[tuple[float, float, float]],
+    target_black_win_rate: float,
+    reference_radius: float,
+) -> tuple[float, float] | None:
+    """Fit ``P(Black) = sigmoid(a + b*komi + c*r^2)`` and return ``(centre, scale)``.
+
+    Balanced komi is not one number once a run mixes board sizes. Komi
+    compensates roughly one stone's worth of area and stone area goes as
+    ``r^2``, so ``r^2`` is the feature to add -- and the balance point comes out
+    affine in it:
+
+        k(r) = (logit(target) - a - c*r^2) / b
+             = centre + scale * (r^2 - reference^2)
+
+    where ``centre`` is the balanced komi at ``reference_radius``. Reported that
+    way so a single-radius run reads the same as it always did, with a scale of
+    zero.
+
+    Returns ``None`` on the same conservative grounds as the two-parameter fit,
+    plus one more: when every game shares a radius, ``r^2`` is collinear with
+    the intercept and ``c`` is not identified. The caller falls back to
+    :func:`fit_komi_balance` there, which is the same model without the
+    unidentifiable term.
+    """
+
+    if len(games) < 3 or not 0.0 < target_black_win_rate < 1.0:
+        return None
+    if not reference_radius > 0.0:
+        return None
+    squares = [radius * radius for _, radius, _ in games]
+    if max(squares) - min(squares) <= 1.0e-12:
+        return None  # single radius: c is degenerate, use the flat fit
+    komis = [komi for komi, _, _ in games]
+    outcomes = [outcome for _, _, outcome in games]
+    if (
+        not all(math.isfinite(v) for v in komis + squares + outcomes)
+        or any(not 0.0 <= v <= 1.0 for v in outcomes)
+        or max(komis) - min(komis) <= 1.0e-9
+    ):
+        return None
+    total = sum(outcomes)
+    if total <= 0.0 or total >= len(games):
+        return None
+
+    # Newton on three features: [1, komi, r^2]. Same solver shape as the
+    # two-parameter fit, one column wider.
+    beta = [0.0, 0.0, 0.0]
+    rows = [(1.0, komi, square) for komi, square in zip(komis, squares)]
+    for _ in range(200):
+        gradient = [0.0, 0.0, 0.0]
+        hessian = [[1.0e-9 if i == j else 0.0 for j in range(3)] for i in range(3)]
+        for row, outcome in zip(rows, outcomes):
+            logit = sum(b * x for b, x in zip(beta, row))
+            probability = (
+                1.0 / (1.0 + math.exp(-logit))
+                if logit >= 0.0
+                else math.exp(logit) / (1.0 + math.exp(logit))
+            )
+            residual = outcome - probability
+            weight = probability * (1.0 - probability)
+            for i in range(3):
+                gradient[i] += residual * row[i]
+                for j in range(3):
+                    hessian[i][j] += weight * row[i] * row[j]
+        step = _solve3(hessian, gradient)
+        if step is None:
+            return None
+        beta = [b + s for b, s in zip(beta, step)]
+        if not all(math.isfinite(b) for b in beta):
+            return None
+        if sum(abs(s) for s in step) < 1.0e-12:
+            break
+
+    intercept, slope, curvature = beta
+    if slope >= -1.0e-6:
+        return None  # higher komi must favour White, or this is noise
+    target_logit = math.log(target_black_win_rate / (1.0 - target_black_win_rate))
+    reference_square = reference_radius * reference_radius
+    centre = (target_logit - intercept - curvature * reference_square) / slope
+    scale = -curvature / slope
+    if not (math.isfinite(centre) and math.isfinite(scale)):
+        return None
+    return centre, scale
+
+
+def _solve3(
+    matrix: list[list[float]], vector: list[float]
+) -> list[float] | None:
+    """Gaussian elimination with partial pivoting on a 3x3 system."""
+
+    rows = [list(matrix[i]) + [vector[i]] for i in range(3)]
+    for column in range(3):
+        pivot = max(range(column, 3), key=lambda r: abs(rows[r][column]))
+        if abs(rows[pivot][column]) < 1.0e-14:
+            return None
+        rows[column], rows[pivot] = rows[pivot], rows[column]
+        for other in range(3):
+            if other == column:
+                continue
+            factor = rows[other][column] / rows[column][column]
+            for k in range(column, 4):
+                rows[other][k] -= factor * rows[column][k]
+    return [rows[i][3] / rows[i][i] for i in range(3)]
+
+
 def fit_komi_balance(
     games: Sequence[tuple[float, float]], target_black_win_rate: float
 ) -> KomiBalanceFit | None:
@@ -533,6 +706,18 @@ class PipelineConfig:
     # as Dirichlet noise does for AlphaZero, at the root because that is where
     # the target comes from. Off by default: it changes what self-play explores.
     root_exploration_noise: float = 0.0
+    # Board sizes to play, as "WEIGHT:UNITS" or "WEIGHT:LOW-HIGH", where units
+    # are board widths in stone diameters -- voronoigo.com's 18 "mini", 26
+    # "midi", 38 "standard". Empty plays every game at `radius`, which is what
+    # every run before multi-radius did.
+    board_mix: tuple[str, ...] = ()
+    # Coefficient in `komi = c * radius^2`. Only consulted when `board_mix` is
+    # set. The default is what our own measurement fixes: 0.104 at r = 1/18.
+    komi_area_coefficient: float = 0.104 * 18.0 * 18.0
+    # Fraction of each game's plies recorded. Standard-board games run past
+    # three hundred plies, and a shard sized in positions would hold about five
+    # games; the value head learns from game-level labels only.
+    ply_sample_rate: float = 1.0
     temperature: float = 1.0
     temperature_plies: int = 30
     actors: int = 64
@@ -718,6 +903,26 @@ class PipelineConfig:
             raise ValueError("widening coefficient must be positive")
         if self.maximum_candidates <= 0:
             raise ValueError("maximum candidates must be positive")
+        for spec in self.board_mix:
+            parts = str(spec).split(":")
+            if len(parts) != 2:
+                raise ValueError(f"board_mix entry {spec!r} is not WEIGHT:UNITS")
+            try:
+                weight = float(parts[0])
+                extent = [float(v) for v in parts[1].split("-")]
+            except ValueError as error:
+                raise ValueError(f"board_mix entry {spec!r} is not numeric") from error
+            if weight <= 0 or not extent or len(extent) > 2:
+                raise ValueError(f"board_mix entry {spec!r} is malformed")
+            if min(extent) < 18.0:
+                raise ValueError(
+                    f"board_mix entry {spec!r} goes below 18 units; smaller boards "
+                    "are a different game and the komi law does not hold there"
+                )
+        if not math.isfinite(self.komi_area_coefficient) or self.komi_area_coefficient <= 0:
+            raise ValueError("komi_area_coefficient must be positive")
+        if not 0.0 < self.ply_sample_rate <= 1.0:
+            raise ValueError("ply_sample_rate must be in (0, 1]")
         if not 0.0 <= self.root_exploration_noise < 1.0:
             raise ValueError("root exploration noise must be in [0, 1)")
         if self.coarse_pool < 0 or self.coarse_pool > self.policy_resolution:
@@ -1319,10 +1524,10 @@ class Pipeline:
             return None
         return low, high
 
-    def _recent_komi_games(self) -> list[tuple[float, float]]:
-        """Exact recent ``(komi, Black outcome)`` rows eligible for fitting."""
+    def _recent_komi_games(self) -> list[tuple[float, float, float]]:
+        """Exact recent ``(komi, radius, Black outcome)`` rows for fitting."""
 
-        games: list[tuple[float, float]] = []
+        games: list[tuple[float, float, float]] = []
         for replay in self.state.replay[-self.config.replay_window :]:
             try:
                 manifest_path = Path(str(replay["manifest"]))
@@ -1343,10 +1548,19 @@ class Pipeline:
                         continue
                     komi = float(row["komi"])
                     utility = float(row["black_utility"])
+                    # Absent on shards written before multi-radius, where every
+                    # game shared the configured radius.
+                    radius = float(row.get("radius", self.config.radius))
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                     continue
-                if math.isfinite(komi) and math.isfinite(utility) and -1.0 <= utility <= 1.0:
-                    games.append((komi, (utility + 1.0) / 2.0))
+                if (
+                    math.isfinite(komi)
+                    and math.isfinite(utility)
+                    and math.isfinite(radius)
+                    and radius > 0.0
+                    and -1.0 <= utility <= 1.0
+                ):
+                    games.append((komi, radius, (utility + 1.0) / 2.0))
         return games
 
     def _effective_komi_range(self) -> KomiRangeDecision:
@@ -1377,9 +1591,17 @@ class Pipeline:
                 break
 
         recent = self._recent_komi_games()
+        # The flat controller recentres one number, which is only meaningful
+        # when every game shares a board. Under a mix the balance point is a
+        # function of radius and `fit_komi_power_law` re-estimates the law
+        # itself; the range below then only sets the jitter around it.
         fit = (
-            fit_komi_balance(recent, config.komi_target_black_win_rate)
+            fit_komi_balance(
+                [(komi, outcome) for komi, _, outcome in recent],
+                config.komi_target_black_win_rate,
+            )
             if len(recent) >= config.komi_recenter_minimum_games
+            and not config.board_mix
             else None
         )
         next_center = current_center
@@ -1503,6 +1725,8 @@ class Pipeline:
         command = self._rust_command("vgo-generate-demo") + [
             "--samples",
             str(config.samples_per_shard),
+            "--ply-sample-rate",
+            str(config.ply_sample_rate),
             "--resolution",
             str(config.resolution),
             "--policy-resolution",
@@ -1545,6 +1769,8 @@ class Pipeline:
             str(config.resign_disable_fraction),
             "--radius",
             str(config.radius),
+            "--komi-area-coefficient",
+            str(config.komi_area_coefficient),
             "--seed",
             str(config.seed + sequence * 1_000_003),
             "--examples",
@@ -1574,6 +1800,10 @@ class Pipeline:
             "--cache-directory",
             str((self.root / "artifacts" / "onnx-cache").resolve()),
         ]
+        # One flag per band. Left empty every game uses `--radius`, which is what
+        # single-radius runs have always done.
+        for band in config.board_mix:
+            command.extend(["--board-mix", str(band)])
         if model is None:
             command.extend(["--runtime", "naive"])
         else:
@@ -2811,6 +3041,9 @@ def config_from_arguments(arguments: argparse.Namespace) -> PipelineConfig:
     values["initial_replay"] = tuple(
         str(Path(path).resolve()) for path in values.get("initial_replay", ())
     )
+    # argparse `append` yields a list; the config is frozen and hashed into the
+    # run identity, so it has to be a tuple.
+    values["board_mix"] = tuple(str(band) for band in values.get("board_mix", ()))
     return PipelineConfig(**values)
 
 
@@ -2839,6 +3072,29 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--widening-coefficient", type=float, default=2.0)
     parser.add_argument("--maximum-candidates", type=int, default=96)
     parser.add_argument("--root-exploration-noise", type=float, default=0.0)
+    parser.add_argument(
+        "--board-mix",
+        action="append",
+        default=[],
+        metavar="WEIGHT:UNITS",
+        help=(
+            "board sizes to play, as WEIGHT:UNITS or WEIGHT:LOW-HIGH in stone "
+            "diameters across (18 mini, 26 midi, 38 standard); repeatable. "
+            "Omitted, every game uses --radius."
+        ),
+    )
+    parser.add_argument(
+        "--komi-area-coefficient",
+        type=float,
+        default=0.104 * 18.0 * 18.0,
+        help="coefficient in komi = c * radius^2; only used with --board-mix",
+    )
+    parser.add_argument(
+        "--ply-sample-rate",
+        type=float,
+        default=1.0,
+        help="fraction of each game's plies recorded (1.0 keeps every ply)",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--temperature-plies", type=int, default=30)
     parser.add_argument("--actors", type=int, default=64)
@@ -3040,7 +3296,15 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--raster-kind",
-        choices=("semantic", "compact", "compact-pass", "compact-dead-zone", "compact-connected", "rgb"),
+        choices=(
+            "semantic",
+            "compact",
+            "compact-pass",
+            "compact-dead-zone",
+            "compact-connected",
+            "compact-radius",
+            "rgb",
+        ),
         default="semantic",
         help=(
             "channel layout. compact is four channels plus komi; compact-pass "
