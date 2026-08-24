@@ -15,7 +15,7 @@ use std::{
 
 use clap::{ArgAction, Parser};
 use sha2::{Digest, Sha256};
-use vgo_core::{Analysis, Color, Position, Ruleset};
+use vgo_core::Ruleset;
 use vgo_inference::{
     BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, OnnxBatchService, OnnxProvider,
     OnnxServiceConfig,
@@ -24,21 +24,16 @@ use vgo_raster::{
     CHANNELS, COMPACT_CHANNELS, ChannelSpec, RasterConfig, RasterKind, SemanticRaster,
 };
 use vgo_search::{
-    EvaluationError, Evaluator, NaiveEvaluator, search_at_ply,
+    EvaluationError, Evaluator, NaiveEvaluator,
 };
 use vgo_selfplay::generation::{
-    CALIBRATION_THRESHOLDS, CALIBRATION_WINDOWS, GameRecord, GameSamples, PendingSample, ResignTrial,
-    calibration_trials, generate_game, resign_exempt,
-    GameSettings, KOMI_AREA_COEFFICIENT, action_index, parse_board_mix, policy_target,
-    replay_capacity_for, search_config,
-};
-use vgo_selfplay::{
-    ResignRule, award_by_area, play_game_with_resignation as run_playout_with_resignation,
+    GameRecord, GameSamples, GameSettings, KOMI_AREA_COEFFICIENT, generate_game,
+    parse_board_mix, replay_capacity_for,
 };
 
 
 use vgo_selfplay::replay_stream::{
-    CELLS_DROPPED, LabeledSample, PublishedReplay, REPLAY_VERSION, ReplayStream,
+    CELLS_DROPPED, PublishedReplay, REPLAY_VERSION, ReplayStream,
     sync_parent_directory,
 };
 

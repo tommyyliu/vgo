@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use vgo_core::{Analysis, Color, Position, Ruleset};
 use vgo_search::{EvaluationError, Evaluator, search_at_ply};
 
-use crate::{ResignRule, adjudicate_positions, award_by_area, play_game_with_resignation};
+use crate::{ResignRule, award_by_area, play_game_with_resignation};
 use crate::replay_stream::LabeledSample;
 use vgo_raster::{RasterConfig, action_pixel};
 
