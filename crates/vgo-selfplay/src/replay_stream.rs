@@ -41,11 +41,38 @@ pub(crate) const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
 // choice: a run at coefficient 4 touches ~152 cells and one at 8 touches ~215,
 // and a global constant would have to be sized for the widest run anyone might
 // make, padding every other shard to match.
-pub(crate) const REPLAY_VERSION: u32 = 7;
+// v8 makes the *stone* capacity a header field for the same reason v7 did it
+// for cells. 128 was sized when "the longest observed game was 88 plies" -- on
+// the 18-unit board. A 38-unit board holds ~330 stones and the 50-unit end of a
+// board mix allows ~540, so a run across sizes overflows it and fails at write
+// time, after the games are played. Sizing one global constant for the widest
+// board anyone might play would pad every mini shard to match, which is exactly
+// the argument v7 made.
+pub(crate) const REPLAY_VERSION: u32 = 8;
 
-/// Stones a v4 record can hold. One stone per ply at most, and the longest
-/// observed game was 88 plies.
+/// Default stones a record holds, when nothing sizes it from the board.
+///
+/// One stone per ply at most, and the longest game on an 18-unit board ran 88
+/// plies. Runs that play larger boards pass their own capacity; this is only
+/// the fallback for callers that do not.
 pub(crate) const STONE_CAPACITY: usize = 128;
+
+/// Stones a board of this radius can hold, with headroom.
+///
+/// Centres sit at least `2r` apart inside a `1 - 2r` square, so the count is
+/// bounded by the area ratio times the densest packing. Rounded up because a
+/// record that cannot hold its own position fails at write time, after the
+/// game has been played and the compute spent.
+#[must_use]
+pub fn stone_capacity_for_radius(radius: f64) -> usize {
+    if !(radius > 0.0 && radius < 0.5) {
+        return STONE_CAPACITY;
+    }
+    let side = 1.0 - 2.0 * radius;
+    let packing = std::f64::consts::PI / (2.0 * 3.0_f64.sqrt());
+    let bound = (side * side) / (4.0 * radius * radius) * packing / (std::f64::consts::PI / 4.0);
+    ((bound * 1.15).ceil() as usize).max(STONE_CAPACITY)
+}
 
 /// Policy cells a v4 record can hold. Progressive widening surfaces a few dozen
 /// candidates from a 512-simulation search; 47 was the observed maximum.
@@ -115,6 +142,7 @@ pub(crate) struct ReplayStream {
     /// Policy slots each record pads to, written into the header so readers do
     /// not have to infer it from the version.
     policy_capacity: usize,
+    stone_capacity: usize,
     final_path: PathBuf,
     temporary_path: PathBuf,
     writer: Option<BufWriter<HashingWriter>>,
@@ -140,6 +168,7 @@ impl ReplayStream {
         policy_size: usize,
         examples_limit: usize,
         policy_capacity: usize,
+        stone_capacity: usize,
     ) -> io::Result<Self> {
         let samples_u32 = u32::try_from(target_samples).map_err(|_| {
             io::Error::new(
@@ -191,11 +220,13 @@ impl ReplayStream {
             width_u32,
             policy_u32,
             u32::try_from(policy_capacity).expect("policy capacity fits in u32"),
+            u32::try_from(stone_capacity).expect("stone capacity fits in u32"),
         ] {
             writer.write_all(&value.to_le_bytes())?;
         }
         Ok(Self {
             policy_capacity,
+            stone_capacity,
             final_path: path.to_path_buf(),
             temporary_path,
             writer: Some(writer),
@@ -255,12 +286,14 @@ impl ReplayStream {
             self.first_game_id.get_or_insert(sample.game);
             self.last_game_id = Some(sample.game);
             let capacity = self.policy_capacity;
+            let stones = self.stone_capacity;
             write_sample(
                 self.writer
                     .as_mut()
                     .expect("writer exists until publication"),
                 &sample,
                 capacity,
+                stones,
             )?;
             self.samples_written += 1;
         }
@@ -349,7 +382,7 @@ impl ReplayStream {
     fn validate_sample(&self, sample: &LabeledSample) -> io::Result<()> {
         // A v4 record carries state, so there is no raster shape to check; what
         // must hold is that the position fits the record's fixed capacity.
-        let dimensions_match = sample.position.stones().len() <= STONE_CAPACITY;
+        let dimensions_match = sample.position.stones().len() <= self.stone_capacity;
         let policies_match = [
             sample.policy.len(),
             sample.policy_mask.len(),
@@ -434,14 +467,15 @@ fn write_sample(
     writer: &mut impl Write,
     sample: &LabeledSample,
     capacity: usize,
+    stone_capacity: usize,
 ) -> io::Result<()> {
     let position = &sample.position;
     let stones = position.stones();
-    if stones.len() > STONE_CAPACITY {
+    if stones.len() > stone_capacity {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "position has {} stones, exceeding the v4 capacity of {STONE_CAPACITY}",
+                "position has {} stones, exceeding the record capacity of {stone_capacity}",
                 stones.len()
             ),
         ));
@@ -458,7 +492,7 @@ fn write_sample(
         writer.write_all(&[color_code(stone.color)])?;
     }
     // Pad the unused stone slots so every record occupies the same bytes.
-    for _ in stones.len()..STONE_CAPACITY {
+    for _ in stones.len()..stone_capacity {
         write_f64(writer, 0.0)?;
         write_f64(writer, 0.0)?;
         writer.write_all(&[0])?;
@@ -625,7 +659,7 @@ mod tests {
         let raster = RasterConfig::square(2);
         let policy_size = raster.pixels() + 1;
         let mut stream =
-            ReplayStream::create(&path, 3, raster, policy_size, 2, TEST_CAPACITY).expect("create replay");
+            ReplayStream::create(&path, 3, raster, policy_size, 2, TEST_CAPACITY, STONE_CAPACITY).expect("create replay");
 
         assert_eq!(
             stream
@@ -648,15 +682,15 @@ mod tests {
         assert!(!temporary_path(&path).exists());
 
         let bytes = fs::read(&path).expect("read replay");
-        // A v7 record is the position at STONE_CAPACITY, the sparse policy at
-        // the shard's own capacity, and the trailing scalars -- fixed size
+        // A v8 record is the position at the shard's stone capacity, the sparse
+        // policy at its cell capacity, and the trailing scalars -- fixed size
         // regardless of how many stones or cells are actually live. The leading
-        // f64s are radius and komi. The header gained a seventh u32 for the
-        // capacity, so it is 36 bytes rather than 32.
+        // f64s are radius and komi. The header carries both capacities now, so
+        // it is 40 bytes: eight magic plus eight u32s.
         let position_bytes = 8 + 8 + 1 + 4 + 1 + 4 + STONE_CAPACITY * (8 + 8 + 1);
         let policy_bytes = 4 + TEST_CAPACITY * V7_CELL_BYTES;
         let record_bytes = position_bytes + policy_bytes + 28;
-        assert_eq!(bytes.len(), 36 + 3 * record_bytes);
+        assert_eq!(bytes.len(), 40 + 3 * record_bytes);
         assert_eq!(&bytes[..8], &REPLAY_MAGIC);
         assert_eq!(
             u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
@@ -674,7 +708,7 @@ mod tests {
         let raster = RasterConfig::square(2);
         let policy_size = raster.pixels() + 1;
         let mut stream =
-            ReplayStream::create(&path, 2, raster, policy_size, 0, TEST_CAPACITY).expect("create replay");
+            ReplayStream::create(&path, 2, raster, policy_size, 0, TEST_CAPACITY, STONE_CAPACITY).expect("create replay");
         stream
             .write_game(vec![sample(1, 0)])
             .expect("write partial replay");
@@ -689,7 +723,7 @@ mod tests {
         assert!(!temporary_path(&path).exists());
 
         File::create(&path).expect("reserve published path");
-        let error = match ReplayStream::create(&path, 1, raster, policy_size, 0, TEST_CAPACITY) {
+        let error = match ReplayStream::create(&path, 1, raster, policy_size, 0, TEST_CAPACITY, STONE_CAPACITY) {
             Ok(_) => panic!("published path cannot be overwritten"),
             Err(error) => error,
         };
@@ -703,7 +737,7 @@ mod tests {
         let raster = RasterConfig::square(2);
         let policy_size = raster.pixels() + 1;
         let mut stream =
-            ReplayStream::create(&path, 1, raster, policy_size, 0, TEST_CAPACITY).expect("create replay");
+            ReplayStream::create(&path, 1, raster, policy_size, 0, TEST_CAPACITY, STONE_CAPACITY).expect("create replay");
         stream.write_game(vec![sample(4, 0)]).expect("write replay");
         let published = stream.publish().expect("publish replay");
 

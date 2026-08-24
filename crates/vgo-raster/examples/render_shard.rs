@@ -15,9 +15,17 @@ use vgo_raster::{RasterConfig, RasterKind, rasterize_any_into};
 // v7 appended the policy capacity, so its header is one u32 longer.
 const HEADER_V6: usize = 32;
 const HEADER_V7: usize = 36;
+// v8 appends the stone capacity, so boards larger than the mini one fit.
+const HEADER_V8: usize = 40;
 
 const fn header_size(version: u32) -> usize {
-    if version >= 7 { HEADER_V7 } else { HEADER_V6 }
+    if version >= 8 {
+        HEADER_V8
+    } else if version >= 7 {
+        HEADER_V7
+    } else {
+        HEADER_V6
+    }
 }
 const STONE: usize = 8 + 8 + 1;
 const STONE_CAPACITY: usize = 128;
@@ -64,7 +72,7 @@ fn main() {
     let blob = fs::read(&source).expect("read shard");
     let version = read_u32(&blob, 8);
     assert!(
-        (4..=7).contains(&version),
+        (4..=8).contains(&version),
         "expected replay version 4 through 7, found {version}"
     );
     let samples = read_u32(&blob, 12) as usize;
@@ -80,9 +88,16 @@ fn main() {
     } else {
         policy_capacity(version)
     };
+    // v8 sizes the stone slots per shard, because a board mix spans 74 stones
+    // at 18 units to ~540 at 50, and one constant would pad every small board.
+    let stone_capacity = if version >= 8 {
+        read_u32(&blob, 36) as usize
+    } else {
+        STONE_CAPACITY
+    };
     let stride = (blob.len() - header) / samples;
     let expected = stones_at
-        + STONE_CAPACITY * STONE
+        + stone_capacity * STONE
         + 4
         + capacity * cell_bytes(version)
         + 4 + 4 + 8 + 4 + 8;

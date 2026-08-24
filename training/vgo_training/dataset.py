@@ -27,8 +27,8 @@ REPLAY_MAGIC = b"VGORPLY1"
 #
 # Older records synthesize unavailable fields so replay windows can span schema
 # versions. REPLAY_VERSION is the version the current generator writes.
-REPLAY_VERSION = 7
-REPLAY_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
+REPLAY_VERSION = 8
+REPLAY_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8)
 
 # v4 stores the position and a sparse policy instead of a rendered raster.
 # These capacities are the writer's, in crates/vgo-selfplay/src/replay_stream.rs,
@@ -91,6 +91,10 @@ HEADER = struct.Struct("<8s6I")
 # every other shard to match. Older headers stop at HEADER.size and take their
 # capacity from `policy_capacity()`.
 HEADER_V7 = struct.Struct("<8s7I")
+# v8 adds the stone capacity, for the same reason v7 added the policy capacity:
+# a board mix spanning 18 to 50 units holds anywhere from 74 to ~540 stones, and
+# one global constant would pad every small-board shard to the largest.
+HEADER_V8 = struct.Struct("<8s8I")
 
 
 @dataclass(frozen=True)
@@ -229,26 +233,35 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_header(path: Path) -> tuple[bytes, int, int, int, int, int, int, int]:
-    """Header fields, with the policy capacity last.
+def _read_header(
+    path: Path,
+) -> tuple[bytes, int, int, int, int, int, int, int, int]:
+    """Header fields, with the policy and stone capacities last.
 
     Pre-v7 headers do not carry a capacity, so it is filled in from the version
     table and the tuple keeps one shape for every caller.
     """
     with path.open("rb") as stream:
-        header = stream.read(HEADER_V7.size)
+        header = stream.read(HEADER_V8.size)
     if len(header) < HEADER.size:
         raise ValueError("dataset header is truncated")
     magic, version, samples, channels, height, width, policy_size = HEADER.unpack(
         header[: HEADER.size]
     )
     capacity = 0
+    stone_capacity = V4_STONE_CAPACITY
     if magic == REPLAY_MAGIC and version >= 7:
-        if len(header) != HEADER_V7.size:
+        if len(header) < HEADER_V7.size:
             raise ValueError("v7 dataset header is truncated")
-        capacity = HEADER_V7.unpack(header)[-1]
+        capacity = HEADER_V7.unpack(header[: HEADER_V7.size])[-1]
         if capacity == 0:
             raise ValueError("v7 header declares a zero policy capacity")
+    if magic == REPLAY_MAGIC and version >= 8:
+        if len(header) != HEADER_V8.size:
+            raise ValueError("v8 dataset header is truncated")
+        stone_capacity = HEADER_V8.unpack(header)[-1]
+        if stone_capacity == 0:
+            raise ValueError("v8 header declares a zero stone capacity")
     if magic not in (MAGIC, REPLAY_MAGIC):
         raise ValueError(f"unexpected dataset magic: {magic!r}")
     if magic == MAGIC:
@@ -282,6 +295,7 @@ def _read_header(path: Path) -> tuple[bytes, int, int, int, int, int, int, int]:
         width,
         policy_size,
         capacity or policy_capacity(version),
+        stone_capacity,
     )
 
 
@@ -540,7 +554,10 @@ def rasterize_records(
 
 
 def _v4_record_dtype(
-    policy_size: int, version: int = REPLAY_VERSION, capacity: int | None = None
+    policy_size: int,
+    version: int = REPLAY_VERSION,
+    capacity: int | None = None,
+    stone_capacity: int | None = None,
 ) -> np.dtype:
     """Fixed-size v4 record: position, sparse policy, scalars.
 
@@ -564,7 +581,7 @@ def _v4_record_dtype(
             (
                 "stones",
                 np.dtype([("x", "<f8"), ("y", "<f8"), ("color", "u1")]),
-                (V4_STONE_CAPACITY,),
+                (stone_capacity or V4_STONE_CAPACITY,),
             ),
             ("touched", "<u4"),
             (
@@ -658,6 +675,8 @@ def header_size(version: int) -> int:
     size mismatch, which is the good outcome -- but only because the length
     check runs first.
     """
+    if version >= 8:
+        return HEADER_V8.size
     return HEADER_V7.size if version >= 7 else HEADER.size
 
 
@@ -689,6 +708,7 @@ def _load_replay_v4(
     version: int = REPLAY_VERSION,
     raster_kind: str | None = None,
     capacity: int | None = None,
+    stone_capacity: int | None = None,
 ) -> tuple[np.ndarray, ...]:
     """Loads a position shard, rendering each state at load time.
 
@@ -696,7 +716,7 @@ def _load_replay_v4(
     produced here and the layout is a training-time choice rather than a
     property of the data -- see docs/POSITION_SHARDS.md.
     """
-    record_dtype = _v4_record_dtype(policy_size, version, capacity)
+    record_dtype = _v4_record_dtype(policy_size, version, capacity, stone_capacity)
     expected_bytes = header_size(version) + samples * record_dtype.itemsize
     if path.stat().st_size != expected_bytes:
         raise ValueError(
@@ -705,7 +725,9 @@ def _load_replay_v4(
     records = np.memmap(
         path, dtype=record_dtype, mode="r", offset=header_size(version), shape=(samples,)
     )
-    if int(np.asarray(records["stone_count"]).max(initial=0)) > V4_STONE_CAPACITY:
+    if int(np.asarray(records["stone_count"]).max(initial=0)) > (
+        stone_capacity or V4_STONE_CAPACITY
+    ):
         raise ValueError("replay record claims more stones than the capacity")
 
     states = _render_states(path, records, channels, height, width, raster_kind)
@@ -848,9 +870,17 @@ def load_dataset(path: str | Path, *, raster_kind: str | None = None) -> RasterD
             f"{sorted(RASTER_CHANNELS)}"
         )
     path = Path(path).resolve(strict=True)
-    magic, version, samples, channels, height, width, policy_size, capacity = _read_header(
-        path
-    )
+    (
+        magic,
+        version,
+        samples,
+        channels,
+        height,
+        width,
+        policy_size,
+        capacity,
+        stone_capacity,
+    ) = _read_header(path)
     if magic == REPLAY_MAGIC:
         _validate_manifest(path)
         if version >= 4:
@@ -868,6 +898,7 @@ def load_dataset(path: str | Path, *, raster_kind: str | None = None) -> RasterD
                 version,
                 raster_kind,
                 capacity,
+                stone_capacity,
             )
         else:
             _reject_stored_raster_mismatch(raster_kind, channels)

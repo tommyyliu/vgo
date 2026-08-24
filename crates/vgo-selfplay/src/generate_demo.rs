@@ -1233,6 +1233,15 @@ fn generate_to_dataset(
     // projection absorbs positions that collide less than average; anything
     // past it is truncated lowest-visit-first and counted in the manifest.
     let policy_capacity = replay_capacity_for(config.maximum_candidates, policy_size);
+    // Sized from the *smallest* radius the run can play, since that board holds
+    // the most stones. Taking it from `--radius` alone would fit the mini board
+    // and fail on a standard one after the games are already played.
+    let smallest_radius = parse_board_mix(&config.board_mix)
+        .unwrap_or_default()
+        .iter()
+        .map(|band| 1.0 / band.high_units)
+        .fold(config.radius, f64::min);
+    let stone_capacity = crate::replay_stream::stone_capacity_for_radius(smallest_radius);
     let mut replay = ReplayStream::create(
         dataset_path,
         config.samples,
@@ -1240,6 +1249,7 @@ fn generate_to_dataset(
         policy_size,
         config.examples,
         policy_capacity,
+        stone_capacity,
     )?;
     let next_game = Arc::new(AtomicU64::new(0));
     let stopped = Arc::new(AtomicBool::new(false));
