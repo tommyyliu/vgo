@@ -27,8 +27,8 @@ use vgo_search::{
     EvaluationError, Evaluator, NaiveEvaluator, search_at_ply,
 };
 use vgo_selfplay::generation::{
-    BoardBand, GameSettings, KOMI_AREA_COEFFICIENT, PolicyTarget, action_index,     komi_centre_for_radius, maximum_plies_for_radius, parse_board_mix, policy_target,
-    replay_capacity_for, sampled_komi, sampled_radius, search_config, seeded_unit,
+    GameSettings, KOMI_AREA_COEFFICIENT, action_index, parse_board_mix, policy_target,
+    replay_capacity_for, search_config,
 };
 use vgo_selfplay::{
     ResignRule, award_by_area, play_game_with_resignation as run_playout_with_resignation,
