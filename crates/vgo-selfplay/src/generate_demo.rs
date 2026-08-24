@@ -27,6 +27,8 @@ use vgo_search::{
     EvaluationError, Evaluator, NaiveEvaluator, search_at_ply,
 };
 use vgo_selfplay::generation::{
+    CALIBRATION_THRESHOLDS, CALIBRATION_WINDOWS, GameRecord, GameSamples, PendingSample, ResignTrial,
+    calibration_trials, generate_game, resign_exempt,
     GameSettings, KOMI_AREA_COEFFICIENT, action_index, parse_board_mix, policy_target,
     replay_capacity_for, search_config,
 };
@@ -71,87 +73,8 @@ impl std::str::FromStr for GenerationRuntime {
 /// 0.0375-wide buckets and ~170 games each per sixteen-shard window.
 const KOMI_BUCKETS: usize = 8;
 
-struct PendingSample {
-    position: Position,
-    root_black_value: f64,
-    policy: Vec<f32>,
-    policy_mask: Vec<f32>,
-    visits: Vec<f32>,
-    beta: Vec<f32>,
-    proposal_counts: Vec<u32>,
-    to_move: Color,
-    selected_action: u32,
-    game: u64,
-    ply: u32,
-    seed: u64,
-}
 
-/// One game's outcome, written to a sidecar rather than into the replay.
-///
-/// The replay record is a training tensor: position, policy, value, and nothing
-/// that identifies which game it came from. Game-level facts -- the komi it was
-/// played at, how it ended, by how much -- have no place there, and replicating
-/// them across every position of a game would pay 72x for one number.
-///
-/// `first_sample` and `sample_count` are the join back: they name the record
-/// range this game produced, which is what lets a later question condition
-/// position-level data on a game-level outcome. They cannot be reconstructed
-/// after the fact, so they are written even though nothing reads them yet.
-#[derive(Clone, Debug)]
-struct GameRecord {
-    game: u64,
-    komi: f64,
-    /// The board this game was played on. Constant across a single-radius run
-    /// and the whole point of a mixed one -- and the komi controller cannot fit
-    /// its balance law without it, since balanced komi is a function of radius.
-    radius: f64,
-    plies: u32,
-    /// Passes and no-op self-captures, which are how a stalled game passes the
-    /// time. A capped game with many of either is stalling, not playing long.
-    passes: u64,
-    self_captures: u64,
-    /// Black-relative: +1 Black, -1 White, 0 tie.
-    black_utility: f32,
-    /// Area margin, always non-negative.
-    margin: f64,
-    reached_ply_cap: bool,
-    resigned: bool,
-    /// Ply a soft concession fired at, if one did. The game played on from
-    /// there at reduced search, so `resigned` stays false and the outcome is a
-    /// real one -- this is what lets the rule be scored after the fact.
-    soft_resign_ply: Option<u32>,
-    first_sample: usize,
-    sample_count: usize,
-    /// The board as the game ended, for the ownership target.
-    ///
-    /// Stored as stones rather than as a rendered map: ownership at a point is
-    /// the colour of the nearest stone, which is what the rasterizer already
-    /// computes for the voronoi channels, so re-rendering from the position
-    /// cannot drift from the inputs the net reads. It is also 26x smaller --
-    /// ~600 bytes against a 16 KB int8 map at 128x128.
-    final_stones: Vec<(f64, f64, u8)>,
-}
 
-struct GameSamples {
-    samples: Vec<LabeledSample>,
-    /// This game's outcome, absent only when it produced no samples.
-    record: Option<GameRecord>,
-    completed: bool,
-    /// The game ran out of plies rather than ending on its own.
-    ///
-    /// Worth tracking on its own: a hundred plies is far past where the board
-    /// settles, so a high share means the sides are stalling rather than that
-    /// the game is genuinely long. It was 88% among games containing a run of
-    /// no-op self-captures and 0% among games without one.
-    reached_ply_cap: bool,
-    /// Counterfactual resignation outcomes for this game, one entry per
-    /// candidate threshold. Produced for every game whose true result is known
-    /// independently of the rule being measured: under hard resignation only
-    /// the games exempted by `--resign-disable-fraction`, under soft
-    /// resignation all of them, since a soft concession plays on to a real
-    /// terminal state. See the note where this is populated.
-    calibration: Vec<ResignTrial>,
-}
 
 #[derive(Clone, Debug, Parser)]
 #[command(about = "Generate a labeled semantic-raster dataset from self-play")]
@@ -393,55 +316,8 @@ struct Config {
 }
 
 
-/// Thresholds the calibrator evaluates each shard.
-///
-/// Spanning the range where a value head this saturated might plausibly be
-/// trusted. The pipeline picks the lowest whose measured error rate is
-/// acceptable -- lower concedes earlier and saves more.
-/// Thresholds the counterfactual sweeps.
-///
-/// Extends past 0.98 because the head saturates: measured on ddrnet-komi3
-/// update 34, 51% of positions read |v| > 0.95 and 30% read |v| > 0.99, so a
-/// sweep stopping at 0.98 cannot tell a confident call from a certain one. The
-/// tail matters -- 0.70 to 0.98 moved the false-positive rate only 9.0% to
-/// 6.2% while still firing on 504 of ~660 games.
-const CALIBRATION_THRESHOLDS: [f64; 9] = [0.70, 0.80, 0.85, 0.90, 0.95, 0.98, 0.99, 0.995, 0.999];
 
-/// Windows swept alongside the thresholds.
-///
-/// The window is the other half of the rule and the untested half: raising the
-/// threshold from 0.95 to 0.98 barely moved the false-positive rate, which says
-/// the head is confidently wrong rather than marginally over the line. Demanding
-/// more consecutive plies of agreement is a different lever -- it asks the
-/// losing seat to keep conceding across more of its own turns, which noise
-/// clears far less easily than one confident evaluation.
-const CALIBRATION_WINDOWS: [u32; 4] = [5, 8, 12, 16];
 
-/// What resignation would have done to one calibrating game at one threshold.
-#[derive(Clone, Copy, Debug)]
-struct ResignTrial {
-    threshold: f64,
-    /// Consecutive own-turn agreements required before conceding.
-    window: u32,
-    /// The rule would have conceded this game.
-    fired: bool,
-    /// It would have conceded for the side that actually won: a false positive,
-    /// and the label the loop would have learned is the wrong one.
-    wrong: bool,
-    /// Plies that would have been skipped had it fired.
-    plies_saved: u32,
-    /// The *least* confident evaluation in the window that triggered the
-    /// concession, as a magnitude in [threshold, 1].
-    ///
-    /// This is the quantity the rule actually tests, and the question it
-    /// answers is whether false positives are less extreme than true ones. If
-    /// they are, confidence separates the two and a higher bar is worth
-    /// raising. If the distributions overlap, no threshold can filter them and
-    /// only a different signal -- a longer window, or not resigning -- will.
-    /// The root values are discarded after a playout, so this cannot be
-    /// recovered later; it has to be measured here.
-    fired_confidence: f64,
-}
 
 
 
@@ -534,221 +410,6 @@ fn validate_config(config: &Config) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn generate_game(
-    config: &Config,
-    evaluator: &dyn Evaluator,
-    game_index: u64,
-    stopped: &AtomicBool,
-) -> Result<GameSamples, EvaluationError> {
-    // Policy targets, the recorded action index, and the replay policy vector all
-    // live on the placement grid, which may be coarser than the render raster.
-    let policy_config = RasterConfig::square(config.policy_resolution);
-    let search_config = search_config(
-        config.simulations,
-        config.coarse_pool,
-        config.temperature,
-        config.temperature_plies,
-        config.leaf_batch,
-        config.maximum_candidates,
-        config.root_exploration_noise,
-        config.widening_coefficient,
-    );
-    let game_seed = config.seed.wrapping_add(game_index);
-    let mut pending = Vec::new();
-    // Exempt a deterministic fraction of games from resignation. Deriving the
-    // choice from the game seed rather than a counter keeps it reproducible and
-    // independent of how games are distributed across actors, so a rerun
-    // exempts exactly the same games.
-    let exempt_from_resignation = resign_exempt(game_seed, config.resign_disable_fraction);
-    let resign = if config.resign_threshold > 0.0 && !exempt_from_resignation {
-        ResignRule {
-            threshold: config.resign_threshold,
-            window: config.resign_window,
-            disable_fraction: config.resign_disable_fraction,
-            minimum_ply: config.resign_minimum_ply,
-            soft_simulations: config.resign_soft_simulations,
-        }
-    } else {
-        ResignRule::disabled()
-    };
-    // Set by the playout the ply a soft concession fires at, read by the search
-    // closure below so the rest of the game runs cheaply. A Cell rather than a
-    // parameter because the playout owns the loop and the closure is its
-    // argument -- neither can see the other's locals.
-    let soft_from = std::cell::Cell::new(u32::MAX);
-    let final_position: std::cell::RefCell<Option<Position>> =
-        std::cell::RefCell::new(None);
-    // Board size, komi and the ply cap are all per game once a run mixes sizes,
-    // and the last two follow from the first. Derived by `GameSettings` so a
-    // second generator cannot arrive at a different answer.
-    let settings = config.game_settings();
-    let (radius, komi, maximum_plies) = settings.board_for_game(game_seed);
-    let playout = run_playout_with_resignation(
-        Position::new(radius, Vec::new(), Color::Black)
-            .with_ruleset(config.ruleset)
-            .with_komi(komi),
-        maximum_plies,
-        resign,
-        |position, ply| {
-            if stopped.load(Ordering::Acquire) {
-                return Err(EvaluationError::new("replay generation cancelled"));
-            }
-            // Past a soft concession the game is only being played out to reach
-            // a real terminal state, so it does not need full search.
-            let mut config_for_ply = search_config;
-            if ply >= soft_from.get() {
-                config_for_ply.simulations = config.resign_soft_simulations;
-            }
-            search_at_ply(position, config_for_ply, game_seed, evaluator, ply)
-        },
-        |step| {
-            if let Some(ply) = step.soft_resign_ply {
-                soft_from.set(ply);
-            }
-            // The last position the game reached, recorded or not. Adjudication
-            // scores this rather than the last *sample*: under subsampling they
-            // are different positions, and scoring a board several plies short
-            // of the end awards the game on a state neither player played to.
-            final_position.replace(Some(step.position.clone()));
-            // Keep a fraction of plies. The draw is per (game, ply) so the kept
-            // set is spread through the game rather than a prefix, and stable
-            // for a given seed.
-            if !settings.records_ply(game_seed, step.ply) {
-                return;
-            }
-            let target = policy_target(step.search, policy_config);
-            pending.push(PendingSample {
-                // Store the position; rendering is a training-time choice now,
-                // which also takes the rasterizer off the self-play hot path.
-                position: step.position.clone(),
-                policy: target.policy,
-                policy_mask: target.mask,
-                visits: target.visits,
-                beta: target.beta,
-                proposal_counts: target.proposal_counts,
-                to_move: step.position.to_move(),
-                // Root evaluation from Black's perspective, kept so a game cut
-                // off at the ply cap can be adjudicated rather than discarded.
-                root_black_value: step.search.root_black_value(),
-                selected_action: action_index(step.action, policy_config),
-                game: game_index,
-                ply: step.ply,
-                seed: game_seed,
-            });
-        },
-    )?;
-    // A game that ran out of plies has no played-out result, but it is not
-    // necessarily undecided: if both sides' own searches have agreed on who is
-    // ahead over the closing plies, the position is settled in the only sense
-    // the loop can observe, and discarding it throws away a real label.
-    //
-    // Agreement is required from *both* seats. The root value is Black-relative
-    // and each ply is evaluated by the side to move, so alternating plies are
-    // independent judgements; demanding the same sign from all of them means
-    // the player who is behind concurs. A margin keeps near-even positions --
-    // where the sides would disagree by noise alone -- discarded as before.
-    let outcome = match playout.outcome {
-        Some(outcome) => outcome,
-        None => {
-            let closing = final_position.borrow().clone();
-            // A game at the ply cap is decided on its final position rather
-            // than discarded. A hundred plies is far past where the board
-            // settles, and the margin was rejecting close games -- which are
-            // the ones a balanced komi produces, so refusing them threw away
-            // exactly the positions the run is trying to learn from.
-            match closing.as_ref() {
-                Some(position) => award_by_area(position),
-                None => {
-                    return Ok(GameSamples {
-                        samples: Vec::new(),
-                        record: None,
-                        completed: false,
-                        reached_ply_cap: true,
-                        calibration: Vec::new(),
-                    });
-                }
-            }
-        }
-    };
-    let black_value = outcome.black_utility() as f32;
-    // Measured before `pending` is consumed below. Only a game the rule did
-    // not end can calibrate it: a hard-resigned game's outcome was assigned by
-    // the rule under test, so asking whether resigning was right is circular.
-    //
-    // A *soft* resignation is not circular, and reports `resigned: false` for
-    // exactly that reason -- the game played on to a real terminal state, so
-    // the outcome is independent of the rule that fired. Under soft resign
-    // every game therefore calibrates, and `--resign-disable-fraction` is no
-    // longer needed to hold out a clean sample: it exists to keep the rule from
-    // deciding the label, which soft resign already prevents. That is a ten-fold
-    // larger calibration sample at no cost, since the counterfactual only
-    // replays root values every game already stores.
-    //
-    // The exemption still matters with hard resignation, where a fired game's
-    // label really is the rule's own assertion.
-    let calibration = if !playout.resigned {
-        calibration_trials(&pending, config.resign_window, black_value > 0.0)
-    } else {
-        Vec::new()
-    };
-    let samples = pending
-        .into_iter()
-        .map(|sample| LabeledSample {
-            position: sample.position,
-            policy: sample.policy,
-            policy_mask: sample.policy_mask,
-            visits: sample.visits,
-            beta: sample.beta,
-            proposal_counts: sample.proposal_counts,
-            value: if sample.to_move == Color::Black {
-                black_value
-            } else {
-                -black_value
-            },
-            selected_action: sample.selected_action,
-            game: sample.game,
-            ply: sample.ply,
-            seed: sample.seed,
-        })
-        .collect();
-    let samples: Vec<LabeledSample> = samples;
-    Ok(GameSamples {
-        record: Some(GameRecord {
-            game: game_index,
-            komi: playout.final_position.komi(),
-            radius: playout.final_position.radius(),
-            plies: playout.stats.plies,
-            passes: playout.stats.passes,
-            self_captures: playout.stats.self_captures,
-            black_utility: black_value,
-            // The board margin, not `outcome.margin`: a resignation reports a
-            // real winner but leaves the margin at zero, since no area was
-            // scored. Recomputing it from the final position is what makes a
-            // resigned game reviewable -- it says how far behind the conceding
-            // side actually was, which is the only way to judge the rule.
-            margin: {
-                let analysis = Analysis::new(&playout.final_position);
-                (analysis.score.black - analysis.score.white - playout.final_position.komi()).abs()
-            },
-            reached_ply_cap: playout.outcome.is_none(),
-            resigned: playout.resigned,
-            soft_resign_ply: playout.stats.soft_resign_ply,
-            // Filled by the writer, which owns the shard-relative offset.
-            first_sample: 0,
-            sample_count: samples.len(),
-            final_stones: playout
-                .final_position
-                .stones()
-                .iter()
-                .map(|stone| (stone.x, stone.y, u8::from(stone.color == Color::White)))
-                .collect(),
-        }),
-        samples,
-        completed: true,
-        reached_ply_cap: playout.outcome.is_none(),
-        calibration,
-    })
-}
 
 #[derive(Default)]
 struct AtomicGenerationMetrics {
@@ -918,6 +579,7 @@ fn generate_to_dataset(
     for actor in 0..config.actors {
         let config = config.clone();
         let evaluator = Arc::clone(&evaluator);
+        let settings = config.game_settings();
         let next_game = Arc::clone(&next_game);
         let stopped = Arc::clone(&stopped);
         let draining = Arc::clone(&draining);
@@ -946,7 +608,7 @@ fn generate_to_dataset(
                             .peak_active_games
                             .fetch_max(active, Ordering::Relaxed);
                         let game_started = Instant::now();
-                        let result = generate_game(&config, evaluator.as_ref(), index, &stopped);
+                        let result = generate_game(&settings, evaluator.as_ref(), index, &stopped);
                         metrics.summed_game_nanoseconds.fetch_add(
                             duration_nanoseconds(game_started.elapsed()),
                             Ordering::Relaxed,
@@ -1805,107 +1467,7 @@ fn write_json_string(writer: &mut impl Write, value: &str) -> std::io::Result<()
     writer.write_all(b"\"")
 }
 
-/// Replays the resign rule over a finished game at each candidate threshold.
-///
-/// Only meaningful for games played to a real result: the rule's error rate is
-/// how often it would have conceded for the eventual winner, and that is
-/// unknowable for a game the rule already ended. That set is the exempt games
-/// under hard resignation and every game under soft, which is the condition the
-/// caller applies.
-///
-/// One caveat the counters cannot express: after a soft concession the rest of
-/// the game is searched at `--resign-soft-simulations`, so both the root values
-/// this replays and the outcome it scores against come from the cheaper search.
-/// A low error rate there is partly the rule agreeing with a playout it shaped.
-/// Games exempted by `--resign-disable-fraction` are the only ones measured at
-/// full strength throughout.
-fn calibration_trials(
-    pending: &[PendingSample],
-    _window: u32,
-    black_won: bool,
-) -> Vec<ResignTrial> {
-    CALIBRATION_THRESHOLDS
-        .iter()
-        .flat_map(|&threshold| {
-            CALIBRATION_WINDOWS
-                .iter()
-                .map(move |&window| (threshold, window))
-        })
-        .map(|(threshold, window)| {
-            // Per seat, matching the live rule: a shared counter is reset by the
-            // winning side's ply and can never reach the window.
-            let mut streak = [0_u32; 2];
-            // The weakest evaluation in the current streak, per seat: the rule
-            // requires every ply in the window to clear the bar, so the streak
-            // is only as confident as its least confident member.
-            let mut weakest = [1.0_f64; 2];
-            let mut fired_at = None;
-            for (index, sample) in pending.iter().enumerate() {
-                let mover_value = if sample.to_move == Color::Black {
-                    sample.root_black_value
-                } else {
-                    -sample.root_black_value
-                };
-                let seat = usize::from(sample.to_move == Color::White);
-                if mover_value <= -threshold {
-                    streak[seat] += 1;
-                    weakest[seat] = weakest[seat].min(mover_value.abs());
-                } else {
-                    streak[seat] = 0;
-                    weakest[seat] = 1.0;
-                }
-                if streak[seat] >= window {
-                    fired_at = Some((index, sample.to_move, weakest[seat]));
-                    break;
-                }
-            }
-            match fired_at {
-                None => ResignTrial {
-                    threshold,
-                    window,
-                    fired: false,
-                    wrong: false,
-                    plies_saved: 0,
-                    fired_confidence: 0.0,
-                },
-                Some((index, conceding, confidence)) => {
-                    let conceding_won = (conceding == Color::Black) == black_won;
-                    ResignTrial {
-                        threshold,
-                        window,
-                        fired: true,
-                        wrong: conceding_won,
-                        plies_saved: (pending.len() - index - 1) as u32,
-                        fired_confidence: confidence,
-                    }
-                }
-            }
-        })
-        .collect()
-}
 
-/// Whether a game is exempt from resignation, decided from its seed.
-///
-/// Hashing the seed rather than counting games keeps the exempt set stable
-/// across reruns and independent of actor scheduling, which matters because
-/// these games are the calibration sample: they have to be a fair draw, not
-/// whichever games happened to land on a particular worker.
-fn resign_exempt(game_seed: u64, fraction: f64) -> bool {
-    if fraction <= 0.0 {
-        return false;
-    }
-    if fraction >= 1.0 {
-        return true;
-    }
-    // SplitMix64 finalizer: cheap, and well distributed for consecutive seeds.
-    let mut value = game_seed ^ 0x9e37_79b9_7f4a_7c15;
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^= value >> 31;
-    (value >> 11) as f64 / (1_u64 << 53) as f64 <= fraction
-}
 
 fn main() -> std::io::Result<()> {
     let config = Config::parse();
@@ -2283,11 +1845,11 @@ mod tests {
     use vgo_raster::RasterConfig;
     use vgo_search::{Action, CandidateSource, ChildSummary, SearchResult, SearchStats};
 
-    use super::{
-        ActorPool, Config, GameEnvelope, GameRecord, GameSamples, KOMI_AREA_COEFFICIENT,
-        PendingSample, calibration_trials, komi_buckets, komi_centre_for_radius,
-        maximum_plies_for_radius, parse_board_mix, policy_target, sampled_komi,
-        sampled_radius, search_config, validate_config,
+    use super::{ActorPool, Config, GameEnvelope, komi_buckets, validate_config};
+    use vgo_selfplay::generation::{
+        GameRecord, GameSamples, KOMI_AREA_COEFFICIENT, PendingSample, calibration_trials,
+        komi_centre_for_radius, maximum_plies_for_radius, parse_board_mix, policy_target,
+        sampled_komi, sampled_radius, search_config,
     };
     use vgo_core::{Color, Position, Stone};
 
