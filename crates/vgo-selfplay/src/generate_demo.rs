@@ -21,10 +21,10 @@ use vgo_inference::{
     OnnxServiceConfig,
 };
 use vgo_raster::{
-    CHANNELS, COMPACT_CHANNELS, ChannelSpec, RasterConfig, RasterKind, SemanticRaster, action_pixel,
+    CHANNELS, COMPACT_CHANNELS, ChannelSpec, RasterConfig, RasterKind, SemanticRaster,
 };
 use vgo_search::{
-    Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, SearchResult, search_at_ply,
+    EvaluationError, Evaluator, NaiveEvaluator, search_at_ply,
 };
 use vgo_selfplay::generation::{
     BoardBand, GameSettings, KOMI_AREA_COEFFICIENT, PolicyTarget, action_index,     komi_centre_for_radius, maximum_plies_for_radius, parse_board_mix, policy_target,
