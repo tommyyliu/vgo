@@ -52,6 +52,19 @@
 # placements on the standard board still sit ~6.7 cells apart, so the grid can
 # name every distinct move.
 #
+# ## Batch 64, because 256 does not fit
+#
+# Activation memory goes as the raster area, so 256 square needs four times what
+# 128 did and the old batch of 256 wants ~31 GB on a 15.5 GB card. Measured at
+# this raster: 4.1 GB at batch 32, 7.9 at 64, 11.8 at 96, OOM at 128. Batch 64
+# lands where batch 256 sat at the old raster.
+#
+# The learning rate halves with it. Four times the steps at four times smaller
+# batches would move four times as far at the same rate; linear scaling says
+# quarter it, the usual Adam heuristic says halve it, and this takes the
+# heuristic. That is a choice, not a measurement -- if the first updates diverge,
+# this is the first thing to look at.
+#
 # ## Ply sampling, because the value head would starve
 #
 # A standard game runs past three hundred plies. Shards are sized in positions,
@@ -64,10 +77,19 @@
 # about the mini board's capacity, and left there a standard game is cut off a
 # fifth of the way in with a truncation artifact for a label.
 #
-# ## What it costs
+# ## What it costs, measured rather than estimated
 #
-# ~3x a mini-only run per update, from the standard board's stone count. First
-# interpretable rating is 15-20 updates in, from random weights.
+# 32 actors on the real mix produced 60 samples from 4 games in 329 s, which is
+# 2.4 hours a shard at 6400 simulations -- six days for sixty updates. Measured
+# after launching twice on an estimate, which is the wrong order.
+#
+# `--generation-simulations 1600` rather than 6400 buys that back fourfold, to
+# roughly 35 minutes a shard. Three things say it is the right knob rather than
+# a concession: search width past the current setting was measured at +64 Elo
+# and simulations are the same currency; the value head is starved of *games*,
+# which this quadruples per hour; and on a cold start the prior is random, so
+# deep search on it is the least valuable search there is. Raise it once the
+# policy is worth searching.
 #
 set -euo pipefail
 
@@ -103,7 +125,7 @@ exec "$python" -m vgo_training.rl_loop \
   --context-attention-blocks 1 --attention-heads 8 \
   --resolution 256 --policy-resolution 128 \
   --radius 0.05555555555555555 \
-  --coarse-pool 16 --generation-simulations 6400 \
+  --coarse-pool 16 --generation-simulations 1600 \
   --widening-coefficient 4.0 --maximum-candidates 321 \
   --root-exploration-noise 0.0 \
   --board-mix 50:38 --board-mix 25:18 --board-mix 25:18-50 \
@@ -115,8 +137,8 @@ exec "$python" -m vgo_training.rl_loop \
   --komi-low 0.017 --komi-high 0.137 \
   --dynamic-komi --komi-target-black-win-rate 0.5 \
   --komi-recenter-minimum-games 256 --komi-recenter-maximum-step 0.025 \
-  --training-epochs 1 --training-batch 256 \
-  --learning-rate 0.001 --warm-learning-rate 0.001 --value-weight 2.0 \
+  --training-epochs 1 --training-batch 64 \
+  --learning-rate 0.0005 --warm-learning-rate 0.0005 --value-weight 2.0 \
   --ownership-weight 0.0 --recency-decay 1.0 --drain-tail \
   --concurrent-generators 1 \
   --schedule cosine --warmup-epochs 0 --compile --restore-optimizer \
