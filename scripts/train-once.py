@@ -30,9 +30,60 @@ sys.path.insert(0, str(_TRAINING))
 from vgo_training.learner import LearnerConfig, LearnerUpdate, PersistentLearner  # noqa: E402
 
 
+def window_from_games(root: Path, window_samples: int) -> tuple[list[Path], int]:
+    """The most recent games totalling at least ``window_samples`` samples.
+
+    Samples, not games and not shards, because they are the only unit that means
+    the same thing twice. A game runs 70 plies on an 18-unit board and 312 on a
+    38-unit one, so "the last N games" is a quantity of data that swings by a
+    factor of four with the board mix; shards from the old generator varied 2.5x
+    in sample count for the same reason. What the learner actually spends, and
+    what the gradient signal scales with, is samples.
+
+    Recency is directory order: generation labels sort chronologically and games
+    are numbered within them. Counts come from each manifest, so choosing a
+    window costs a few hundred small reads rather than loading any data.
+    """
+
+    entries: list[tuple[Path, int]] = []
+    for generation in sorted(p for p in root.iterdir() if p.is_dir()):
+        for game in sorted(p for p in generation.iterdir() if p.is_dir()):
+            manifest = game / "manifest.json"
+            dataset = game / "dataset.vgo"
+            if not manifest.is_file() or not dataset.is_file():
+                continue  # a game still being written, or a staging leftover
+            try:
+                samples = int(json.loads(manifest.read_text())["samples"])
+            except (ValueError, KeyError, OSError):
+                continue
+            if samples > 0:
+                entries.append((dataset, samples))
+
+    chosen: list[Path] = []
+    total = 0
+    for dataset, samples in reversed(entries):
+        if total >= window_samples:
+            break
+        chosen.append(dataset)
+        total += samples
+    chosen.reverse()  # oldest first, so the window reads in play order
+    return chosen, total
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("datasets", type=Path, nargs="+")
+    parser.add_argument("datasets", type=Path, nargs="*")
+    parser.add_argument(
+        "--games-root", type=Path, default=None,
+        help="directory of per-generation game directories, as written by "
+        "vgo-generate-continuous. Selects the window instead of listing "
+        "datasets by hand.",
+    )
+    parser.add_argument(
+        "--window-samples", type=int, default=0,
+        help="with --games-root, train on the most recent games totalling at "
+        "least this many samples.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--initial-checkpoint", type=Path, default=None,
@@ -64,7 +115,7 @@ def main() -> None:
     parser.add_argument(
         "--raster-kind",
         default=None,
-        choices=("semantic", "compact", "compact-pass", "compact-dead-zone", "compact-connected", "rgb"),
+        choices=("semantic", "compact", "compact-pass", "compact-dead-zone", "compact-connected", "compact-radius", "rgb"),
         help=(
             "which planes to render from each shard. A property of the model "
             "rather than of the data: shards store positions, so the raster is "
@@ -104,6 +155,22 @@ def main() -> None:
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
     arguments = parser.parse_args()
+    if arguments.games_root is not None:
+        if arguments.window_samples <= 0:
+            parser.error("--games-root needs a positive --window-samples")
+        datasets, total = window_from_games(
+            arguments.games_root, arguments.window_samples
+        )
+        if not datasets:
+            parser.error(f"no complete games under {arguments.games_root}")
+        print(
+            f"[window] {len(datasets)} games, {total:,} samples "
+            f"(asked for {arguments.window_samples:,})",
+            flush=True,
+        )
+        arguments.datasets = datasets
+    elif not arguments.datasets:
+        parser.error("pass dataset paths, or --games-root with --window-samples")
 
     config = LearnerConfig(
         epochs=arguments.epochs,

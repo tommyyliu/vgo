@@ -32,6 +32,10 @@ name = "vgo-generate-demo"
 path = "src/generate_demo.rs"
 
 [[bin]]
+name = "vgo-generate-continuous"
+path = "src/generate_continuous.rs"
+
+[[bin]]
 name = "vgo-arena"
 path = "src/arena.rs"
 
