@@ -61,6 +61,29 @@ pub const COMPACT_CHANNELS: [usize; 5] = [
 /// passing now would end the game -- it can neither pass to close out a win nor
 /// see that passing while behind hands over the result. The plane is constant
 /// over the board and therefore costs nothing to write.
+/// [`RasterKind::CompactPass`] plus the radius plane.
+///
+/// The board is the unit square whatever the stone size, so radius *is* the
+/// board size: `voronoigo.com` plays 18, 26 and 38 units across, which are
+/// radii of 1/18, 1/26 and 1/38 here. Nothing in `CompactPass` carries it. An
+/// empty board renders identically at every radius -- no stones, so no ridge,
+/// no settled region, and the two scalars say nothing about scale -- and a net
+/// asked to open on a board whose size it cannot see is guessing which game it
+/// is playing.
+///
+/// The plane holds `2r`, the stone diameter, matching what the semantic
+/// rasterizer writes at index 8. That is in `[0, 1]` for every playable radius
+/// and reads directly as "how much of the board does one stone span".
+pub const COMPACT_RADIUS_CHANNELS: [usize; 7] = [
+    0,  // current_stones
+    1,  // opponent_stones
+    6,  // voronoi_ridge
+    10, // settled
+    11, // komi
+    9,  // previous_pass
+    8,  // radius
+];
+
 pub const COMPACT_PASS_CHANNELS: [usize; 6] = [
     0,  // current_stones
     1,  // opponent_stones
@@ -242,6 +265,12 @@ pub enum RasterKind {
     /// search, and nothing in the other planes exposes it. This is the plane a
     /// player reads off the board and the network otherwise has to infer.
     CompactConnected,
+    /// [`CompactPass`](Self::CompactPass) plus the radius.
+    ///
+    /// The layout for training across board sizes. See
+    /// [`COMPACT_RADIUS_CHANNELS`] for why the plane is needed rather than
+    /// inferable.
+    CompactRadius,
 }
 
 impl RasterKind {
@@ -254,6 +283,7 @@ impl RasterKind {
             Self::CompactPass => COMPACT_PASS_CHANNELS.len(),
             Self::CompactDeadZone => COMPACT_DEAD_ZONE_CHANNELS.len(),
             Self::CompactConnected => COMPACT_CONNECTED_CHANNELS.len(),
+            Self::CompactRadius => COMPACT_RADIUS_CHANNELS.len(),
         }
     }
 
@@ -266,6 +296,7 @@ impl RasterKind {
             Self::CompactPass => &COMPACT_PASS_CHANNELS,
             Self::CompactDeadZone => &COMPACT_DEAD_ZONE_CHANNELS,
             Self::CompactConnected => &COMPACT_CONNECTED_CHANNELS,
+            Self::CompactRadius => &COMPACT_RADIUS_CHANNELS,
         }
     }
 
@@ -284,6 +315,7 @@ impl RasterKind {
             Self::CompactPass => "compact-pass",
             Self::CompactDeadZone => "compact-dead-zone",
             Self::CompactConnected => "compact-connected",
+            Self::CompactRadius => "compact-radius",
         }
     }
 }
@@ -299,6 +331,7 @@ impl std::str::FromStr for RasterKind {
             "compact-pass" => Ok(Self::CompactPass),
             "compact-dead-zone" => Ok(Self::CompactDeadZone),
             "compact-connected" => Ok(Self::CompactConnected),
+            "compact-radius" => Ok(Self::CompactRadius),
             _ => Err(format!("unsupported raster kind: {value}")),
         }
     }
@@ -458,6 +491,7 @@ pub fn rasterize_any_into(position: &Position, config: RasterConfig, data: &mut 
             rasterize_compact_six_into(position, config, data);
         }
         RasterKind::CompactConnected => rasterize_compact_connected_into(position, config, data),
+        RasterKind::CompactRadius => rasterize_compact_radius_into(position, config, data),
     }
 }
 
@@ -579,6 +613,27 @@ pub fn rasterize_compact_six_into(position: &Position, config: RasterConfig, dat
     let (head, tail) = data.split_at_mut(COMPACT_CHANNELS.len() * pixels);
     rasterize_compact_with_predicate_into(position, compact, &predicate, head);
     tail.fill(f32::from(position.consecutive_passes() > 0));
+}
+
+/// Writes [`RasterKind::CompactRadius`]: the six-plane layout plus the radius.
+///
+/// Both trailing planes are constant over the board, so they are filled rather
+/// than rendered. The first five come from the shared compact writer, which is
+/// what keeps this layout from disagreeing with `CompactPass` about any plane
+/// they have in common.
+pub fn rasterize_compact_radius_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
+    let pixels = config.pixels();
+    assert_eq!(data.len(), COMPACT_RADIUS_CHANNELS.len() * pixels);
+    let predicate = settled_for_raster(position, config);
+    let compact = RasterConfig {
+        kind: RasterKind::Compact,
+        ..config
+    };
+    let (head, rest) = data.split_at_mut(COMPACT_CHANNELS.len() * pixels);
+    rasterize_compact_with_predicate_into(position, compact, &predicate, head);
+    let (pass, radius) = rest.split_at_mut(pixels);
+    pass.fill(f32::from(position.consecutive_passes() > 0));
+    radius.fill((2.0 * position.radius()) as f32);
 }
 
 /// Writes the [`RasterKind::Compact`] subset.
@@ -1304,7 +1359,7 @@ mod tests {
 
     use super::{
         CHANNEL_COUNT, CHANNELS, COMPACT_CHANNELS, RGB_CHANNEL_COUNT, RasterConfig, RasterKind,
-        action_pixel, rasterize, rasterize_compact_into,
+        action_pixel, rasterize, rasterize_any_into, rasterize_compact_into,
         rasterize_compact_shader_reference_into, rasterize_into, rasterize_rgb, settled_for_raster,
     };
 
@@ -2029,6 +2084,72 @@ mod tests {
     }
 
     /// Every plane of the eight-channel layout is what its name says.
+    /// The whole reason the layout exists: two board sizes must not render
+    /// identically. An empty board is the case that matters, because it is
+    /// where every other plane is zero and the net has nothing else to go on.
+    #[test]
+    fn the_radius_layout_separates_board_sizes() {
+        let config = RasterConfig::square_of(64, RasterKind::CompactRadius);
+        let mut mini = vec![0.0f32; config.channels() * config.pixels()];
+        let mut standard = vec![0.0f32; config.channels() * config.pixels()];
+        rasterize_any_into(
+            &Position::new(1.0 / 18.0, Vec::new(), Color::Black),
+            config,
+            &mut mini,
+        );
+        rasterize_any_into(
+            &Position::new(1.0 / 38.0, Vec::new(), Color::Black),
+            config,
+            &mut standard,
+        );
+        assert_ne!(mini, standard, "empty boards must differ by radius");
+
+        // And the six-plane layout genuinely cannot tell them apart, which is
+        // what makes the extra plane necessary rather than merely convenient.
+        let six = RasterConfig::square_of(64, RasterKind::CompactPass);
+        let mut mini_six = vec![0.0f32; six.channels() * six.pixels()];
+        let mut standard_six = vec![0.0f32; six.channels() * six.pixels()];
+        rasterize_any_into(
+            &Position::new(1.0 / 18.0, Vec::new(), Color::Black),
+            six,
+            &mut mini_six,
+        );
+        rasterize_any_into(
+            &Position::new(1.0 / 38.0, Vec::new(), Color::Black),
+            six,
+            &mut standard_six,
+        );
+        assert_eq!(mini_six, standard_six, "compact-pass is scale-blind");
+
+        // The plane holds the stone diameter, the same value the semantic
+        // rasterizer writes at index 8.
+        let pixels = config.pixels();
+        let plane = &standard[6 * pixels..7 * pixels];
+        assert!(plane.iter().all(|&v| (v - (2.0 / 38.0) as f32).abs() < 1e-6));
+    }
+
+    /// Everything `compact-pass` renders must survive unchanged, or the two
+    /// layouts would disagree about planes they share.
+    #[test]
+    fn the_radius_layout_extends_compact_pass() {
+        let position = Position::new(
+            1.0 / 18.0,
+            vec![
+                Stone::new(0.30, 0.30, Color::Black),
+                Stone::new(0.62, 0.44, Color::White),
+                Stone::new(0.45, 0.70, Color::Black),
+            ],
+            Color::White,
+        );
+        let seven = RasterConfig::square_of(64, RasterKind::CompactRadius);
+        let six = RasterConfig::square_of(64, RasterKind::CompactPass);
+        let mut wide = vec![0.0f32; seven.channels() * seven.pixels()];
+        let mut narrow = vec![0.0f32; six.channels() * six.pixels()];
+        rasterize_any_into(&position, seven, &mut wide);
+        rasterize_any_into(&position, six, &mut narrow);
+        assert_eq!(&wide[..narrow.len()], &narrow[..]);
+    }
+
     #[test]
     fn the_connected_layout_carries_every_plane_it_names() {
         let names: Vec<&str> = RasterKind::CompactConnected
