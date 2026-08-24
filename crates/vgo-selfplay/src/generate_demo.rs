@@ -98,6 +98,10 @@ struct PendingSample {
 struct GameRecord {
     game: u64,
     komi: f64,
+    /// The board this game was played on. Constant across a single-radius run
+    /// and the whole point of a mixed one -- and the komi controller cannot fit
+    /// its balance law without it, since balanced komi is a function of radius.
+    radius: f64,
     plies: u32,
     /// Passes and no-op self-captures, which are how a stalled game passes the
     /// time. A capped game with many of either is stalling, not playing long.
@@ -303,6 +307,46 @@ struct Config {
     komi_high: f64,
     #[arg(long, default_value_t = 1.0 / 6.0)]
     radius: f64,
+    /// Coefficient in `komi = c * radius^2`, the balance law across board sizes.
+    ///
+    /// Defaults to the value our own measurement fixes: 0.104 at `r = 1/18`.
+    /// Only consulted when `--board-mix` is set; a single-radius run keeps
+    /// using `--komi-low` and `--komi-high` directly, unchanged.
+    #[arg(long, default_value_t = KOMI_AREA_COEFFICIENT)]
+    komi_area_coefficient: f64,
+    /// Board sizes to play, as `WEIGHT:UNITS` or `WEIGHT:LOW-HIGH`, repeatable.
+    ///
+    /// Units are board widths in stone diameters, which is how `voronoigo.com`
+    /// names its boards -- 18 "mini", 26 "midi", 38 "standard" -- and the
+    /// radius is `1 / units`. A range samples uniformly in *units*, not in
+    /// radius: uniform radius puts density proportional to `1/units^2` and
+    /// would pile most of a wide band into its smallest boards.
+    ///
+    /// Empty falls back to `--radius` for every game, which is what every run
+    /// before multi-radius did.
+    ///
+    ///     --board-mix 50:38 --board-mix 25:18 --board-mix 25:18-50
+    ///
+    /// Nothing below 18 units. Small boards are a different game: living gets
+    /// hard, single sequences decide everything, and Go's fair komi across
+    /// 5x5 to 9x9 is non-monotonic (25, 4, 9, 7 points) because of it. Those
+    /// patterns do not transfer, and the komi law fitted here would be
+    /// extrapolating into the regime that breaks it.
+    #[arg(long = "board-mix")]
+    board_mix: Vec<String>,
+    /// Positions recorded per game, as a fraction of its plies.
+    ///
+    /// A standard-board game runs past three hundred plies, and a shard sized
+    /// in *positions* would then hold about five games. The value head learns
+    /// from game-level labels only, so that starves the component that is
+    /// already weakest -- 62 games per shard was the old number and it was
+    /// already thin. Recording a fraction restores the game count at the same
+    /// shard size, and decorrelates the window besides: consecutive plies are
+    /// nearly the same position and contribute nearly the same gradient.
+    ///
+    /// One keeps every ply, which is what runs before this did.
+    #[arg(long, default_value_t = 1.0)]
+    ply_sample_rate: f64,
     /// Which rules to play. `vgo` is this repository's, `official` is
     /// voronoigo.com's -- see docs/OFFICIAL_RULES.md. Part of run identity: a
     /// replay window mixing the two holds games from two different games.
@@ -546,6 +590,123 @@ fn seeded_unit(game_seed: u64) -> f64 {
 /// still reaching the ends often enough to teach the relationship. Sigma is a
 /// quarter of the width, so the range spans +/-2 sigma and about 95% of draws
 /// land inside it before truncation.
+/// One band of the board mix: a weight and a range of board widths in units.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoardBand {
+    pub weight: f64,
+    pub low_units: f64,
+    pub high_units: f64,
+}
+
+/// Smallest board this will play, in stone diameters across.
+///
+/// Below here the game changes character rather than merely getting smaller.
+const MINIMUM_BOARD_UNITS: f64 = 18.0;
+
+/// Parse `WEIGHT:UNITS` or `WEIGHT:LOW-HIGH`.
+pub fn parse_board_mix(specs: &[String]) -> Result<Vec<BoardBand>, String> {
+    let mut bands = Vec::new();
+    for spec in specs {
+        let (weight, extent) = spec
+            .split_once(':')
+            .ok_or_else(|| format!("board mix {spec:?} is not WEIGHT:UNITS"))?;
+        let weight: f64 = weight
+            .trim()
+            .parse()
+            .map_err(|_| format!("board mix {spec:?} has a non-numeric weight"))?;
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!("board mix {spec:?} needs a positive weight"));
+        }
+        let (low, high) = match extent.trim().split_once('-') {
+            Some((low, high)) => (low, high),
+            None => (extent.trim(), extent.trim()),
+        };
+        let low: f64 = low
+            .trim()
+            .parse()
+            .map_err(|_| format!("board mix {spec:?} has non-numeric units"))?;
+        let high: f64 = high
+            .trim()
+            .parse()
+            .map_err(|_| format!("board mix {spec:?} has non-numeric units"))?;
+        if !(low.is_finite() && high.is_finite()) || low > high {
+            return Err(format!("board mix {spec:?} has a malformed range"));
+        }
+        if low < MINIMUM_BOARD_UNITS {
+            return Err(format!(
+                "board mix {spec:?} goes below {MINIMUM_BOARD_UNITS} units; \
+                 smaller boards are a different game"
+            ));
+        }
+        bands.push(BoardBand {
+            weight,
+            low_units: low,
+            high_units: high,
+        });
+    }
+    Ok(bands)
+}
+
+/// This game's radius, drawn from the mix.
+///
+/// Uniform in *units* within a band, so a wide band spreads across board sizes
+/// evenly rather than concentrating in its smallest boards.
+pub fn sampled_radius(game_seed: u64, bands: &[BoardBand], fallback: f64) -> f64 {
+    if bands.is_empty() {
+        return fallback;
+    }
+    let total: f64 = bands.iter().map(|band| band.weight).sum();
+    let mut choice = seeded_unit(game_seed ^ 0x9e37_79b9_7f4a_7c15) * total;
+    for band in bands {
+        if choice < band.weight || std::ptr::eq(band, &bands[bands.len() - 1]) {
+            let units = if band.high_units > band.low_units {
+                let position = seeded_unit(game_seed ^ 0xc2b2_ae3d_27d4_eb4f);
+                band.low_units + position * (band.high_units - band.low_units)
+            } else {
+                band.low_units
+            };
+            return 1.0 / units.max(MINIMUM_BOARD_UNITS);
+        }
+        choice -= band.weight;
+    }
+    fallback
+}
+
+/// Balanced komi at this radius, before the per-game jitter.
+///
+/// Komi compensates about one stone's worth of area and a board holds about
+/// `1/r^2` stones, so komi as a fraction of the board goes as `r^2`. Three
+/// things agree on the coefficient: our own measurement of 0.104 at `r = 1/18`,
+/// which fixes it at 33.7; Go's 9x9 komi of 8.6% of the board against our
+/// 10.4% on a board of nearly the same stone capacity; and Go's 9x9-to-19x19
+/// exponent of 1.89, near enough to 2.
+///
+/// It is a prior, not a law. `fit_komi_power_law` re-estimates both the
+/// coefficient and the exponent from real games once a run has enough of them,
+/// and the exponent is known to drift on small boards -- which is one reason
+/// this refuses to play them.
+pub const KOMI_AREA_COEFFICIENT: f64 = 0.104 * 18.0 * 18.0;
+
+#[must_use]
+pub fn komi_centre_for_radius(radius: f64, coefficient: f64) -> f64 {
+    coefficient * radius * radius
+}
+
+/// Plies to allow a game on this board.
+///
+/// The cap exists to stop a game running forever, so it has to scale with what
+/// the board can hold -- about `1/r^2` stones. Left at the mini board's value a
+/// standard game is cut off around a fifth of the way in, and every value
+/// target from it is a truncation artifact rather than a result.
+#[must_use]
+pub fn maximum_plies_for_radius(radius: f64, plies_at_reference: u32, reference: f64) -> u32 {
+    if !(radius > 0.0 && reference > 0.0) {
+        return plies_at_reference;
+    }
+    let scale = (reference / radius).powi(2);
+    ((plies_at_reference as f64) * scale).ceil().min(4096.0) as u32
+}
+
 fn sampled_komi(game_seed: u64, low: f64, high: f64) -> f64 {
     if !(low.is_finite() && high.is_finite()) || high <= low {
         return low.max(0.0).min(high.max(0.0));
@@ -734,15 +895,37 @@ fn generate_game(
     // parameter because the playout owns the loop and the closure is its
     // argument -- neither can see the other's locals.
     let soft_from = std::cell::Cell::new(u32::MAX);
+    let final_position: std::cell::RefCell<Option<Position>> =
+        std::cell::RefCell::new(None);
+    let keep_rate = config.ply_sample_rate.clamp(0.0, 1.0);
+    // Board size, komi and the ply cap are all per game once a run mixes sizes,
+    // and the last two follow from the first: komi scales with the board's area
+    // per stone, and the cap with how many stones the board holds.
+    let bands = parse_board_mix(&config.board_mix).unwrap_or_default();
+    let radius = sampled_radius(game_seed, &bands, config.radius);
+    let komi = if bands.is_empty() {
+        sampled_komi(game_seed, config.komi_low, config.komi_high)
+    } else {
+        // The configured range sets the *relative* width; its centre is
+        // replaced by the radius law, which is the only thing that can be right
+        // at more than one board size.
+        let centre = komi_centre_for_radius(radius, config.komi_area_coefficient);
+        let width = (config.komi_high - config.komi_low).max(0.0);
+        let relative = if config.komi_low + config.komi_high > 0.0 {
+            width / (0.5 * (config.komi_low + config.komi_high)).max(f64::MIN_POSITIVE)
+        } else {
+            0.5
+        };
+        let half = 0.5 * relative * centre;
+        sampled_komi(game_seed, centre - half, centre + half)
+    };
+    let maximum_plies =
+        maximum_plies_for_radius(radius, config.maximum_plies, config.radius);
     let playout = run_playout_with_resignation(
-        Position::new(config.radius, Vec::new(), Color::Black)
+        Position::new(radius, Vec::new(), Color::Black)
             .with_ruleset(config.ruleset)
-            .with_komi(sampled_komi(
-            game_seed,
-            config.komi_low,
-            config.komi_high,
-        )),
-        config.maximum_plies,
+            .with_komi(komi),
+        maximum_plies,
         resign,
         |position, ply| {
             if stopped.load(Ordering::Acquire) {
@@ -759,6 +942,24 @@ fn generate_game(
         |step| {
             if let Some(ply) = step.soft_resign_ply {
                 soft_from.set(ply);
+            }
+            // The last position the game reached, recorded or not. Adjudication
+            // scores this rather than the last *sample*: under subsampling they
+            // are different positions, and scoring a board several plies short
+            // of the end awards the game on a state neither player played to.
+            final_position.replace(Some(step.position.clone()));
+            // Keep a fraction of plies. The draw is per (game, ply) so the kept
+            // set is spread through the game rather than a prefix, and stable
+            // for a given seed.
+            if keep_rate < 1.0 {
+                let draw = seeded_unit(
+                    game_seed
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                        .wrapping_add(u64::from(step.ply)),
+                );
+                if draw >= keep_rate {
+                    return;
+                }
             }
             let target = policy_target(step.search, policy_config);
             pending.push(PendingSample {
@@ -794,16 +995,13 @@ fn generate_game(
     let outcome = match playout.outcome {
         Some(outcome) => outcome,
         None => {
-            let closing: Vec<_> = pending
-                .iter()
-                .map(|sample| sample.position.clone())
-                .collect();
+            let closing = final_position.borrow().clone();
             // A game at the ply cap is decided on its final position rather
             // than discarded. A hundred plies is far past where the board
             // settles, and the margin was rejecting close games -- which are
             // the ones a balanced komi produces, so refusing them threw away
             // exactly the positions the run is trying to learn from.
-            match closing.last() {
+            match closing.as_ref() {
                 Some(position) => award_by_area(position),
                 None => {
                     return Ok(GameSamples {
@@ -863,6 +1061,7 @@ fn generate_game(
         record: Some(GameRecord {
             game: game_index,
             komi: playout.final_position.komi(),
+            radius: playout.final_position.radius(),
             plies: playout.stats.plies,
             passes: playout.stats.passes,
             self_captures: playout.stats.self_captures,
@@ -1293,13 +1492,14 @@ fn write_game_records(path: &Path, records: &[GameRecord]) -> std::io::Result<()
         writeln!(
             writer,
             concat!(
-                r#"{{"game":{},"komi":{:.6},"plies":{},"passes":{},"#,
+                r#"{{"game":{},"komi":{:.6},"radius":{:.8},"plies":{},"passes":{},"#,
                 r#""self_captures":{},"black_utility":{},"margin":{:.6},"#,
                 r#""reached_ply_cap":{},"resigned":{},"soft_resign_ply":{},"#,
                 r#""first_sample":{},"sample_count":{},"final_stones":[{}]}}"#
             ),
             record.game,
             record.komi,
+            record.radius,
             record.plies,
             record.passes,
             record.self_captures,
@@ -1490,6 +1690,24 @@ fn write_manifest(
         config.temperature_plies
     )?;
     writeln!(writer, "  \"radius\": {},", config.radius)?;
+    if !config.board_mix.is_empty() {
+        writeln!(
+            writer,
+            "  \"board_mix\": [{}],",
+            config
+                .board_mix
+                .iter()
+                .map(|spec| format!("{spec:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )?;
+        writeln!(
+            writer,
+            "  \"komi_area_coefficient\": {},",
+            config.komi_area_coefficient
+        )?;
+    }
+    writeln!(writer, "  \"ply_sample_rate\": {},", config.ply_sample_rate)?;
     // Dynamic komi shifts these per shard, so the effective bounds belong in
     // durable replay rather than only in the coordinator's initial config.
     writeln!(writer, "  \"komi_low\": {},", config.komi_low)?;
@@ -2299,9 +2517,10 @@ mod tests {
     use vgo_search::{Action, CandidateSource, ChildSummary, SearchResult, SearchStats};
 
     use super::{
-        ActorPool, Config, GameEnvelope, GameRecord, GameSamples, PendingSample,
-        calibration_trials, komi_buckets, policy_target, sampled_komi, search_config,
-        validate_config,
+        ActorPool, Config, GameEnvelope, GameRecord, GameSamples, KOMI_AREA_COEFFICIENT,
+        PendingSample, calibration_trials, komi_buckets, komi_centre_for_radius,
+        maximum_plies_for_radius, parse_board_mix, policy_target, sampled_komi,
+        sampled_radius, search_config, validate_config,
     };
     use vgo_core::{Color, Position, Stone};
 
@@ -2330,6 +2549,7 @@ mod tests {
 
     fn game_at(komi: f64, black_wins: bool, margin: f64) -> GameRecord {
         GameRecord {
+            radius: 1.0 / 18.0,
             game: 0,
             komi,
             plies: 60,
@@ -2579,6 +2799,98 @@ mod tests {
             validate_config(&finer_policy),
             Err("--policy-resolution must not exceed --resolution")
         );
+    }
+
+    #[test]
+    /// The mix must hit its weights and stay inside its bands, or a run that
+    /// says half its games are standard quietly plays some other distribution.
+    #[test]
+    fn the_board_mix_samples_its_declared_weights() {
+        let bands = parse_board_mix(&[
+            "50:38".to_string(),
+            "25:18".to_string(),
+            "25:18-50".to_string(),
+        ])
+        .expect("mix parses");
+        let mut standard = 0usize;
+        let mut mini = 0usize;
+        let mut scattered = 0usize;
+        let draws = 20_000;
+        for index in 0..draws {
+            let radius = sampled_radius(index as u64 * 0x9e37_79b9, &bands, 1.0 / 18.0);
+            let units = 1.0 / radius;
+            assert!(
+                (18.0..=50.0).contains(&units),
+                "units {units} outside the mix"
+            );
+            if (units - 38.0).abs() < 1.0e-9 {
+                standard += 1;
+            } else if (units - 18.0).abs() < 1.0e-9 {
+                mini += 1;
+            } else {
+                scattered += 1;
+            }
+        }
+        let share = |count: usize| count as f64 / draws as f64;
+        assert!((share(standard) - 0.50).abs() < 0.02, "standard {}", share(standard));
+        assert!((share(mini) - 0.25).abs() < 0.05, "mini {}", share(mini));
+        assert!((share(scattered) - 0.25).abs() < 0.05, "scattered {}", share(scattered));
+    }
+
+    /// Uniform in units, not in radius. Sampling radius uniformly would put
+    /// density proportional to `1/units^2` and pile a wide band into its
+    /// smallest boards, which is the opposite of spreading across sizes.
+    #[test]
+    fn a_wide_band_spreads_evenly_across_board_sizes() {
+        let bands = parse_board_mix(&["1:18-50".to_string()]).expect("parses");
+        let mut lower = 0usize;
+        let mut upper = 0usize;
+        for index in 0..20_000u64 {
+            let units = 1.0 / sampled_radius(index * 0x2545_f491, &bands, 1.0 / 18.0);
+            if units < 34.0 {
+                lower += 1;
+            } else {
+                upper += 1;
+            }
+        }
+        let ratio = lower as f64 / (lower + upper) as f64;
+        assert!((ratio - 0.5).abs() < 0.03, "half below the midpoint, got {ratio}");
+    }
+
+    /// Small boards are refused rather than clamped: a run asking for them has
+    /// a mistaken premise, and silently playing something else hides it.
+    #[test]
+    fn the_mix_refuses_boards_below_the_floor() {
+        assert!(parse_board_mix(&["1:9".to_string()]).is_err());
+        assert!(parse_board_mix(&["1:10-40".to_string()]).is_err());
+        assert!(parse_board_mix(&["1:18-50".to_string()]).is_ok());
+        assert!(parse_board_mix(&["1:38".to_string()]).is_ok());
+        assert!(parse_board_mix(&["nonsense".to_string()]).is_err());
+        assert!(parse_board_mix(&["0:38".to_string()]).is_err());
+    }
+
+    /// Komi has to follow the board or every game on one is played at the
+    /// wrong balance. The anchor is the measured 0.104 at 1/18.
+    #[test]
+    fn komi_follows_the_board_size() {
+        let at = |units: f64| komi_centre_for_radius(1.0 / units, KOMI_AREA_COEFFICIENT);
+        assert!((at(18.0) - 0.104).abs() < 1.0e-9, "anchor: {}", at(18.0));
+        // Standard: near Go's 19x19 komi of ~2.1% of the board.
+        assert!((0.021..=0.026).contains(&at(38.0)), "standard: {}", at(38.0));
+        // Monotone decreasing in board size, which is the whole point.
+        assert!(at(18.0) > at(26.0) && at(26.0) > at(38.0) && at(38.0) > at(50.0));
+    }
+
+    /// The cap has to scale with what the board holds, or a standard game is
+    /// cut off a fifth of the way in and its label is a truncation artifact.
+    #[test]
+    fn the_ply_cap_scales_with_the_board() {
+        let mini = maximum_plies_for_radius(1.0 / 18.0, 70, 1.0 / 18.0);
+        let standard = maximum_plies_for_radius(1.0 / 38.0, 70, 1.0 / 18.0);
+        assert_eq!(mini, 70);
+        assert!((300..=320).contains(&standard), "standard cap {standard}");
+        // A single-radius run is unchanged.
+        assert_eq!(maximum_plies_for_radius(1.0 / 6.0, 48, 1.0 / 6.0), 48);
     }
 
     #[test]
