@@ -1,6 +1,14 @@
 #![forbid(unsafe_code)]
 
 pub mod render_svg;
+/// The replay record format, shared by every generator.
+///
+/// Lived inside `generate_demo` when there was one generator. A second one that
+/// wrote its own records would be a second format the moment either changed,
+/// and the readers -- the Python loader and `render_shard` -- already have to
+/// agree with this file exactly.
+pub mod replay_stream;
+pub mod generation;
 
 use vgo_core::{Analysis, Color, GameEvent, Outcome, Phase, Position};
 

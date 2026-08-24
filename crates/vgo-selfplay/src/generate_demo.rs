@@ -26,13 +26,16 @@ use vgo_raster::{
 use vgo_search::{
     Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, SearchResult, search_at_ply,
 };
+use vgo_selfplay::generation::{
+    BoardBand, KOMI_AREA_COEFFICIENT, PolicyTarget, action_index,     komi_centre_for_radius, maximum_plies_for_radius, parse_board_mix, policy_target,
+    replay_capacity_for, sampled_komi, sampled_radius, search_config, seeded_unit,
+};
 use vgo_selfplay::{
     ResignRule, award_by_area, play_game_with_resignation as run_playout_with_resignation,
 };
 
-mod replay_stream;
 
-use replay_stream::{
+use vgo_selfplay::replay_stream::{
     CELLS_DROPPED, LabeledSample, PublishedReplay, REPLAY_VERSION, ReplayStream,
     sync_parent_directory,
 };
@@ -389,20 +392,6 @@ struct Config {
     cache_directory: PathBuf,
 }
 
-struct PolicyTarget {
-    /// Normalized visit distribution over cells (the legacy target).
-    policy: Vec<f32>,
-    /// 1.0 for any cell that received a candidate, else 0.0.
-    mask: Vec<f32>,
-    /// Raw visit counts per cell (unnormalized), for off-policy reweighting.
-    visits: Vec<f32>,
-    /// Coarse->fine sampling probability beta per cell; 0.0 for legacy/pass
-    /// candidates (which have no factored sampling probability).
-    beta: Vec<f32>,
-    /// Number of raw coarse->fine proposal draws landing in each cell. Legacy
-    /// candidates and pass have zero multiplicity.
-    proposal_counts: Vec<u32>,
-}
 
 /// Thresholds the calibrator evaluates each shard.
 ///
@@ -454,357 +443,18 @@ struct ResignTrial {
     fired_confidence: f64,
 }
 
-/// Replays the resign rule over a finished game at each candidate threshold.
-///
-/// Only meaningful for games played to a real result: the rule's error rate is
-/// how often it would have conceded for the eventual winner, and that is
-/// unknowable for a game the rule already ended. That set is the exempt games
-/// under hard resignation and every game under soft, which is the condition the
-/// caller applies.
-///
-/// One caveat the counters cannot express: after a soft concession the rest of
-/// the game is searched at `--resign-soft-simulations`, so both the root values
-/// this replays and the outcome it scores against come from the cheaper search.
-/// A low error rate there is partly the rule agreeing with a playout it shaped.
-/// Games exempted by `--resign-disable-fraction` are the only ones measured at
-/// full strength throughout.
-fn calibration_trials(
-    pending: &[PendingSample],
-    _window: u32,
-    black_won: bool,
-) -> Vec<ResignTrial> {
-    CALIBRATION_THRESHOLDS
-        .iter()
-        .flat_map(|&threshold| {
-            CALIBRATION_WINDOWS
-                .iter()
-                .map(move |&window| (threshold, window))
-        })
-        .map(|(threshold, window)| {
-            // Per seat, matching the live rule: a shared counter is reset by the
-            // winning side's ply and can never reach the window.
-            let mut streak = [0_u32; 2];
-            // The weakest evaluation in the current streak, per seat: the rule
-            // requires every ply in the window to clear the bar, so the streak
-            // is only as confident as its least confident member.
-            let mut weakest = [1.0_f64; 2];
-            let mut fired_at = None;
-            for (index, sample) in pending.iter().enumerate() {
-                let mover_value = if sample.to_move == Color::Black {
-                    sample.root_black_value
-                } else {
-                    -sample.root_black_value
-                };
-                let seat = usize::from(sample.to_move == Color::White);
-                if mover_value <= -threshold {
-                    streak[seat] += 1;
-                    weakest[seat] = weakest[seat].min(mover_value.abs());
-                } else {
-                    streak[seat] = 0;
-                    weakest[seat] = 1.0;
-                }
-                if streak[seat] >= window {
-                    fired_at = Some((index, sample.to_move, weakest[seat]));
-                    break;
-                }
-            }
-            match fired_at {
-                None => ResignTrial {
-                    threshold,
-                    window,
-                    fired: false,
-                    wrong: false,
-                    plies_saved: 0,
-                    fired_confidence: 0.0,
-                },
-                Some((index, conceding, confidence)) => {
-                    let conceding_won = (conceding == Color::Black) == black_won;
-                    ResignTrial {
-                        threshold,
-                        window,
-                        fired: true,
-                        wrong: conceding_won,
-                        plies_saved: (pending.len() - index - 1) as u32,
-                        fired_confidence: confidence,
-                    }
-                }
-            }
-        })
-        .collect()
-}
 
-/// Whether a game is exempt from resignation, decided from its seed.
-///
-/// Hashing the seed rather than counting games keeps the exempt set stable
-/// across reruns and independent of actor scheduling, which matters because
-/// these games are the calibration sample: they have to be a fair draw, not
-/// whichever games happened to land on a particular worker.
-fn resign_exempt(game_seed: u64, fraction: f64) -> bool {
-    if fraction <= 0.0 {
-        return false;
-    }
-    if fraction >= 1.0 {
-        return true;
-    }
-    // SplitMix64 finalizer: cheap, and well distributed for consecutive seeds.
-    let mut value = game_seed ^ 0x9e37_79b9_7f4a_7c15;
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^= value >> 31;
-    (value >> 11) as f64 / (1_u64 << 53) as f64 <= fraction
-}
 
-/// A uniform draw in `[0, 1)` from a game seed.
-///
-/// Shares `resign_exempt`'s SplitMix64 finalizer but with a different constant,
-/// so a game's komi and its exemption are independent -- reusing the stream
-/// would correlate the two and make every exempt game share a komi.
-fn seeded_unit(game_seed: u64) -> f64 {
-    let mut value = game_seed ^ 0x2545_f491_4f6c_dd1d;
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^= value >> 31;
-    (value >> 11) as f64 / (1_u64 << 53) as f64
-}
 
-/// Komi for one game, drawn uniformly from `[low, high]`.
-///
-/// Varying it across games is what lets one model play at any komi: a net shown
-/// a single value learns that value's balance rather than the relationship. It
-/// also spreads the training distribution over positions that are close under
-/// *some* komi, which a fixed value cannot do.
-/// Komi for one game: a normal centred on the range, truncated to it.
-///
-/// Uniform spends as much mass at the ends of the range as at the middle, and
-/// the ends are where komi decides the game rather than shading it. Measured on
-/// ddrnet-resign64 with the range at [-0.037, 0.363]: Black took 77% of the
-/// bottom bucket and 3.2% of the top, so a game drawn near either end is
-/// settled before a stone is placed and teaches the value head only which end
-/// it came from.
-///
-/// A normal concentrates games where the position is genuinely contested while
-/// still reaching the ends often enough to teach the relationship. Sigma is a
-/// quarter of the width, so the range spans +/-2 sigma and about 95% of draws
-/// land inside it before truncation.
-/// One band of the board mix: a weight and a range of board widths in units.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BoardBand {
-    pub weight: f64,
-    pub low_units: f64,
-    pub high_units: f64,
-}
 
-/// Smallest board this will play, in stone diameters across.
-///
-/// Below here the game changes character rather than merely getting smaller.
-const MINIMUM_BOARD_UNITS: f64 = 18.0;
 
-/// Parse `WEIGHT:UNITS` or `WEIGHT:LOW-HIGH`.
-pub fn parse_board_mix(specs: &[String]) -> Result<Vec<BoardBand>, String> {
-    let mut bands = Vec::new();
-    for spec in specs {
-        let (weight, extent) = spec
-            .split_once(':')
-            .ok_or_else(|| format!("board mix {spec:?} is not WEIGHT:UNITS"))?;
-        let weight: f64 = weight
-            .trim()
-            .parse()
-            .map_err(|_| format!("board mix {spec:?} has a non-numeric weight"))?;
-        if !(weight.is_finite() && weight > 0.0) {
-            return Err(format!("board mix {spec:?} needs a positive weight"));
-        }
-        let (low, high) = match extent.trim().split_once('-') {
-            Some((low, high)) => (low, high),
-            None => (extent.trim(), extent.trim()),
-        };
-        let low: f64 = low
-            .trim()
-            .parse()
-            .map_err(|_| format!("board mix {spec:?} has non-numeric units"))?;
-        let high: f64 = high
-            .trim()
-            .parse()
-            .map_err(|_| format!("board mix {spec:?} has non-numeric units"))?;
-        if !(low.is_finite() && high.is_finite()) || low > high {
-            return Err(format!("board mix {spec:?} has a malformed range"));
-        }
-        if low < MINIMUM_BOARD_UNITS {
-            return Err(format!(
-                "board mix {spec:?} goes below {MINIMUM_BOARD_UNITS} units; \
-                 smaller boards are a different game"
-            ));
-        }
-        bands.push(BoardBand {
-            weight,
-            low_units: low,
-            high_units: high,
-        });
-    }
-    Ok(bands)
-}
 
-/// This game's radius, drawn from the mix.
-///
-/// Uniform in *units* within a band, so a wide band spreads across board sizes
-/// evenly rather than concentrating in its smallest boards.
-pub fn sampled_radius(game_seed: u64, bands: &[BoardBand], fallback: f64) -> f64 {
-    if bands.is_empty() {
-        return fallback;
-    }
-    let total: f64 = bands.iter().map(|band| band.weight).sum();
-    let mut choice = seeded_unit(game_seed ^ 0x9e37_79b9_7f4a_7c15) * total;
-    for band in bands {
-        if choice < band.weight || std::ptr::eq(band, &bands[bands.len() - 1]) {
-            let units = if band.high_units > band.low_units {
-                let position = seeded_unit(game_seed ^ 0xc2b2_ae3d_27d4_eb4f);
-                band.low_units + position * (band.high_units - band.low_units)
-            } else {
-                band.low_units
-            };
-            return 1.0 / units.max(MINIMUM_BOARD_UNITS);
-        }
-        choice -= band.weight;
-    }
-    fallback
-}
 
-/// Balanced komi at this radius, before the per-game jitter.
-///
-/// Komi compensates about one stone's worth of area and a board holds about
-/// `1/r^2` stones, so komi as a fraction of the board goes as `r^2`. Three
-/// things agree on the coefficient: our own measurement of 0.104 at `r = 1/18`,
-/// which fixes it at 33.7; Go's 9x9 komi of 8.6% of the board against our
-/// 10.4% on a board of nearly the same stone capacity; and Go's 9x9-to-19x19
-/// exponent of 1.89, near enough to 2.
-///
-/// It is a prior, not a law. `fit_komi_power_law` re-estimates both the
-/// coefficient and the exponent from real games once a run has enough of them,
-/// and the exponent is known to drift on small boards -- which is one reason
-/// this refuses to play them.
-pub const KOMI_AREA_COEFFICIENT: f64 = 0.104 * 18.0 * 18.0;
 
-#[must_use]
-pub fn komi_centre_for_radius(radius: f64, coefficient: f64) -> f64 {
-    coefficient * radius * radius
-}
 
-/// Plies to allow a game on this board.
-///
-/// The cap exists to stop a game running forever, so it has to scale with what
-/// the board can hold -- about `1/r^2` stones. Left at the mini board's value a
-/// standard game is cut off around a fifth of the way in, and every value
-/// target from it is a truncation artifact rather than a result.
-#[must_use]
-pub fn maximum_plies_for_radius(radius: f64, plies_at_reference: u32, reference: f64) -> u32 {
-    if !(radius > 0.0 && reference > 0.0) {
-        return plies_at_reference;
-    }
-    let scale = (reference / radius).powi(2);
-    ((plies_at_reference as f64) * scale).ceil().min(4096.0) as u32
-}
 
-fn sampled_komi(game_seed: u64, low: f64, high: f64) -> f64 {
-    if !(low.is_finite() && high.is_finite()) || high <= low {
-        return low.max(0.0).min(high.max(0.0));
-    }
-    let centre = 0.5 * (low + high);
-    let sigma = 0.25 * (high - low);
-    // Box-Muller from two independent uniforms off the same seed. The second
-    // stream uses a different constant so the pair is not degenerate.
-    let u1 = seeded_unit(game_seed).max(f64::MIN_POSITIVE);
-    let u2 = seeded_unit(game_seed ^ 0x51ed_2701_a3f5_9c7b);
-    let normal = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
-    (centre + sigma * normal).clamp(low, high)
-}
 
-fn policy_target(result: &SearchResult, config: RasterConfig) -> PolicyTarget {
-    let size = config.pixels() + 1;
-    let mut policy = vec![0.0_f32; size];
-    let mut mask = vec![0.0_f32; size];
-    let mut visits = vec![0.0_f32; size];
-    let mut beta = vec![0.0_f32; size];
-    let mut proposal_counts = vec![0_u32; size];
-    let total = result
-        .children
-        .iter()
-        .map(|child| child.visits)
-        .sum::<u32>();
-    for child in &result.children {
-        let index = match child.action {
-            Action::Pass => config.pixels(),
-            Action::Place(point) => action_pixel(point.x, point.y, config),
-        };
-        policy[index] += child.visits as f32 / total as f32;
-        mask[index] = 1.0;
-        visits[index] += child.visits as f32;
-        if let Some(b) = child.beta {
-            beta[index] = b as f32;
-        }
-        proposal_counts[index] = proposal_counts[index]
-            .checked_add(child.proposal_count)
-            .expect("proposal multiplicity must fit in u32");
-    }
-    PolicyTarget {
-        policy,
-        mask,
-        visits,
-        beta,
-        proposal_counts,
-    }
-}
 
-fn action_index(action: Action, config: RasterConfig) -> u32 {
-    match action {
-        Action::Pass => config.pixels() as u32,
-        Action::Place(point) => action_pixel(point.x, point.y, config) as u32,
-    }
-}
-
-fn search_config(
-    simulations: u32,
-    coarse_pool: usize,
-    temperature: f64,
-    temperature_plies: u32,
-    leaf_batch: usize,
-    maximum_candidates: usize,
-    root_exploration_noise: f64,
-    widening_coefficient: f64,
-) -> SearchConfig {
-    let mut config = SearchConfig::canary(simulations);
-    config.coarse_pool = coarse_pool;
-    config.temperature = temperature;
-    config.temperature_plies = temperature_plies;
-    config.leaf_batch = leaf_batch.max(1);
-    config.maximum_candidates = maximum_candidates.max(config.initial_candidates);
-    config.root_exploration_noise = root_exploration_noise;
-    config.widening_coefficient = widening_coefficient;
-    config
-}
-
-/// Policy slots a record needs for a given draw budget.
-///
-/// Provisioned for the worst case -- every draw landing on a distinct cell --
-/// rather than projected from a collision model. An earlier version modelled it
-/// from measured collisions (79.6 draws touching 68.6 cells, inverting to an
-/// effective pool of ~259) and sized 321 draws at 224 slots. That dropped
-/// 109,111 cells in one shard: the model was fitted on runs with no exploration
-/// noise, and mixing uniform mass into the proposal flattens it so collisions
-/// become rare and distinct cells approach the draw count. A model of one
-/// regime sized a record for a different one.
-///
-/// The cost of over-provisioning is zero-padding on disk. The cost of
-/// under-provisioning is silently truncated policy targets, so this errs the
-/// cheap way.
-fn replay_capacity_for(maximum_candidates: usize, policy_size: usize) -> usize {
-    // Every candidate plus pass.
-    let wanted = maximum_candidates.saturating_add(1).max(64);
-    let rounded = wanted.div_ceil(32) * 32;
-    rounded.min(policy_size)
-}
 
 fn validate_config(config: &Config) -> Result<(), &'static str> {
     if config.samples == 0
@@ -1241,7 +891,7 @@ fn generate_to_dataset(
         .iter()
         .map(|band| 1.0 / band.high_units)
         .fold(config.radius, f64::min);
-    let stone_capacity = crate::replay_stream::stone_capacity_for_radius(smallest_radius);
+    let stone_capacity = vgo_selfplay::replay_stream::stone_capacity_for_radius(smallest_radius);
     let mut replay = ReplayStream::create(
         dataset_path,
         config.samples,
@@ -2148,6 +1798,108 @@ fn write_json_string(writer: &mut impl Write, value: &str) -> std::io::Result<()
         }
     }
     writer.write_all(b"\"")
+}
+
+/// Replays the resign rule over a finished game at each candidate threshold.
+///
+/// Only meaningful for games played to a real result: the rule's error rate is
+/// how often it would have conceded for the eventual winner, and that is
+/// unknowable for a game the rule already ended. That set is the exempt games
+/// under hard resignation and every game under soft, which is the condition the
+/// caller applies.
+///
+/// One caveat the counters cannot express: after a soft concession the rest of
+/// the game is searched at `--resign-soft-simulations`, so both the root values
+/// this replays and the outcome it scores against come from the cheaper search.
+/// A low error rate there is partly the rule agreeing with a playout it shaped.
+/// Games exempted by `--resign-disable-fraction` are the only ones measured at
+/// full strength throughout.
+fn calibration_trials(
+    pending: &[PendingSample],
+    _window: u32,
+    black_won: bool,
+) -> Vec<ResignTrial> {
+    CALIBRATION_THRESHOLDS
+        .iter()
+        .flat_map(|&threshold| {
+            CALIBRATION_WINDOWS
+                .iter()
+                .map(move |&window| (threshold, window))
+        })
+        .map(|(threshold, window)| {
+            // Per seat, matching the live rule: a shared counter is reset by the
+            // winning side's ply and can never reach the window.
+            let mut streak = [0_u32; 2];
+            // The weakest evaluation in the current streak, per seat: the rule
+            // requires every ply in the window to clear the bar, so the streak
+            // is only as confident as its least confident member.
+            let mut weakest = [1.0_f64; 2];
+            let mut fired_at = None;
+            for (index, sample) in pending.iter().enumerate() {
+                let mover_value = if sample.to_move == Color::Black {
+                    sample.root_black_value
+                } else {
+                    -sample.root_black_value
+                };
+                let seat = usize::from(sample.to_move == Color::White);
+                if mover_value <= -threshold {
+                    streak[seat] += 1;
+                    weakest[seat] = weakest[seat].min(mover_value.abs());
+                } else {
+                    streak[seat] = 0;
+                    weakest[seat] = 1.0;
+                }
+                if streak[seat] >= window {
+                    fired_at = Some((index, sample.to_move, weakest[seat]));
+                    break;
+                }
+            }
+            match fired_at {
+                None => ResignTrial {
+                    threshold,
+                    window,
+                    fired: false,
+                    wrong: false,
+                    plies_saved: 0,
+                    fired_confidence: 0.0,
+                },
+                Some((index, conceding, confidence)) => {
+                    let conceding_won = (conceding == Color::Black) == black_won;
+                    ResignTrial {
+                        threshold,
+                        window,
+                        fired: true,
+                        wrong: conceding_won,
+                        plies_saved: (pending.len() - index - 1) as u32,
+                        fired_confidence: confidence,
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+/// Whether a game is exempt from resignation, decided from its seed.
+///
+/// Hashing the seed rather than counting games keeps the exempt set stable
+/// across reruns and independent of actor scheduling, which matters because
+/// these games are the calibration sample: they have to be a fair draw, not
+/// whichever games happened to land on a particular worker.
+fn resign_exempt(game_seed: u64, fraction: f64) -> bool {
+    if fraction <= 0.0 {
+        return false;
+    }
+    if fraction >= 1.0 {
+        return true;
+    }
+    // SplitMix64 finalizer: cheap, and well distributed for consecutive seeds.
+    let mut value = game_seed ^ 0x9e37_79b9_7f4a_7c15;
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    (value >> 11) as f64 / (1_u64 << 53) as f64 <= fraction
 }
 
 fn main() -> std::io::Result<()> {

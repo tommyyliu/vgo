@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use vgo_core::{Color, Phase, Position};
 use vgo_raster::{RasterConfig, SemanticRaster, rasterize};
 
-pub(crate) const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
+pub const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
 // v2 added raw per-cell visit counts and coarse->fine sampling probability
 // (beta). v3 additionally records the empirical proposal multiplicity per cell.
 //
@@ -48,14 +48,14 @@ pub(crate) const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
 // time, after the games are played. Sizing one global constant for the widest
 // board anyone might play would pad every mini shard to match, which is exactly
 // the argument v7 made.
-pub(crate) const REPLAY_VERSION: u32 = 8;
+pub const REPLAY_VERSION: u32 = 8;
 
 /// Default stones a record holds, when nothing sizes it from the board.
 ///
 /// One stone per ply at most, and the longest game on an 18-unit board ran 88
 /// plies. Runs that play larger boards pass their own capacity; this is only
 /// the fallback for callers that do not.
-pub(crate) const STONE_CAPACITY: usize = 128;
+pub const STONE_CAPACITY: usize = 128;
 
 /// Stones a board of this radius can hold, with headroom.
 ///
@@ -84,7 +84,7 @@ pub fn stone_capacity_for_radius(radius: f64) -> usize {
 
 /// Bytes per stored policy cell in v7: index u16, visits u32, beta f32,
 /// proposal_counts u16.
-pub(crate) const V7_CELL_BYTES: usize = 12;
+pub const V7_CELL_BYTES: usize = 12;
 
 /// Policy cells dropped because a node's search outgrew the shard's capacity.
 ///
@@ -93,42 +93,42 @@ pub(crate) const V7_CELL_BYTES: usize = 12;
 /// which is the point of tracking it -- truncation trades target fidelity for a
 /// shard that still writes, and that trade should be visible in the manifest
 /// rather than inferred later from a policy target that looks oddly narrow.
-pub(crate) static CELLS_DROPPED: std::sync::atomic::AtomicUsize =
+pub static CELLS_DROPPED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-pub(crate) struct LabeledSample {
+pub struct LabeledSample {
     /// The position itself. A shard records state, not a picture of it.
-    pub(crate) position: Position,
-    pub(crate) policy: Vec<f32>,
-    pub(crate) policy_mask: Vec<f32>,
-    pub(crate) visits: Vec<f32>,
-    pub(crate) beta: Vec<f32>,
-    pub(crate) proposal_counts: Vec<u32>,
-    pub(crate) value: f32,
-    pub(crate) selected_action: u32,
-    pub(crate) game: u64,
-    pub(crate) ply: u32,
-    pub(crate) seed: u64,
+    pub position: Position,
+    pub policy: Vec<f32>,
+    pub policy_mask: Vec<f32>,
+    pub visits: Vec<f32>,
+    pub beta: Vec<f32>,
+    pub proposal_counts: Vec<u32>,
+    pub value: f32,
+    pub selected_action: u32,
+    pub game: u64,
+    pub ply: u32,
+    pub seed: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct GameWrite {
+pub struct GameWrite {
     /// Shard-relative offset of this game's first record.
-    pub(crate) first_sample: usize,
-    pub(crate) samples_written: usize,
-    pub(crate) samples_truncated: usize,
+    pub first_sample: usize,
+    pub samples_written: usize,
+    pub samples_truncated: usize,
 }
 
 #[derive(Debug)]
-pub(crate) struct PublishedReplay {
-    pub(crate) samples: usize,
-    pub(crate) sha256: String,
-    pub(crate) bytes: u64,
-    pub(crate) examples: Vec<SemanticRaster>,
-    pub(crate) first_game_id: Option<u64>,
-    pub(crate) last_game_id: Option<u64>,
-    pub(crate) write_time: Duration,
-    pub(crate) sync_time: Duration,
+pub struct PublishedReplay {
+    pub samples: usize,
+    pub sha256: String,
+    pub bytes: u64,
+    pub examples: Vec<SemanticRaster>,
+    pub first_game_id: Option<u64>,
+    pub last_game_id: Option<u64>,
+    pub write_time: Duration,
+    pub sync_time: Duration,
 }
 
 /// Incrementally writes replay-v3 records while games are still being played.
@@ -138,7 +138,7 @@ pub(crate) struct PublishedReplay {
 /// published. The advertised sample count is therefore known before the first
 /// record is written and remains compatible with the existing memory-mapped v3
 /// loader.
-pub(crate) struct ReplayStream {
+pub struct ReplayStream {
     /// Policy slots each record pads to, written into the header so readers do
     /// not have to infer it from the version.
     policy_capacity: usize,
@@ -161,7 +161,7 @@ pub(crate) struct ReplayStream {
 }
 
 impl ReplayStream {
-    pub(crate) fn create(
+    pub fn create(
         path: &Path,
         target_samples: usize,
         raster: RasterConfig,
@@ -244,7 +244,7 @@ impl ReplayStream {
         })
     }
 
-    pub(crate) const fn is_full(&self) -> bool {
+    pub const fn is_full(&self) -> bool {
         self.samples_written >= self.target_samples
     }
 
@@ -258,11 +258,11 @@ impl ReplayStream {
     ///
     /// `target_samples` stays where it was so `publish` still rejects a shard
     /// that never reached it; only the per-game truncation is lifted.
-    pub(crate) fn allow_overshoot(&mut self) {
+    pub fn allow_overshoot(&mut self) {
         self.overshoot = true;
     }
 
-    pub(crate) fn write_game(&mut self, samples: Vec<LabeledSample>) -> io::Result<GameWrite> {
+    pub fn write_game(&mut self, samples: Vec<LabeledSample>) -> io::Result<GameWrite> {
         // The offset this game's records start at, captured before any are
         // written. This is the join key back into the dataset, and it is the
         // one thing the writer knows that the caller cannot.
@@ -305,7 +305,7 @@ impl ReplayStream {
         })
     }
 
-    pub(crate) fn publish(mut self) -> io::Result<PublishedReplay> {
+    pub fn publish(mut self) -> io::Result<PublishedReplay> {
         if !self.is_full() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -587,7 +587,7 @@ fn temporary_path(path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-pub(crate) fn sync_parent_directory(path: &Path) -> io::Result<()> {
+pub fn sync_parent_directory(path: &Path) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     File::open(parent)?.sync_all()
 }
