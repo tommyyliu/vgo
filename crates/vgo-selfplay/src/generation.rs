@@ -8,7 +8,87 @@
 //! carry that problem across `vgo-core` and the JS reference, with mutual "must
 //! match" comments and a bug that had to be found twice.
 
+use vgo_core::Ruleset;
 use vgo_raster::{RasterConfig, action_pixel};
+
+/// Everything a single game needs, independent of how games are batched.
+///
+/// `generate_game` used to take the generator's whole clap `Config`, which tied
+/// it to one binary's flags. A generator that batches games differently wants
+/// the same game -- same boards, same komi law, same targets -- and differs only
+/// in what it does with the results.
+#[derive(Clone, Debug)]
+pub struct GameSettings {
+    pub policy_resolution: usize,
+    pub simulations: u32,
+    pub coarse_pool: usize,
+    pub temperature: f64,
+    pub temperature_plies: u32,
+    pub leaf_batch: usize,
+    pub maximum_candidates: usize,
+    pub root_exploration_noise: f64,
+    pub widening_coefficient: f64,
+    pub seed: u64,
+    pub radius: f64,
+    pub board_mix: Vec<BoardBand>,
+    pub komi_low: f64,
+    pub komi_high: f64,
+    pub komi_area_coefficient: f64,
+    pub maximum_plies: u32,
+    pub ruleset: Ruleset,
+    pub ply_sample_rate: f64,
+    pub resign_threshold: f64,
+    pub resign_window: u32,
+    pub resign_minimum_ply: u32,
+    pub resign_soft_simulations: u32,
+    pub resign_disable_fraction: f64,
+}
+
+impl GameSettings {
+    /// The board this game is played on, and what follows from it.
+    ///
+    /// Komi and the ply cap are not free parameters once a run mixes board
+    /// sizes: komi scales with the board's area per stone, and the cap with how
+    /// many stones the board holds. Derived together so no caller can set one
+    /// without the others.
+    #[must_use]
+    pub fn board_for_game(&self, game_seed: u64) -> (f64, f64, u32) {
+        let radius = sampled_radius(game_seed, &self.board_mix, self.radius);
+        let komi = if self.board_mix.is_empty() {
+            sampled_komi(game_seed, self.komi_low, self.komi_high)
+        } else {
+            let centre = komi_centre_for_radius(radius, self.komi_area_coefficient);
+            let width = (self.komi_high - self.komi_low).max(0.0);
+            let relative = if self.komi_low + self.komi_high > 0.0 {
+                width / (0.5 * (self.komi_low + self.komi_high)).max(f64::MIN_POSITIVE)
+            } else {
+                0.5
+            };
+            let half = 0.5 * relative * centre;
+            sampled_komi(game_seed, centre - half, centre + half)
+        };
+        let plies = maximum_plies_for_radius(radius, self.maximum_plies, self.radius);
+        (radius, komi, plies)
+    }
+
+    /// Whether this ply is recorded, at the configured rate.
+    ///
+    /// Drawn per (game, ply) so the kept set is spread through the game rather
+    /// than a prefix, and stable for a given seed.
+    #[must_use]
+    pub fn records_ply(&self, game_seed: u64, ply: u32) -> bool {
+        let rate = self.ply_sample_rate.clamp(0.0, 1.0);
+        if rate >= 1.0 {
+            return true;
+        }
+        seeded_unit(
+            game_seed
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .wrapping_add(u64::from(ply)),
+        ) < rate
+    }
+}
+
 use vgo_search::{Action, SearchConfig, SearchResult};
 
 pub struct PolicyTarget {

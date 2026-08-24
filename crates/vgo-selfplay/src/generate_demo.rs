@@ -27,7 +27,7 @@ use vgo_search::{
     Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, SearchResult, search_at_ply,
 };
 use vgo_selfplay::generation::{
-    BoardBand, KOMI_AREA_COEFFICIENT, PolicyTarget, action_index,     komi_centre_for_radius, maximum_plies_for_radius, parse_board_mix, policy_target,
+    BoardBand, GameSettings, KOMI_AREA_COEFFICIENT, PolicyTarget, action_index,     komi_centre_for_radius, maximum_plies_for_radius, parse_board_mix, policy_target,
     replay_capacity_for, sampled_komi, sampled_radius, search_config, seeded_unit,
 };
 use vgo_selfplay::{
@@ -456,6 +456,37 @@ struct ResignTrial {
 
 
 
+impl Config {
+    /// The per-game half of this configuration.
+    fn game_settings(&self) -> GameSettings {
+        GameSettings {
+            policy_resolution: self.policy_resolution,
+            simulations: self.simulations,
+            coarse_pool: self.coarse_pool,
+            temperature: self.temperature,
+            temperature_plies: self.temperature_plies,
+            leaf_batch: self.leaf_batch,
+            maximum_candidates: self.maximum_candidates,
+            root_exploration_noise: self.root_exploration_noise,
+            widening_coefficient: self.widening_coefficient,
+            seed: self.seed,
+            radius: self.radius,
+            board_mix: parse_board_mix(&self.board_mix).unwrap_or_default(),
+            komi_low: self.komi_low,
+            komi_high: self.komi_high,
+            komi_area_coefficient: self.komi_area_coefficient,
+            maximum_plies: self.maximum_plies,
+            ruleset: self.ruleset,
+            ply_sample_rate: self.ply_sample_rate,
+            resign_threshold: self.resign_threshold,
+            resign_window: self.resign_window,
+            resign_minimum_ply: self.resign_minimum_ply,
+            resign_soft_simulations: self.resign_soft_simulations,
+            resign_disable_fraction: self.resign_disable_fraction,
+        }
+    }
+}
+
 fn validate_config(config: &Config) -> Result<(), &'static str> {
     if config.samples == 0
         || config.resolution == 0
@@ -547,30 +578,11 @@ fn generate_game(
     let soft_from = std::cell::Cell::new(u32::MAX);
     let final_position: std::cell::RefCell<Option<Position>> =
         std::cell::RefCell::new(None);
-    let keep_rate = config.ply_sample_rate.clamp(0.0, 1.0);
     // Board size, komi and the ply cap are all per game once a run mixes sizes,
-    // and the last two follow from the first: komi scales with the board's area
-    // per stone, and the cap with how many stones the board holds.
-    let bands = parse_board_mix(&config.board_mix).unwrap_or_default();
-    let radius = sampled_radius(game_seed, &bands, config.radius);
-    let komi = if bands.is_empty() {
-        sampled_komi(game_seed, config.komi_low, config.komi_high)
-    } else {
-        // The configured range sets the *relative* width; its centre is
-        // replaced by the radius law, which is the only thing that can be right
-        // at more than one board size.
-        let centre = komi_centre_for_radius(radius, config.komi_area_coefficient);
-        let width = (config.komi_high - config.komi_low).max(0.0);
-        let relative = if config.komi_low + config.komi_high > 0.0 {
-            width / (0.5 * (config.komi_low + config.komi_high)).max(f64::MIN_POSITIVE)
-        } else {
-            0.5
-        };
-        let half = 0.5 * relative * centre;
-        sampled_komi(game_seed, centre - half, centre + half)
-    };
-    let maximum_plies =
-        maximum_plies_for_radius(radius, config.maximum_plies, config.radius);
+    // and the last two follow from the first. Derived by `GameSettings` so a
+    // second generator cannot arrive at a different answer.
+    let settings = config.game_settings();
+    let (radius, komi, maximum_plies) = settings.board_for_game(game_seed);
     let playout = run_playout_with_resignation(
         Position::new(radius, Vec::new(), Color::Black)
             .with_ruleset(config.ruleset)
@@ -601,15 +613,8 @@ fn generate_game(
             // Keep a fraction of plies. The draw is per (game, ply) so the kept
             // set is spread through the game rather than a prefix, and stable
             // for a given seed.
-            if keep_rate < 1.0 {
-                let draw = seeded_unit(
-                    game_seed
-                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-                        .wrapping_add(u64::from(step.ply)),
-                );
-                if draw >= keep_rate {
-                    return;
-                }
+            if !settings.records_ply(game_seed, step.ply) {
+                return;
             }
             let target = policy_target(step.search, policy_config);
             pending.push(PendingSample {
