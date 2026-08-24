@@ -94,6 +94,12 @@
 # when the tail was 24% of wall time. Ours was 50%, so the headroom is larger.
 # Actors halve to 16 each so the machine still runs 32 in total.
 #
+# `--maximum-prefetch-shards 2` with it, or the first flag does nothing. The
+# scheduler gates on `prefetched + in_flight < maximum_prefetch_shards`, so a
+# limit of 1 caps in-flight shards at one however many generator slots are
+# allowed -- and the symptom is not an error, it is a second generator that
+# never starts and a load average that quietly sits at half the actor count.
+#
 # This is a workaround and not a fix. The tail exists because shards are batch
 # boundaries and a batch ends with its slowest member; continuous generation --
 # actors writing games as they finish, training on the last N games -- removes
@@ -163,7 +169,7 @@ exec "$python" -m vgo_training.rl_loop \
   --training-epochs 1 --training-batch 64 \
   --learning-rate 0.0005 --warm-learning-rate 0.0005 --value-weight 2.0 \
   --ownership-weight 0.0 --recency-decay 1.0 --drain-tail \
-  --concurrent-generators 2 \
+  --concurrent-generators 2 --maximum-prefetch-shards 2 \
   --schedule cosine --warmup-epochs 0 --compile --restore-optimizer \
   --full-adam \
   --training-device cuda --training-threads "${VGO_TRAINING_THREADS:-4}" \
