@@ -16,10 +16,16 @@
 # guessing which game it is in. Seven channels cannot load six-channel weights,
 # so this is a cold start; nothing before it can seed it.
 #
-# `--board-mix 50:38 25:18 25:18-50`. Half the games on the board people play,
-# a quarter on the one we have always trained, a quarter spread across the rest.
+# `--board-mix 50:38 25:18 25:18-38`. Half the games on the board people play,
+# a quarter on the one we have always trained, a quarter spread between them.
 # Ranges sample uniformly in *units*: uniform radius puts density as 1/units^2
 # and would pile the wide band into its smallest boards.
+#
+# Nothing above 38 units, because nothing above 38 units exists. voronoigo.com
+# serves 18, 26 and 38; a band running to 50 spent the highest per-game cost in
+# the mix on boards no one plays. It also set the tail: the ply cap scales as
+# 1/r^2, so 50 units allowed 541 plies against 38's 312, and one unfinished
+# 541-ply game holds a whole shard open.
 #
 # Nothing below 18 units. Small boards are a different game -- living is hard,
 # single sequences decide everything, and Go's fair komi across 5x5 to 9x9 runs
@@ -77,6 +83,23 @@
 # about the mini board's capacity, and left there a standard game is cut off a
 # fifth of the way in with a truncation artifact for a label.
 #
+# ## Two generators, because one leaves the machine idle
+#
+# A shard ends when its slowest game does. Measured here: 57 minutes to reach
+# the sample target with 32 actors busy, then 65 minutes of tail with *two*
+# actors busy and thirty cores idle -- half the wall clock at 6% utilisation.
+#
+# `--concurrent-generators 2` starts the next shard while the current one
+# drains, which is what the field was added for: measured 4.16 -> 5.49 samples/s
+# when the tail was 24% of wall time. Ours was 50%, so the headroom is larger.
+# Actors halve to 16 each so the machine still runs 32 in total.
+#
+# This is a workaround and not a fix. The tail exists because shards are batch
+# boundaries and a batch ends with its slowest member; continuous generation --
+# actors writing games as they finish, training on the last N games -- removes
+# it rather than overlapping it. That is the next thing to build, against a
+# baseline this produces.
+#
 # ## What it costs, measured rather than estimated
 #
 # 32 actors on the real mix produced 60 samples from 4 games in 329 s, which is
@@ -128,7 +151,7 @@ exec "$python" -m vgo_training.rl_loop \
   --coarse-pool 16 --generation-simulations 1600 \
   --widening-coefficient 4.0 --maximum-candidates 321 \
   --root-exploration-noise 0.0 \
-  --board-mix 50:38 --board-mix 25:18 --board-mix 25:18-50 \
+  --board-mix 50:38 --board-mix 25:18 --board-mix 25:18-38 \
   --ply-sample-rate 0.25 \
   --temperature 1.0 --temperature-plies 30 --maximum-plies 70 \
   --resign-target-false-positive 0.02 --resign-soft-simulations 2400 \
@@ -140,12 +163,12 @@ exec "$python" -m vgo_training.rl_loop \
   --training-epochs 1 --training-batch 64 \
   --learning-rate 0.0005 --warm-learning-rate 0.0005 --value-weight 2.0 \
   --ownership-weight 0.0 --recency-decay 1.0 --drain-tail \
-  --concurrent-generators 1 \
+  --concurrent-generators 2 \
   --schedule cosine --warmup-epochs 0 --compile --restore-optimizer \
   --full-adam \
   --training-device cuda --training-threads "${VGO_TRAINING_THREADS:-4}" \
   --report-every 1 --validation-fraction 0.1 \
-  --actors "${VGO_ACTORS:-32}" --arena-actors "${VGO_ARENA_ACTORS:-${VGO_ACTORS:-32}}" \
+  --actors "${VGO_ACTORS:-16}" --arena-actors "${VGO_ARENA_ACTORS:-32}" \
   --leaf-batch 4 \
   --inference-batch 32 --inference-delay-ms 1 \
   --inference-slots "${VGO_SLOTS:-2}" \
