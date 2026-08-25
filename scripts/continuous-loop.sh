@@ -79,6 +79,16 @@ print(total)
 PY
 }
 
+# Throughput levers are `--actors`, `--inference-slots` and `--maximum-batch`:
+# each adds work in flight without changing what the search does. `--leaf-batch`
+# stays at 4 -- leaf parallelism trades search quality for throughput, measured
+# at -70 Elo for batch 32 in the browser client, and halving the simulations
+# already spent the quality budget.
+#
+# Nothing in the invocation below may be interrupted by a comment. A trailing
+# backslash joins the next line, so a `#` on it comments out every remaining
+# argument and the binary starts with a silently truncated command line -- no
+# `--model` reads as a naive generator, which still runs and still writes games.
 start_generator () {
   local label="$1" model="$2" first_game="$3"
   local stop_file="$games/$label.stop"
@@ -95,7 +105,7 @@ start_generator () {
     --coarse-pool 16 --widening-coefficient 4.0 --maximum-candidates 321 \
     --komi-low 0.017 --komi-high 0.137 \
     --temperature 1.0 --temperature-plies 30 \
-    --leaf-batch 4 --maximum-batch 32 --delay-ms 1 --inference-slots 2 \
+    --leaf-batch 4 --maximum-batch 64 --delay-ms 1 --inference-slots 4 \
     --provider tensorrt --fp16 true \
     --cache-directory "$root/artifacts/onnx-cache" \
     --seed $((70000 + first_game)) \
