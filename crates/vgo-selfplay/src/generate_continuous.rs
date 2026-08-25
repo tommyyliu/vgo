@@ -221,6 +221,15 @@ fn write_game(
     let staging = root.join(format!("{name}.staging"));
     let final_path = root.join(&name);
     if final_path.exists() {
+        // Already written, so the game in hand is a duplicate of it and there is
+        // nothing to do. Say so: reaching here means the index range is being
+        // replayed, and every game the run finishes from now on is discarded
+        // after paying its full search cost, with nothing else looking wrong.
+        eprintln!(
+            "warning: {name} already exists in {}; discarding the finished game. \
+             Game indices are being reused -- check --first-game.",
+            root.display()
+        );
         return Ok(0);
     }
     if staging.exists() {

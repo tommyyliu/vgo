@@ -128,7 +128,18 @@ first_update=$(( ${first_update:-(-1)} + 1 ))
 generation=0
 # Game indices never restart: a reused index would replay a seed, and two games
 # with the same seed are the same game.
+#
+# Derived from what is on disk, not from the update number. `write_game` treats
+# an existing game directory as already done and returns without writing, so a
+# reused index does not collide loudly -- it discards the finished game in
+# silence. The update number repeats whenever a restart resumes the same update,
+# which is exactly when a crash or a config change brings the loop back, so
+# deriving the index from it throws away everything the restarted generator
+# produces while every other signal reports a healthy run.
+highest=$(find "$games" -maxdepth 2 -name 'game-*' -type d 2>/dev/null \
+  | sed 's/.*game-0*\([0-9]\+\)$/\1/' | sort -n | tail -1)
 next_game=$(( 1000000 + first_update * 1000000 ))
+[ "${highest:-0}" -ge "$next_game" ] && next_game=$(( highest + 1000 ))
 label="gen-$(printf '%06d' "$generation")-seed"
 generator=$(start_generator "$label" "$model" "$next_game")
 echo "[loop] generation $generation started (pid $generator, model ${model:-none})"
