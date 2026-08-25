@@ -79,11 +79,16 @@ print(total)
 PY
 }
 
-# Throughput levers are `--actors`, `--inference-slots` and `--maximum-batch`:
-# each adds work in flight without changing what the search does. `--leaf-batch`
-# stays at 4 -- leaf parallelism trades search quality for throughput, measured
-# at -70 Elo for batch 32 in the browser client, and halving the simulations
-# already spent the quality budget.
+# `--inference-slots 2` and `--maximum-batch 32` are the known-good pair. Do not
+# raise them without watching a game actually land: at 4 slots the inference
+# threads livelock, spinning at 100% CPU while every actor blocks on a result
+# that never arrives. `nvidia-smi` reports 100% utilization throughout, because
+# a spin-wait is indistinguishable from work by that metric -- the tell is power
+# draw, which sits at idle (~52 W) instead of the 200 W+ of real load.
+#
+# `--leaf-batch` stays at 4 for a different reason: leaf parallelism trades
+# search quality for throughput, measured at -70 Elo for batch 32 in the browser
+# client, and halving the simulations already spent the quality budget.
 #
 # Nothing in the invocation below may be interrupted by a comment. A trailing
 # backslash joins the next line, so a `#` on it comments out every remaining
@@ -105,7 +110,7 @@ start_generator () {
     --coarse-pool 16 --widening-coefficient 4.0 --maximum-candidates 321 \
     --komi-low 0.017 --komi-high 0.137 \
     --temperature 1.0 --temperature-plies 30 \
-    --leaf-batch 4 --maximum-batch 64 --delay-ms 1 --inference-slots 4 \
+    --leaf-batch 4 --maximum-batch 32 --delay-ms 1 --inference-slots 2 \
     --provider tensorrt --fp16 true \
     --cache-directory "$root/artifacts/onnx-cache" \
     --seed $((70000 + first_game)) \
