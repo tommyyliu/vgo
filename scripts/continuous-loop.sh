@@ -32,11 +32,23 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 output="${VGO_OUTPUT:-$root/artifacts/vgo-continuous}"
 games="$output/games"
 models="$output/models"
-window="${VGO_WINDOW_SAMPLES:-40000}"
-step="${VGO_STEP_SAMPLES:-4000}"
+# The window is denominated in samples, so it and the ply sample rate have to
+# move together: recording every ply rather than a quarter of them puts four
+# times the positions in a game, and a window left at its old size would cover
+# a quarter as many *games*. Games are what the value head learns from, so that
+# trade is the one thing worth not making. Four times both keeps the same game
+# diversity and takes four times the positions from each.
+#
+# `step` keeps the same ratio, so a sample is still seen in about ten updates.
+window="${VGO_WINDOW_SAMPLES:-120000}"
+step="${VGO_STEP_SAMPLES:-12000}"
 updates="${VGO_UPDATES:-200}"
 actors="${VGO_ACTORS:-32}"
-simulations="${VGO_SIMULATIONS:-1600}"
+# Every ply is searched at this budget whether or not it is recorded, so this
+# is the whole per-game cost. Halved from 1600: one doubling of search is worth
+# about 61 Elo, and the model was even with a naive evaluator at the time, so
+# the search was resolving positions the network could not yet exploit.
+simulations="${VGO_SIMULATIONS:-800}"
 seed_model="${VGO_SEED_MODEL:-}"
 
 python="$root/training/.venv/bin/python"
@@ -74,7 +86,7 @@ start_generator () {
     --actors "$actors" --simulations "$simulations" \
     --resolution 256 --policy-resolution 128 --raster-kind compact-radius \
     --board-mix 50:38 --board-mix 25:18 --board-mix 25:18-38 \
-    --ply-sample-rate 0.25 --max-plies 70 --radius 0.05555555555555555 \
+    --ply-sample-rate 1.0 --max-plies 70 --radius 0.05555555555555555 \
     --coarse-pool 16 --widening-coefficient 4.0 --maximum-candidates 321 \
     --komi-low 0.017 --komi-high 0.137 \
     --temperature 1.0 --temperature-plies 30 \
