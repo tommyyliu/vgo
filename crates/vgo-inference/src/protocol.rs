@@ -4,23 +4,51 @@ use std::{
     mem::size_of,
 };
 
-use vgo_raster::{CHANNEL_COUNT, RasterConfig, SemanticRaster};
+use vgo_raster::{CHANNEL_COUNT, RasterConfig, SemanticRaster, packed::PackedRaster};
 use vgo_search::EvaluationError;
 
 const REQUEST_MAGIC: [u8; 8] = *b"VGOIFR01";
 const RESPONSE_MAGIC: [u8; 8] = *b"VGOOFR01";
 const PROTOCOL_VERSION: u32 = 1;
 
+/// What one request carries to the backend.
+///
+/// Dense is the original form and what the wire protocol below can serialize.
+/// Packed is for models exported with `--packed-input`, which take the raster
+/// compressed and expand it inside the graph: the binary planes as bits, the
+/// constant planes as one value each, the rest at fp16. At 256x256 that is
+/// 152 KB against 1792 KB, and staging is what limits inference.
+///
+/// The two are a choice made once, by the model, not per request -- a batch
+/// mixing them cannot be gathered into one tensor, which `OnnxBatchService`
+/// rejects rather than silently splits.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RasterPayload {
+    Dense(SemanticRaster),
+    Packed(PackedRaster),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct InferenceInput {
     id: u64,
-    raster: SemanticRaster,
+    payload: RasterPayload,
 }
 
 impl InferenceInput {
     #[must_use]
     pub const fn new(id: u64, raster: SemanticRaster) -> Self {
-        Self { id, raster }
+        Self {
+            id,
+            payload: RasterPayload::Dense(raster),
+        }
+    }
+
+    #[must_use]
+    pub const fn packed(id: u64, raster: PackedRaster) -> Self {
+        Self {
+            id,
+            payload: RasterPayload::Packed(raster),
+        }
     }
 
     #[must_use]
@@ -29,8 +57,34 @@ impl InferenceInput {
     }
 
     #[must_use]
-    pub const fn raster(&self) -> &SemanticRaster {
-        &self.raster
+    pub const fn payload(&self) -> &RasterPayload {
+        &self.payload
+    }
+
+    /// The dense raster, or `None` for a packed request.
+    #[must_use]
+    pub const fn raster(&self) -> Option<&SemanticRaster> {
+        match &self.payload {
+            RasterPayload::Dense(raster) => Some(raster),
+            RasterPayload::Packed(_) => None,
+        }
+    }
+
+    /// The packed raster, or `None` for a dense request.
+    #[must_use]
+    pub const fn packed_raster(&self) -> Option<&PackedRaster> {
+        match &self.payload {
+            RasterPayload::Packed(raster) => Some(raster),
+            RasterPayload::Dense(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> RasterConfig {
+        match &self.payload {
+            RasterPayload::Dense(raster) => raster.config(),
+            RasterPayload::Packed(raster) => raster.config(),
+        }
     }
 }
 
@@ -81,12 +135,27 @@ pub fn encode_request_frame(batch: &[InferenceInput]) -> Result<Vec<u8>, Evaluat
     let first = batch
         .first()
         .ok_or_else(|| EvaluationError::new("inference batch must not be empty"))?;
-    let config = first.raster.config();
+    // This frame carries dense float32 planes, which is what the Python backend
+    // on the other end reads. A packed request has no representation here and
+    // is refused rather than silently widened -- widening it would undo exactly
+    // the saving it exists for, and do so invisibly.
+    let config = first
+        .raster()
+        .ok_or_else(|| {
+            EvaluationError::new(
+                "packed rasters cannot cross the request frame; the Python backend \
+                 reads dense float32 planes",
+            )
+        })?
+        .config();
     let identifiers = batch.iter().map(InferenceInput::id).collect::<HashSet<_>>();
     if identifiers.len() != batch.len() {
         return Err(EvaluationError::new("duplicate inference request ID"));
     }
-    if batch.iter().any(|input| input.raster.config() != config) {
+    if batch
+        .iter()
+        .any(|input| input.raster().map(SemanticRaster::config) != Some(config))
+    {
         return Err(EvaluationError::new(
             "mixed raster shapes in inference batch",
         ));
@@ -102,7 +171,10 @@ pub fn encode_request_frame(batch: &[InferenceInput]) -> Result<Vec<u8>, Evaluat
     push_u32(&mut frame, config.width as u32);
     for input in batch {
         frame.extend_from_slice(&input.id.to_le_bytes());
-        for value in input.raster.data() {
+        let raster = input
+            .raster()
+            .expect("checked above that every request in the batch is dense");
+        for value in raster.data() {
             frame.extend_from_slice(&value.to_le_bytes());
         }
     }
@@ -116,7 +188,6 @@ pub fn read_response_frame(
     let policy = batch
         .first()
         .ok_or_else(|| EvaluationError::new("inference batch must not be empty"))?
-        .raster
         .config();
     read_response_frame_with_policy(reader, batch, policy)
 }

@@ -10,8 +10,12 @@ rust-version.workspace = true
 # load a self-built libonnxruntime.so at runtime via ORT_DYLIB_PATH instead of
 # the crate's downloaded binary. The CUDA and TensorRT EPs still register
 # through the dynamically loaded library. See docs/NVRTX_HANDOFF.md.
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "std", "ndarray", "tracing", "api-24"] }
+# `half` gives f16 tensors, which the packed input contract stages instead of
+# float32: at 256x256 that is 152 KB per position against 1792 KB, and staging
+# is what limits inference. See vgo-raster's `packed` module.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "std", "ndarray", "tracing", "api-24", "half"] }
 sha2 = "0.10"
+half = "2.7"
 vgo-core = { path = "../vgo-core" }
 vgo-raster = { path = "../vgo-raster" }
 vgo-search = { path = "../vgo-search" }

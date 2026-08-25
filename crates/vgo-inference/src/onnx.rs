@@ -11,10 +11,15 @@ use ort::{
     value::TensorRef,
 };
 use sha2::{Digest, Sha256};
+use half::f16;
 use vgo_raster::RasterConfig;
+use vgo_raster::packed::{bit_plane_bytes, packed_layout_for};
 use vgo_search::EvaluationError;
 
-use crate::{BatchContract, BatchService, InferenceInput, InferenceOutput, InferenceStageMetrics};
+use crate::{
+    BatchContract, BatchService, InferenceInput, InferenceOutput, InferenceStageMetrics,
+    InputLayout,
+};
 
 const MODEL_SCHEMA: &str = "vgo.raster-policy-value.onnx.v1";
 
@@ -77,6 +82,13 @@ pub struct OnnxBatchService {
     /// freeing several megabytes for each short GPU run creates avoidable host
     /// allocator pressure on the inference critical path.
     states: Vec<f32>,
+    /// Staging for a packed model, unused by a dense one. Same reason as
+    /// `states`: one broker thread owns the session, so these are allocated
+    /// once at maximum batch rather than per call.
+    bits: Vec<u8>,
+    halves: Vec<f16>,
+    scalars: Vec<f16>,
+    input_layout: InputLayout,
     last_stages: InferenceStageMetrics,
 }
 
@@ -168,13 +180,43 @@ impl OnnxBatchService {
             .checked_mul(config.raster.channels())
             .and_then(|value| value.checked_mul(config.raster.pixels()))
             .ok_or_else(|| EvaluationError::new("ONNX input allocation size overflow"))?;
+        let input_layout = model_input_layout(&session);
+        let layout = packed_layout_for(config.raster.kind);
+        if input_layout == InputLayout::Packed && layout.is_none() {
+            return Err(EvaluationError::new(format!(
+                "model takes packed input but raster kind {:?} has no packed layout",
+                config.raster.kind
+            )));
+        }
+        let (bits, halves, scalars) = match (input_layout, layout) {
+            (InputLayout::Packed, Some(layout)) => (
+                Vec::with_capacity(
+                    config.maximum_batch
+                        * layout.binary.len()
+                        * bit_plane_bytes(config.raster.pixels()),
+                ),
+                Vec::with_capacity(
+                    config.maximum_batch * layout.continuous.len() * config.raster.pixels(),
+                ),
+                Vec::with_capacity(config.maximum_batch * layout.scalar.len()),
+            ),
+            _ => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        let states = match input_layout {
+            InputLayout::Dense => Vec::with_capacity(state_capacity),
+            InputLayout::Packed => Vec::new(),
+        };
         Ok(Self {
             session,
             raster: config.raster,
             policy: config.policy.unwrap_or(config.raster),
             maximum_batch: config.maximum_batch,
             provider: config.provider,
-            states: Vec::with_capacity(state_capacity),
+            states,
+            bits,
+            halves,
+            scalars,
+            input_layout,
             last_stages: InferenceStageMetrics::default(),
         })
     }
@@ -188,6 +230,11 @@ impl OnnxBatchService {
     pub const fn policy_grid(&self) -> RasterConfig {
         self.policy
     }
+
+    #[must_use]
+    pub const fn input_layout(&self) -> InputLayout {
+        self.input_layout
+    }
 }
 
 impl BatchService for OnnxBatchService {
@@ -196,6 +243,7 @@ impl BatchService for OnnxBatchService {
             raster: self.raster,
             policy: self.policy,
             maximum_batch: self.maximum_batch,
+            input_layout: self.input_layout,
         }
     }
 
@@ -208,32 +256,86 @@ impl BatchService for OnnxBatchService {
                 self.maximum_batch
             )));
         }
-        if batch
-            .iter()
-            .any(|input| input.raster().config() != self.raster)
-        {
+        if batch.iter().any(|input| input.config() != self.raster) {
             return Err(EvaluationError::new("ONNX batch raster shape mismatch"));
         }
         let packing_started = Instant::now();
-        self.states.clear();
-        for input in batch {
-            self.states.extend_from_slice(input.raster().data());
-        }
-        let input = TensorRef::from_array_view((
-            [
-                batch.len(),
-                self.raster.channels(),
-                self.raster.height,
-                self.raster.width,
-            ],
-            self.states.as_slice(),
-        ));
-        self.last_stages.input_packing_nanoseconds = packing_started.elapsed().as_nanos() as u64;
-        let input =
-            input.map_err(|error| evaluation_error("construct ONNX input tensor", error))?;
-
-        let session_started = Instant::now();
-        let outputs = self.session.run(ort::inputs! {"states" => input});
+        let session_started;
+        let outputs = match self.input_layout {
+            InputLayout::Dense => {
+                self.states.clear();
+                for input in batch {
+                    let raster = input.raster().ok_or_else(|| {
+                        EvaluationError::new(
+                            "dense model received a packed raster; the generator and the \
+                             model disagree about the input layout",
+                        )
+                    })?;
+                    self.states.extend_from_slice(raster.data());
+                }
+                let input = TensorRef::from_array_view((
+                    [
+                        batch.len(),
+                        self.raster.channels(),
+                        self.raster.height,
+                        self.raster.width,
+                    ],
+                    self.states.as_slice(),
+                ))
+                .map_err(|error| evaluation_error("construct ONNX input tensor", error))?;
+                self.last_stages.input_packing_nanoseconds =
+                    packing_started.elapsed().as_nanos() as u64;
+                session_started = Instant::now();
+                self.session.run(ort::inputs! {"states" => input})
+            }
+            InputLayout::Packed => {
+                let layout = packed_layout_for(self.raster.kind)
+                    .expect("checked at load that the raster kind has a packed layout");
+                self.bits.clear();
+                self.halves.clear();
+                self.scalars.clear();
+                for input in batch {
+                    let raster = input.packed_raster().ok_or_else(|| {
+                        EvaluationError::new(
+                            "packed model received a dense raster; the generator and the \
+                             model disagree about the input layout",
+                        )
+                    })?;
+                    self.bits.extend_from_slice(raster.bits());
+                    self.halves.extend_from_slice(raster.dense());
+                    self.scalars.extend_from_slice(raster.scalars());
+                }
+                let pixels = self.raster.pixels();
+                let bits = TensorRef::from_array_view((
+                    [batch.len(), layout.binary.len(), bit_plane_bytes(pixels)],
+                    self.bits.as_slice(),
+                ))
+                .map_err(|error| evaluation_error("construct ONNX bits tensor", error))?;
+                let dense = TensorRef::from_array_view((
+                    [
+                        batch.len(),
+                        layout.continuous.len(),
+                        self.raster.height,
+                        self.raster.width,
+                    ],
+                    self.halves.as_slice(),
+                ))
+                .map_err(|error| evaluation_error("construct ONNX dense tensor", error))?;
+                let scalars = TensorRef::from_array_view((
+                    [batch.len(), layout.scalar.len()],
+                    self.scalars.as_slice(),
+                ))
+                .map_err(|error| evaluation_error("construct ONNX scalars tensor", error))?;
+                self.last_stages.input_packing_nanoseconds =
+                    packing_started.elapsed().as_nanos() as u64;
+                session_started = Instant::now();
+                self.session.run(ort::inputs! {
+                    "bits" => bits,
+                    "dense" => dense,
+                    "scalars" => scalars,
+                })
+            }
+        };
         self.last_stages.session_run_nanoseconds = session_started.elapsed().as_nanos() as u64;
         let outputs = outputs.map_err(|error| evaluation_error("run ONNX inference", error))?;
 
@@ -403,12 +505,28 @@ fn validate_model(session: &Session, config: &OnnxServiceConfig) -> Result<(), E
         .iter()
         .map(|output| output.name())
         .collect::<Vec<_>>();
-    if input_names != ["states"] || output_names != ["policy_logits", "values"] {
+    let dense = input_names == ["states"];
+    let packed = input_names == ["bits", "dense", "scalars"];
+    if !(dense || packed) || output_names != ["policy_logits", "values"] {
         return Err(EvaluationError::new(format!(
             "ONNX input/output contract mismatch: inputs={input_names:?}, outputs={output_names:?}"
         )));
     }
     Ok(())
+}
+
+/// Which input contract the model declares.
+///
+/// Absent means dense: every model exported before `--packed-input` existed
+/// omits the property, and those all take a single float32 `states` tensor.
+fn model_input_layout(session: &Session) -> InputLayout {
+    let Ok(metadata) = session.metadata() else {
+        return InputLayout::Dense;
+    };
+    match metadata.custom("vgo.input_layout").as_deref() {
+        Some("packed") => InputLayout::Packed,
+        _ => InputLayout::Dense,
+    }
 }
 
 fn is_sha256(value: &str) -> bool {

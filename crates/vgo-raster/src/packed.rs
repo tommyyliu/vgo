@@ -172,6 +172,17 @@ fn set_bit(plane: &mut [u8], pixel: usize, value: bool) {
     plane[pixel / 8] |= u8::from(value) << (pixel % 8);
 }
 
+/// Allocates and fills a packed raster, mirroring `rasterize`.
+///
+/// The reusing form is `rasterize_compact_radius_packed_into`; prefer it on the
+/// hot path, where one buffer per actor outlives every position it renders.
+#[must_use]
+pub fn rasterize_packed(position: &Position, config: RasterConfig) -> PackedRaster {
+    let mut out = PackedRaster::new(config);
+    rasterize_compact_radius_packed_into(position, config, &mut out);
+    out
+}
+
 /// Writes `position` into `out` in packed form.
 ///
 /// Produces exactly what `rasterize_compact_radius_into` produces, then

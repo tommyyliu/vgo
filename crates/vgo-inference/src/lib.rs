@@ -28,7 +28,7 @@ use std::{
 };
 
 use vgo_core::Position;
-use vgo_raster::{DensePolicy, RasterConfig, rasterize};
+use vgo_raster::{DensePolicy, RasterConfig, packed::rasterize_packed, rasterize};
 use vgo_search::{Evaluation, EvaluationError, Evaluator};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +72,38 @@ pub struct PythonProcessConfig {
     pub compile: bool,
 }
 
+/// Renders one position into whatever form the backend asked for.
+///
+/// Both request producers go through here rather than each choosing, because a
+/// mismatch is invisible until inference: a graph fed the wrong layout does not
+/// fail, it computes something else. The backend states the layout in its
+/// contract and this is the only place that reads it.
+fn encode_request(id: u64, position: &Position, contract: BatchContract) -> InferenceInput {
+    match contract.input_layout {
+        InputLayout::Dense => InferenceInput::new(id, rasterize(position, contract.raster)),
+        InputLayout::Packed => {
+            InferenceInput::packed(id, rasterize_packed(position, contract.raster))
+        }
+    }
+}
+
+/// Which input contract a model was exported with.
+///
+/// A packed model takes the raster compressed -- binary planes as bits,
+/// constant planes as one value each, the rest at fp16 -- and expands it in the
+/// graph. At 256x256 that stages 152 KB per position against 1792 KB, and the
+/// inference lanes were measured at 87% CPU while actors idled at 39%.
+///
+/// Read from the model rather than configured, so a binary and a model that
+/// disagree fail at load with a name mismatch instead of feeding the wrong
+/// bytes into a graph that will happily consume them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum InputLayout {
+    #[default]
+    Dense,
+    Packed,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BatchContract {
     pub raster: RasterConfig,
@@ -79,6 +111,9 @@ pub struct BatchContract {
     /// was exported with a decoupled (coarser) policy grid.
     pub policy: RasterConfig,
     pub maximum_batch: usize,
+    /// Which form the backend wants positions in. Set by the model, so every
+    /// producer of requests has to ask rather than assume.
+    pub input_layout: InputLayout,
 }
 
 /// Time spent inside the host-visible stages of one backend call.
@@ -168,6 +203,10 @@ impl PythonBatchService {
                 raster: config.raster,
                 policy: config.policy.unwrap_or(config.raster),
                 maximum_batch: config.maximum_batch,
+                // The request frame carries dense float32 planes, so this
+                // backend cannot take the packed form; `encode_request_frame`
+                // refuses one rather than widening it back.
+                input_layout: InputLayout::Dense,
             },
         })
     }
@@ -528,7 +567,7 @@ impl BatchedEvaluator {
             .iter()
             .map(|position| {
                 let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-                InferenceInput::new(id, rasterize(position, self.inner.contract.raster))
+                encode_request(id, position, self.inner.contract)
             })
             .collect::<Vec<_>>();
         let encoding_nanoseconds = encoding_started.elapsed().as_nanos() as u64;
@@ -734,7 +773,7 @@ impl BatchedEvaluatorPool {
             .iter()
             .map(|position| {
                 let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-                InferenceInput::new(id, rasterize(position, self.inner.contract.raster))
+                encode_request(id, position, self.inner.contract)
             })
             .collect::<Vec<_>>();
         let encoding_nanoseconds = encoding_started.elapsed().as_nanos() as u64;
@@ -1415,6 +1454,7 @@ mod tests {
                 raster: RasterConfig::square(2),
                 policy: RasterConfig::square(2),
                 maximum_batch: 2,
+            input_layout: InputLayout::Dense,
             }
         }
 
@@ -1442,6 +1482,7 @@ mod tests {
                 raster: RasterConfig::square(2),
                 policy: RasterConfig::square(2),
                 maximum_batch: self.maximum_batch,
+            input_layout: InputLayout::Dense,
             }
         }
 
@@ -1521,6 +1562,7 @@ mod tests {
             raster: RasterConfig::square(2),
             policy: RasterConfig::square(2),
             maximum_batch,
+        input_layout: InputLayout::Dense,
         }
     }
 
@@ -1578,6 +1620,7 @@ mod tests {
             raster: RasterConfig::square(2),
             policy: RasterConfig::square(2),
             maximum_batch: MAXIMUM_BATCH,
+            input_layout: InputLayout::Dense,
         };
         let batch_sizes = Arc::new(Mutex::new(Vec::new()));
         let service = RecordingService {

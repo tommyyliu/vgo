@@ -323,7 +323,7 @@ mod tests {
         BatchExecutor, CompletedBatch, InferenceBatch, ThreadedBatchExecutor,
         ThreadedBatchExecutorPool,
     };
-    use crate::{BatchContract, BatchService, InferenceInput, InferenceOutput};
+    use crate::{BatchContract, BatchService, InferenceInput, InferenceOutput, InputLayout};
     use vgo_search::EvaluationError;
 
     struct EchoService;
@@ -334,6 +334,7 @@ mod tests {
                 raster: RasterConfig::square(2),
                 policy: RasterConfig::square(2),
                 maximum_batch: 1,
+            input_layout: InputLayout::Dense,
             }
         }
 

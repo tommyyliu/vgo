@@ -24,6 +24,7 @@ use std::{
 use clap::Parser;
 use vgo_core::{Color, Position, Stone};
 use vgo_inference::{
+    InputLayout,
     BatchContract, BatchService, BatchedEvaluatorPool, BrokerConfig, BrokerMetrics, InferenceInput,
     OnnxBatchService, OnnxProvider, OnnxServiceConfig,
     InferenceOutput, InferenceStageMetrics,
@@ -140,6 +141,9 @@ impl PackingService {
                 // cost from this input-feed benchmark.
                 policy: RasterConfig::square(1),
                 maximum_batch,
+                // This benchmark sizes the dense handoff path, which is the
+                // one it was written to measure.
+                input_layout: InputLayout::Dense,
             },
             states: Vec::with_capacity(maximum_batch * raster.channels() * raster.pixels()),
             last_stages: InferenceStageMetrics::default(),
@@ -157,7 +161,13 @@ impl BatchService for PackingService {
         let packing_started = Instant::now();
         self.states.clear();
         for input in batch {
-            self.states.extend_from_slice(input.raster().data());
+            // This benchmark measures the dense handoff path, which is the one
+            // it was written to size; a packed request has nothing to gather
+            // here and is a caller error rather than something to widen.
+            let raster = input
+                .raster()
+                .ok_or_else(|| EvaluationError::new("feed benchmark requires dense rasters"))?;
+            self.states.extend_from_slice(raster.data());
         }
         black_box(self.states.as_slice());
         self.last_stages.input_packing_nanoseconds = packing_started.elapsed().as_nanos() as u64;
