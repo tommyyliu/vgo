@@ -599,3 +599,121 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod packed_parity_tests {
+    use std::path::PathBuf;
+
+    use vgo_core::{Color, Position, Stone};
+    use vgo_raster::{RasterConfig, RasterKind};
+
+    use super::*;
+    use crate::{BatchService, InferenceInput};
+
+    /// The Rust packer and the graph's expansion have to agree, and nothing
+    /// else checks that they do.
+    ///
+    /// Each side is tested against its own reference elsewhere: the packed
+    /// rasterizer against the dense one in `vgo-raster`, the graph against the
+    /// dense export in `test_packed_input.py`. Neither catches a disagreement
+    /// *between* the two -- a swapped bit order, a binary plane in the wrong
+    /// slot, komi and radius transposed. None of those fail. They produce a
+    /// model that quietly reads a different board than the one it was handed.
+    ///
+    /// Ignored because it needs two exports of one checkpoint and a GPU. Build
+    /// them with:
+    ///
+    /// ```text
+    /// python -m vgo_training.export_onnx --checkpoint C --output dense.onnx
+    /// python -m vgo_training.export_onnx --checkpoint C --output packed.onnx --packed-input
+    /// VGO_PARITY_DIR=<dir> cargo test -p vgo-inference packed_parity -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn the_packed_lane_agrees_with_the_dense_one() {
+        let Ok(directory) = std::env::var("VGO_PARITY_DIR") else {
+            panic!("set VGO_PARITY_DIR to a directory holding dense.onnx and packed.onnx");
+        };
+        let directory = PathBuf::from(directory);
+        let raster = RasterConfig::square_of(256, RasterKind::CompactRadius);
+        let policy = Some(RasterConfig::square(128));
+
+        let service = |name: &str| {
+            OnnxBatchService::load(&OnnxServiceConfig {
+                model: directory.join(name),
+                raster,
+                policy,
+                maximum_batch: 4,
+                provider: OnnxProvider::Cpu,
+                device_id: 0,
+                fp16: false,
+                cache_directory: directory.join("cache"),
+            })
+            .unwrap_or_else(|error| panic!("load {name}: {error}"))
+        };
+        let mut dense = service("dense.onnx");
+        let mut packed = service("packed.onnx");
+        assert_eq!(dense.input_layout(), InputLayout::Dense);
+        assert_eq!(packed.input_layout(), InputLayout::Packed);
+
+        let radius = 1.0 / 18.0;
+        let step = 2.5 * radius;
+        let mut stones = Vec::new();
+        let mut index = 0;
+        'outer: for row in 0..8 {
+            for column in 0..8 {
+                let x = 0.08 + step * f64::from(column);
+                let y = 0.08 + step * f64::from(row);
+                if x > 0.95 || y > 0.95 {
+                    continue;
+                }
+                stones.push(Stone::new(
+                    x,
+                    y,
+                    if index % 2 == 0 { Color::Black } else { Color::White },
+                ));
+                index += 1;
+                if index == 24 {
+                    break 'outer;
+                }
+            }
+        }
+        let position = Position::new(radius, stones, Color::White).with_komi(0.104);
+
+        let dense_out = dense
+            .infer(&[InferenceInput::new(
+                1,
+                vgo_raster::rasterize(&position, raster),
+            )])
+            .expect("dense inference");
+        let packed_out = packed
+            .infer(&[InferenceInput::packed(
+                1,
+                vgo_raster::packed::rasterize_packed(&position, raster),
+            )])
+            .expect("packed inference");
+
+        let (_, dense_value, dense_policy) = dense_out[0].clone().into_parts();
+        let (_, packed_value, packed_policy) = packed_out[0].clone().into_parts();
+        assert_eq!(dense_policy.len(), packed_policy.len());
+
+        let worst = dense_policy
+            .iter()
+            .zip(&packed_policy)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!(
+            "  value {dense_value:.6} vs {packed_value:.6} (delta {:.3e})\n  policy worst delta {worst:.3e}",
+            (dense_value - packed_value).abs()
+        );
+        // fp16 staging is exact for this data -- the states are fp16 on disk
+        // already -- so the two paths should agree to floating-point noise from
+        // nothing more than a different graph shape.
+        assert!(worst < 1e-4, "policy diverged by {worst}");
+        assert!(
+            (dense_value - packed_value).abs() < 1e-4,
+            "value diverged by {}",
+            (dense_value - packed_value).abs()
+        );
+    }
+}

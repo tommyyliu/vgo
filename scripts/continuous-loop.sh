@@ -49,6 +49,14 @@ actors="${VGO_ACTORS:-32}"
 # about 61 Elo, and the model was even with a naive evaluator at the time, so
 # the search was resolving positions the network could not yet exploit.
 simulations="${VGO_SIMULATIONS:-800}"
+# Export the model taking the compressed input triple instead of a dense
+# float32 raster, which it expands in the graph. 152 KB staged per position
+# against 1792 KB at 256x256, and staging is what limits inference: the two
+# lanes measured 87% CPU each while the actor threads idled at 39%. Off by
+# default until a run has actually been measured on it -- the parity is proven
+# (Rust packer against graph expansion, policy within 8e-5) but the throughput
+# claim is not.
+packed_input="${VGO_PACKED_INPUT:-0}"
 # Absolute, because training runs from `$root/training` and a relative path
 # would resolve against that instead of the repo root -- generation, which does
 # not cd, would keep working while every training step failed on a checkpoint
@@ -176,8 +184,11 @@ for ((update = first_update; update < first_update + updates; update++)); do
   ) >> "$output/train.log" 2>&1 || { echo "[loop] training failed" >&2; exit 1; }
 
   onnx="${checkpoint%.pt}.onnx"
+  packed_flag=()
+  [ "$packed_input" = "1" ] && packed_flag=(--packed-input)
   ( cd "$root/training" && "$python" -m vgo_training.export_onnx \
       --checkpoint "$checkpoint" --output "$onnx" --maximum-batch 64 \
+      "${packed_flag[@]}" \
   ) >> "$output/train.log" 2>&1 || { echo "[loop] export failed" >&2; exit 1; }
 
   # Start the successor before stopping the incumbent, so generation never
