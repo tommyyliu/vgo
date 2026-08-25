@@ -12,6 +12,7 @@ gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
 
 
 [dependencies]
+half = "2.7"
 vgo-core = { path = "../vgo-core" }
 vgo-search = { path = "../vgo-search" }
 wgpu = { version = "30.0.0", default-features = false, features = ["std", "wgsl", "vulkan"], optional = true }

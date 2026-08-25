@@ -8,6 +8,7 @@ mod gpu;
 pub use gpu::settled_mask_gpu;
 
 mod edt;
+pub mod packed;
 mod policy;
 pub use policy::DensePolicy;
 pub use edt::{
@@ -1082,7 +1083,10 @@ pub fn settled_mask(position: &Position, config: RasterConfig) -> Vec<bool> {
     settled
 }
 
-fn relative_stones(position: &Position, to_move: Color) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+pub(crate) fn relative_stones(
+    position: &Position,
+    to_move: Color,
+) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
     let stones = position.stones();
     let mut current = Vec::with_capacity(stones.len());
     let mut opponent = Vec::with_capacity(stones.len());
