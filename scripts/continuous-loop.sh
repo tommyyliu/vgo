@@ -88,15 +88,25 @@ start_generator () {
 }
 
 model="$seed_model"
+
+# Continue the update numbering from whatever is already on disk. Restarting
+# from zero rewrites `update-000000`, which on a restart is usually the model
+# just passed as `--seed-model` -- the loop would destroy its own starting point
+# and only notice later, when the history it wanted to compare against was gone.
+first_update=$(ls "$models"/update-*.pt 2>/dev/null \
+  | sed 's/.*update-0*\([0-9]\+\)\.pt/\1/' | sort -n | tail -1)
+first_update=$(( ${first_update:-(-1)} + 1 ))
+[ "$first_update" -gt 0 ] && echo "[loop] continuing from update $first_update"
+
 generation=0
 # Game indices never restart: a reused index would replay a seed, and two games
 # with the same seed are the same game.
-next_game=1000000
+next_game=$(( 1000000 + first_update * 1000000 ))
 label="gen-$(printf '%06d' "$generation")-seed"
 generator=$(start_generator "$label" "$model" "$next_game")
 echo "[loop] generation $generation started (pid $generator, model ${model:-none})"
 
-for ((update = 0; update < updates; update++)); do
+for ((update = first_update; update < first_update + updates; update++)); do
   target=$(( $(count_samples) + step ))
   echo "[loop] update $update: waiting for $target samples"
   while [ "$(count_samples)" -lt "$target" ]; do
