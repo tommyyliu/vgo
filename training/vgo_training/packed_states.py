@@ -61,6 +61,13 @@ _LAYOUTS: dict[int, Layout] = {
     5: Layout(channels=5, binary=(0, 1, 3), scalar=(4,), continuous=(2,)),
     # ..., komi, previous_pass
     6: Layout(channels=6, binary=(0, 1, 3), scalar=(4, 5), continuous=(2,)),
+    # ..., komi, previous_pass, radius -- `compact-radius`.
+    #
+    # `radius` joins komi and previous_pass as a scalar: the Rust fills the
+    # whole plane with `2.0 * position.radius()`, one value per position. It is
+    # the multi-radius run's only structural addition, so a run that trains on
+    # mixed board sizes packs exactly as tightly as one that does not.
+    7: Layout(channels=7, binary=(0, 1, 3), scalar=(4, 5, 6), continuous=(2,)),
     # current_stones, opponent_stones, voronoi_ridge, settled, dead_zone,
     # connections, komi, previous_pass.
     #
@@ -81,6 +88,7 @@ VORONOI_RIDGE = 2
 SETTLED = 3
 KOMI = 4
 PREVIOUS_PASS = 5
+RADIUS = 6
 
 COMPACT_CHANNEL_COUNT = 5
 COMPACT_LAYOUT = _LAYOUTS[COMPACT_CHANNEL_COUNT]
