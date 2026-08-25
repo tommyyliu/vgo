@@ -49,7 +49,12 @@ actors="${VGO_ACTORS:-32}"
 # about 61 Elo, and the model was even with a naive evaluator at the time, so
 # the search was resolving positions the network could not yet exploit.
 simulations="${VGO_SIMULATIONS:-800}"
+# Absolute, because training runs from `$root/training` and a relative path
+# would resolve against that instead of the repo root -- generation, which does
+# not cd, would keep working while every training step failed on a checkpoint
+# one directory too deep.
 seed_model="${VGO_SEED_MODEL:-}"
+[ -n "$seed_model" ] && seed_model="$(cd "$(dirname "$seed_model")" && pwd)/$(basename "$seed_model")"
 
 python="$root/training/.venv/bin/python"
 source "$root/scripts/env/ort.sh"
