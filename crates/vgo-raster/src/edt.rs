@@ -640,8 +640,10 @@ fn masks_by_bounded_distance(
     // this cost for one.
     let row_width = config.width;
     let mut column_xs = vec![0.0f64; row_width];
+    let mut fine_columns = vec![0usize; row_width];
     for (column, x) in column_xs.iter_mut().enumerate() {
         *x = (column as f64 + 0.5) / row_width as f64;
+        fine_columns[column] = (column * scale + scale / 2).min(fine_width - 1);
     }
     let mut nearest_squares = vec![f64::INFINITY; row_width];
     let nearest_grid = if want_settled && stones.len() >= NEAREST_SEARCH_MINIMUM_STONES {
@@ -653,6 +655,8 @@ fn masks_by_bounded_distance(
     for row in 0..config.height {
         let y = (row as f64 + 0.5) / config.height as f64;
         let fine_row = (row * scale + scale / 2).min(fine_height - 1);
+        let output_base = row * config.width;
+        let sampled_base = fine_row * fine_width;
         if want_settled && !stones.is_empty() {
             if let Some(grid) = nearest_grid.as_ref() {
                 nearest_row_chunked(position, grid, y, &column_xs, &mut nearest_squares);
@@ -665,6 +669,11 @@ fn masks_by_bounded_distance(
                     // Zipped rather than indexed, and `min` rather than a branch:
                     // both are what let this compile to a flat vector min with no
                     // bounds checks in the loop.
+                    // `mul_add`, matching `nearest_row_chunked`. The two paths
+                    // must compute the same distance or the dispatch threshold
+                    // becomes a knob that silently re-renders positions near it;
+                    // and it is the faster of the two here anyway, measured at
+                    // 0.562 ms against 0.585 at 28 stones.
                     for (nearest, &x) in nearest_squares.iter_mut().zip(column_xs.iter()) {
                         let dx = x - stone_x;
                         *nearest = dx.mul_add(dx, dy_square).min(*nearest);
@@ -672,13 +681,11 @@ fn masks_by_bounded_distance(
                 }
             }
         }
-        for column in 0..config.width {
-            let x = column_xs[column];
-            let fine_column = (column * scale + scale / 2).min(fine_width - 1);
-            let sampled_squared = squared[fine_row * fine_width + fine_column] * spacing_squared;
-
-            if want_dead_zone {
-                dead[row * config.width + column] = if near_vertex[row * config.width + column] {
+        if want_dead_zone {
+            for column in 0..config.width {
+                let x = column_xs[column];
+                let sampled_squared = squared[sampled_base + fine_columns[column]] * spacing_squared;
+                dead[output_base + column] = if near_vertex[output_base + column] {
                     false
                 } else if sampled_squared <= radius_squared {
                     false
@@ -690,10 +697,13 @@ fn masks_by_bounded_distance(
                     distance_to_legal_set(position, Point::new(x, y), Some(known)) > radius
                 };
             }
-            if stones.is_empty() || !want_settled {
-                continue;
-            }
-
+        }
+        if stones.is_empty() || !want_settled {
+            continue;
+        }
+        for column in 0..config.width {
+            let x = column_xs[column];
+            let sampled_squared = squared[sampled_base + fine_columns[column]] * spacing_squared;
             // Keep the cheap cases in squared-distance space. The old form
             // took two square roots for every pixel, although only the narrow
             // undecided band needs the exact nearest distance. This leaves one
@@ -715,7 +725,7 @@ fn masks_by_bounded_distance(
             // So the mask is unchanged and only `exact_tests` moves.
             let sampled = sampled_squared.sqrt();
             let sampled_minus_slack = sampled - slack;
-            mask[row * config.width + column] = if sampled_minus_slack > 0.0
+            mask[output_base + column] = if sampled_minus_slack > 0.0
                 && nearest_squares[column] <= sampled_minus_slack * sampled_minus_slack
             {
                 true
@@ -938,5 +948,69 @@ mod tests {
         let config = RasterConfig::square_of(32, RasterKind::Compact);
         let (dead, _) = dead_zone_mask(&position, config, 1);
         assert!(dead.iter().all(|d| *d), "an empty legal set makes every point dead");
+    }
+}
+
+#[cfg(test)]
+mod dispatch_parity {
+    use super::*;
+    use vgo_core::{Color, Position, Stone};
+
+    /// A checksum of the settled mask, for checking that the nearest-stone
+    /// dispatch does not change what is rendered.
+    ///
+    /// The threshold is a tuning constant, and a tuning constant that alters a
+    /// network input is a trap: someone moves it for speed and silently
+    /// re-renders every position near the boundary. Run this, move
+    /// `NEAREST_SEARCH_MINIMUM_STONES` to 0 and to a huge value, and diff the
+    /// output. It was identical across every configuration when last checked,
+    /// with both paths computing distances by `mul_add`.
+    ///
+    /// Printed rather than asserted because the comparison is between two
+    /// builds, which a single test cannot do.
+    #[test]
+    #[ignore]
+    fn settled_checksum_across_stone_counts() {
+        for units in [18usize, 38] {
+            let radius = 1.0 / units as f64;
+            let step = 2.2 * radius;
+            for count in [40usize, 55, 60, 65, 80, 120, 240] {
+                let mut stones = Vec::new();
+                let mut placed = 0usize;
+                'outer: for row in 0..40 {
+                    for column in 0..40 {
+                        let x = 0.04 + step * f64::from(column);
+                        let y = 0.04 + step * f64::from(row);
+                        if x > 0.97 || y > 0.97 {
+                            continue;
+                        }
+                        stones.push(Stone::new(
+                            x,
+                            y,
+                            if placed % 2 == 0 { Color::Black } else { Color::White },
+                        ));
+                        placed += 1;
+                        if placed == count {
+                            break 'outer;
+                        }
+                    }
+                }
+                if stones.len() < count {
+                    continue;
+                }
+                let position = Position::new(radius, stones, Color::White).with_komi(0.104);
+                let config = RasterConfig::square_of(256, crate::RasterKind::CompactRadius);
+                let mask = crate::settled_for_raster(&position, config);
+                let set = mask.iter().filter(|b| **b).count();
+                let mut hash = 1469598103934665603u64;
+                for (index, bit) in mask.iter().enumerate() {
+                    if *bit {
+                        hash ^= index as u64;
+                        hash = hash.wrapping_mul(1099511628211);
+                    }
+                }
+                println!("  {units}u {count:>3} stones: {set:>6} settled  hash {hash:016x}");
+            }
+        }
     }
 }

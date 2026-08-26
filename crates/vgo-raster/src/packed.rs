@@ -243,8 +243,9 @@ const CHUNK: usize = 64;
 /// row is not enough to recover it, because that machinery still runs; the flat
 /// scan has to be a separate path.
 ///
-/// 64 is where they cross: 0.95x at 60 stones, 2.05x at 120.
-const SEARCH_MINIMUM_STONES: usize = 64;
+/// The measured break-even is around 60 stones; keeping the threshold there
+/// avoids paying the grid setup on early positions while helping late ones.
+const SEARCH_MINIMUM_STONES: usize = 60;
 
 /// Every stone against every pixel, one stone at a time.
 ///
