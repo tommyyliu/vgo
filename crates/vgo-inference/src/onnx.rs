@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{BufReader, Read},
+    io::{BufReader, Read, Seek},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -399,12 +399,64 @@ struct ProfileShapes {
     maximum: String,
 }
 
+/// Whether the model file declares the packed input contract.
+///
+/// Read from the file rather than from `session.metadata()`, because TensorRT
+/// wants a shape profile for every dynamic input *before* the session exists,
+/// and the profile has to name the right ones. Loading twice to find out would
+/// cost an engine build.
+///
+/// `onnx.helper.set_model_props` appends, so the properties land in the last
+/// bytes of the file; a tail read finds them without parsing protobuf. A model
+/// with no such property is dense, which is every model exported before the
+/// packed contract existed.
+fn file_declares_packed_input(path: &Path) -> bool {
+    const TAIL: u64 = 64 * 1024;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(length) = file.metadata().map(|data| data.len()) else {
+        return false;
+    };
+    let start = length.saturating_sub(TAIL);
+    if file.seek(std::io::SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    let mut tail = Vec::new();
+    if file.read_to_end(&mut tail).is_err() {
+        return false;
+    }
+    let key = b"vgo.input_layout";
+    let Some(at) = tail.windows(key.len()).position(|window| window == key) else {
+        return false;
+    };
+    // The value follows the key within a few bytes of protobuf framing.
+    let window = &tail[at + key.len()..(at + key.len() + 24).min(tail.len())];
+    window
+        .windows(6)
+        .any(|candidate| candidate == b"packed")
+}
+
 fn profile_shapes(config: &OnnxServiceConfig) -> ProfileShapes {
-    let shape = |batch| {
-        format!(
+    let packed = file_declares_packed_input(&config.model)
+        .then(|| packed_layout_for(config.raster.kind))
+        .flatten();
+    let shape = |batch| match packed {
+        None => format!(
             "states:{batch}x{}x{}x{}",
-            config.raster.channels(), config.raster.height, config.raster.width
-        )
+            config.raster.channels(),
+            config.raster.height,
+            config.raster.width
+        ),
+        Some(layout) => format!(
+            "bits:{batch}x{}x{},dense:{batch}x{}x{}x{},scalars:{batch}x{}",
+            layout.binary.len(),
+            bit_plane_bytes(config.raster.pixels()),
+            layout.continuous.len(),
+            config.raster.height,
+            config.raster.width,
+            layout.scalar.len(),
+        ),
     };
     ProfileShapes {
         minimum: shape(1),
@@ -644,9 +696,16 @@ mod packed_parity_tests {
                 raster,
                 policy,
                 maximum_batch: 4,
-                provider: OnnxProvider::Cpu,
+                // TensorRT by request: the expansion ops are the part most
+                // likely to differ by provider, and TensorRT is what runs in
+                // production. CPU is the default because it needs no device.
+                provider: if std::env::var("VGO_PARITY_TENSORRT").is_ok() {
+                    OnnxProvider::TensorRt
+                } else {
+                    OnnxProvider::Cpu
+                },
                 device_id: 0,
-                fp16: false,
+                fp16: std::env::var("VGO_PARITY_TENSORRT").is_ok(),
                 cache_directory: directory.join("cache"),
             })
             .unwrap_or_else(|error| panic!("load {name}: {error}"))

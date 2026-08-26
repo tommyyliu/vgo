@@ -50,13 +50,20 @@ actors="${VGO_ACTORS:-32}"
 # the search was resolving positions the network could not yet exploit.
 simulations="${VGO_SIMULATIONS:-800}"
 # Export the model taking the compressed input triple instead of a dense
-# float32 raster, which it expands in the graph. 152 KB staged per position
-# against 1792 KB at 256x256, and staging is what limits inference: the two
-# lanes measured 87% CPU each while the actor threads idled at 39%. Off by
-# default until a run has actually been measured on it -- the parity is proven
-# (Rust packer against graph expansion, policy within 8e-5) but the throughput
-# claim is not.
-packed_input="${VGO_PACKED_INPUT:-0}"
+# float32 raster, which it expands in the graph.
+#
+# Measured through the production broker, two lanes, batch 32, at 256x256:
+#
+#     dense    1720-1810 positions/s   11.2 ms pack + 22.6 session + 0.50 out
+#     packed   3698-3789 positions/s    0.30 ms pack + 16.1 session + 0.22 out
+#
+# 2.15x. The staging collapses 37x, and the session shrinks by a quarter too
+# because the host-to-device copy is inside it. Outputs are bit-identical to
+# the dense graph under TensorRT -- exactly 0.0 apart on both heads, since the
+# packing throws nothing away and both reduce to the same fp16 arithmetic.
+#
+# Set VGO_PACKED_INPUT=0 to go back to the dense contract.
+packed_input="${VGO_PACKED_INPUT:-1}"
 # Absolute, because training runs from `$root/training` and a relative path
 # would resolve against that instead of the repo root -- generation, which does
 # not cd, would keep working while every training step failed on a checkpoint

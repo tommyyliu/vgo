@@ -66,7 +66,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let delay_ms: u64 = get("--delay-ms", "1").parse()?;
     let cache = PathBuf::from(get("--cache-directory", "artifacts/onnx-cache"));
 
-    let raster = RasterConfig::square_of(resolution, RasterKind::Compact);
+    // The layout has to match what the model was exported with, or validation
+    // rejects it on channel count. Also the only way to reach a packed model
+    // from here: the packed contract is defined for `compact-radius` alone.
+    let kind = match get("--raster-kind", "compact").as_str() {
+        "compact" => RasterKind::Compact,
+        "compact-pass" => RasterKind::CompactPass,
+        "compact-radius" => RasterKind::CompactRadius,
+        other => return Err(format!("unknown raster kind {other}").into()),
+    };
+    let raster = RasterConfig::square_of(resolution, kind);
 
     let mut built = Vec::with_capacity(lanes);
     for _ in 0..lanes {
