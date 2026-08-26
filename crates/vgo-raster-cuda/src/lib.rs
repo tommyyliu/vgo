@@ -480,6 +480,169 @@ impl EdtSettledRasterizer {
     pub fn mask(&self, position: &Position, config: RasterConfig) -> Result<Vec<bool>, CudaError> {
         Ok(self.masks(&[position], config)?.remove(0))
     }
+
+    /// Milliseconds in each of the four kernels, synchronising between them.
+    ///
+    /// Diagnostic only: the synchronisation is exactly what production must not
+    /// do, and it inflates the total. What it answers is where the time sits,
+    /// which the aggregate cannot -- the two transform passes launch 8,192
+    /// threads against the pixel kernels' 2,097,152, so if they dominate then
+    /// the card is idle for most of a mask and the algorithm, not the hardware,
+    /// is the limit.
+    pub fn phase_milliseconds(
+        &self,
+        positions: &[&Position],
+        config: RasterConfig,
+        rounds: usize,
+    ) -> Result<[f64; 4], CudaError> {
+        use std::time::Instant;
+        let launch = |e: cudarc::driver::DriverError| CudaError::Launch(e.to_string());
+        let pixels = config.pixels();
+        let items = positions.len();
+        let radius = positions[0].radius();
+
+        let mut stones: Vec<f64> = Vec::new();
+        let mut stone_offsets: Vec<i32> = Vec::new();
+        let mut stone_counts: Vec<i32> = Vec::new();
+        let mut vertices: Vec<f64> = Vec::new();
+        let mut vertex_offsets: Vec<i32> = Vec::new();
+        let mut vertex_counts: Vec<i32> = Vec::new();
+        for position in positions {
+            stone_offsets.push((stones.len() / 2) as i32);
+            stone_counts.push(position.stones().len() as i32);
+            for stone in position.stones() {
+                stones.push(stone.x);
+                stones.push(stone.y);
+            }
+            let found = legal_set_vertices(position);
+            vertex_offsets.push((vertices.len() / 2) as i32);
+            vertex_counts.push(found.len() as i32);
+            for vertex in &found {
+                vertices.push(vertex.x);
+                vertices.push(vertex.y);
+            }
+        }
+        if stones.is_empty() {
+            stones.extend_from_slice(&[0.0, 0.0]);
+        }
+        if vertices.is_empty() {
+            vertices.extend_from_slice(&[0.0, 0.0]);
+        }
+        let stone_buffer = self.stream.clone_htod(&stones).map_err(launch)?;
+        let vertex_buffer = self.stream.clone_htod(&vertices).map_err(launch)?;
+        let stone_offset_buffer = self.stream.clone_htod(&stone_offsets).map_err(launch)?;
+        let stone_count_buffer = self.stream.clone_htod(&stone_counts).map_err(launch)?;
+        let vertex_offset_buffer = self.stream.clone_htod(&vertex_offsets).map_err(launch)?;
+        let vertex_count_buffer = self.stream.clone_htod(&vertex_counts).map_err(launch)?;
+
+        let width = config.width as i32;
+        let height = config.height as i32;
+        let longest = config.width.max(config.height);
+        let lines = items * longest;
+        let mut field = self.stream.alloc_zeros::<f64>(pixels * items).map_err(launch)?;
+        let mut source = self.stream.alloc_zeros::<f64>(lines * longest).map_err(launch)?;
+        let mut result = self.stream.alloc_zeros::<f64>(lines * longest).map_err(launch)?;
+        let mut envelope = self.stream.alloc_zeros::<i32>(lines * longest).map_err(launch)?;
+        let mut boundaries = self
+            .stream
+            .alloc_zeros::<f64>(lines * (longest + 1))
+            .map_err(launch)?;
+        let mut out = self.stream.alloc_zeros::<u8>(pixels * items).map_err(launch)?;
+
+        let pixel_launch = LaunchConfig {
+            grid_dim: (
+                (config.width as u32).div_ceil(16),
+                (config.height as u32).div_ceil(16),
+                items as u32,
+            ),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let line_launch = |count: usize| LaunchConfig {
+            grid_dim: ((count as u32).div_ceil(64), items as u32, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut timings = [0.0f64; 4];
+        for round in 0..rounds + 1 {
+            // Round zero warms; its time is discarded.
+            let record = round > 0;
+
+            let started = Instant::now();
+            let mut builder = self.stream.launch_builder(&self.sample_legal);
+            builder
+                .arg(&stone_buffer)
+                .arg(&stone_offset_buffer)
+                .arg(&stone_count_buffer)
+                .arg(&radius)
+                .arg(&width)
+                .arg(&height)
+                .arg(&mut field);
+            unsafe { builder.launch(pixel_launch).map_err(launch)? };
+            self.stream.synchronize().map_err(launch)?;
+            if record {
+                timings[0] += started.elapsed().as_secs_f64() * 1000.0;
+            }
+
+            let started = Instant::now();
+            let mut builder = self.stream.launch_builder(&self.edt_columns);
+            builder
+                .arg(&mut field)
+                .arg(&mut source)
+                .arg(&mut result)
+                .arg(&mut envelope)
+                .arg(&mut boundaries)
+                .arg(&width)
+                .arg(&height);
+            unsafe { builder.launch(line_launch(config.width)).map_err(launch)? };
+            self.stream.synchronize().map_err(launch)?;
+            if record {
+                timings[1] += started.elapsed().as_secs_f64() * 1000.0;
+            }
+
+            let started = Instant::now();
+            let mut builder = self.stream.launch_builder(&self.edt_rows);
+            builder
+                .arg(&mut field)
+                .arg(&mut source)
+                .arg(&mut result)
+                .arg(&mut envelope)
+                .arg(&mut boundaries)
+                .arg(&width)
+                .arg(&height);
+            unsafe { builder.launch(line_launch(config.height)).map_err(launch)? };
+            self.stream.synchronize().map_err(launch)?;
+            if record {
+                timings[2] += started.elapsed().as_secs_f64() * 1000.0;
+            }
+
+            let started = Instant::now();
+            let mut builder = self.stream.launch_builder(&self.settled_from_field);
+            builder
+                .arg(&stone_buffer)
+                .arg(&stone_offset_buffer)
+                .arg(&stone_count_buffer)
+                .arg(&vertex_buffer)
+                .arg(&vertex_offset_buffer)
+                .arg(&vertex_count_buffer)
+                .arg(&field)
+                .arg(&radius)
+                .arg(&width)
+                .arg(&height)
+                .arg(&mut out);
+            unsafe { builder.launch(pixel_launch).map_err(launch)? };
+            self.stream.synchronize().map_err(launch)?;
+            if record {
+                timings[3] += started.elapsed().as_secs_f64() * 1000.0;
+            }
+        }
+        for value in &mut timings {
+            *value /= rounds as f64;
+        }
+        Ok(timings)
+    }
+
 }
 
 #[cfg(test)]
@@ -698,6 +861,44 @@ mod edt_tests {
         }
     }
 
+    /// How far batching carries it.
+    ///
+    /// The line kernels launch `width` threads per batch item, so occupancy is
+    /// proportional to the batch and the small end is starved. This finds where
+    /// that stops mattering, which is the number that decides whether a broker
+    /// assembling positions can beat the actor threads it takes them from.
+    ///
+    /// Ignored: needs an idle CUDA device.
+    #[test]
+    #[ignore]
+    fn batching_carries_the_transform() {
+        let radius = 1.0 / 18.0;
+        let config = RasterConfig::square_of(256, RasterKind::CompactRadius);
+        let position = lattice(28, radius);
+        let transform = EdtSettledKernel::compile(0, Precision::Single)
+            .expect("compile")
+            .rasterizer()
+            .expect("stream");
+        println!("  CPU: 980 masks/s per core; 8 cores 7,840; 32 cores 31,360");
+        for batch in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
+            let positions: Vec<&Position> = (0..batch).map(|_| &position).collect();
+            let rounds = (512 / batch).max(3);
+            transform.masks(&positions, config).expect("warm");
+            let started = Instant::now();
+            for _ in 0..rounds {
+                transform.masks(&positions, config).expect("masks");
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            let total = (batch * rounds) as f64;
+            let per = elapsed * 1000.0 / total;
+            println!(
+                "  batch {batch:>3}: {:>8.0} masks/s  ({per:.4} ms each)  = {:>5.1} CPU cores",
+                total / elapsed,
+                (total / elapsed) / 980.0
+            );
+        }
+    }
+
     /// Against the direct kernel it replaces.
     ///
     /// Ignored: needs an idle CUDA device.
@@ -743,6 +944,41 @@ mod edt_tests {
             }
         }
         println!("  CPU reference: 1.02 ms per mask per core (980/s); 32 cores = 31,000/s");
+    }
+}
+
+#[cfg(test)]
+mod phase_tests {
+    use vgo_raster::RasterKind;
+
+    use super::tests::lattice;
+    use super::*;
+
+    /// Where the time goes, kernel by kernel.
+    ///
+    /// Ignored: needs an idle CUDA device.
+    #[test]
+    #[ignore]
+    fn the_transform_passes_dominate() {
+        let radius = 1.0 / 18.0;
+        let config = RasterConfig::square_of(256, RasterKind::CompactRadius);
+        let position = lattice(28, radius);
+        let rasterizer = EdtSettledKernel::compile(0, Precision::Single)
+            .expect("compile")
+            .rasterizer()
+            .expect("stream");
+        for batch in [8usize, 32, 64] {
+            let positions: Vec<&Position> = (0..batch).map(|_| &position).collect();
+            let phases = rasterizer
+                .phase_milliseconds(&positions, config, 20)
+                .expect("phases");
+            let total: f64 = phases.iter().sum();
+            let names = ["sample_legal", "edt_columns", "edt_rows", "settled_from_field"];
+            println!("  batch {batch}: {total:.3} ms per launch, synchronised");
+            for (name, value) in names.iter().zip(&phases) {
+                println!("      {name:<20} {value:>7.3} ms  {:>5.1}%", value / total * 100.0);
+            }
+        }
     }
 }
 
