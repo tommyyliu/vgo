@@ -151,6 +151,266 @@ impl PackedRaster {
     }
 }
 
+
+/// Stones bucketed by cell, so a chunk of pixels can find the few that matter.
+///
+/// The sweep it replaces is O(pixels x stones): every stone is tested against
+/// every pixel, and on a 38-unit board running to 312 plies that is 150+ stones
+/// against 65,536 pixels, roughly ten million distance computations per raster.
+/// A profile put the sweeps at 29% of the generator's CPU.
+///
+/// Cell size is one exclusion diameter, so a cell holds *at most two* stones --
+/// not one, as the tempting argument goes: two stones at opposite corners of a
+/// `2r` cell are `2r*sqrt(2)` apart, comfortably above the `2r` minimum
+/// separation. Hence buckets rather than a single slot per cell.
+///
+/// CSR rather than `Vec<Vec<_>>`: the grid is rebuilt for every rasterization,
+/// and a hundred small allocations per raster would cost more than the scan it
+/// is replacing.
+struct StoneGrid {
+    cell: f64,
+    width: usize,
+    height: usize,
+    starts: Vec<u32>,
+    indices: Vec<u32>,
+}
+
+impl StoneGrid {
+    fn build(xs: &[f64], ys: &[f64], cell: f64) -> Self {
+        debug_assert_eq!(xs.len(), ys.len());
+        let width = (1.0 / cell).ceil() as usize + 1;
+        let height = width;
+        let cells = width * height;
+        let mut counts = vec![0u32; cells + 1];
+        let index_of = |x: f64, y: f64| {
+            let cx = ((x / cell) as usize).min(width - 1);
+            let cy = ((y / cell) as usize).min(height - 1);
+            cy * width + cx
+        };
+        for (x, y) in xs.iter().zip(ys) {
+            counts[index_of(*x, *y) + 1] += 1;
+        }
+        for i in 0..cells {
+            counts[i + 1] += counts[i];
+        }
+        let mut cursor = counts.clone();
+        let mut indices = vec![0u32; xs.len()];
+        for (stone, (x, y)) in xs.iter().zip(ys).enumerate() {
+            let cell_index = index_of(*x, *y);
+            indices[cursor[cell_index] as usize] = stone as u32;
+            cursor[cell_index] += 1;
+        }
+        Self { cell, width, height, starts: counts, indices }
+    }
+
+    fn empty(cell: f64) -> Self {
+        Self { cell, width: 1, height: 1, starts: vec![0, 0], indices: Vec::new() }
+    }
+
+    #[inline]
+    fn bucket(&self, cx: usize, cy: usize) -> &[u32] {
+        let cell = cy * self.width + cx;
+        let (start, end) = (self.starts[cell] as usize, self.starts[cell + 1] as usize);
+        &self.indices[start..end]
+    }
+}
+
+/// Pixels per chunk, once chunking is worth doing.
+///
+/// The box a chunk needs grows with its width, so a wider chunk gathers more
+/// stones; a narrower one amortizes the ring walk over fewer pixels. Measured
+/// at radius 1/38, 256x256, sweep time against the flat scan:
+///
+/// ```text
+/// CHUNK    28 stones   60    120    240
+///    16        0.28x  0.53  1.30   3.62
+///    32        0.39   0.78  1.78   4.48
+///    64        0.51   0.95  2.05   5.16
+///   128        0.54   1.05  1.99   4.49
+///   256        0.53   1.18  1.79   3.87
+/// ```
+///
+/// 64 wins where it matters. Half of generated games are 38-unit boards running
+/// to 312 plies, so by sample count roughly three quarters of positions come
+/// from boards carrying over a hundred stones.
+const CHUNK: usize = 64;
+
+/// Below this many stones, scan every stone instead.
+///
+/// The search only pays when the bound actually prunes, and with few stones
+/// every stone is inside it anyway -- so the ring walk, the grid indirection
+/// and the per-ring bound scan are pure overhead. Setting the chunk to the full
+/// row is not enough to recover it, because that machinery still runs; the flat
+/// scan has to be a separate path.
+///
+/// 64 is where they cross: 0.95x at 60 stones, 2.05x at 120.
+const SEARCH_MINIMUM_STONES: usize = 64;
+
+/// Every stone against every pixel, one stone at a time.
+///
+/// What the dense writer does, and what wins below `SEARCH_MINIMUM_STONES`.
+/// Stones outside and pixels inside, so the inner loop is a flat sequence of
+/// independent minima over contiguous f64 -- the shape the autovectorizer
+/// handles.
+#[allow(clippy::too_many_arguments)]
+fn sweep_row_flat(
+    stone_xs: &[f64],
+    stone_ys: &[f64],
+    stone_is_current: &[bool],
+    y: f64,
+    xs: &[f64],
+    current_squares: &mut [f64],
+    opponent_squares: &mut [f64],
+    nearest_squares: &mut [f64],
+    second_squares: &mut [f64],
+) {
+    for stone in 0..stone_xs.len() {
+        let (sx, sy) = (stone_xs[stone], stone_ys[stone]);
+        let dy = y - sy;
+        let dy_square = dy * dy;
+        let target = if stone_is_current[stone] {
+            &mut *current_squares
+        } else {
+            &mut *opponent_squares
+        };
+        for column in 0..xs.len() {
+            let dx = xs[column] - sx;
+            let square = dx * dx + dy_square;
+            if square < target[column] {
+                target[column] = square;
+            }
+            if square < nearest_squares[column] {
+                second_squares[column] = nearest_squares[column];
+                nearest_squares[column] = square;
+            } else if square < second_squares[column] {
+                second_squares[column] = square;
+            }
+        }
+    }
+}
+
+/// Nearest and second-nearest squared distances over all stones, plus the
+/// nearest over each colour, for one row -- searching outward from each chunk
+/// instead of scanning every stone.
+///
+/// The bound: a stone whose closest possible approach to the chunk already
+/// exceeds every pixel's current second-nearest distance cannot change any of
+/// them, and if it also exceeds `radius^2` it cannot set a stone-disc bit
+/// either. Rings are walked outward so the near stones land first and pull that
+/// bound down quickly; ring `k` is at least `(k-1) * cell` away, so once that
+/// passes the bound every later ring does too.
+///
+/// Writes exactly what the all-stones scan writes. `min` and the two-smallest
+/// update are order-independent for the values they produce, so visiting stones
+/// in a different order changes nothing -- which is what lets this be checked
+/// bit-for-bit against the dense writer.
+#[allow(clippy::too_many_arguments)]
+fn sweep_row_chunked(
+    grid: &StoneGrid,
+    stone_xs: &[f64],
+    stone_ys: &[f64],
+    stone_is_current: &[bool],
+    y: f64,
+    xs: &[f64],
+    radius_square: f64,
+    current_squares: &mut [f64],
+    opponent_squares: &mut [f64],
+    nearest_squares: &mut [f64],
+    second_squares: &mut [f64],
+) {
+    let width = xs.len();
+    let cell = grid.cell;
+    let row_cell = ((y / cell) as usize).min(grid.height - 1);
+    for start in (0..width).step_by(CHUNK) {
+        let end = (start + CHUNK).min(width);
+        let (low_x, high_x) = (xs[start], xs[end - 1]);
+        let cx0 = ((low_x / cell) as usize).min(grid.width - 1);
+        let cx1 = ((high_x / cell) as usize).min(grid.width - 1);
+
+        let mut bound = f64::INFINITY;
+        let longest = grid.width.max(grid.height);
+        for ring in 0..=longest {
+            if ring > 0 {
+                let reach = (ring - 1) as f64 * cell;
+                let reach_square = reach * reach;
+                if reach_square >= bound && reach_square > radius_square {
+                    break;
+                }
+            }
+            let mut touched = false;
+            for cy in row_cell.saturating_sub(ring)..=(row_cell + ring).min(grid.height - 1) {
+                let edge_y = cy.abs_diff(row_cell) == ring;
+                let from = cx0.saturating_sub(ring);
+                let to = (cx1 + ring).min(grid.width - 1);
+                for cx in from..=to {
+                    // Only the ring itself, not the filled block: inner cells
+                    // were visited by an earlier, closer ring.
+                    let edge_x = cx + ring == cx0 || cx == cx1 + ring;
+                    if !(edge_y || edge_x) {
+                        continue;
+                    }
+                    touched = true;
+                    for &stone in grid.bucket(cx, cy) {
+                        let stone = stone as usize;
+                        let (sx, sy) = (stone_xs[stone], stone_ys[stone]);
+                        let dy = y - sy;
+                        let dy_square = dy * dy;
+                        // Closest the chunk can come to this stone.
+                        let gap = if sx < low_x {
+                            low_x - sx
+                        } else if sx > high_x {
+                            sx - high_x
+                        } else {
+                            0.0
+                        };
+                        let floor_square = gap.mul_add(gap, dy_square);
+                        if floor_square >= bound && floor_square > radius_square {
+                            continue;
+                        }
+                        let target = if stone_is_current[stone] {
+                            &mut *current_squares
+                        } else {
+                            &mut *opponent_squares
+                        };
+                        for column in start..end {
+                            let dx = xs[column] - sx;
+                            let square = dx.mul_add(dx, dy_square);
+                            if square < target[column] {
+                                target[column] = square;
+                            }
+                            if square < nearest_squares[column] {
+                                second_squares[column] = nearest_squares[column];
+                                nearest_squares[column] = square;
+                            } else if square < second_squares[column] {
+                                second_squares[column] = square;
+                            }
+                        }
+                    }
+                }
+            }
+            // Recompute the bound once per ring, not once per stone: it only
+            // ever decreases, so a stale value prunes less but never wrongly,
+            // and a per-stone reduction over the chunk would cost as much as
+            // the scan being avoided.
+            let mut worst: f64 = 0.0;
+            for column in start..end {
+                if second_squares[column] > worst {
+                    worst = second_squares[column];
+                }
+            }
+            bound = worst;
+            if !touched && ring > 0 && bound.is_finite() {
+                // Nothing left in this ring and the bound is real; the next
+                // rings are further still.
+                let reach = ring as f64 * cell;
+                if reach * reach >= bound && reach * reach > radius_square {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// The ridge value for one pixel, from the nearest and second-nearest squared
 /// distances. Matches the dense writer's expression exactly, including doing
 /// the square roots before the subtraction.
@@ -241,9 +501,40 @@ pub fn rasterize_compact_radius_packed_into(
     let (opponent_plane, settled_plane) = rest.split_at_mut(stride);
     let dense_plane = dense_plane.as_mut_slice();
 
-    // The same row-major accumulation as the dense writer: one stone across a
-    // whole row at a time, so the vertical distance is squared once per row and
-    // the minima stay in contiguous buffers.
+    // Stones flattened with a colour flag, so one grid serves all three minima.
+    // The dense writer keeps two lists and scans each in full; the grid decides
+    // which stones a chunk of pixels can possibly need.
+    let mut stone_xs = Vec::with_capacity(current_stones.len() + opponent_stones.len());
+    let mut stone_ys = Vec::with_capacity(stone_xs.capacity());
+    let mut stone_is_current = Vec::with_capacity(stone_xs.capacity());
+    for &(x, y) in &current_stones {
+        stone_xs.push(x);
+        stone_ys.push(y);
+        stone_is_current.push(true);
+    }
+    for &(x, y) in &opponent_stones {
+        stone_xs.push(x);
+        stone_ys.push(y);
+        stone_is_current.push(false);
+    }
+    // Cell size from the stone count, not from the radius. `2r` is the natural
+    // geometric choice -- it caps a cell at two stones -- but on a sparse board
+    // it leaves the grid 93% empty, and the ring walk then spends its time
+    // stepping over cells that hold nothing. One stone per cell on average
+    // keeps the walk proportional to the stones it finds. Never finer than 2r,
+    // which is where the bucket bound comes from.
+    let searching = stone_xs.len() >= SEARCH_MINIMUM_STONES;
+    let spacing = if stone_xs.is_empty() {
+        2.0 * radius
+    } else {
+        (2.0 * radius).max(1.0 / (stone_xs.len() as f64).sqrt())
+    };
+    let grid = if searching {
+        StoneGrid::build(&stone_xs, &stone_ys, spacing)
+    } else {
+        StoneGrid::empty(spacing)
+    };
+
     let mut row_storage = vec![f64::INFINITY; 5 * width];
     let (xs, row_storage) = row_storage.split_at_mut(width);
     for (column, x) in xs.iter_mut().enumerate() {
@@ -260,39 +551,32 @@ pub fn rasterize_compact_radius_packed_into(
         nearest_squares.fill(f64::INFINITY);
         second_squares.fill(f64::INFINITY);
 
-        for &(stone_x, stone_y) in &current_stones {
-            let dy = y - stone_y;
-            let dy_square = dy * dy;
-            for column in 0..width {
-                let dx = xs[column] - stone_x;
-                let square = dx * dx + dy_square;
-                if square < current_squares[column] {
-                    current_squares[column] = square;
-                }
-                if square < nearest_squares[column] {
-                    second_squares[column] = nearest_squares[column];
-                    nearest_squares[column] = square;
-                } else if square < second_squares[column] {
-                    second_squares[column] = square;
-                }
-            }
-        }
-        for &(stone_x, stone_y) in &opponent_stones {
-            let dy = y - stone_y;
-            let dy_square = dy * dy;
-            for column in 0..width {
-                let dx = xs[column] - stone_x;
-                let square = dx * dx + dy_square;
-                if square < opponent_squares[column] {
-                    opponent_squares[column] = square;
-                }
-                if square < nearest_squares[column] {
-                    second_squares[column] = nearest_squares[column];
-                    nearest_squares[column] = square;
-                } else if square < second_squares[column] {
-                    second_squares[column] = square;
-                }
-            }
+        if searching {
+            sweep_row_chunked(
+                &grid,
+                &stone_xs,
+                &stone_ys,
+                &stone_is_current,
+                y,
+                xs,
+                radius_square,
+                current_squares,
+                opponent_squares,
+                nearest_squares,
+                second_squares,
+            );
+        } else {
+            sweep_row_flat(
+                &stone_xs,
+                &stone_ys,
+                &stone_is_current,
+                y,
+                xs,
+                current_squares,
+                opponent_squares,
+                nearest_squares,
+                second_squares,
+            );
         }
 
         // Build each output byte in a register and store it once. Setting bits
@@ -361,6 +645,73 @@ mod tests {
         )
         .with_komi(komi)
         .with_passes(passes)
+    }
+
+    /// A board dense enough that the grid actually prunes.
+    ///
+    /// The four-stone fixture below exercises none of the search: with that few
+    /// stones every ring is visited and nothing is skipped, so it would pass
+    /// even if the bound were wrong. This is the case that can fail.
+    #[test]
+    fn the_chunked_sweep_matches_at_real_stone_counts() {
+        // Both sides of `CHUNKED_SWEEP_MINIMUM_STONES`, and a radius small
+        // enough to fit counts above it: at 1/18 the board holds ~128 stones,
+        // so a threshold of 100 would barely be crossed. Without the high
+        // counts the chunked path is not exercised at all and the dispatch
+        // hides it.
+        let radius = 1.0 / 38.0;
+        let step = 2.2 * radius;
+        for count in [1usize, 2, 9, 28, 60, 99, 100, 140, 240] {
+            let mut stones = Vec::new();
+            let mut index = 0;
+            'outer: for row in 0..24 {
+                for column in 0..24 {
+                    let x = 0.04 + step * f64::from(column);
+                    let y = 0.04 + step * f64::from(row);
+                    if x > 0.97 || y > 0.97 {
+                        continue;
+                    }
+                    stones.push(Stone::new(
+                        x,
+                        y,
+                        if index % 2 == 0 { Color::Black } else { Color::White },
+                    ));
+                    index += 1;
+                    if index == count {
+                        break 'outer;
+                    }
+                }
+            }
+            if stones.len() < count {
+                continue;
+            }
+            let position = Position::new(radius, stones, Color::White).with_komi(0.024);
+            for size in [64usize, 128, 256] {
+                let config = RasterConfig::square_of(size, RasterKind::CompactRadius);
+                let pixels = config.pixels();
+                let mut dense = vec![0.0f32; config.channels() * pixels];
+                rasterize_compact_radius_into(&position, config, &mut dense);
+                let mut packed = PackedRaster::new(config);
+                rasterize_compact_radius_packed_into(&position, config, &mut packed);
+                let layout = packed.layout();
+                for (slot, &channel) in layout.binary.iter().enumerate() {
+                    for pixel in 0..pixels {
+                        assert_eq!(
+                            packed.binary_pixel(slot, pixel),
+                            dense[channel * pixels + pixel] != 0.0,
+                            "{count} stones at {size}: binary channel {channel}, pixel {pixel}"
+                        );
+                    }
+                }
+                for pixel in 0..pixels {
+                    assert_eq!(
+                        packed.dense()[pixel],
+                        f16::from_f32(dense[2 * pixels + pixel]),
+                        "{count} stones at {size}: ridge, pixel {pixel}"
+                    );
+                }
+            }
+        }
     }
 
     /// The packed form has to be the dense form compressed, not a second
@@ -554,6 +905,83 @@ mod tests {
             packed_elapsed.as_secs_f64() / dense_elapsed.as_secs_f64(),
             dense_bytes as f64 / packed.bytes() as f64,
         );
+    }
+
+    /// The sweep across the stone counts the board mix actually produces.
+    ///
+    /// Half of generated games are 38-unit boards running to 312 plies, so the
+    /// expensive positions carry hundreds of stones -- not the 28 the benchmark
+    /// above uses, which is a mini-board figure and has misled every estimate
+    /// made from it tonight.
+    ///
+    /// `cargo test --release -p vgo-raster stone_count_sweep -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn the_stone_count_sweep() {
+        use std::time::Instant;
+        let radius = 1.0 / 38.0;
+        let step = 2.2 * radius;
+        let config = RasterConfig::square_of(256, RasterKind::CompactRadius);
+        let pixels = config.pixels();
+        println!("  radius 1/38, 256x256, dense vs chunked");
+        for count in [28usize, 60, 120, 240] {
+            let mut stones = Vec::new();
+            let mut index = 0;
+            'outer: for row in 0..24 {
+                for column in 0..24 {
+                    let x = 0.04 + step * f64::from(column);
+                    let y = 0.04 + step * f64::from(row);
+                    if x > 0.97 || y > 0.97 {
+                        continue;
+                    }
+                    stones.push(Stone::new(
+                        x,
+                        y,
+                        if index % 2 == 0 { Color::Black } else { Color::White },
+                    ));
+                    index += 1;
+                    if index == count {
+                        break 'outer;
+                    }
+                }
+            }
+            if stones.len() < count {
+                continue;
+            }
+            let position = Position::new(radius, stones, Color::White).with_komi(0.024);
+            let rounds = 24;
+            let mut dense = vec![0.0f32; config.channels() * pixels];
+            let mut packed = PackedRaster::new(config);
+            let settled = crate::settled_for_raster(&position, config);
+            std::hint::black_box(&settled);
+
+            rasterize_compact_radius_into(&position, config, &mut dense);
+            let started = Instant::now();
+            for _ in 0..rounds {
+                rasterize_compact_radius_into(&position, config, &mut dense);
+            }
+            let dense_ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds);
+
+            rasterize_compact_radius_packed_into(&position, config, &mut packed);
+            let started = Instant::now();
+            for _ in 0..rounds {
+                rasterize_compact_radius_packed_into(&position, config, &mut packed);
+            }
+            let packed_ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds);
+
+            let started = Instant::now();
+            for _ in 0..rounds {
+                std::hint::black_box(crate::settled_for_raster(&position, config));
+            }
+            let settled_ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds);
+
+            println!(
+                "  {count:>3} stones: settled {settled_ms:>5.2}  dense-sweep {:>5.2}  chunked-sweep {:>5.2}  ({:.2}x)",
+                dense_ms - settled_ms,
+                packed_ms - settled_ms,
+                (dense_ms - settled_ms) / (packed_ms - settled_ms).max(1e-9)
+            );
+        }
     }
 
     #[test]
