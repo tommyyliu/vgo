@@ -103,6 +103,15 @@ fn intersection(f: &[f64], q: usize, vk: usize) -> f64 {
 /// again but doubles the scratch and starts missing L1 on the transposed side.
 const COLUMN_BLOCK: usize = 8;
 
+/// Pixel columns processed together by the nearest-stone search. The same
+/// chunking shape is used by the packed writer: it amortizes the grid-ring
+/// walk without making the chunk's bound so wide that nearby stones are kept.
+const NEAREST_CHUNK: usize = 128;
+
+/// Below this many stones, the flat vectorizable scan is faster than building
+/// and walking a spatial index.
+const NEAREST_SEARCH_MINIMUM_STONES: usize = 96;
+
 /// Exposed for `vgo-raster-bench`. See `sampled_legal_set`.
 #[doc(hidden)]
 pub fn squared_distance_transform(mask: &[bool], width: usize, height: usize) -> Vec<f64> {
@@ -160,6 +169,129 @@ pub fn squared_distance_transform(mask: &[bool], width: usize, height: usize) ->
     field
 }
 
+/// Stones bucketed into a uniform grid for nearest-distance queries.
+///
+/// A settled mask needs only the nearest stone, but the old row sweep still
+/// visits every stone for every output pixel. At late-game stone counts this
+/// is the remaining O(pixels * stones) part of the settled path. Querying
+/// chunks of pixels outward through this grid lets the nearest-distance bound
+/// discard distant buckets while retaining exact point-to-stone distances.
+struct StoneGrid {
+    cell: f64,
+    width: usize,
+    height: usize,
+    starts: Vec<u32>,
+    indices: Vec<u32>,
+}
+
+impl StoneGrid {
+    fn build(position: &Position, cell: f64) -> Self {
+        let stones = position.stones();
+        let width = (1.0 / cell).ceil() as usize + 1;
+        let height = width;
+        let cells = width * height;
+        let index_of = |x: f64, y: f64| {
+            let cx = ((x / cell) as usize).min(width - 1);
+            let cy = ((y / cell) as usize).min(height - 1);
+            cy * width + cx
+        };
+        let mut counts = vec![0u32; cells + 1];
+        for stone in stones {
+            counts[index_of(stone.x, stone.y) + 1] += 1;
+        }
+        for index in 0..cells {
+            counts[index + 1] += counts[index];
+        }
+        let mut cursor = counts.clone();
+        let mut indices = vec![0u32; stones.len()];
+        for (stone, value) in stones.iter().enumerate() {
+            let cell_index = index_of(value.x, value.y);
+            indices[cursor[cell_index] as usize] = stone as u32;
+            cursor[cell_index] += 1;
+        }
+        Self { cell, width, height, starts: counts, indices }
+    }
+
+    #[inline]
+    fn bucket(&self, cx: usize, cy: usize) -> &[u32] {
+        let cell = cy * self.width + cx;
+        let start = self.starts[cell] as usize;
+        let end = self.starts[cell + 1] as usize;
+        &self.indices[start..end]
+    }
+}
+
+/// Exact nearest squared distances for one output row, using a spatial search
+/// once the stone count makes the flat scan too expensive.
+fn nearest_row_chunked(
+    position: &Position,
+    grid: &StoneGrid,
+    y: f64,
+    xs: &[f64],
+    nearest_squares: &mut [f64],
+) {
+    nearest_squares.fill(f64::INFINITY);
+    let stones = position.stones();
+    let cell = grid.cell;
+    let row_cell = ((y / cell) as usize).min(grid.height - 1);
+    let longest = grid.width.max(grid.height);
+
+    for start in (0..xs.len()).step_by(NEAREST_CHUNK) {
+        let end = (start + NEAREST_CHUNK).min(xs.len());
+        let low_x = xs[start];
+        let high_x = xs[end - 1];
+        let cx0 = ((low_x / cell) as usize).min(grid.width - 1);
+        let cx1 = ((high_x / cell) as usize).min(grid.width - 1);
+        let mut bound = f64::INFINITY;
+
+        for ring in 0..=longest {
+            if ring > 0 {
+                let reach = (ring - 1) as f64 * cell;
+                if reach * reach >= bound {
+                    break;
+                }
+            }
+            for cy in row_cell.saturating_sub(ring)..=(row_cell + ring).min(grid.height - 1) {
+                let edge_y = cy.abs_diff(row_cell) == ring;
+                let from = cx0.saturating_sub(ring);
+                let to = (cx1 + ring).min(grid.width - 1);
+                for cx in from..=to {
+                    let edge_x = cx + ring == cx0 || cx == cx1 + ring;
+                    if !(edge_y || edge_x) {
+                        continue;
+                    }
+                    for &index in grid.bucket(cx, cy) {
+                        let stone = stones[index as usize];
+                        let dy = y - stone.y;
+                        let dy_squared = dy * dy;
+                        let gap = if stone.x < low_x {
+                            low_x - stone.x
+                        } else if stone.x > high_x {
+                            stone.x - high_x
+                        } else {
+                            0.0
+                        };
+                        if gap.mul_add(gap, dy_squared) >= bound {
+                            continue;
+                        }
+                        for column in start..end {
+                            let dx = xs[column] - stone.x;
+                            let square = dx.mul_add(dx, dy_squared);
+                            if square < nearest_squares[column] {
+                                nearest_squares[column] = square;
+                            }
+                        }
+                    }
+                }
+            }
+            bound = nearest_squares[start..end]
+                .iter()
+                .copied()
+                .fold(0.0, f64::max);
+        }
+    }
+}
+
 
 /// The legal set sampled onto a grid, built by stamping exclusion discs.
 /// Exposed for `vgo-raster-bench`, which times the raster's parts separately so
@@ -179,16 +311,26 @@ pub fn sampled_legal_set(position: &Position, fine_width: usize, fine_height: us
     let exclusion = 2.0 * radius - COORDINATE_EPSILON;
     let exclusion_squared = exclusion * exclusion;
     let mut legal = vec![false; fine_width * fine_height];
+    let column_xs: Vec<f64> = (0..fine_width)
+        .map(|column| (column as f64 + 0.5) / fine_width as f64)
+        .collect();
+    let row_ys: Vec<f64> = (0..fine_height)
+        .map(|row| (row as f64 + 0.5) / fine_height as f64)
+        .collect();
     let inset_low = radius - COORDINATE_EPSILON;
     let inset_high = 1.0 - radius + COORDINATE_EPSILON;
+    let first_column = ((inset_low * fine_width as f64 - 0.5).ceil().max(0.0)) as usize;
+    let last_column = ((inset_high * fine_width as f64 - 0.5)
+        .floor()
+        .min(fine_width.saturating_sub(1) as f64)) as usize;
     for row in 0..fine_height {
-        let y = (row as f64 + 0.5) / fine_height as f64;
+        let y = row_ys[row];
         if y < inset_low || y > inset_high {
             continue;
         }
-        for column in 0..fine_width {
-            let x = (column as f64 + 0.5) / fine_width as f64;
-            legal[row * fine_width + column] = x >= inset_low && x <= inset_high;
+        if first_column <= last_column {
+            let base = row * fine_width;
+            legal[base + first_column..=base + last_column].fill(true);
         }
     }
     for stone in stones {
@@ -201,7 +343,7 @@ pub fn sampled_legal_set(position: &Position, fine_width: usize, fine_height: us
         let high_column = ((((stone.x + exclusion) * fine_width as f64 - 0.5).ceil()) as usize)
             .min(fine_width - 1);
         for row in low_row..=high_row {
-            let y = (row as f64 + 0.5) / fine_height as f64;
+            let y = row_ys[row];
             let dy = y - stone.y;
             let dy_squared = dy * dy;
             if dy_squared > exclusion_squared {
@@ -209,7 +351,7 @@ pub fn sampled_legal_set(position: &Position, fine_width: usize, fine_height: us
             }
             let base = row * fine_width;
             for column in low_column..=high_column {
-                let x = (column as f64 + 0.5) / fine_width as f64;
+                let x = column_xs[column];
                 let dx = x - stone.x;
                 if dx.mul_add(dx, dy_squared) < exclusion_squared {
                     legal[base + column] = false;
@@ -441,6 +583,10 @@ fn masks_by_bounded_distance(
     let legal = sampled_legal_set(position, fine_width, fine_height);
     let squared = squared_distance_transform(&legal, fine_width, fine_height);
     let spacing = 1.0 / fine_width as f64;
+    let spacing_squared = spacing * spacing;
+    let slack = spacing * std::f64::consts::SQRT_2;
+    let radius_squared = radius * radius;
+    let radius_plus_slack_squared = (radius + slack) * (radius + slack);
     // How far the sampled distance can overstate the true one.
     //
     // Half a cell diagonal is the tempting answer and it is wrong: it assumes
@@ -450,8 +596,6 @@ fn masks_by_bounded_distance(
     // wrong pixels at eight stones, where slivers cannot be the explanation.
     // A full diagonal covers the boundary case; nothing covers a sliver
     // narrower than a cell, which is why this function is not exact.
-    let slack = spacing * std::f64::consts::SQRT_2;
-
     // Sampling can only *miss* parts of the legal set, never invent them, so
     // `sampled` is an overestimate and every error runs one way: a pixel called
     // dead that is really alive. The slack above covers being off by where a
@@ -488,48 +632,57 @@ fn masks_by_bounded_distance(
     // The nearest stone, a row at a time, stones outside and pixels inside.
     //
     // This loop is 85% of `settled`, and `settled` is ~80% of the raster, so its
-    // shape is most of what rasterization costs. Asked per pixel -- by scanning
-    // the stone list, or by looking it up in a spatial grid -- it does not
-    // vectorize, and a grid additionally pays cell arithmetic and indirection at
-    // every pixel. Written this way the inner loop is a flat min over contiguous
-    // f64, which is the shape the autovectorizer handles. It is also the
-    // structure the four non-`settled` planes already use, and they compute two
-    // minima for both colours in a fraction of what this cost for one.
+    // shape is most of what rasterization costs. Sparse positions use the flat
+    // min below, over contiguous f64 that the autovectorizer handles; dense
+    // positions use the exact chunked grid query, which avoids work on distant
+    // stones. It is also the structure the four non-`settled` planes already
+    // use, and they compute two minima for both colours in a fraction of what
+    // this cost for one.
     let row_width = config.width;
     let mut column_xs = vec![0.0f64; row_width];
     for (column, x) in column_xs.iter_mut().enumerate() {
         *x = (column as f64 + 0.5) / row_width as f64;
     }
     let mut nearest_squares = vec![f64::INFINITY; row_width];
+    let nearest_grid = if want_settled && stones.len() >= NEAREST_SEARCH_MINIMUM_STONES {
+        let cell = (2.0 * radius).max(1.0 / (stones.len() as f64).sqrt());
+        Some(StoneGrid::build(position, cell))
+    } else {
+        None
+    };
     for row in 0..config.height {
         let y = (row as f64 + 0.5) / config.height as f64;
         let fine_row = (row * scale + scale / 2).min(fine_height - 1);
         if want_settled && !stones.is_empty() {
-            nearest_squares.fill(f64::INFINITY);
-            for stone in stones {
-                let dy = y - stone.y;
-                let dy_square = dy * dy;
-                let stone_x = stone.x;
-                // Zipped rather than indexed, and `min` rather than a branch:
-                // both are what let this compile to a flat vector min with no
-                // bounds checks in the loop.
-                for (nearest, &x) in nearest_squares.iter_mut().zip(column_xs.iter()) {
-                    let dx = x - stone_x;
-                    *nearest = dx.mul_add(dx, dy_square).min(*nearest);
+            if let Some(grid) = nearest_grid.as_ref() {
+                nearest_row_chunked(position, grid, y, &column_xs, &mut nearest_squares);
+            } else {
+                nearest_squares.fill(f64::INFINITY);
+                for stone in stones {
+                    let dy = y - stone.y;
+                    let dy_square = dy * dy;
+                    let stone_x = stone.x;
+                    // Zipped rather than indexed, and `min` rather than a branch:
+                    // both are what let this compile to a flat vector min with no
+                    // bounds checks in the loop.
+                    for (nearest, &x) in nearest_squares.iter_mut().zip(column_xs.iter()) {
+                        let dx = x - stone_x;
+                        *nearest = dx.mul_add(dx, dy_square).min(*nearest);
+                    }
                 }
             }
         }
         for column in 0..config.width {
             let x = column_xs[column];
             let fine_column = (column * scale + scale / 2).min(fine_width - 1);
-            let sampled = squared[fine_row * fine_width + fine_column].sqrt() * spacing;
+            let sampled_squared = squared[fine_row * fine_width + fine_column] * spacing_squared;
 
             if want_dead_zone {
                 dead[row * config.width + column] = if near_vertex[row * config.width + column] {
                     false
-                } else if sampled <= radius {
+                } else if sampled_squared <= radius_squared {
                     false
-                } else if sampled - slack > radius {
+                } else if sampled_squared > radius_plus_slack_squared {
                     true
                 } else {
                     exact_tests += 1;
@@ -541,15 +694,37 @@ fn masks_by_bounded_distance(
                 continue;
             }
 
-            let nearest = nearest_squares[column].sqrt();
-
-            mask[row * config.width + column] = if nearest <= sampled - slack {
+            // Keep the cheap cases in squared-distance space. The old form
+            // took two square roots for every pixel, although only the narrow
+            // undecided band needs the exact nearest distance. This leaves one
+            // root for the common settled case and defers the other until the
+            // fallback is actually entered.
+            //
+            // This is not the same arithmetic: `sqrt(s) * spacing` and
+            // `sqrt(s * spacing^2)` round differently, and squaring a
+            // comparison moves its boundary by a few ulp. That is safe here for
+            // a reason worth writing down, because it is not obvious.
+            //
+            // The three cases are disjoint and ordered -- `slack > 0` keeps
+            // `sampled - slack` strictly below `sampled` -- so a rounding flip
+            // can only move a pixel between a cheap case and the undecided
+            // band, never from settled straight to unsettled. A pixel that
+            // drifts into the band gets the exact test, which is authoritative
+            // and agrees with whichever cheap case it came from, since both
+            // cheap tests are sound implications rather than approximations.
+            // So the mask is unchanged and only `exact_tests` moves.
+            let sampled = sampled_squared.sqrt();
+            let sampled_minus_slack = sampled - slack;
+            mask[row * config.width + column] = if sampled_minus_slack > 0.0
+                && nearest_squares[column] <= sampled_minus_slack * sampled_minus_slack
+            {
                 true
-            } else if nearest > sampled {
+            } else if nearest_squares[column] > sampled_squared {
                 false
             } else {
                 exact_tests += 1;
                 let known = vertices.get_or_insert_with(|| legal_set_vertices(position));
+                let nearest = nearest_squares[column].sqrt();
                 no_legal_point_closer_than(position, Point::new(x, y), nearest, Some(known))
             };
         }
@@ -622,6 +797,58 @@ mod tests {
                 exact_tests * 20 < config.pixels(),
                 "{count} stones: {exact_tests} exact tests is too many to be a fallback"
             );
+        }
+    }
+
+    #[test]
+    fn chunked_nearest_matches_the_flat_scan() {
+        let radius = 1.0 / 38.0;
+        let step = 2.2 * radius;
+        let mut stones = Vec::new();
+        'outer: for row in 0..24 {
+            for column in 0..24 {
+                let x = 0.04 + step * f64::from(column);
+                let y = 0.04 + step * f64::from(row);
+                if x > 0.97 || y > 0.97 {
+                    continue;
+                }
+                stones.push(Stone::new(
+                    x,
+                    y,
+                    if stones.len() % 2 == 0 {
+                        Color::Black
+                    } else {
+                        Color::White
+                    },
+                ));
+                if stones.len() == 240 {
+                    break 'outer;
+                }
+            }
+        }
+        let position = Position::new(radius, stones, Color::Black);
+        let config = RasterConfig::square_of(128, RasterKind::Compact);
+        let cell = (2.0 * radius).max(1.0 / (position.stones().len() as f64).sqrt());
+        let grid = StoneGrid::build(&position, cell);
+        let xs: Vec<f64> = (0..config.width)
+            .map(|column| (column as f64 + 0.5) / config.width as f64)
+            .collect();
+        let mut chunked = vec![f64::INFINITY; config.width];
+        for row in 0..config.height {
+            let y = (row as f64 + 0.5) / config.height as f64;
+            nearest_row_chunked(&position, &grid, y, &xs, &mut chunked);
+            for (column, &x) in xs.iter().enumerate() {
+                let mut expected = f64::INFINITY;
+                for stone in position.stones() {
+                    let dx = x - stone.x;
+                    let dy = y - stone.y;
+                    let square = dx.mul_add(dx, dy * dy);
+                    if square < expected {
+                        expected = square;
+                    }
+                }
+                assert_eq!(chunked[column], expected, "row {row}, column {column}");
+            }
         }
     }
 

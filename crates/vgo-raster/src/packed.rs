@@ -472,13 +472,9 @@ pub fn rasterize_compact_radius_packed_into(
 
     let pixels = config.pixels();
     let width = config.width;
-    let settled = settled_for_raster(position, config);
-    assert_eq!(settled.len(), pixels);
-
     let radius = position.radius();
     let radius_square = radius * radius;
     let to_move = position.to_move();
-    let (current_stones, opponent_stones) = crate::relative_stones(position, to_move);
 
     // The three constant planes, as three stores rather than three fills over
     // 65,536 floats each.
@@ -503,6 +499,17 @@ pub fn rasterize_compact_radius_packed_into(
         *byte = 0;
     }
 
+    // There is no geometry to sweep on the first position of every game. Clear
+    // the reusable continuous plane and return before allocating scratch or
+    // taking 65,536 `sqrt(inf - inf)` paths for a ridge that is known to be 0.
+    if position.stones().is_empty() {
+        dense_plane.fill(f16::ZERO);
+        return;
+    }
+
+    let settled = settled_for_raster(position, config);
+    assert_eq!(settled.len(), pixels);
+
     let stride = bit_plane_bytes(pixels);
     let (current_plane, rest) = bits.split_at_mut(stride);
     let (opponent_plane, settled_plane) = rest.split_at_mut(stride);
@@ -511,18 +518,14 @@ pub fn rasterize_compact_radius_packed_into(
     // Stones flattened with a colour flag, so one grid serves all three minima.
     // The dense writer keeps two lists and scans each in full; the grid decides
     // which stones a chunk of pixels can possibly need.
-    let mut stone_xs = Vec::with_capacity(current_stones.len() + opponent_stones.len());
+    let stones = position.stones();
+    let mut stone_xs = Vec::with_capacity(stones.len());
     let mut stone_ys = Vec::with_capacity(stone_xs.capacity());
     let mut stone_is_current = Vec::with_capacity(stone_xs.capacity());
-    for &(x, y) in &current_stones {
-        stone_xs.push(x);
-        stone_ys.push(y);
-        stone_is_current.push(true);
-    }
-    for &(x, y) in &opponent_stones {
-        stone_xs.push(x);
-        stone_ys.push(y);
-        stone_is_current.push(false);
+    for stone in stones {
+        stone_xs.push(stone.x);
+        stone_ys.push(stone.y);
+        stone_is_current.push(stone.color == to_move);
     }
     // Cell size from the stone count, not from the radius. `2r` is the natural
     // geometric choice -- it caps a cell at two stones -- but on a sparse board
