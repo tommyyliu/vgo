@@ -418,13 +418,18 @@ fn sweep_row_chunked(
 fn ridge_at(nearest_square: f64, second_square: f64, radius: f64) -> f32 {
     let nearest = nearest_square.sqrt();
     let second = second_square.sqrt();
-    // No `is_finite` guard: with no second stone the subtraction is infinite,
-    // the expression is negative infinity, and the clamp already returns 0.0 --
-    // exactly what an explicit branch would. Dropping it makes this branchless,
-    // which is what lets the two square roots vectorize into `vsqrtpd`; with
-    // the branch in place a profile put this function at 22.7% of all samples,
-    // roughly the cost of 131,072 scalar roots per raster.
-    (1.0 - (second - nearest) / radius).clamp(0.0, 1.0) as f32
+    // No `is_finite` guard, so the two roots vectorize into `vsqrtpd`: with the
+    // branch in place a profile put this function at 22.7% of all samples,
+    // about what 131,072 scalar roots per raster costs.
+    //
+    // `max` then `min` rather than `clamp`, and that is the whole subtlety.
+    // With one stone the subtraction is `inf`, the expression is `-inf`, and
+    // either spelling gives 0.0. With *no* stones both distances are infinite,
+    // `inf - inf` is NaN, and `clamp` propagates NaN where `max` returns the
+    // other operand. Every game starts from an empty board, so the NaN version
+    // reached the model on the first position of the first game and the run
+    // died with "invalid inference value".
+    (1.0 - (second - nearest) / radius).max(0.0).min(1.0) as f32
 }
 
 #[inline]
@@ -663,10 +668,17 @@ mod tests {
         // hides it.
         let radius = 1.0 / 38.0;
         let step = 2.2 * radius;
-        for count in [1usize, 2, 9, 28, 60, 99, 100, 140, 240] {
+        for count in [0usize, 1, 2, 9, 28, 60, 99, 100, 140, 240] {
             let mut stones = Vec::new();
             let mut index = 0;
+            // `count == 0` is an empty board -- the first position of every
+            // game, and where `inf - inf` becomes NaN. The loop below tests
+            // `index == count` after incrementing, so zero would fill it.
+            let wanted = count;
             'outer: for row in 0..24 {
+                if wanted == 0 {
+                    break;
+                }
                 for column in 0..24 {
                     let x = 0.04 + step * f64::from(column);
                     let y = 0.04 + step * f64::from(row);
@@ -687,6 +699,8 @@ mod tests {
             if stones.len() < count {
                 continue;
             }
+            // Zero stones is not a corner case: it is the first position of
+            // every game, and it is where `inf - inf` becomes NaN.
             let position = Position::new(radius, stones, Color::White).with_komi(0.024);
             for size in [64usize, 128, 256] {
                 let config = RasterConfig::square_of(size, RasterKind::CompactRadius);
