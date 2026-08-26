@@ -273,7 +273,7 @@ mod tests {
     use super::*;
 
     /// A lattice coarser than a diameter, so the position is playable.
-    fn lattice(count: usize, radius: f64) -> Position {
+    pub(super) fn lattice(count: usize, radius: f64) -> Position {
         let step = 2.5 * radius;
         let mut stones = Vec::new();
         let mut index = 0;
@@ -384,6 +384,52 @@ mod tests {
             let total = (threads * rounds) as f64;
             println!(
                 "  {threads:>2} threads: {:>8.0} masks/s  ({:.3} ms each)",
+                total / elapsed,
+                elapsed * 1000.0 / total
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use std::time::Instant;
+
+    use vgo_raster::RasterKind;
+
+    use super::tests::lattice;
+    use super::*;
+
+    /// How much of a single-position launch is overhead.
+    ///
+    /// The shelving measurement recorded 0.072 ms per position at f32, but that
+    /// was one launch for a whole batch. Per-position launches were noted there
+    /// as "more on overhead than on work". This puts numbers on the gap,
+    /// because it decides the shape of any integration: an actor evaluating
+    /// four leaves at a time can only batch four.
+    ///
+    /// Ignored: needs a CUDA device, and an idle one.
+    #[test]
+    #[ignore]
+    fn batching_amortises_the_launch() {
+        let radius = 1.0 / 18.0;
+        let config = RasterConfig::square_of(256, RasterKind::CompactRadius);
+        let position = lattice(28, radius);
+        let kernel = SettledKernel::compile(0, Precision::Single).expect("compile");
+        let rasterizer = kernel.rasterizer().expect("stream");
+
+        for batch in [1usize, 2, 4, 8, 16, 32, 64] {
+            let positions: Vec<&Position> = (0..batch).map(|_| &position).collect();
+            let rounds = (256 / batch).max(4);
+            rasterizer.masks(&positions, config).expect("warm");
+            let started = Instant::now();
+            for _ in 0..rounds {
+                rasterizer.masks(&positions, config).expect("masks");
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            let total = (batch * rounds) as f64;
+            println!(
+                "  batch {batch:>3}: {:>8.0} masks/s  ({:.3} ms per position)",
                 total / elapsed,
                 elapsed * 1000.0 / total
             );
