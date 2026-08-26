@@ -22,9 +22,13 @@ use half::f16;
 use vgo_core::{Color, Point, Position};
 
 use crate::edt::{
-    EdtScratch, prime_incremental_transform, settled_mask_by_incremental_append_into,
+    EdtScratch, prepare_settled_rows, prime_incremental_transform,
+    settled_mask_by_incremental_append_into,
 };
-use crate::{RasterConfig, RasterKind, settled_for_raster_into};
+use crate::{
+    DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS, DISTANCE_SETTLED_MINIMUM_STONES, RasterConfig,
+    RasterKind, settled_for_raster_into,
+};
 
 /// Which planes of a layout are binary, continuous, and constant.
 ///
@@ -616,7 +620,14 @@ fn sweep_row_flat(
         };
         for column in 0..xs.len() {
             let dx = xs[column] - sx;
-            let square = dx * dx + dy_square;
+            // `mul_add`, matching `sweep_row_chunked` and the nearest field
+            // `settled` classifies against. These used to differ: the flat path
+            // rounded twice and the chunked one once, so the stone-count
+            // dispatch quietly changed the arithmetic underneath a position.
+            // The ridge absorbed that in f16, but `settled` is a bit decided by
+            // comparing this distance against a sampled one, and there a single
+            // ulp is a different pixel.
+            let square = dx.mul_add(dx, dy_square);
             if square < target[column] {
                 target[column] = square;
             }
@@ -894,9 +905,24 @@ pub fn rasterize_compact_radius_packed_into(
         return;
     }
 
-    settled_for_raster_into(position, config, edt, settled);
+    // On the dispatch that dominates production, `settled` is classified row by
+    // row inside the sweep below, against the nearest-stone minimum that loop
+    // already computes for the ridge -- rather than by a builder that sweeps
+    // every stone a second time to recompute it. See `SettledRows`. The other
+    // branch is the small-board O(stones^2) solve, which has no such field to
+    // share, so it still builds the whole mask up front.
+    let cells_per_radius = config.width.min(config.height) as f64 * radius;
+    let mut settled_rows = if position.stones().len() >= DISTANCE_SETTLED_MINIMUM_STONES
+        && cells_per_radius >= DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS
+    {
+        settled.clear();
+        settled.resize(pixels, false);
+        Some(prepare_settled_rows(position, config, edt))
+    } else {
+        settled_for_raster_into(position, config, edt, settled);
+        None
+    };
     assert_eq!(settled.len(), pixels);
-    let settled = settled.as_slice();
 
     let stride = bit_plane_bytes(pixels);
     let (current_plane, rest) = bits.split_at_mut(stride);
@@ -980,6 +1006,20 @@ pub fn rasterize_compact_radius_packed_into(
                 opponent_squares,
                 nearest_squares,
                 second_squares,
+            );
+        }
+
+        if let Some(rows) = settled_rows.as_mut() {
+            let base = row * width;
+            rows.classify_row(
+                position,
+                row,
+                width,
+                y,
+                xs,
+                nearest_squares,
+                edt.field(),
+                &mut settled[base..base + width],
             );
         }
 
@@ -1202,6 +1242,67 @@ mod tests {
     /// Compares the whole `PackedRaster` -- every bit plane, every fp16 ridge
     /// value, every scalar -- at every step, so a divergence is caught at the
     /// step it appears rather than at the end.
+    /// The fused classifier against the builder it replaced.
+    ///
+    /// The packed writer classifies `settled` row by row from the sweep's own
+    /// minima; `settled_for_raster` sweeps the stones again to find its own. The
+    /// two must agree on every pixel, and unlike the ridge there is no f16
+    /// quantisation here to hide a last-ulp disagreement -- which is why both
+    /// sides compute squared distances by `mul_add`.
+    ///
+    /// Stone counts straddle `DISTANCE_SETTLED_MINIMUM_STONES`, so this covers
+    /// the dispatch in both directions, and the sweep's own flat/chunked
+    /// dispatch at `SEARCH_MINIMUM_STONES` as well.
+    #[test]
+    fn fused_settled_matches_the_reference_builder() {
+        let config = RasterConfig {
+            width: 256,
+            height: 256,
+            kind: RasterKind::CompactRadius,
+        };
+        let radius = 1.0 / 38.0;
+        let spacing = 2.0 * radius * 1.05;
+        let per_row = ((0.88_f64 / spacing).floor() as usize).max(1);
+        for count in [1usize, 19, 20, 21, 40, 61, 95, 96, 130, 240] {
+            let mut stones = Vec::new();
+            for index in 0..count {
+                let (row, column) = (index / per_row, index % per_row);
+                let x = radius + 0.02 + column as f64 * spacing;
+                let y = radius + 0.02 + row as f64 * spacing;
+                if x > 1.0 - radius || y > 1.0 - radius {
+                    break;
+                }
+                stones.push(Stone {
+                    x,
+                    y,
+                    color: if index % 2 == 0 {
+                        Color::Black
+                    } else {
+                        Color::White
+                    },
+                });
+            }
+            let position = Position::new(radius, stones, Color::Black);
+            let packed = rasterize_packed(&position, config);
+            let expected = crate::settled_for_raster(&position, config);
+            let stride = bit_plane_bytes(config.pixels());
+            let plane = &packed.bits[2 * stride..3 * stride];
+            let mut wrong = Vec::new();
+            for pixel in 0..config.pixels() {
+                let got = plane[pixel / 8] >> (pixel % 8) & 1 == 1;
+                if got != expected[pixel] {
+                    wrong.push(pixel);
+                }
+            }
+            assert!(
+                wrong.is_empty(),
+                "{count} stones: {} settled pixels disagree with the reference, first at {:?}",
+                wrong.len(),
+                wrong.first()
+            );
+        }
+    }
+
     #[test]
     fn incremental_stays_exact_over_a_long_chain() {
         let radius = 1.0 / 38.0;

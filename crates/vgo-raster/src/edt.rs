@@ -183,6 +183,12 @@ impl EdtScratch {
         self.legal.len()
     }
 
+    /// The squared sampled distance field, for a caller classifying `settled`
+    /// a row at a time.
+    pub(crate) fn field(&self) -> &[f64] {
+        &self.field
+    }
+
     pub(crate) fn invalidate_legal(&mut self) {
         self.legal.clear();
     }
@@ -937,6 +943,96 @@ pub(crate) fn settled_mask_by_incremental_append_into(
         }
     }
     true
+}
+
+/// The bounded-distance `settled` test, split so a caller can supply the
+/// nearest-stone field instead of having one computed for it.
+///
+/// `masks_by_bounded_distance_into` sweeps every stone against every pixel to
+/// find the nearest one -- and the packed writer then sweeps them all again for
+/// the ridge, which needs that same minimum. Measured at 240 stones the settled
+/// sweep is 0.397 ms of a 1.56 ms raster, spent recomputing a field the caller
+/// is already holding. This half does the row-invariant work; `classify_row`
+/// does the rest against minima the caller passes in.
+///
+/// The two sweeps agree bit for bit only because every squared distance in the
+/// raster is now `mul_add`. That is load-bearing: `settled` is a *bit* decided
+/// by comparing this distance against a sampled one, so unlike the ridge -- which
+/// quantises to f16 and swallows a last-ulp difference -- one ulp here is a
+/// different pixel.
+///
+/// Oversample is fixed at 1, the production path, as in the incremental builder.
+pub(crate) struct SettledRows {
+    spacing_squared: f64,
+    slack: f64,
+    vertices: Option<Vec<Point>>,
+    pub(crate) exact_tests: usize,
+}
+
+pub(crate) fn prepare_settled_rows(
+    position: &Position,
+    config: RasterConfig,
+    scratch: &mut EdtScratch,
+) -> SettledRows {
+    let (width, height) = (config.width, config.height);
+    sampled_legal_set_into(position, width, height, scratch);
+    let legal = std::mem::take(&mut scratch.legal);
+    squared_distance_transform_into(&legal, width, height, scratch, false);
+    scratch.legal = legal;
+    let spacing = 1.0 / width as f64;
+    SettledRows {
+        spacing_squared: spacing * spacing,
+        slack: spacing * std::f64::consts::SQRT_2,
+        vertices: None,
+        exact_tests: 0,
+    }
+}
+
+impl SettledRows {
+    /// Classify one row. `nearest_squares` is the caller's per-column minimum
+    /// over every stone, `field` the squared sampled distance transform, and
+    /// `out` the row's slice of the settled mask.
+    ///
+    /// The three cases and why rounding cannot break them are documented on the
+    /// equivalent loop in `masks_by_bounded_distance_into`, which stays the
+    /// reference implementation this is pinned against.
+    pub(crate) fn classify_row(
+        &mut self,
+        position: &Position,
+        row: usize,
+        width: usize,
+        y: f64,
+        xs: &[f64],
+        nearest_squares: &[f64],
+        field: &[f64],
+        out: &mut [bool],
+    ) {
+        let base = row * width;
+        for column in 0..width {
+            let sampled_squared = field[base + column] * self.spacing_squared;
+            let sampled = sampled_squared.sqrt();
+            let sampled_minus_slack = sampled - self.slack;
+            out[column] = if sampled_minus_slack > 0.0
+                && nearest_squares[column] <= sampled_minus_slack * sampled_minus_slack
+            {
+                true
+            } else if nearest_squares[column] > sampled_squared {
+                false
+            } else {
+                self.exact_tests += 1;
+                let known = self
+                    .vertices
+                    .get_or_insert_with(|| legal_set_vertices(position));
+                let nearest = nearest_squares[column].sqrt();
+                no_legal_point_closer_than(
+                    position,
+                    Point::new(xs[column], y),
+                    nearest,
+                    Some(known),
+                )
+            };
+        }
+    }
 }
 
 fn masks_by_bounded_distance_into(

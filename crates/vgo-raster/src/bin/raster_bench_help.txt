@@ -5,9 +5,12 @@ vgo-raster-bench -- where rasterization spends its time
                     change: the raster is a network input, so a difference that
                     looks like rounding is a model that is quietly wrong.
 
-                    It does NOT cover `settled`. Both writers call the same
-                    `settled_for_raster`, so a change there passes this gate
-                    trivially. What guards settled is
+                    It now covers `settled` as well. That was not always true:
+                    both writers used to call the same `settled_for_raster`, so
+                    a change there passed this gate trivially. The packed writer
+                    now classifies settled from its own sweep's minima while the
+                    dense writer still calls the builder, so the two are
+                    independent and this compares them. Still also run
                     `edt::tests::bounded_distance_agrees_with_the_definition`,
                     which pins it against the mathematical definition rather
                     than against the other writer -- run the crate's tests too,
@@ -24,8 +27,9 @@ Phases:
   legal      marking which cells a stone could still be played on
   transform  the Euclidean distance transform over that mask
   settled    both, plus the dispatch that chooses between two algorithms
-  sweep+out  packed minus settled: nearest/second-nearest stone distances,
-             the ridge, and packing the planes
+             Note these are phases of the *standalone* settled builder, which
+             is what the dense writer calls. The packed writer classifies
+             settled from its own sweep's minima, so these do not decompose it.
 
 Notes for anyone optimising this:
 

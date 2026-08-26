@@ -21,8 +21,10 @@
 //!   settled     both of the above plus the dispatch around them
 //!   raster      everything: settled, the stone sweeps, ridge, and packing
 //!
-//! `raster - settled` is the sweep and output loop, which is the other half of
-//! the cost and has no entry point of its own.
+//! The first three are phases of the standalone `settled` builder, which the
+//! dense writer calls. The packed writer classifies settled row by row from the
+//! minima its own sweep already computes, so `raster - settled` is not the sweep
+//! and output loop -- those have no entry point of their own to measure.
 //!
 //! ## Verifying a change
 //!
@@ -274,26 +276,29 @@ fn main() {
     }
 
     println!(
-        "  {:>5} {:>7} {:>5} | {:>8} {:>9} {:>8} | {:>8} {:>8} {:>8}",
-        "units", "stones", "px", "legal", "transform", "settled", "sweep+out", "packed", "dense"
+        "  {:>5} {:>7} {:>5} | {:>8} {:>9} {:>8} | {:>8} {:>8}",
+        "units", "stones", "px", "legal", "transform", "settled", "packed", "dense"
     );
-    println!("  {}", "-".repeat(86));
+    println!("  {}", "-".repeat(77));
     for r in &rows {
         println!(
-            "  {:>5} {:>7} {:>5} | {:>8.3} {:>9.3} {:>8.3} | {:>8.3} {:>8.3} {:>8.3}",
+            "  {:>5} {:>7} {:>5} | {:>8.3} {:>9.3} {:>8.3} | {:>8.3} {:>8.3}",
             r.units,
             r.stones,
             r.size,
             r.legal,
             r.transform,
             r.settled,
-            r.raster - r.settled,
             r.raster,
             r.dense
         );
     }
     println!();
-    println!("  milliseconds, median of {rounds}. `sweep+out` is packed minus settled:");
-    println!("  the stone sweeps, the ridge, and the bit packing, which have no entry");
-    println!("  point of their own. Run --verify after any change.");
+    println!("  milliseconds, median of {rounds}. The three phase columns are the");
+    println!("  standalone `settled` builder, which is what the *dense* writer calls.");
+    println!("  The packed writer no longer calls it: it classifies settled row by row");
+    println!("  from the minima its own sweep computes, so the phases do not sum to");
+    println!("  `packed` and subtracting them from it does not give the sweep.");
+    println!("  Run --verify after any change -- with the two writers on different");
+    println!("  settled implementations it now covers settled too.");
 }
