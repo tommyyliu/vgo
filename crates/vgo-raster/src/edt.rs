@@ -27,7 +27,10 @@
 //! toward reporting too much settled. `resolution` oversamples the mask to
 //! shrink that; `examples/settled_edt.rs` measures what it costs.
 
-use vgo_core::{no_legal_point_closer_than, COORDINATE_EPSILON, Point, Position, distance_to_legal_set, legal_set_vertices};
+use vgo_core::{
+    COORDINATE_EPSILON, Point, Position, distance_to_legal_set, legal_set_vertices,
+    no_legal_point_closer_than,
+};
 
 use crate::RasterConfig;
 
@@ -83,6 +86,48 @@ fn transform_1d(f: &[f64], d: &mut [f64], v: &mut [usize], z: &mut [f64]) {
     }
 }
 
+fn transform_1d_with_owners(
+    f: &[f64],
+    d: &mut [f64],
+    v: &mut [usize],
+    z: &mut [f64],
+    owners: &mut [usize],
+) {
+    let n = f.len();
+    if n == 0 {
+        return;
+    }
+    let mut k = 0usize;
+    v[0] = 0;
+    z[0] = f64::NEG_INFINITY;
+    z[1] = f64::INFINITY;
+    for q in 1..n {
+        let mut s = intersection(f, q, v[k]);
+        while k > 0 && s <= z[k] {
+            k -= 1;
+            s = intersection(f, q, v[k]);
+        }
+        if k == 0 && s <= z[0] {
+            v[0] = q;
+            z[1] = f64::INFINITY;
+            continue;
+        }
+        k += 1;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = f64::INFINITY;
+    }
+    let mut k = 0usize;
+    for q in 0..n {
+        while z[k + 1] < q as f64 {
+            k += 1;
+        }
+        owners[q] = v[k];
+        let offset = q as f64 - v[k] as f64;
+        d[q] = offset * offset + f[v[k]];
+    }
+}
+
 fn intersection(f: &[f64], q: usize, vk: usize) -> f64 {
     let (fq, fv) = (f[q], f[vk]);
     let (qf, vf) = (q as f64, vk as f64);
@@ -118,6 +163,7 @@ const NEAREST_SEARCH_MINIMUM_STONES: usize = 96;
 pub(crate) struct EdtScratch {
     legal: Vec<bool>,
     field: Vec<f64>,
+    column_field: Vec<f64>,
     sources: Vec<f64>,
     results: Vec<f64>,
     vertices: Vec<usize>,
@@ -127,6 +173,9 @@ pub(crate) struct EdtScratch {
     column_xs: Vec<f64>,
     fine_columns: Vec<usize>,
     nearest_squares: Vec<f64>,
+    row_owners: Vec<u64>,
+    row_owner_columns: Vec<usize>,
+    pub(crate) incremental_rows: Vec<bool>,
 }
 
 impl EdtScratch {
@@ -139,11 +188,25 @@ impl EdtScratch {
     }
 }
 
+pub(crate) fn prime_incremental_transform(
+    scratch: &mut EdtScratch,
+    width: usize,
+    height: usize,
+) -> bool {
+    if scratch.legal.len() != width * height {
+        return false;
+    }
+    let legal = std::mem::take(&mut scratch.legal);
+    squared_distance_transform_into(&legal, width, height, scratch, true);
+    scratch.legal = legal;
+    true
+}
+
 /// Exposed for `vgo-raster-bench`. See `sampled_legal_set`.
 #[doc(hidden)]
 pub fn squared_distance_transform(mask: &[bool], width: usize, height: usize) -> Vec<f64> {
     let mut scratch = EdtScratch::default();
-    squared_distance_transform_into(mask, width, height, &mut scratch);
+    squared_distance_transform_into(mask, width, height, &mut scratch, false);
     scratch.field
 }
 
@@ -152,6 +215,7 @@ fn squared_distance_transform_into(
     width: usize,
     height: usize,
     scratch: &mut EdtScratch,
+    track_incremental: bool,
 ) {
     scratch.field.resize(mask.len(), 0.0);
     for (value, inside) in scratch.field.iter_mut().zip(mask) {
@@ -193,19 +257,125 @@ fn squared_distance_transform_into(
     }
 
     // Rows are already contiguous, so they need none of that.
-    for row in 0..height {
-        let base = row * width;
-        scratch
-            .sources[..width]
-            .copy_from_slice(&scratch.field[base..base + width]);
+    if track_incremental {
+        let owner_words = width.div_ceil(64);
+        scratch.column_field.resize(mask.len(), 0.0);
+        scratch.column_field.copy_from_slice(&scratch.field);
+        scratch.row_owners.resize(height * owner_words, 0);
+        scratch.row_owner_columns.resize(width, usize::MAX);
+        for row in 0..height {
+            let base = row * width;
+            scratch.sources[..width].copy_from_slice(&scratch.column_field[base..base + width]);
+            transform_1d_with_owners(
+                &scratch.sources[..width],
+                &mut scratch.results[..width],
+                &mut scratch.vertices,
+                &mut scratch.boundaries,
+                &mut scratch.row_owner_columns[..width],
+            );
+            scratch.row_owners[row * owner_words..(row + 1) * owner_words].fill(0);
+            for &owner in &scratch.row_owner_columns[..width] {
+                scratch.row_owners[row * owner_words + owner / 64] |= 1 << (owner % 64);
+            }
+            scratch.field[base..base + width].copy_from_slice(&scratch.results[..width]);
+        }
+    } else {
+        for row in 0..height {
+            let base = row * width;
+            scratch.sources[..width].copy_from_slice(&scratch.field[base..base + width]);
+            transform_1d(
+                &scratch.sources[..width],
+                &mut scratch.results[..width],
+                &mut scratch.vertices,
+                &mut scratch.boundaries,
+            );
+            scratch.field[base..base + width].copy_from_slice(&scratch.results[..width]);
+        }
+    }
+}
+
+fn squared_distance_transform_incremental_into(
+    mask: &[bool],
+    width: usize,
+    height: usize,
+    low_column: usize,
+    high_column: usize,
+    scratch: &mut EdtScratch,
+    changed_rows: &mut [bool],
+) -> bool {
+    if scratch.column_field.len() != mask.len() {
+        return false;
+    }
+    let owner_words = width.div_ceil(64);
+    if scratch.row_owners.len() != height * owner_words {
+        return false;
+    }
+    if changed_rows.len() != height {
+        return false;
+    }
+    scratch.row_owner_columns.resize(width, usize::MAX);
+    for column in low_column..=high_column {
+        for row in 0..height {
+            scratch.sources[row] = if mask[row * width + column] {
+                0.0
+            } else {
+                ABSENT
+            };
+        }
         transform_1d(
+            &scratch.sources[..height],
+            &mut scratch.results[..height],
+            &mut scratch.vertices,
+            &mut scratch.boundaries,
+        );
+        for row in 0..height {
+            scratch.column_field[row * width + column] = scratch.results[row];
+        }
+    }
+    for row in 0..height {
+        if !owner_mask_intersects(
+            &scratch.row_owners[row * owner_words..(row + 1) * owner_words],
+            low_column,
+            high_column,
+        ) {
+            continue;
+        }
+        changed_rows[row] = true;
+        let base = row * width;
+        scratch.sources[..width].copy_from_slice(&scratch.column_field[base..base + width]);
+        transform_1d_with_owners(
             &scratch.sources[..width],
             &mut scratch.results[..width],
             &mut scratch.vertices,
             &mut scratch.boundaries,
+            &mut scratch.row_owner_columns[..width],
         );
+        scratch.row_owners[row * owner_words..(row + 1) * owner_words].fill(0);
+        for &owner in &scratch.row_owner_columns[..width] {
+            scratch.row_owners[row * owner_words + owner / 64] |= 1 << (owner % 64);
+        }
         scratch.field[base..base + width].copy_from_slice(&scratch.results[..width]);
     }
+    true
+}
+
+fn owner_mask_intersects(mask: &[u64], low: usize, high: usize) -> bool {
+    let first_word = low / 64;
+    let last_word = high / 64;
+    for word in first_word..=last_word {
+        let low_bit = if word == first_word { low % 64 } else { 0 };
+        let high_bit = if word == last_word { high % 64 } else { 63 };
+        let low_mask = u64::MAX << low_bit;
+        let high_mask = if high_bit == 63 {
+            u64::MAX
+        } else {
+            (1u64 << (high_bit + 1)) - 1
+        };
+        if mask[word] & low_mask & high_mask != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Stones bucketed into a uniform grid for nearest-distance queries.
@@ -248,7 +418,13 @@ impl StoneGrid {
             indices[cursor[cell_index] as usize] = stone as u32;
             cursor[cell_index] += 1;
         }
-        Self { cell, width, height, starts: counts, indices }
+        Self {
+            cell,
+            width,
+            height,
+            starts: counts,
+            indices,
+        }
     }
 
     #[inline]
@@ -331,7 +507,6 @@ fn nearest_row_chunked(
     }
 }
 
-
 /// The legal set sampled onto a grid, built by stamping exclusion discs.
 /// Exposed for `vgo-raster-bench`, which times the raster's parts separately so
 /// they can be optimised one at a time. Not part of the API: the signature
@@ -388,7 +563,8 @@ fn sampled_legal_set_into(
     }
     for stone in stones {
         // Bounding box of the exclusion disc, clipped to the grid.
-        let low_row = (((stone.y - exclusion) * fine_height as f64 - 0.5).floor()).max(0.0) as usize;
+        let low_row =
+            (((stone.y - exclusion) * fine_height as f64 - 0.5).floor()).max(0.0) as usize;
         let high_row = ((((stone.y + exclusion) * fine_height as f64 - 0.5).ceil()) as usize)
             .min(fine_height - 1);
         let low_column =
@@ -649,14 +825,7 @@ pub(crate) fn settled_mask_by_bounded_distance_into(
 ) {
     let mut dead = Vec::new();
     masks_by_bounded_distance_into(
-        position,
-        config,
-        oversample,
-        true,
-        false,
-        scratch,
-        mask,
-        &mut dead,
+        position, config, oversample, true, false, scratch, mask, &mut dead,
     );
 }
 
@@ -681,12 +850,15 @@ pub(crate) fn settled_mask_by_incremental_append_into(
     let exclusion_squared = exclusion * exclusion;
     let width = config.width;
     let height = config.height;
+    let mut incremental_rows = std::mem::take(&mut scratch.incremental_rows);
+    incremental_rows.resize(height, false);
     let low_row = (((stone.y - exclusion) * height as f64 - 0.5).floor()).max(0.0) as usize;
-    let high_row = ((((stone.y + exclusion) * height as f64 - 0.5).ceil()) as usize)
-        .min(height - 1);
+    let high_row =
+        ((((stone.y + exclusion) * height as f64 - 0.5).ceil()) as usize).min(height - 1);
     let low_column = (((stone.x - exclusion) * width as f64 - 0.5).floor()).max(0.0) as usize;
-    let high_column = ((((stone.x + exclusion) * width as f64 - 0.5).ceil()) as usize)
-        .min(width - 1);
+    let high_column =
+        ((((stone.x + exclusion) * width as f64 - 0.5).ceil()) as usize).min(width - 1);
+    let mut legal_changed = false;
     for row in low_row..=high_row {
         let y = (row as f64 + 0.5) / height as f64;
         let dy = y - stone.y;
@@ -695,19 +867,38 @@ pub(crate) fn settled_mask_by_incremental_append_into(
             let x = (column as f64 + 0.5) / width as f64;
             let dx = x - stone.x;
             if dx.mul_add(dx, dy_squared) < exclusion_squared {
-                scratch.legal[row * width + column] = false;
+                let pixel = row * width + column;
+                legal_changed |= scratch.legal[pixel];
+                scratch.legal[pixel] = false;
             }
         }
     }
-    let legal = std::mem::take(&mut scratch.legal);
-    squared_distance_transform_into(&legal, width, height, scratch);
-    scratch.legal = legal;
+    if legal_changed {
+        let legal = std::mem::take(&mut scratch.legal);
+        let incremental = squared_distance_transform_incremental_into(
+            &legal,
+            width,
+            height,
+            low_column,
+            high_column,
+            scratch,
+            &mut incremental_rows,
+        );
+        if !incremental {
+            squared_distance_transform_into(&legal, width, height, scratch, true);
+            incremental_rows.fill(true);
+        }
+        scratch.legal = legal;
+    }
+    scratch.incremental_rows = incremental_rows;
 
-    scratch.column_xs.resize(width, 0.0);
-    scratch.fine_columns.resize(width, 0);
-    for (column, x) in scratch.column_xs.iter_mut().enumerate() {
-        *x = (column as f64 + 0.5) / width as f64;
-        scratch.fine_columns[column] = column;
+    if scratch.column_xs.len() != width || scratch.fine_columns.len() != width {
+        scratch.column_xs.resize(width, 0.0);
+        scratch.fine_columns.resize(width, 0);
+        for (column, x) in scratch.column_xs.iter_mut().enumerate() {
+            *x = (column as f64 + 0.5) / width as f64;
+            scratch.fine_columns[column] = column;
+        }
     }
     mask.resize(pixels, false);
     let spacing = 1.0 / width as f64;
@@ -715,13 +906,16 @@ pub(crate) fn settled_mask_by_incremental_append_into(
     let slack = spacing * std::f64::consts::SQRT_2;
     let mut vertices: Option<Vec<Point>> = None;
     for row in 0..height {
+        if !scratch.incremental_rows[row] {
+            continue;
+        }
         let y = (row as f64 + 0.5) / height as f64;
         let output_base = row * width;
         let sampled_base = row * width;
         for column in 0..width {
             let x = scratch.column_xs[column];
-            let sampled_squared = scratch.field[sampled_base + scratch.fine_columns[column]]
-                * spacing_squared;
+            let sampled_squared =
+                scratch.field[sampled_base + scratch.fine_columns[column]] * spacing_squared;
             let sampled = sampled_squared.sqrt();
             let sampled_minus_slack = sampled - slack;
             let pixel = output_base + column;
@@ -768,7 +962,7 @@ fn masks_by_bounded_distance_into(
     let (fine_width, fine_height) = (config.width * scale, config.height * scale);
     sampled_legal_set_into(position, fine_width, fine_height, scratch);
     let legal = std::mem::take(&mut scratch.legal);
-    squared_distance_transform_into(&legal, fine_width, fine_height, scratch);
+    squared_distance_transform_into(&legal, fine_width, fine_height, scratch, false);
     scratch.legal = legal;
     let spacing = 1.0 / fine_width as f64;
     let spacing_squared = spacing * spacing;
@@ -884,8 +1078,8 @@ fn masks_by_bounded_distance_into(
         if want_dead_zone {
             for column in 0..config.width {
                 let x = scratch.column_xs[column];
-                let sampled_squared = scratch.field[sampled_base + scratch.fine_columns[column]]
-                    * spacing_squared;
+                let sampled_squared =
+                    scratch.field[sampled_base + scratch.fine_columns[column]] * spacing_squared;
                 dead[output_base + column] = if near_vertex[output_base + column] {
                     false
                 } else if sampled_squared <= radius_squared {
@@ -962,7 +1156,11 @@ mod tests {
             if x > 0.96 || y > 0.96 {
                 break;
             }
-            let colour = if index % 2 == 0 { Color::Black } else { Color::White };
+            let colour = if index % 2 == 0 {
+                Color::Black
+            } else {
+                Color::White
+            };
             stones.push(Stone::new(x, y, colour));
         }
         Position::new(radius, stones, Color::Black).with_komi(0.104)
@@ -1002,7 +1200,10 @@ mod tests {
                     wrong += 1;
                 }
             }
-            assert_eq!(wrong, 0, "{count} stones: {wrong} pixels disagree with the definition");
+            assert_eq!(
+                wrong, 0,
+                "{count} stones: {wrong} pixels disagree with the definition"
+            );
             // The bound has to be doing the work; if the fallback ran
             // everywhere this would pass while being slower than the exact path.
             assert!(
@@ -1106,7 +1307,10 @@ mod tests {
                     wrong += 1;
                 }
             }
-            assert_eq!(wrong, 0, "{count} stones: {wrong} pixels disagree with the definition");
+            assert_eq!(
+                wrong, 0,
+                "{count} stones: {wrong} pixels disagree with the definition"
+            );
             assert!(
                 exact_tests * 8 < config.pixels(),
                 "{count} stones: {exact_tests} exact tests is too many to be a fallback"
@@ -1132,12 +1336,21 @@ mod tests {
             let row = (y * config.height as f64) as usize;
             dead[row * config.width + column]
         };
-        assert!(at(0.002, 0.002), "the corner can never be covered by a stone");
+        assert!(
+            at(0.002, 0.002),
+            "the corner can never be covered by a stone"
+        );
         assert!(!at(0.5, 0.5), "the centre of an empty board is reachable");
-        assert!(!at(0.5, 0.002), "mid-edge is within a radius of the inset line");
+        assert!(
+            !at(0.5, 0.002),
+            "mid-edge is within a radius of the inset line"
+        );
 
         let (settled, _) = settled_mask_by_bounded_distance(&position, config, 1);
-        assert!(settled.iter().all(|s| !s), "no stones means nothing is settled");
+        assert!(
+            settled.iter().all(|s| !s),
+            "no stones means nothing is settled"
+        );
     }
 
     /// A board with no legal placements left is entirely dead.
@@ -1149,7 +1362,10 @@ mod tests {
         assert!(position.validate().is_playable());
         let config = RasterConfig::square_of(32, RasterKind::Compact);
         let (dead, _) = dead_zone_mask(&position, config, 1);
-        assert!(dead.iter().all(|d| *d), "an empty legal set makes every point dead");
+        assert!(
+            dead.iter().all(|d| *d),
+            "an empty legal set makes every point dead"
+        );
     }
 }
 
@@ -1189,7 +1405,11 @@ mod dispatch_parity {
                         stones.push(Stone::new(
                             x,
                             y,
-                            if placed % 2 == 0 { Color::Black } else { Color::White },
+                            if placed % 2 == 0 {
+                                Color::Black
+                            } else {
+                                Color::White
+                            },
                         ));
                         placed += 1;
                         if placed == count {
