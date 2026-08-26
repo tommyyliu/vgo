@@ -221,13 +221,23 @@ pub fn rasterize_compact_radius_packed_into(
     out.scalars[1] = f16::from_f32(f32::from(position.consecutive_passes() > 0));
     out.scalars[2] = f16::from_f32((2.0 * radius) as f32);
 
-    for byte in &mut out.bits {
+
+    // Destructured once, so the loops below work through plain slices. Indexing
+    // `out.dense` while `out.bits` is separately borrowed leaves the compiler
+    // unable to prove the Vec's data pointer is loop-invariant, and it reloads
+    // it every pixel: measured 0.49 ms against 0.35 ms for the same arithmetic
+    // through a hoisted slice.
+    let PackedRaster {
+        bits, dense: dense_plane, ..
+    } = out;
+    for byte in bits.iter_mut() {
         *byte = 0;
     }
 
     let stride = bit_plane_bytes(pixels);
-    let (current_plane, rest) = out.bits.split_at_mut(stride);
+    let (current_plane, rest) = bits.split_at_mut(stride);
     let (opponent_plane, settled_plane) = rest.split_at_mut(stride);
+    let dense_plane = dense_plane.as_mut_slice();
 
     // The same row-major accumulation as the dense writer: one stone across a
     // whole row at a time, so the vertical distance is squared once per row and
@@ -302,7 +312,7 @@ pub fn rasterize_compact_radius_packed_into(
                     current |= u8::from(current_squares[column] <= radius_square) << bit;
                     opponent |= u8::from(opponent_squares[column] <= radius_square) << bit;
                     settled_bits |= u8::from(settled[pixel]) << bit;
-                    out.dense[pixel] = f16::from_f32(ridge_at(
+                    dense_plane[pixel] = f16::from_f32(ridge_at(
                         nearest_squares[column],
                         second_squares[column],
                         radius,
@@ -319,7 +329,7 @@ pub fn rasterize_compact_radius_packed_into(
                 set_bit(current_plane, pixel, current_squares[column] <= radius_square);
                 set_bit(opponent_plane, pixel, opponent_squares[column] <= radius_square);
                 set_bit(settled_plane, pixel, settled[pixel]);
-                out.dense[pixel] = f16::from_f32(ridge_at(
+                dense_plane[pixel] = f16::from_f32(ridge_at(
                     nearest_squares[column],
                     second_squares[column],
                     radius,
@@ -505,6 +515,14 @@ mod tests {
         rasterize_compact_radius_into(&position, config, &mut dense);
         rasterize_compact_radius_packed_into(&position, config, &mut packed);
 
+        // `settled` is the same call in both writers, so timing it alone says
+        // how much of each total is shared and how much is actually different.
+        let started = Instant::now();
+        for _ in 0..rounds {
+            std::hint::black_box(crate::settled_for_raster(&position, config));
+        }
+        let settled_elapsed = started.elapsed();
+
         let started = Instant::now();
         for _ in 0..rounds {
             rasterize_compact_radius_into(&position, config, &mut dense);
@@ -518,6 +536,13 @@ mod tests {
         let packed_elapsed = started.elapsed();
 
         let dense_bytes = config.channels() * pixels * 4;
+        let per = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / f64::from(rounds);
+        println!(
+            "  settled (shared by both)  {:>7.2} ms\n  dense minus settled       {:>7.2} ms\n  packed minus settled      {:>7.2} ms",
+            per(settled_elapsed),
+            per(dense_elapsed) - per(settled_elapsed),
+            per(packed_elapsed) - per(settled_elapsed),
+        );
         println!(
             "  dense  {:>7.2} ms/raster  {:>6} KB\n  packed {:>7.2} ms/raster  {:>6} KB\n  {:.2}x time, {:.1}x bytes",
             dense_elapsed.as_secs_f64() * 1000.0 / f64::from(rounds),
