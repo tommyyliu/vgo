@@ -79,6 +79,23 @@ struct Config {
     /// Stop after this many games. Zero runs until the stop file appears.
     #[arg(long, default_value_t = 0)]
     maximum_games: u64,
+    /// Block rather than spin while waiting for the GPU.
+    ///
+    /// CUDA's default busy-polls, which costs a core per inference lane for the
+    /// whole 7.6 ms a session takes. Blocking wakes in tens of microseconds --
+    /// under a percent of that -- and frees the core. Measured at 43% of all
+    /// CPU samples across two lanes, both pinned at 100% while the GPU was the
+    /// thing actually working.
+    ///
+    /// Measured, 32 actors, two lanes, GPU pinned at 100% either way:
+    ///
+    ///     spin    5.0 cores total, 2.0 in the inference threads
+    ///     block   2.8 cores total, 0.2 in the inference threads
+    ///
+    /// On by default. Must be set before any session exists, so it happens
+    /// first in `main`; a failure is reported and the run continues, spinning.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    blocking_sync: bool,
     /// Write a flamegraph here on exit, sampling every thread at 199 Hz.
     ///
     /// Requires the `profiling` feature; without it this errors rather than
@@ -397,6 +414,15 @@ fn finish_profiler(_: Profiler, _: Option<&std::path::Path>) -> io::Result<()> {
 
 fn main() -> io::Result<()> {
     let config = Config::parse();
+    // Before anything touches CUDA: the driver refuses to change this flag once
+    // the primary context is active, and ONNX Runtime retains that same
+    // context when the first session is built.
+    if config.blocking_sync {
+        match vgo_raster_cuda::use_blocking_sync(config.device_id.max(0) as usize) {
+            Ok(()) => eprintln!("[cuda] waiting on the GPU will block, not spin"),
+            Err(error) => eprintln!("[cuda] blocking sync unavailable, continuing: {error}"),
+        }
+    }
     let profiler = start_profiler(config.profile_output.as_deref())?;
     if config.actors == 0 {
         return Err(io::Error::new(

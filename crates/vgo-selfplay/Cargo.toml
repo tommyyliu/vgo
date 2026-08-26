@@ -10,6 +10,10 @@ profiling = ["dep:pprof"]
 default = []
 
 [dependencies]
+# For `use_blocking_sync` only -- the driver flag that stops the inference
+# threads busy-polling while the GPU works. cudarc loads libcuda at runtime, so
+# this adds no link-time CUDA requirement.
+vgo-raster-cuda = { path = "../vgo-raster-cuda" }
 # In-process sampling profiler, behind a feature so it costs nothing when off.
 # `perf` is not installed here and needs root to install; pprof samples with
 # SIGPROF from inside the process, which needs neither. Symbols are already in

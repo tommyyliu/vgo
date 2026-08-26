@@ -1444,6 +1444,7 @@ dependencies = [
  "vgo-core",
  "vgo-inference",
  "vgo-raster",
+ "vgo-raster-cuda",
  "vgo-search",
 ]
 
