@@ -121,8 +121,146 @@ fn visit_candidates_within(
     false
 }
 
+/// Below this many stones the quadratic loops in [`vertices`] are cheaper than
+/// the grid that would prune them, and a grid over a nearly empty board is all
+/// build cost and no saving.
+const BUCKET_MINIMUM_STONES: usize = 32;
+
+/// A uniform bucket grid over the stones, one cell per stone diameter.
+///
+/// Both loops in [`vertices`] are quadratic in the stone count and neither needs
+/// to be. A pair of stones only produces a vertex when they are within
+/// `2 * diameter`, and a candidate point is rejected by the first stone within
+/// `2 * radius` of it -- both local questions asked against every stone on the
+/// board. Measured at 240 stones the clearance test alone walked 211,924 stones
+/// across 1,781 calls, 119 apiece, where nine would have done; the pair scan was
+/// 28,823 for the 873 pairs that survived it.
+struct StoneBuckets {
+    cell: f64,
+    columns: usize,
+    rows: usize,
+    starts: Vec<u32>,
+    indices: Vec<u32>,
+}
+
+impl StoneBuckets {
+    fn build(position: &Position) -> Self {
+        let stones = position.stones();
+        let cell = 2.0 * position.radius();
+        let columns = ((1.0 / cell).ceil() as usize).clamp(1, 512);
+        let rows = columns;
+        let locate = |x: f64, y: f64| -> usize {
+            let column = ((x / cell) as isize).clamp(0, columns as isize - 1) as usize;
+            let row = ((y / cell) as isize).clamp(0, rows as isize - 1) as usize;
+            row * columns + column
+        };
+        let mut starts = vec![0u32; columns * rows + 1];
+        for stone in stones {
+            starts[locate(stone.x, stone.y) + 1] += 1;
+        }
+        for index in 0..columns * rows {
+            starts[index + 1] += starts[index];
+        }
+        let mut cursor = starts.clone();
+        let mut indices = vec![0u32; stones.len()];
+        for (index, stone) in stones.iter().enumerate() {
+            let bucket = locate(stone.x, stone.y);
+            indices[cursor[bucket] as usize] = index as u32;
+            cursor[bucket] += 1;
+        }
+        Self {
+            cell,
+            columns,
+            rows,
+            starts,
+            indices,
+        }
+    }
+
+    fn cell_of(&self, x: f64, y: f64) -> (usize, usize) {
+        let column = ((x / self.cell) as isize).clamp(0, self.columns as isize - 1) as usize;
+        let row = ((y / self.cell) as isize).clamp(0, self.rows as isize - 1) as usize;
+        (column, row)
+    }
+
+    fn bucket(&self, row: usize, column: usize) -> &[u32] {
+        let index = row * self.columns + column;
+        &self.indices[self.starts[index] as usize..self.starts[index + 1] as usize]
+    }
+
+    /// Every stone after `first` that could pair with the point, in index order.
+    ///
+    /// Three cells of reach, not two. The pair test admits a separation up to
+    /// `2 * diameter + COORDINATE_EPSILON`, which is two cells *plus* whatever
+    /// slack the point's offset within its own cell contributes, and a stone
+    /// sitting a hair past a boundary lands in the third. The caller still
+    /// applies the exact separation test, so the extra ring only costs
+    /// distances, never correctness.
+    fn partners_into(&self, x: f64, y: f64, first: usize, out: &mut Vec<usize>) {
+        let (column, row) = self.cell_of(x, y);
+        for r in row.saturating_sub(3)..=(row + 3).min(self.rows - 1) {
+            for c in column.saturating_sub(3)..=(column + 3).min(self.columns - 1) {
+                for &index in self.bucket(r, c) {
+                    if index as usize > first {
+                        out.push(index as usize);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+    }
+}
+
+/// [`clear_of_stones`], restricted to the stones that can possibly fail it.
+///
+/// A stone that fails is closer than `2 * radius` and the cells are that wide,
+/// so it cannot be more than one cell away in either axis. With no buckets --
+/// too few stones to have built any -- this is the original scan.
+fn clear_of_stones_pruned(
+    position: &Position,
+    buckets: Option<&StoneBuckets>,
+    x: f64,
+    y: f64,
+    skip_a: Option<usize>,
+    skip_b: Option<usize>,
+) -> bool {
+    let Some(buckets) = buckets else {
+        return clear_of_stones(position, x, y, skip_a, skip_b);
+    };
+    let stones = position.stones();
+    let minimum = 2.0 * position.radius() - numeric::COORDINATE_EPSILON;
+    let minimum_squared = minimum * minimum;
+    let (column, row) = buckets.cell_of(x, y);
+    for r in row.saturating_sub(1)..=(row + 1).min(buckets.rows - 1) {
+        for c in column.saturating_sub(1)..=(column + 1).min(buckets.columns - 1) {
+            for &index in buckets.bucket(r, c) {
+                let index = index as usize;
+                if Some(index) == skip_a || Some(index) == skip_b {
+                    continue;
+                }
+                let stone = &stones[index];
+                let dx = x - stone.x;
+                let dy = y - stone.y;
+                if dx.mul_add(dx, dy * dy) < minimum_squared {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 #[must_use]
 pub fn vertices(position: &Position) -> Vec<Point> {
+    let buckets =
+        (position.stones().len() >= BUCKET_MINIMUM_STONES).then(|| StoneBuckets::build(position));
+    vertices_with(position, buckets.as_ref())
+}
+
+/// The enumeration itself, with the pruning structure handed in so a test can
+/// run it both ways and compare. `None` is the original quadratic form, and it
+/// stays the definition of the answer.
+fn vertices_with(position: &Position, buckets: Option<&StoneBuckets>) -> Vec<Point> {
     let stones = position.stones();
     let radius = position.radius();
     let diameter = 2.0 * radius;
@@ -133,7 +271,7 @@ pub fn vertices(position: &Position) -> Vec<Point> {
         if !x.is_finite()
             || !y.is_finite()
             || !in_inset(position, x, y)
-            || !clear_of_stones(position, x, y, skip_a, skip_b)
+            || !clear_of_stones_pruned(position, buckets, x, y, skip_a, skip_b)
         {
             return;
         }
@@ -169,8 +307,16 @@ pub fn vertices(position: &Position) -> Vec<Point> {
             }
         }
     }
+    let mut partners: Vec<usize> = Vec::new();
     for first in 0..stones.len() {
-        for second in first + 1..stones.len() {
+        partners.clear();
+        match buckets {
+            Some(buckets) => {
+                buckets.partners_into(stones[first].x, stones[first].y, first, &mut partners)
+            }
+            None => partners.extend(first + 1..stones.len()),
+        }
+        for &second in &partners {
             let dx = stones[second].x - stones[first].x;
             let dy = stones[second].y - stones[first].y;
             let separation = numeric::length(dx, dy);
@@ -462,6 +608,114 @@ pub(crate) fn escape_witness(
 
 #[cfg(test)]
 mod tests {
+    use super::{StoneBuckets, vertices_with};
+
+    /// The bucketed enumeration against the quadratic one it replaced.
+    ///
+    /// `vertices_with(_, None)` is the original: every pair considered, every
+    /// stone walked in every clearance test. The buckets only decide which of
+    /// those are worth asking about, so the two must agree exactly -- the same
+    /// points in the same order, because the dedup key keeps whichever of two
+    /// near-identical points it saw first.
+    ///
+    /// Counts straddle `BUCKET_MINIMUM_STONES`, and the lattice is there because
+    /// it is the case the sampled legal set is known to miss: stones just over
+    /// the exclusion diameter apart leave a gap between every four neighbours
+    /// that exists only as a vertex.
+    #[test]
+    fn bucketed_vertices_match_the_quadratic_enumeration() {
+        let radius = 1.0 / 38.0;
+        let mut fixtures: Vec<crate::Position> = Vec::new();
+        for &count in &[0usize, 1, 5, 31, 32, 33, 60, 120, 240] {
+            for &seed in &[1u64, 7, 99] {
+                fixtures.push(scattered(count, radius, seed));
+            }
+            fixtures.push(lattice(count, radius, 1.08));
+            fixtures.push(lattice(count, radius, 2.02));
+        }
+        for position in &fixtures {
+            let quadratic = vertices_with(position, None);
+            let bucketed = vertices_with(position, Some(&StoneBuckets::build(position)));
+            assert_eq!(
+                quadratic.len(),
+                bucketed.len(),
+                "{} stones: {} vertices without buckets, {} with",
+                position.stones().len(),
+                quadratic.len(),
+                bucketed.len()
+            );
+            for (index, (want, got)) in quadratic.iter().zip(bucketed.iter()).enumerate() {
+                assert!(
+                    want.x == got.x && want.y == got.y,
+                    "{} stones: vertex {index} is ({}, {}) without buckets and ({}, {}) with",
+                    position.stones().len(),
+                    want.x,
+                    want.y,
+                    got.x,
+                    got.y
+                );
+            }
+        }
+    }
+
+    fn lattice(count: usize, radius: f64, pitch: f64) -> crate::Position {
+        let spacing = 2.0 * radius * pitch;
+        let per_row = ((0.88_f64 / spacing).floor() as usize).max(1);
+        let mut stones = Vec::new();
+        for index in 0..count {
+            let x = radius + 0.02 + (index % per_row) as f64 * spacing;
+            let y = radius + 0.02 + (index / per_row) as f64 * spacing;
+            if x > 1.0 - radius || y > 1.0 - radius {
+                break;
+            }
+            stones.push(crate::Stone {
+                x,
+                y,
+                color: if index % 2 == 0 {
+                    crate::Color::Black
+                } else {
+                    crate::Color::White
+                },
+            });
+        }
+        crate::Position::new(radius, stones, crate::Color::Black)
+    }
+
+    /// Rejection-sampled placements, so the buckets meet uneven density rather
+    /// than only the regular spacing a lattice gives them.
+    fn scattered(count: usize, radius: f64, seed: u64) -> crate::Position {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let mut stones: Vec<crate::Stone> = Vec::new();
+        let mut attempts = 0;
+        while stones.len() < count && attempts < 40_000 {
+            attempts += 1;
+            let x = radius + next() * (1.0 - 2.0 * radius);
+            let y = radius + next() * (1.0 - 2.0 * radius);
+            let minimum = 2.0 * radius;
+            if stones
+                .iter()
+                .any(|s: &crate::Stone| (s.x - x).hypot(s.y - y) < minimum)
+            {
+                continue;
+            }
+            stones.push(crate::Stone {
+                x,
+                y,
+                color: if stones.len() % 2 == 0 {
+                    crate::Color::Black
+                } else {
+                    crate::Color::White
+                },
+            });
+        }
+        crate::Position::new(radius, stones, crate::Color::Black)
+    }
     use super::none_closer_than;
 
     fn threshold_lattice(count: usize, radius: f64) -> Position {
