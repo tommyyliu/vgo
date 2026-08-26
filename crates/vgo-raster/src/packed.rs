@@ -281,7 +281,7 @@ impl IncrementalPackedRaster {
                 for (stone_index, stone) in position.stones().iter().enumerate() {
                     let dx = x - stone.x;
                     let dy = y - stone.y;
-                    let square = dx * dx + dy * dy;
+                    let square = dx.mul_add(dx, dy * dy);
                     let settled_square = dx.mul_add(dx, dy * dy);
                     let settled_nearest = &mut self.settled_nearest_squares[pixel];
                     if settled_square < *settled_nearest {
@@ -400,7 +400,7 @@ impl IncrementalPackedRaster {
                             self.settled_nearest_squares[pixel] = settled_square;
                             self.raster.scratch.edt.incremental_rows[row] = true;
                         }
-                        let square = dx * dx + dy * dy;
+                        let square = dx.mul_add(dx, dy * dy);
                         let changed = if square < self.nearest_squares[pixel] {
                             self.second_squares[pixel] = self.nearest_squares[pixel];
                             self.second_stones[pixel] = self.nearest_stones[pixel];
@@ -468,7 +468,7 @@ impl IncrementalPackedRaster {
             for column in low_column..=high_column {
                 let x = self.column_xs[column];
                 let dx = x - new_stone.x;
-                if dx * dx + dy_square <= radius_square {
+                if dx.mul_add(dx, dy_square) <= radius_square {
                     set_bit(target_plane, row * width + column, true);
                 }
             }
