@@ -7,7 +7,7 @@ mod gpu;
 #[cfg(feature = "gpu")]
 pub use gpu::settled_mask_gpu;
 
-mod edt;
+pub mod edt;
 pub mod packed;
 mod policy;
 pub use policy::DensePolicy;

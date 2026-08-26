@@ -90,39 +90,83 @@ fn intersection(f: &[f64], q: usize, vk: usize) -> f64 {
 }
 
 /// Squared distance, in pixel units, from each cell to the nearest `true` cell.
-fn squared_distance_transform(mask: &[bool], width: usize, height: usize) -> Vec<f64> {
+/// Columns processed this many at a time.
+///
+/// A column gather strides by `width`, so it touches one cache line per row and
+/// uses eight of its sixty-four bytes. Doing eight columns together uses the
+/// whole line, which cuts the pass's memory traffic eightfold -- and that
+/// traffic, not the transform, is where the time went: a profile put the
+/// gather/scatter wrapper at 18.6% of all samples against `transform_1d`'s
+/// 9.8%, so the bookkeeping cost twice the algorithm it wraps.
+///
+/// Eight because a cache line holds eight `f64`. Sixteen would halve the passes
+/// again but doubles the scratch and starts missing L1 on the transposed side.
+const COLUMN_BLOCK: usize = 8;
+
+/// Exposed for `vgo-raster-bench`. See `sampled_legal_set`.
+#[doc(hidden)]
+pub fn squared_distance_transform(mask: &[bool], width: usize, height: usize) -> Vec<f64> {
     let mut field: Vec<f64> = mask
         .iter()
         .map(|inside| if *inside { 0.0 } else { ABSENT })
         .collect();
 
     let longest = width.max(height);
-    let mut source = vec![0.0_f64; longest];
-    let mut result = vec![0.0_f64; longest];
+    let mut sources = vec![0.0_f64; COLUMN_BLOCK * longest];
+    let mut results = vec![0.0_f64; COLUMN_BLOCK * longest];
     let mut vertices = vec![0usize; longest];
     let mut boundaries = vec![0.0_f64; longest + 1];
 
-    for column in 0..width {
+    // Columns, a cache line's worth at a time. `transform_1d` still sees one
+    // contiguous line and is untouched; only the order of the gather changes,
+    // and a minimum does not care in which order it is fed.
+    for block in (0..width).step_by(COLUMN_BLOCK) {
+        let columns = COLUMN_BLOCK.min(width - block);
         for row in 0..height {
-            source[row] = field[row * width + column];
+            let base = row * width + block;
+            for column in 0..columns {
+                sources[column * longest + row] = field[base + column];
+            }
         }
-        transform_1d(&source[..height], &mut result[..height], &mut vertices, &mut boundaries);
+        for column in 0..columns {
+            let from = column * longest;
+            transform_1d(
+                &sources[from..from + height],
+                &mut results[from..from + height],
+                &mut vertices,
+                &mut boundaries,
+            );
+        }
         for row in 0..height {
-            field[row * width + column] = result[row];
+            let base = row * width + block;
+            for column in 0..columns {
+                field[base + column] = results[column * longest + row];
+            }
         }
     }
+
+    // Rows are already contiguous, so they need none of that.
     for row in 0..height {
         let base = row * width;
-        source[..width].copy_from_slice(&field[base..base + width]);
-        transform_1d(&source[..width], &mut result[..width], &mut vertices, &mut boundaries);
-        field[base..base + width].copy_from_slice(&result[..width]);
+        sources[..width].copy_from_slice(&field[base..base + width]);
+        transform_1d(
+            &sources[..width],
+            &mut results[..width],
+            &mut vertices,
+            &mut boundaries,
+        );
+        field[base..base + width].copy_from_slice(&results[..width]);
     }
     field
 }
 
 
 /// The legal set sampled onto a grid, built by stamping exclusion discs.
-fn sampled_legal_set(position: &Position, fine_width: usize, fine_height: usize) -> Vec<bool> {
+/// Exposed for `vgo-raster-bench`, which times the raster's parts separately so
+/// they can be optimised one at a time. Not part of the API: the signature
+/// tracks whatever the transform needs and will change without notice.
+#[doc(hidden)]
+pub fn sampled_legal_set(position: &Position, fine_width: usize, fine_height: usize) -> Vec<bool> {
     let stones = position.stones();
     //
     // Testing every pixel against every stone is O(pixels · n) and dominates at

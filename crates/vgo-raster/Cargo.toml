@@ -34,3 +34,7 @@ required-features = ["gpu"]
 [[example]]
 name = "settled_edt"
 path = "examples/settled_edt.rs"
+
+[[bin]]
+name = "vgo-raster-bench"
+path = "src/bin/raster_bench.rs"
