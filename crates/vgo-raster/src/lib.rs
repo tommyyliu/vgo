@@ -680,6 +680,23 @@ pub fn settled_for_raster(position: &Position, config: RasterConfig) -> Vec<bool
     settled_mask(position, config)
 }
 
+pub(crate) fn settled_for_raster_into(
+    position: &Position,
+    config: RasterConfig,
+    scratch: &mut edt::EdtScratch,
+    output: &mut Vec<bool>,
+) {
+    let cells_per_radius = config.width.min(config.height) as f64 * position.radius();
+    if position.stones().len() >= DISTANCE_SETTLED_MINIMUM_STONES
+        && cells_per_radius >= DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS
+    {
+        edt::settled_mask_by_bounded_distance_into(position, config, 1, scratch, output);
+    } else {
+        output.clear();
+        output.extend_from_slice(&settled_for_raster(position, config));
+    }
+}
+
 pub fn rasterize_compact_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
     let settled = settled_for_raster(position, config);
     rasterize_compact_with_predicate_into(position, config, &settled, data);

@@ -61,8 +61,38 @@ struct Config {
     #[arg(long, default_value = "artifacts/onnx-cache")]
     cache_directory: PathBuf,
     /// Replay dataset whose real positions form the untimed fixture corpus.
+    ///
+    /// Optional now: `--stones` builds a synthetic lattice instead, which the
+    /// shard reader cannot do. Real shards are preferable when they can be
+    /// read, but this reader understands only the v5/v6 position prefix and
+    /// refuses anything newer rather than misreading it.
     #[arg(long)]
-    dataset: PathBuf,
+    dataset: Option<PathBuf>,
+    /// Board size in stone diameters, for the synthetic fixture.
+    #[arg(long, default_value_t = 38)]
+    units: usize,
+    /// Raster resolution, square.
+    ///
+    /// Not cosmetic: `settled_for_raster` dispatches on `cells_per_radius`,
+    /// which is `resolution / units`, and below 6.0 it takes an O(n^2) contour
+    /// walk instead of the distance transform. This benchmark hardcoded 128,
+    /// which at 38 units is 3.37 -- so it measured a path production never
+    /// takes there, and reported 207 ms per position at 240 stones against the
+    /// 1.5 ms the raster actually costs. Generation runs 256.
+    #[arg(long, default_value_t = 256)]
+    resolution: usize,
+    /// Channel layout. Generation runs `compact-radius`.
+    #[arg(long, default_value = "compact-radius")]
+    raster_kind: String,
+    /// Stones on the synthetic board. Zero reads `--dataset` instead.
+    ///
+    /// Rasterization cost depends on this more than on anything else, and the
+    /// positions that dominate generation carry well over a hundred stones --
+    /// half of games are 38-unit boards running to 312 plies. Measuring the
+    /// host's feed capacity on a near-empty board answers a question nobody
+    /// has.
+    #[arg(long, default_value_t = 0)]
+    stones: usize,
     /// Producer thread counts to benchmark.
     #[arg(long, value_delimiter = ',', default_value = "1,2,4,8,16,24,32,48,64")]
     threads: Vec<usize>,
@@ -202,6 +232,38 @@ fn read_f64(bytes: &[u8], offset: usize) -> io::Result<f64> {
     Ok(f64::from_le_bytes(
         value.try_into().expect("eight-byte slice"),
     ))
+}
+
+/// A playable lattice, as the fixture when no shard can be read.
+fn lattice_positions(units: usize, stones: usize) -> Vec<Position> {
+    let radius = 1.0 / units as f64;
+    let step = 2.2 * radius;
+    let mut placed: Vec<Stone> = Vec::new();
+    'outer: for row in 0..64 {
+        for column in 0..64 {
+            let x = 0.04 + step * f64::from(column);
+            let y = 0.04 + step * f64::from(row);
+            if x > 0.97 || y > 0.97 {
+                continue;
+            }
+            placed.push(Stone::new(
+                x,
+                y,
+                if placed.len() % 2 == 0 { Color::Black } else { Color::White },
+            ));
+            if placed.len() == stones {
+                break 'outer;
+            }
+        }
+    }
+    // Several distinct boards, so nothing between here and the backend can be
+    // flattered by seeing one position repeatedly.
+    (0..16)
+        .map(|offset| {
+            let count = placed.len().saturating_sub(offset);
+            Position::new(radius, placed[..count].to_vec(), Color::Black)
+        })
+        .collect()
 }
 
 fn load_positions(path: &Path) -> io::Result<Vec<Position>> {
@@ -589,7 +651,7 @@ fn print_json(config: &Config, positions: &[Position], results: &[ScalingResult]
     let (minimum, mean, median_stones, maximum) = stone_statistics(positions);
     println!("{{");
     println!("  \"schema\": \"vgo.cpu-feed-scaling.v1\",");
-    println!("  \"dataset\": {:?},", config.dataset.display().to_string());
+    println!("  \"dataset\": {:?},", config.dataset.as_ref().map_or_else(|| format!("lattice {}u {} stones", config.units, config.stones), |p| p.display().to_string()).to_string());
     println!("  \"positions\": {},", positions.len());
     println!(
         "  \"stones\": {{\"minimum\": {minimum}, \"mean\": {mean:.3}, \
@@ -648,8 +710,17 @@ fn print_json(config: &Config, positions: &[Position], results: &[ScalingResult]
 
 fn print_table(config: &Config, positions: &[Position], results: &[ScalingResult]) {
     let (minimum, mean, median_stones, maximum) = stone_statistics(positions);
+    // Say which corpus this is. A synthetic lattice labelled "real replay
+    // positions" is the kind of thing that misleads whoever reads the result
+    // later, and the two are not interchangeable: real positions carry the
+    // clustering that self-play produces, a lattice is uniform.
+    let source = if config.stones > 0 {
+        format!("synthetic lattice, {} units", config.units)
+    } else {
+        "real replay".to_string()
+    };
     println!(
-        "fixture: {} real replay positions, stones min={minimum} mean={mean:.1} \
+        "fixture: {} {source} positions, stones min={minimum} mean={mean:.1} \
          median={median_stones} max={maximum}",
         positions.len()
     );
@@ -700,7 +771,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.threads.sort_unstable();
     config.threads.dedup();
 
-    let positions = load_positions(&config.dataset)?;
+    let positions = if config.stones > 0 {
+        lattice_positions(config.units, config.stones)
+    } else {
+        let dataset = config.dataset.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pass --dataset for real positions, or --stones for a synthetic lattice",
+            )
+        })?;
+        load_positions(dataset)?
+    };
     if positions.len() < config.group {
         return Err("dataset does not contain one complete request group".into());
     }
@@ -708,7 +789,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .chunks_exact(config.group)
         .map(<[Position]>::to_vec)
         .collect::<Vec<_>>();
-    let raster = RasterConfig::square_of(128, RasterKind::Compact);
+    let kind = match config.raster_kind.as_str() {
+        "compact" => RasterKind::Compact,
+        "compact-pass" => RasterKind::CompactPass,
+        "compact-radius" => RasterKind::CompactRadius,
+        other => {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown raster kind {other}"),
+            )));
+        }
+    };
+    let raster = RasterConfig::square_of(config.resolution, kind);
+    let cells_per_radius = config.resolution as f64 / config.units as f64;
+    if config.stones > 0 && cells_per_radius < 6.0 {
+        eprintln!(
+            "warning: {cells_per_radius:.2} cells per radius is below the 6.0 that \
+             selects the distance transform, so `settled` will take the O(n^2) \
+             contour walk -- not the path generation runs at this board size"
+        );
+    }
     let duration = Duration::from_millis(config.sample_millis);
     let maximum_delay = Duration::from_millis(config.delay_ms);
     let mut results = Vec::with_capacity(config.threads.len());

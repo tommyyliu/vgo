@@ -112,19 +112,57 @@ const NEAREST_CHUNK: usize = 128;
 /// and walking a spatial index.
 const NEAREST_SEARCH_MINIMUM_STONES: usize = 96;
 
+/// Buffers retained by a caller that renders many positions at one raster
+/// size. Their contents are scratch, not part of a raster's meaning.
+#[derive(Debug, Default)]
+pub(crate) struct EdtScratch {
+    legal: Vec<bool>,
+    field: Vec<f64>,
+    sources: Vec<f64>,
+    results: Vec<f64>,
+    vertices: Vec<usize>,
+    boundaries: Vec<f64>,
+    fine_column_xs: Vec<f64>,
+    fine_row_ys: Vec<f64>,
+    column_xs: Vec<f64>,
+    fine_columns: Vec<usize>,
+    nearest_squares: Vec<f64>,
+}
+
+impl EdtScratch {
+    pub(crate) fn legal_len(&self) -> usize {
+        self.legal.len()
+    }
+
+    pub(crate) fn invalidate_legal(&mut self) {
+        self.legal.clear();
+    }
+}
+
 /// Exposed for `vgo-raster-bench`. See `sampled_legal_set`.
 #[doc(hidden)]
 pub fn squared_distance_transform(mask: &[bool], width: usize, height: usize) -> Vec<f64> {
-    let mut field: Vec<f64> = mask
-        .iter()
-        .map(|inside| if *inside { 0.0 } else { ABSENT })
-        .collect();
+    let mut scratch = EdtScratch::default();
+    squared_distance_transform_into(mask, width, height, &mut scratch);
+    scratch.field
+}
+
+fn squared_distance_transform_into(
+    mask: &[bool],
+    width: usize,
+    height: usize,
+    scratch: &mut EdtScratch,
+) {
+    scratch.field.resize(mask.len(), 0.0);
+    for (value, inside) in scratch.field.iter_mut().zip(mask) {
+        *value = if *inside { 0.0 } else { ABSENT };
+    }
 
     let longest = width.max(height);
-    let mut sources = vec![0.0_f64; COLUMN_BLOCK * longest];
-    let mut results = vec![0.0_f64; COLUMN_BLOCK * longest];
-    let mut vertices = vec![0usize; longest];
-    let mut boundaries = vec![0.0_f64; longest + 1];
+    scratch.sources.resize(COLUMN_BLOCK * longest, 0.0);
+    scratch.results.resize(COLUMN_BLOCK * longest, 0.0);
+    scratch.vertices.resize(longest, 0);
+    scratch.boundaries.resize(longest + 1, 0.0);
 
     // Columns, a cache line's worth at a time. `transform_1d` still sees one
     // contiguous line and is untouched; only the order of the gather changes,
@@ -134,22 +172,22 @@ pub fn squared_distance_transform(mask: &[bool], width: usize, height: usize) ->
         for row in 0..height {
             let base = row * width + block;
             for column in 0..columns {
-                sources[column * longest + row] = field[base + column];
+                scratch.sources[column * longest + row] = scratch.field[base + column];
             }
         }
         for column in 0..columns {
             let from = column * longest;
             transform_1d(
-                &sources[from..from + height],
-                &mut results[from..from + height],
-                &mut vertices,
-                &mut boundaries,
+                &scratch.sources[from..from + height],
+                &mut scratch.results[from..from + height],
+                &mut scratch.vertices,
+                &mut scratch.boundaries,
             );
         }
         for row in 0..height {
             let base = row * width + block;
             for column in 0..columns {
-                field[base + column] = results[column * longest + row];
+                scratch.field[base + column] = scratch.results[column * longest + row];
             }
         }
     }
@@ -157,16 +195,17 @@ pub fn squared_distance_transform(mask: &[bool], width: usize, height: usize) ->
     // Rows are already contiguous, so they need none of that.
     for row in 0..height {
         let base = row * width;
-        sources[..width].copy_from_slice(&field[base..base + width]);
+        scratch
+            .sources[..width]
+            .copy_from_slice(&scratch.field[base..base + width]);
         transform_1d(
-            &sources[..width],
-            &mut results[..width],
-            &mut vertices,
-            &mut boundaries,
+            &scratch.sources[..width],
+            &mut scratch.results[..width],
+            &mut scratch.vertices,
+            &mut scratch.boundaries,
         );
-        field[base..base + width].copy_from_slice(&results[..width]);
+        scratch.field[base..base + width].copy_from_slice(&scratch.results[..width]);
     }
-    field
 }
 
 /// Stones bucketed into a uniform grid for nearest-distance queries.
@@ -299,6 +338,17 @@ fn nearest_row_chunked(
 /// tracks whatever the transform needs and will change without notice.
 #[doc(hidden)]
 pub fn sampled_legal_set(position: &Position, fine_width: usize, fine_height: usize) -> Vec<bool> {
+    let mut scratch = EdtScratch::default();
+    sampled_legal_set_into(position, fine_width, fine_height, &mut scratch);
+    scratch.legal
+}
+
+fn sampled_legal_set_into(
+    position: &Position,
+    fine_width: usize,
+    fine_height: usize,
+    scratch: &mut EdtScratch,
+) {
     let stones = position.stones();
     //
     // Testing every pixel against every stone is O(pixels · n) and dominates at
@@ -310,13 +360,16 @@ pub fn sampled_legal_set(position: &Position, fine_width: usize, fine_height: us
     let radius = position.radius();
     let exclusion = 2.0 * radius - COORDINATE_EPSILON;
     let exclusion_squared = exclusion * exclusion;
-    let mut legal = vec![false; fine_width * fine_height];
-    let column_xs: Vec<f64> = (0..fine_width)
-        .map(|column| (column as f64 + 0.5) / fine_width as f64)
-        .collect();
-    let row_ys: Vec<f64> = (0..fine_height)
-        .map(|row| (row as f64 + 0.5) / fine_height as f64)
-        .collect();
+    scratch.legal.resize(fine_width * fine_height, false);
+    scratch.legal.fill(false);
+    scratch.fine_column_xs.resize(fine_width, 0.0);
+    for (column, x) in scratch.fine_column_xs.iter_mut().enumerate() {
+        *x = (column as f64 + 0.5) / fine_width as f64;
+    }
+    scratch.fine_row_ys.resize(fine_height, 0.0);
+    for (row, y) in scratch.fine_row_ys.iter_mut().enumerate() {
+        *y = (row as f64 + 0.5) / fine_height as f64;
+    }
     let inset_low = radius - COORDINATE_EPSILON;
     let inset_high = 1.0 - radius + COORDINATE_EPSILON;
     let first_column = ((inset_low * fine_width as f64 - 0.5).ceil().max(0.0)) as usize;
@@ -324,13 +377,13 @@ pub fn sampled_legal_set(position: &Position, fine_width: usize, fine_height: us
         .floor()
         .min(fine_width.saturating_sub(1) as f64)) as usize;
     for row in 0..fine_height {
-        let y = row_ys[row];
+        let y = scratch.fine_row_ys[row];
         if y < inset_low || y > inset_high {
             continue;
         }
         if first_column <= last_column {
             let base = row * fine_width;
-            legal[base + first_column..=base + last_column].fill(true);
+            scratch.legal[base + first_column..=base + last_column].fill(true);
         }
     }
     for stone in stones {
@@ -343,7 +396,7 @@ pub fn sampled_legal_set(position: &Position, fine_width: usize, fine_height: us
         let high_column = ((((stone.x + exclusion) * fine_width as f64 - 0.5).ceil()) as usize)
             .min(fine_width - 1);
         for row in low_row..=high_row {
-            let y = row_ys[row];
+            let y = scratch.fine_row_ys[row];
             let dy = y - stone.y;
             let dy_squared = dy * dy;
             if dy_squared > exclusion_squared {
@@ -351,15 +404,14 @@ pub fn sampled_legal_set(position: &Position, fine_width: usize, fine_height: us
             }
             let base = row * fine_width;
             for column in low_column..=high_column {
-                let x = column_xs[column];
+                let x = scratch.fine_column_xs[column];
                 let dx = x - stone.x;
                 if dx.mul_add(dx, dy_squared) < exclusion_squared {
-                    legal[base + column] = false;
+                    scratch.legal[base + column] = false;
                 }
             }
         }
     }
-    legal
 }
 
 /// Cells whose centre lies within `radius` of any of `centres`.
@@ -572,16 +624,152 @@ fn masks_by_bounded_distance(
     want_settled: bool,
     want_dead_zone: bool,
 ) -> (Vec<bool>, Vec<bool>, usize) {
+    let mut scratch = EdtScratch::default();
+    let mut mask = Vec::new();
+    let mut dead = Vec::new();
+    let exact_tests = masks_by_bounded_distance_into(
+        position,
+        config,
+        oversample,
+        want_settled,
+        want_dead_zone,
+        &mut scratch,
+        &mut mask,
+        &mut dead,
+    );
+    (mask, dead, exact_tests)
+}
+
+pub(crate) fn settled_mask_by_bounded_distance_into(
+    position: &Position,
+    config: RasterConfig,
+    oversample: usize,
+    scratch: &mut EdtScratch,
+    mask: &mut Vec<bool>,
+) {
+    let mut dead = Vec::new();
+    masks_by_bounded_distance_into(
+        position,
+        config,
+        oversample,
+        true,
+        false,
+        scratch,
+        mask,
+        &mut dead,
+    );
+}
+
+/// Update the sampled legal set for one appended stone and classify settled
+/// pixels using a caller-maintained nearest-stone field. This is deliberately
+/// limited to the production oversample-1 path; captures and other changes use
+/// the full builder.
+pub(crate) fn settled_mask_by_incremental_append_into(
+    position: &Position,
+    config: RasterConfig,
+    stone: Point,
+    nearest_squares: &[f64],
+    scratch: &mut EdtScratch,
+    mask: &mut Vec<bool>,
+) -> bool {
+    let pixels = config.pixels();
+    if scratch.legal.len() != pixels || nearest_squares.len() != pixels {
+        return false;
+    }
+    let radius = position.radius();
+    let exclusion = 2.0 * radius - COORDINATE_EPSILON;
+    let exclusion_squared = exclusion * exclusion;
+    let width = config.width;
+    let height = config.height;
+    let low_row = (((stone.y - exclusion) * height as f64 - 0.5).floor()).max(0.0) as usize;
+    let high_row = ((((stone.y + exclusion) * height as f64 - 0.5).ceil()) as usize)
+        .min(height - 1);
+    let low_column = (((stone.x - exclusion) * width as f64 - 0.5).floor()).max(0.0) as usize;
+    let high_column = ((((stone.x + exclusion) * width as f64 - 0.5).ceil()) as usize)
+        .min(width - 1);
+    for row in low_row..=high_row {
+        let y = (row as f64 + 0.5) / height as f64;
+        let dy = y - stone.y;
+        let dy_squared = dy * dy;
+        for column in low_column..=high_column {
+            let x = (column as f64 + 0.5) / width as f64;
+            let dx = x - stone.x;
+            if dx.mul_add(dx, dy_squared) < exclusion_squared {
+                scratch.legal[row * width + column] = false;
+            }
+        }
+    }
+    let legal = std::mem::take(&mut scratch.legal);
+    squared_distance_transform_into(&legal, width, height, scratch);
+    scratch.legal = legal;
+
+    scratch.column_xs.resize(width, 0.0);
+    scratch.fine_columns.resize(width, 0);
+    for (column, x) in scratch.column_xs.iter_mut().enumerate() {
+        *x = (column as f64 + 0.5) / width as f64;
+        scratch.fine_columns[column] = column;
+    }
+    mask.resize(pixels, false);
+    let spacing = 1.0 / width as f64;
+    let spacing_squared = spacing * spacing;
+    let slack = spacing * std::f64::consts::SQRT_2;
+    let mut vertices: Option<Vec<Point>> = None;
+    for row in 0..height {
+        let y = (row as f64 + 0.5) / height as f64;
+        let output_base = row * width;
+        let sampled_base = row * width;
+        for column in 0..width {
+            let x = scratch.column_xs[column];
+            let sampled_squared = scratch.field[sampled_base + scratch.fine_columns[column]]
+                * spacing_squared;
+            let sampled = sampled_squared.sqrt();
+            let sampled_minus_slack = sampled - slack;
+            let pixel = output_base + column;
+            mask[pixel] = if sampled_minus_slack > 0.0
+                && nearest_squares[pixel] <= sampled_minus_slack * sampled_minus_slack
+            {
+                true
+            } else if nearest_squares[pixel] > sampled_squared {
+                false
+            } else {
+                let known = vertices.get_or_insert_with(|| legal_set_vertices(position));
+                no_legal_point_closer_than(
+                    position,
+                    Point::new(x, y),
+                    nearest_squares[pixel].sqrt(),
+                    Some(known),
+                )
+            };
+        }
+    }
+    true
+}
+
+fn masks_by_bounded_distance_into(
+    position: &Position,
+    config: RasterConfig,
+    oversample: usize,
+    want_settled: bool,
+    want_dead_zone: bool,
+    scratch: &mut EdtScratch,
+    mask: &mut Vec<bool>,
+    dead: &mut Vec<bool>,
+) -> usize {
     let pixels = config.pixels();
     let stones = position.stones();
     if (stones.is_empty() || !want_settled) && !want_dead_zone {
-        return (vec![false; pixels], Vec::new(), 0);
+        mask.resize(pixels, false);
+        mask.fill(false);
+        dead.clear();
+        return 0;
     }
     let radius = position.radius();
     let scale = oversample.max(1) | 1;
     let (fine_width, fine_height) = (config.width * scale, config.height * scale);
-    let legal = sampled_legal_set(position, fine_width, fine_height);
-    let squared = squared_distance_transform(&legal, fine_width, fine_height);
+    sampled_legal_set_into(position, fine_width, fine_height, scratch);
+    let legal = std::mem::take(&mut scratch.legal);
+    squared_distance_transform_into(&legal, fine_width, fine_height, scratch);
+    scratch.legal = legal;
     let spacing = 1.0 / fine_width as f64;
     let spacing_squared = spacing * spacing;
     let slack = spacing * std::f64::consts::SQRT_2;
@@ -618,16 +806,18 @@ fn masks_by_bounded_distance(
     } else {
         Vec::new()
     };
-    let mut mask = if want_settled {
-        vec![false; pixels]
+    if want_settled {
+        mask.resize(pixels, false);
+        mask.fill(false);
     } else {
-        Vec::new()
-    };
-    let mut dead = if want_dead_zone {
-        vec![false; pixels]
+        mask.clear();
+    }
+    if want_dead_zone {
+        dead.resize(pixels, false);
+        dead.fill(false);
     } else {
-        Vec::new()
-    };
+        dead.clear();
+    }
     let mut exact_tests = 0usize;
     // The nearest stone, a row at a time, stones outside and pixels inside.
     //
@@ -639,13 +829,13 @@ fn masks_by_bounded_distance(
     // use, and they compute two minima for both colours in a fraction of what
     // this cost for one.
     let row_width = config.width;
-    let mut column_xs = vec![0.0f64; row_width];
-    let mut fine_columns = vec![0usize; row_width];
-    for (column, x) in column_xs.iter_mut().enumerate() {
+    scratch.column_xs.resize(row_width, 0.0);
+    scratch.fine_columns.resize(row_width, 0);
+    for (column, x) in scratch.column_xs.iter_mut().enumerate() {
         *x = (column as f64 + 0.5) / row_width as f64;
-        fine_columns[column] = (column * scale + scale / 2).min(fine_width - 1);
+        scratch.fine_columns[column] = (column * scale + scale / 2).min(fine_width - 1);
     }
-    let mut nearest_squares = vec![f64::INFINITY; row_width];
+    scratch.nearest_squares.resize(row_width, f64::INFINITY);
     let nearest_grid = if want_settled && stones.len() >= NEAREST_SEARCH_MINIMUM_STONES {
         let cell = (2.0 * radius).max(1.0 / (stones.len() as f64).sqrt());
         Some(StoneGrid::build(position, cell))
@@ -659,9 +849,15 @@ fn masks_by_bounded_distance(
         let sampled_base = fine_row * fine_width;
         if want_settled && !stones.is_empty() {
             if let Some(grid) = nearest_grid.as_ref() {
-                nearest_row_chunked(position, grid, y, &column_xs, &mut nearest_squares);
+                nearest_row_chunked(
+                    position,
+                    grid,
+                    y,
+                    &scratch.column_xs,
+                    &mut scratch.nearest_squares,
+                );
             } else {
-                nearest_squares.fill(f64::INFINITY);
+                scratch.nearest_squares.fill(f64::INFINITY);
                 for stone in stones {
                     let dy = y - stone.y;
                     let dy_square = dy * dy;
@@ -674,7 +870,11 @@ fn masks_by_bounded_distance(
                     // becomes a knob that silently re-renders positions near it;
                     // and it is the faster of the two here anyway, measured at
                     // 0.562 ms against 0.585 at 28 stones.
-                    for (nearest, &x) in nearest_squares.iter_mut().zip(column_xs.iter()) {
+                    for (nearest, &x) in scratch
+                        .nearest_squares
+                        .iter_mut()
+                        .zip(scratch.column_xs.iter())
+                    {
                         let dx = x - stone_x;
                         *nearest = dx.mul_add(dx, dy_square).min(*nearest);
                     }
@@ -683,8 +883,9 @@ fn masks_by_bounded_distance(
         }
         if want_dead_zone {
             for column in 0..config.width {
-                let x = column_xs[column];
-                let sampled_squared = squared[sampled_base + fine_columns[column]] * spacing_squared;
+                let x = scratch.column_xs[column];
+                let sampled_squared = scratch.field[sampled_base + scratch.fine_columns[column]]
+                    * spacing_squared;
                 dead[output_base + column] = if near_vertex[output_base + column] {
                     false
                 } else if sampled_squared <= radius_squared {
@@ -702,8 +903,9 @@ fn masks_by_bounded_distance(
             continue;
         }
         for column in 0..config.width {
-            let x = column_xs[column];
-            let sampled_squared = squared[sampled_base + fine_columns[column]] * spacing_squared;
+            let x = scratch.column_xs[column];
+            let sampled_squared =
+                scratch.field[sampled_base + scratch.fine_columns[column]] * spacing_squared;
             // Keep the cheap cases in squared-distance space. The old form
             // took two square roots for every pixel, although only the narrow
             // undecided band needs the exact nearest distance. This leaves one
@@ -726,20 +928,20 @@ fn masks_by_bounded_distance(
             let sampled = sampled_squared.sqrt();
             let sampled_minus_slack = sampled - slack;
             mask[output_base + column] = if sampled_minus_slack > 0.0
-                && nearest_squares[column] <= sampled_minus_slack * sampled_minus_slack
+                && scratch.nearest_squares[column] <= sampled_minus_slack * sampled_minus_slack
             {
                 true
-            } else if nearest_squares[column] > sampled_squared {
+            } else if scratch.nearest_squares[column] > sampled_squared {
                 false
             } else {
                 exact_tests += 1;
                 let known = vertices.get_or_insert_with(|| legal_set_vertices(position));
-                let nearest = nearest_squares[column].sqrt();
+                let nearest = scratch.nearest_squares[column].sqrt();
                 no_legal_point_closer_than(position, Point::new(x, y), nearest, Some(known))
             };
         }
     }
-    (mask, dead, exact_tests)
+    exact_tests
 }
 
 #[cfg(test)]

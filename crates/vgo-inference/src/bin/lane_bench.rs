@@ -20,27 +20,43 @@ use vgo_inference::{
 use vgo_raster::{RasterConfig, RasterKind};
 use vgo_search::Evaluator;
 
-fn fixture_positions() -> Vec<Position> {
-    let radius = 1.0 / 6.0;
-    let coordinates = [radius, 0.5, 1.0 - radius];
-    let stones = coordinates
-        .into_iter()
-        .flat_map(|y| coordinates.into_iter().map(move |x| (x, y)))
-        .enumerate()
-        .map(|(index, (x, y))| {
-            Stone::new(
+/// Positions to drive the broker with.
+///
+/// `units` is the board size in stone diameters and `stones` how many are on
+/// it, because both decide what rasterization costs and the default of neither
+/// is representative. The original fixture was a 3x3 lattice at radius 1/6 --
+/// nine enormous stones -- which makes the raster nearly free and turns this
+/// into a measurement of the GPU alone. Real generation plays 38-unit boards to
+/// 312 plies, so the positions that dominate carry well over a hundred stones
+/// and rasterizing them is most of the host's work.
+fn fixture_positions(units: usize, stones: usize) -> Vec<Position> {
+    let radius = 1.0 / units as f64;
+    let step = 2.2 * radius;
+    let mut placed = Vec::new();
+    'outer: for row in 0..64 {
+        for column in 0..64 {
+            let x = 0.04 + step * f64::from(column);
+            let y = 0.04 + step * f64::from(row);
+            if x > 0.97 || y > 0.97 {
+                continue;
+            }
+            placed.push(Stone::new(
                 x,
                 y,
-                if index % 2 == 0 {
-                    Color::Black
-                } else {
-                    Color::White
-                },
-            )
+                if placed.len() % 2 == 0 { Color::Black } else { Color::White },
+            ));
+            if placed.len() == stones {
+                break 'outer;
+            }
+        }
+    }
+    // A handful of distinct positions so the evaluator is not handed the same
+    // board every time, which would flatter any cache between here and the GPU.
+    (0..8)
+        .map(|offset| {
+            let count = placed.len().saturating_sub(offset);
+            Position::new(radius, placed[..count].to_vec(), Color::Black)
         })
-        .collect::<Vec<_>>();
-    (0..=stones.len())
-        .map(|count| Position::new(radius, stones[..count].to_vec(), Color::Black))
         .collect()
 }
 
@@ -65,6 +81,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seconds: f64 = get("--seconds", "8").parse()?;
     let delay_ms: u64 = get("--delay-ms", "1").parse()?;
     let cache = PathBuf::from(get("--cache-directory", "artifacts/onnx-cache"));
+    // Board size and occupancy, because rasterization cost depends on both and
+    // a sparse fixture measures the GPU rather than the pipeline.
+    let units: usize = get("--units", "38").parse()?;
+    let stones: usize = get("--stones", "0").parse()?;
 
     // The layout has to match what the model was exported with, or validation
     // rejects it on channel count. Also the only way to reach a packed model
@@ -99,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         built,
     )?);
 
-    let positions = fixture_positions();
+    let positions = fixture_positions(units, stones);
     let evaluations = Arc::new(AtomicUsize::new(0));
 
     // Warm every lane before timing.
@@ -144,7 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let batches = metrics.batches.max(1);
     let positions_done = metrics.positions.max(1);
 
-    println!("lanes={lanes} callers={callers} group={group} batch={batch} delay_ms={delay_ms}");
+    println!("lanes={lanes} callers={callers} group={group} batch={batch} delay_ms={delay_ms} units={units} stones={stones}");
     println!("  positions/s   {:9.0}", total as f64 / elapsed);
     println!(
         "  average batch {:9.1}",

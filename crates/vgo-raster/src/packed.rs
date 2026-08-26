@@ -19,9 +19,10 @@
 use std::ops::Range;
 
 use half::f16;
-use vgo_core::{Color, Position};
+use vgo_core::{Color, Point, Position};
 
-use crate::{RasterConfig, RasterKind, settled_for_raster};
+use crate::edt::{EdtScratch, settled_mask_by_incremental_append_into};
+use crate::{RasterConfig, RasterKind, settled_for_raster_into};
 
 /// Which planes of a layout are binary, continuous, and constant.
 ///
@@ -71,13 +72,48 @@ pub const fn bit_plane_bytes(pixels: usize) -> usize {
 /// One position, in the three tensors the packed graph takes.
 // No `Eq`: the fp16 planes are floats, and a raster comparing equal to
 // itself is not something anything here relies on.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct PackedRaster {
     config: RasterConfig,
     layout: PackedLayout,
     bits: Vec<u8>,
     dense: Vec<f16>,
     scalars: Vec<f16>,
+    scratch: PackedScratch,
+}
+
+#[derive(Debug, Default)]
+struct PackedScratch {
+    edt: EdtScratch,
+    settled: Vec<bool>,
+    stone_xs: Vec<f64>,
+    stone_ys: Vec<f64>,
+    stone_is_current: Vec<bool>,
+}
+
+impl Clone for PackedRaster {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config,
+            layout: self.layout,
+            bits: self.bits.clone(),
+            dense: self.dense.clone(),
+            scalars: self.scalars.clone(),
+            // Scratch is deliberately not cloned: cloning an inference input
+            // should copy the raster, not duplicate its retained work buffers.
+            scratch: PackedScratch::default(),
+        }
+    }
+}
+
+impl PartialEq for PackedRaster {
+    fn eq(&self, other: &Self) -> bool {
+        self.config == other.config
+            && self.layout == other.layout
+            && self.bits == other.bits
+            && self.dense == other.dense
+            && self.scalars == other.scalars
+    }
 }
 
 impl PackedRaster {
@@ -96,6 +132,7 @@ impl PackedRaster {
             bits: vec![0; layout.binary.len() * bit_plane_bytes(pixels)],
             dense: vec![f16::ZERO; layout.continuous.len() * pixels],
             scalars: vec![f16::ZERO; layout.scalar.len()],
+            scratch: PackedScratch::default(),
         }
     }
 
@@ -148,6 +185,274 @@ impl PackedRaster {
     pub fn binary_pixel(&self, slot: usize, pixel: usize) -> bool {
         let plane = self.bit_plane(slot);
         self.bits[plane.start + pixel / 8] & (1 << (pixel % 8)) != 0
+    }
+}
+
+/// Experimental append-only raster state.
+///
+/// This is a prototype for game positions that are a direct child of the
+/// previous position and did not capture. It keeps the exact nearest and
+/// second-nearest stone labels so the stone-derived planes can be updated for
+/// one appended stone. The legal set is updated by clearing only the newly
+/// occupied exclusion disc; its exact distance transform is then recomputed.
+/// Captures deliberately return `false` so callers can use the normal full
+/// raster path.
+#[doc(hidden)]
+pub struct IncrementalPackedRaster {
+    raster: PackedRaster,
+    nearest_squares: Vec<f64>,
+    settled_nearest_squares: Vec<f64>,
+    second_squares: Vec<f64>,
+    nearest_stones: Vec<usize>,
+    second_stones: Vec<usize>,
+    candidate_bounds: Vec<f64>,
+}
+
+const CANDIDATE_TILE: usize = 16;
+
+impl IncrementalPackedRaster {
+    #[must_use]
+    pub fn new(position: &Position, config: RasterConfig) -> Self {
+        let raster = rasterize_packed(position, config);
+        let mut this = Self {
+            raster,
+            nearest_squares: vec![f64::INFINITY; config.pixels()],
+            settled_nearest_squares: vec![f64::INFINITY; config.pixels()],
+            second_squares: vec![f64::INFINITY; config.pixels()],
+            nearest_stones: vec![usize::MAX; config.pixels()],
+            second_stones: vec![usize::MAX; config.pixels()],
+            candidate_bounds: vec![
+                f64::INFINITY;
+                config.width.div_ceil(CANDIDATE_TILE)
+                    * config.height.div_ceil(CANDIDATE_TILE)
+            ],
+        };
+        this.rebuild_stone_fields(position);
+        this
+    }
+
+    #[must_use]
+    pub fn raster(&self) -> &PackedRaster {
+        &self.raster
+    }
+
+    /// Replace the cached position after a capture or another non-append
+    /// transition. The next append can then use [`Self::update_no_capture`]
+    /// again.
+    pub fn replace(&mut self, position: &Position) {
+        self.raster.scratch.edt.invalidate_legal();
+        rasterize_compact_radius_packed_into(position, self.raster.config, &mut self.raster);
+        self.rebuild_stone_fields(position);
+    }
+
+    fn rebuild_stone_fields(&mut self, position: &Position) {
+        let width = self.raster.config.width;
+        let height = self.raster.config.height;
+        self.nearest_squares.fill(f64::INFINITY);
+        self.settled_nearest_squares.fill(f64::INFINITY);
+        self.second_squares.fill(f64::INFINITY);
+        self.nearest_stones.fill(usize::MAX);
+        self.second_stones.fill(usize::MAX);
+        for row in 0..height {
+            let y = (row as f64 + 0.5) / height as f64;
+            for column in 0..width {
+                let x = (column as f64 + 0.5) / width as f64;
+                let pixel = row * width + column;
+                for (stone_index, stone) in position.stones().iter().enumerate() {
+                    let dx = x - stone.x;
+                    let dy = y - stone.y;
+                    let square = dx * dx + dy * dy;
+                    let settled_square = dx.mul_add(dx, dy * dy);
+                    let settled_nearest = &mut self.settled_nearest_squares[pixel];
+                    if settled_square < *settled_nearest {
+                        *settled_nearest = settled_square;
+                    }
+                    if square < self.nearest_squares[pixel] {
+                        self.second_squares[pixel] = self.nearest_squares[pixel];
+                        self.second_stones[pixel] = self.nearest_stones[pixel];
+                        self.nearest_squares[pixel] = square;
+                        self.nearest_stones[pixel] = stone_index;
+                    } else if square < self.second_squares[pixel] {
+                        self.second_squares[pixel] = square;
+                        self.second_stones[pixel] = stone_index;
+                    }
+                }
+            }
+        }
+        self.rebuild_candidate_bounds();
+    }
+
+    fn rebuild_candidate_bounds(&mut self) {
+        let width = self.raster.config.width;
+        let height = self.raster.config.height;
+        let tiles_width = width.div_ceil(CANDIDATE_TILE);
+        self.candidate_bounds.fill(0.0);
+        for row in 0..height {
+            let tile_row = row / CANDIDATE_TILE;
+            for column in 0..width {
+                let pixel = row * width + column;
+                let tile = tile_row * tiles_width + column / CANDIDATE_TILE;
+                self.candidate_bounds[tile] = self.candidate_bounds[tile]
+                    .max(self.second_squares[pixel])
+                    .max(self.settled_nearest_squares[pixel]);
+            }
+        }
+    }
+
+    /// Apply an append-only, no-capture transition.
+    ///
+    /// Returns `true` when the transition was handled incrementally. A false
+    /// result leaves this raster unchanged. Call [`Self::replace`] to
+    /// resynchronize it through the full raster path.
+    pub fn update_no_capture(&mut self, previous: &Position, next: &Position) -> bool {
+        let previous_stones = previous.stones();
+        let next_stones = next.stones();
+        if next.radius() != previous.radius()
+            || next_stones.len() != previous_stones.len() + 1
+            || next_stones[..previous_stones.len()] != *previous_stones
+        {
+            return false;
+        }
+        let width = self.raster.config.width;
+        let height = self.raster.config.height;
+        let pixels = self.raster.config.pixels();
+        let new_index = previous_stones.len();
+        let new_stone = next_stones[new_index];
+        let radius = next.radius();
+        let radius_square = radius * radius;
+
+        // The full writer only leaves a reusable legal mask on its EDT path.
+        // If the previous position used the cheap small-board fallback, let
+        // the caller do one full render to establish that state.
+        if self.raster.scratch.edt.legal_len() != pixels {
+            return false;
+        }
+
+        // A new stone can change a pixel only when it beats that pixel's
+        // current second-nearest stone. The tile bounds are conservative upper
+        // bounds, so skipping a tile cannot skip a change. They also include
+        // the FMA nearest field used by settled classification.
+        let tiles_width = width.div_ceil(CANDIDATE_TILE);
+        let tiles_height = height.div_ceil(CANDIDATE_TILE);
+        for tile_row in 0..tiles_height {
+            let low_row = tile_row * CANDIDATE_TILE;
+            let high_row = ((tile_row + 1) * CANDIDATE_TILE).min(height);
+            for tile_column in 0..tiles_width {
+                let tile = tile_row * tiles_width + tile_column;
+                let low_column = tile_column * CANDIDATE_TILE;
+                let high_column = ((tile_column + 1) * CANDIDATE_TILE).min(width);
+                let low_x = (low_column as f64 + 0.5) / width as f64;
+                let high_x = ((high_column - 1) as f64 + 0.5) / width as f64;
+                let low_y = (low_row as f64 + 0.5) / height as f64;
+                let high_y = ((high_row - 1) as f64 + 0.5) / height as f64;
+                let dx = if new_stone.x < low_x {
+                    low_x - new_stone.x
+                } else if new_stone.x > high_x {
+                    new_stone.x - high_x
+                } else {
+                    0.0
+                };
+                let dy = if new_stone.y < low_y {
+                    low_y - new_stone.y
+                } else if new_stone.y > high_y {
+                    new_stone.y - high_y
+                } else {
+                    0.0
+                };
+                if dx.mul_add(dx, dy * dy) >= self.candidate_bounds[tile] {
+                    continue;
+                }
+                for row in low_row..high_row {
+                    let y = (row as f64 + 0.5) / height as f64;
+                    for column in low_column..high_column {
+                        let pixel = row * width + column;
+                        let x = (column as f64 + 0.5) / width as f64;
+                        let dx = x - new_stone.x;
+                        let dy = y - new_stone.y;
+                        let settled_square = dx.mul_add(dx, dy * dy);
+                        if settled_square < self.settled_nearest_squares[pixel] {
+                            self.settled_nearest_squares[pixel] = settled_square;
+                        }
+                        let square = dx * dx + dy * dy;
+                        let changed = if square < self.nearest_squares[pixel] {
+                            self.second_squares[pixel] = self.nearest_squares[pixel];
+                            self.second_stones[pixel] = self.nearest_stones[pixel];
+                            self.nearest_squares[pixel] = square;
+                            self.nearest_stones[pixel] = new_index;
+                            true
+                        } else if square < self.second_squares[pixel] {
+                            self.second_squares[pixel] = square;
+                            self.second_stones[pixel] = new_index;
+                            true
+                        } else {
+                            false
+                        };
+                        if changed {
+                            self.raster.dense[pixel] = f16::from_f32(ridge_at(
+                                self.nearest_squares[pixel],
+                                self.second_squares[pixel],
+                                radius,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(settled_mask_by_incremental_append_into(
+            next,
+            self.raster.config,
+            Point::new(new_stone.x, new_stone.y),
+            &self.settled_nearest_squares,
+            &mut self.raster.scratch.edt,
+            &mut self.raster.scratch.settled,
+        ));
+
+        let stride = bit_plane_bytes(pixels);
+        let (current_plane, rest) = self.raster.bits.split_at_mut(stride);
+        let (opponent_plane, settled_plane) = rest.split_at_mut(stride);
+        settled_plane.fill(0);
+        for pixel in 0..pixels {
+            set_bit(settled_plane, pixel, self.raster.scratch.settled[pixel]);
+        }
+
+        if next.to_move() != previous.to_move() {
+            for byte in 0..stride {
+                std::mem::swap(&mut current_plane[byte], &mut opponent_plane[byte]);
+            }
+        }
+        let target_plane = if new_stone.color == next.to_move() {
+            current_plane
+        } else {
+            opponent_plane
+        };
+        let low_row = (((new_stone.y - radius) * height as f64 - 0.5).floor()).max(0.0) as usize;
+        let high_row = ((((new_stone.y + radius) * height as f64 - 0.5).ceil()) as usize)
+            .min(height - 1);
+        let low_column =
+            (((new_stone.x - radius) * width as f64 - 0.5).floor()).max(0.0) as usize;
+        let high_column = ((((new_stone.x + radius) * width as f64 - 0.5).ceil()) as usize)
+            .min(width - 1);
+        for row in low_row..=high_row {
+            let y = (row as f64 + 0.5) / height as f64;
+            let dy = y - new_stone.y;
+            let dy_square = dy * dy;
+            for column in low_column..=high_column {
+                let x = (column as f64 + 0.5) / width as f64;
+                let dx = x - new_stone.x;
+                if dx * dx + dy_square <= radius_square {
+                    set_bit(target_plane, row * width + column, true);
+                }
+            }
+        }
+
+        self.raster.scalars[0] = f16::from_f32(match next.to_move() {
+            Color::Black => next.komi() as f32,
+            Color::White => -next.komi() as f32,
+        });
+        self.raster.scalars[1] = f16::from_f32(f32::from(next.consecutive_passes() > 0));
+        self.raster.scalars[2] = f16::from_f32((2.0 * radius) as f32);
+        true
     }
 }
 
@@ -494,8 +799,18 @@ pub fn rasterize_compact_radius_packed_into(
     // it every pixel: measured 0.49 ms against 0.35 ms for the same arithmetic
     // through a hoisted slice.
     let PackedRaster {
-        bits, dense: dense_plane, ..
+        bits,
+        dense: dense_plane,
+        scratch,
+        ..
     } = out;
+    let PackedScratch {
+        edt,
+        settled,
+        stone_xs,
+        stone_ys,
+        stone_is_current,
+    } = scratch;
     for byte in bits.iter_mut() {
         *byte = 0;
     }
@@ -508,8 +823,9 @@ pub fn rasterize_compact_radius_packed_into(
         return;
     }
 
-    let settled = settled_for_raster(position, config);
+    settled_for_raster_into(position, config, edt, settled);
     assert_eq!(settled.len(), pixels);
+    let settled = settled.as_slice();
 
     let stride = bit_plane_bytes(pixels);
     let (current_plane, rest) = bits.split_at_mut(stride);
@@ -520,14 +836,20 @@ pub fn rasterize_compact_radius_packed_into(
     // The dense writer keeps two lists and scans each in full; the grid decides
     // which stones a chunk of pixels can possibly need.
     let stones = position.stones();
-    let mut stone_xs = Vec::with_capacity(stones.len());
-    let mut stone_ys = Vec::with_capacity(stone_xs.capacity());
-    let mut stone_is_current = Vec::with_capacity(stone_xs.capacity());
+    stone_xs.clear();
+    stone_ys.clear();
+    stone_is_current.clear();
+    stone_xs.reserve(stones.len());
+    stone_ys.reserve(stones.len());
+    stone_is_current.reserve(stones.len());
     for stone in stones {
         stone_xs.push(stone.x);
         stone_ys.push(stone.y);
         stone_is_current.push(stone.color == to_move);
     }
+    let stone_xs = stone_xs.as_slice();
+    let stone_ys = stone_ys.as_slice();
+    let stone_is_current = stone_is_current.as_slice();
     // Cell size from the stone count, not from the radius. `2r` is the natural
     // geometric choice -- it caps a cell at two stones -- but on a sparse board
     // it leaves the grid 93% empty, and the ring walk then spends its time
@@ -784,6 +1106,159 @@ mod tests {
                 assert_eq!(packed.scalars()[slot], expected, "scalar channel {channel}");
             }
         }
+    }
+
+    /// A hundred chained updates, each checked against a full render.
+    ///
+    /// Two updates cannot show drift, and drift is the entire risk of carrying
+    /// state: each step is exact, and the hundredth is wrong because the
+    /// ninety-nine before it each moved something by an ulp. A real game plays
+    /// 312 plies on a 38-unit board, so the incremental path is asked to stay
+    /// exact over hundreds of appends, not two.
+    ///
+    /// Compares the whole `PackedRaster` -- every bit plane, every fp16 ridge
+    /// value, every scalar -- at every step, so a divergence is caught at the
+    /// step it appears rather than at the end.
+    #[test]
+    fn incremental_stays_exact_over_a_long_chain() {
+        let radius = 1.0 / 38.0;
+        let step = 2.2 * radius;
+        let place = |index: usize| {
+            Stone::new(
+                0.04 + step * f64::from((index % 15) as u32),
+                0.04 + step * f64::from((index / 15) as u32),
+                if index % 2 == 0 { Color::Black } else { Color::White },
+            )
+        };
+        let config = RasterConfig::square_of(256, RasterKind::CompactRadius);
+
+        // Start above DISTANCE_SETTLED_MINIMUM_STONES so the first position is
+        // already on the EDT path; below it the writer leaves no reusable legal
+        // mask and the incremental path correctly refuses.
+        let start = 30usize;
+        let mut stones: Vec<Stone> = (0..start).map(place).collect();
+        let mut previous = Position::new(radius, stones.clone(), Color::White).with_komi(0.104);
+        let mut state = IncrementalPackedRaster::new(&previous, config);
+        let mut expected = PackedRaster::new(config);
+
+        let mut taken = 0usize;
+        for index in start..start + 100 {
+            stones.push(place(index));
+            let to_move = if index % 2 == 0 { Color::White } else { Color::Black };
+            let next = Position::new(radius, stones.clone(), to_move).with_komi(0.104);
+            if !next.validate().is_playable() {
+                break;
+            }
+            if state.update_no_capture(&previous, &next) {
+                taken += 1;
+                rasterize_compact_radius_packed_into(&next, config, &mut expected);
+                assert_eq!(
+                    state.raster(),
+                    &expected,
+                    "diverged at append {} ({} stones)",
+                    index - start,
+                    next.stones().len()
+                );
+            } else {
+                state.replace(&next);
+            }
+            previous = next;
+        }
+        assert!(taken >= 50, "only {taken} appends took the incremental path");
+    }
+
+#[test]
+    fn incremental_no_capture_matches_a_full_raster() {
+        let radius = 1.0 / 38.0;
+        let mut previous_stones = Vec::new();
+        for index in 0..60 {
+            let row = index / 16;
+            let column = index % 16;
+            previous_stones.push(Stone::new(
+                0.04 + 2.2 * radius * f64::from(column),
+                0.04 + 2.2 * radius * f64::from(row),
+                if index % 2 == 0 { Color::Black } else { Color::White },
+            ));
+        }
+        let mut next_stones = previous_stones.clone();
+        next_stones.push(Stone::new(
+            0.04 + 2.2 * radius * f64::from(60 % 16),
+            0.04 + 2.2 * radius * f64::from(60 / 16),
+            Color::Black,
+        ));
+        let previous = Position::new(radius, previous_stones, Color::White).with_komi(0.104);
+        let next = Position::new(radius, next_stones, Color::Black).with_komi(0.104);
+        let config = RasterConfig::square_of(256, RasterKind::CompactRadius);
+
+        let mut incremental = IncrementalPackedRaster::new(&previous, config);
+        assert!(incremental.update_no_capture(&previous, &next));
+
+        let mut expected = PackedRaster::new(config);
+        rasterize_compact_radius_packed_into(&next, config, &mut expected);
+        assert_eq!(incremental.raster(), &expected);
+
+        let mut next2_stones = next.stones().to_vec();
+        next2_stones.push(Stone::new(
+            0.04 + 2.2 * radius * f64::from(61 % 16),
+            0.04 + 2.2 * radius * f64::from(61 / 16),
+            Color::White,
+        ));
+        let next2 = Position::new(radius, next2_stones, Color::White).with_komi(0.104);
+        assert!(incremental.update_no_capture(&next, &next2));
+        rasterize_compact_radius_packed_into(&next2, config, &mut expected);
+        assert_eq!(incremental.raster(), &expected);
+    }
+
+    #[test]
+    #[ignore]
+    fn incremental_no_capture_timing_probe() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let radius = 1.0 / 38.0;
+        let config = RasterConfig::square_of(256, RasterKind::CompactRadius);
+        let mut stones = Vec::new();
+        let mut positions = Vec::new();
+        for count in 0..=240 {
+            positions.push(Position::new(radius, stones.clone(), Color::White));
+            if count == 240 {
+                break;
+            }
+            let index = count;
+            let row = index / 16;
+            let column = index % 16;
+            stones.push(Stone::new(
+                0.04 + 2.2 * radius * f64::from(column),
+                0.04 + 2.2 * radius * f64::from(row),
+                if index % 2 == 0 { Color::Black } else { Color::White },
+            ));
+        }
+        let rounds = 3;
+        let started = Instant::now();
+        for _ in 0..rounds {
+            let mut incremental = IncrementalPackedRaster::new(&positions[0], config);
+            for pair in positions.windows(2) {
+                if !incremental.update_no_capture(&pair[0], &pair[1]) {
+                    incremental.replace(&pair[1]);
+                }
+            }
+            black_box(incremental.raster());
+        }
+        let incremental_ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds);
+
+        let started = Instant::now();
+        for _ in 0..rounds {
+            let mut full = PackedRaster::new(config);
+            for position in &positions {
+                rasterize_compact_radius_packed_into(position, config, &mut full);
+            }
+            black_box(&full);
+        }
+        let full_ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds);
+        println!(
+            "incremental {incremental_ms:.2} ms vs full {full_ms:.2} ms for {} appends",
+            positions.len() - 1
+        );
     }
 
     /// The dense planes really are constant, which is the premise of storing
