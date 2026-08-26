@@ -199,7 +199,9 @@ pub fn rasterize_compact_radius_packed_into(
     assert_eq!(config.kind, RasterKind::CompactRadius);
     assert_eq!(out.config, config);
     assert!(config.width > 0 && config.height > 0);
-    assert!(position.validate().is_playable());
+    // Caller invariant, not this function's business, and an O(n^2)
+    // sweep per rasterization if checked in release. See `game::place`.
+    debug_assert!(position.validate().is_playable());
 
     let pixels = config.pixels();
     let width = config.width;

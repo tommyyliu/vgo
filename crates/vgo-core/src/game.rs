@@ -5,6 +5,9 @@ use crate::{Analysis, Color, Phase, Position, Ruleset, Settlement, Stone, legal_
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MoveError {
     Finished,
+    /// No longer produced. Board self-consistency is a caller invariant, checked
+    /// by `debug_assert` in `place` and `pass` rather than paid for per move;
+    /// the variant is kept so exhaustive matches on this enum keep compiling.
     InvalidPosition,
     IllegalPlacement,
     /// The move would take only the mover's own stones.
@@ -69,9 +72,22 @@ pub fn place(position: &Position, x: f64, y: f64) -> Result<MoveResult, MoveErro
     if position.phase() != Phase::Playing {
         return Err(MoveError::Finished);
     }
-    if !position.validate().is_playable() {
-        return Err(MoveError::InvalidPosition);
-    }
+    // Whether the board is self-consistent -- no two stones overlapping -- is an
+    // invariant of however the position was built, not something this move can
+    // break or fix. Every position reaching here came from an earlier `place`,
+    // `pass`, or `Position::new`, and the placement being attempted is checked
+    // separately by `legal_set::contains` below.
+    //
+    // Checking it anyway cost an O(n^2) pairwise sweep per move. A stack
+    // profile of the generator put the distance call inside it at 6% of working
+    // samples, because the search plays a move for every simulation.
+    //
+    // `debug_assert` keeps the check wherever it can catch a real mistake --
+    // tests, and any debug build -- and takes it off the hot path.
+    debug_assert!(
+        position.validate().is_playable(),
+        "position handed to the move generator is not playable"
+    );
     if !legal_set::contains(position, x, y) {
         return Err(MoveError::IllegalPlacement);
     }
@@ -163,9 +179,10 @@ pub fn pass(position: &Position) -> Result<MoveResult, MoveError> {
     if position.phase() != Phase::Playing {
         return Err(MoveError::Finished);
     }
-    if !position.validate().is_playable() {
-        return Err(MoveError::InvalidPosition);
-    }
+    debug_assert!(
+        position.validate().is_playable(),
+        "position handed to the move generator is not playable"
+    );
     let next = position.after_pass();
     let analysis = Analysis::new(&next);
     let event = if next.phase() == Phase::Finished {

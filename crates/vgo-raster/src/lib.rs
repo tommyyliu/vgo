@@ -709,7 +709,9 @@ pub fn rasterize_compact_with_predicate_into(
     data: &mut [f32],
 ) {
     assert!(config.width > 0 && config.height > 0);
-    assert!(position.validate().is_playable());
+    // Caller invariant, not this function's business, and an O(n^2)
+    // sweep per rasterization if checked in release. See `game::place`.
+    debug_assert!(position.validate().is_playable());
     let pixels = config.pixels();
     assert_eq!(data.len(), COMPACT_CHANNELS.len() * pixels);
     assert_eq!(settled.len(), pixels);
@@ -902,7 +904,9 @@ pub fn rasterize_compact_shader_reference_into(
 /// intermediate per-position allocation and host-side gather.
 pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
     assert!(config.width > 0 && config.height > 0);
-    assert!(position.validate().is_playable());
+    // Caller invariant, not this function's business, and an O(n^2)
+    // sweep per rasterization if checked in release. See `game::place`.
+    debug_assert!(position.validate().is_playable());
     let pixels = config.pixels();
     assert_eq!(data.len(), CHANNEL_COUNT * pixels);
     let radius = position.radius();
@@ -1188,7 +1192,9 @@ const LEGAL_TINT_ALPHA: f32 = 42.0 / 255.0;
 /// the position and differ only in what they expose.
 pub fn rasterize_rgb_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
     assert!(config.width > 0 && config.height > 0);
-    assert!(position.validate().is_playable());
+    // Caller invariant, not this function's business, and an O(n^2)
+    // sweep per rasterization if checked in release. See `game::place`.
+    debug_assert!(position.validate().is_playable());
     let pixels = config.pixels();
     assert_eq!(data.len(), RGB_CHANNEL_COUNT * pixels);
     let radius = position.radius();
@@ -2022,7 +2028,7 @@ mod tests {
             Color::Black,
         )
         .with_komi(0.104);
-        assert!(position.validate().is_playable());
+    assert!(position.validate().is_playable());
         let size = 64;
         let pixels = size * size;
 
@@ -2063,7 +2069,7 @@ mod tests {
             ],
             Color::Black,
         );
-        assert!(position.validate().is_playable());
+    assert!(position.validate().is_playable());
         let config = RasterConfig::square_of(128, RasterKind::CompactConnected);
         let pixels = config.pixels();
         let mut data = vec![f32::NAN; config.channels() * pixels];
