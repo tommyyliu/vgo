@@ -243,6 +243,9 @@ impl IncrementalPackedRaster {
         };
         this.rebuild_stone_fields(position);
         prime_incremental_transform(&mut this.raster.scratch.edt, config.width, config.height);
+        // The full render above did not record which pixels were undecided, so
+        // the first append has to classify everything once to find out.
+        this.raster.scratch.edt.invalidate_band();
         this
     }
 
@@ -256,6 +259,7 @@ impl IncrementalPackedRaster {
     /// again.
     pub fn replace(&mut self, position: &Position) {
         self.raster.scratch.edt.invalidate_legal();
+        self.raster.scratch.edt.invalidate_band();
         rasterize_compact_radius_packed_into(position, self.raster.config, &mut self.raster);
         self.rebuild_stone_fields(position);
         prime_incremental_transform(
@@ -353,6 +357,7 @@ impl IncrementalPackedRaster {
             .incremental_rows
             .resize(height, false);
         self.raster.scratch.edt.incremental_rows.fill(false);
+        self.raster.scratch.edt.reset_row_changes(height);
 
         // A new stone can change a pixel only when it beats that pixel's
         // current second-nearest stone. The tile bounds are conservative upper
@@ -399,6 +404,10 @@ impl IncrementalPackedRaster {
                         if settled_square < self.settled_nearest_squares[pixel] {
                             self.settled_nearest_squares[pixel] = settled_square;
                             self.raster.scratch.edt.incremental_rows[row] = true;
+                            // The other half of what decides a settled pixel.
+                            // The transform marks where the sampled distance
+                            // moved; this marks where the nearest stone did.
+                            self.raster.scratch.edt.mark_row_change(row, column);
                         }
                         let square = dx.mul_add(dx, dy * dy);
                         let changed = if square < self.nearest_squares[pixel] {

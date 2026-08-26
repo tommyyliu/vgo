@@ -32,10 +32,14 @@ fn clear_of_stones(
 
 #[must_use]
 pub fn contains(position: &Position, x: f64, y: f64) -> bool {
+    contains_with(position, None, x, y)
+}
+
+fn contains_with(position: &Position, buckets: Option<&StoneBuckets>, x: f64, y: f64) -> bool {
     x.is_finite()
         && y.is_finite()
         && in_inset(position, x, y)
-        && clear_of_stones(position, x, y, None, None)
+        && clear_of_stones_pruned(position, buckets, x, y, None, None)
 }
 
 fn visit_candidates(
@@ -44,7 +48,7 @@ fn visit_candidates(
     known_vertices: Option<&[Point]>,
     mut visit: impl FnMut(Point) -> bool,
 ) -> bool {
-    visit_candidates_within(position, point, None, known_vertices, &mut visit)
+    visit_candidates_within(position, point, None, known_vertices, None, &mut visit)
 }
 
 /// [`visit_candidates`], skipping stones whose candidate cannot land within
@@ -64,9 +68,10 @@ fn visit_candidates_within(
     point: Point,
     threshold: Option<f64>,
     known_vertices: Option<&[Point]>,
+    buckets: Option<&StoneBuckets>,
     visit: &mut impl FnMut(Point) -> bool,
 ) -> bool {
-    if contains(position, point.x, point.y) && visit(point) {
+    if contains_with(position, buckets, point.x, point.y) && visit(point) {
         return true;
     }
     let radius = position.radius();
@@ -89,7 +94,7 @@ fn visit_candidates_within(
         };
         for &(ux, uy) in directions {
             let candidate = Point::new(stone.x + diameter * ux, stone.y + diameter * uy);
-            if contains(position, candidate.x, candidate.y) && visit(candidate) {
+            if contains_with(position, buckets, candidate.x, candidate.y) && visit(candidate) {
                 return true;
             }
         }
@@ -101,7 +106,7 @@ fn visit_candidates_within(
         Point::new(point.x, radius),
         Point::new(point.x, 1.0 - radius),
     ] {
-        if contains(position, candidate.x, candidate.y) && visit(candidate) {
+        if contains_with(position, buckets, candidate.x, candidate.y) && visit(candidate) {
             return true;
         }
     }
@@ -366,6 +371,53 @@ fn vertices_with(position: &Position, buckets: Option<&StoneBuckets>) -> Vec<Poi
 /// in the stone count. Measured inside the settled mask at 240 stones, the exact
 /// tests were 6.5 ms of a 10 ms raster -- 65% of it, for 477 pixels out of
 /// 147,456.
+/// The vertices and bucket grid for one position, built once and reused across
+/// the many point queries a raster makes of it.
+///
+/// Every exact test in the settled classification screens its candidates with
+/// `contains`, which is O(stones), inside a loop over the stones near the query
+/// -- quadratic per test, and there are hundreds of tests per raster. Measured
+/// at 240 stones that screen is 30% of an incremental append. The buckets
+/// answer the same question against the nine cells that can hold a violator.
+pub struct LegalSetIndex {
+    buckets: Option<StoneBuckets>,
+    vertices: Vec<Point>,
+}
+
+impl LegalSetIndex {
+    #[must_use]
+    pub fn build(position: &Position) -> Self {
+        let buckets = (position.stones().len() >= BUCKET_MINIMUM_STONES)
+            .then(|| StoneBuckets::build(position));
+        let vertices = vertices_with(position, buckets.as_ref());
+        Self { buckets, vertices }
+    }
+
+    #[must_use]
+    pub fn vertices(&self) -> &[Point] {
+        &self.vertices
+    }
+}
+
+/// [`none_closer_than`], against a prebuilt index.
+#[must_use]
+pub fn none_closer_than_indexed(
+    position: &Position,
+    point: Point,
+    threshold: f64,
+    index: &LegalSetIndex,
+) -> bool {
+    let mut visit = |candidate: Point| point.distance(candidate) < threshold;
+    !visit_candidates_within(
+        position,
+        point,
+        Some(threshold),
+        Some(&index.vertices),
+        index.buckets.as_ref(),
+        &mut visit,
+    )
+}
+
 pub fn none_closer_than(
     position: &Position,
     point: Point,
@@ -373,7 +425,7 @@ pub fn none_closer_than(
     known_vertices: Option<&[Point]>,
 ) -> bool {
     let mut visit = |candidate: Point| point.distance(candidate) < threshold;
-    !visit_candidates_within(position, point, Some(threshold), known_vertices, &mut visit)
+    !visit_candidates_within(position, point, Some(threshold), known_vertices, None, &mut visit)
 }
 
 pub fn distance(position: &Position, point: Point, known_vertices: Option<&[Point]>) -> f64 {

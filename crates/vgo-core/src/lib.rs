@@ -20,6 +20,7 @@ pub use legal_set::{
     nearest as nearest_legal_placement,
     nearest_with as nearest_legal_placement_with, none_closer_than as no_legal_point_closer_than,
     vertices as legal_set_vertices,
+    LegalSetIndex, none_closer_than_indexed as no_legal_point_closer_than_indexed,
 };
 pub use model::{Color, Phase, Position, Ruleset, Stone, Validation, ValidationIssue};
 pub use settled::SettledRegion;

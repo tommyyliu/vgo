@@ -28,8 +28,8 @@
 //! shrink that; `examples/settled_edt.rs` measures what it costs.
 
 use vgo_core::{
-    COORDINATE_EPSILON, Point, Position, distance_to_legal_set, legal_set_vertices,
-    no_legal_point_closer_than,
+    COORDINATE_EPSILON, LegalSetIndex, Point, Position, distance_to_legal_set,
+    no_legal_point_closer_than_indexed,
 };
 
 use crate::RasterConfig;
@@ -176,11 +176,69 @@ pub(crate) struct EdtScratch {
     row_owners: Vec<u64>,
     row_owner_columns: Vec<usize>,
     pub(crate) incremental_rows: Vec<bool>,
+    /// Per row, the first and last column whose classification inputs moved on
+    /// this append. `lo > hi` means nothing in the row did.
+    ///
+    /// A settled pixel is decided by two numbers: the sampled distance to the
+    /// legal set, and the distance to the nearest stone. An append moves the
+    /// first only where the distance transform's output actually changed, and
+    /// the second only inside the new stone's disc. Both are local, but the row
+    /// flag they used to share is not -- 94% of rows carry at least one moved
+    /// pixel, so classifying by row reclassified nearly the whole board to find
+    /// the tenth of it that could have changed.
+    row_change_lo: Vec<u32>,
+    row_change_hi: Vec<u32>,
+    /// Pixels that took the exact test last time, and whether that record can
+    /// be trusted. See the classification loop for why they are special.
+    band_pixels: Vec<u32>,
+    band_scratch: Vec<u32>,
+    band_valid: bool,
 }
 
 impl EdtScratch {
     pub(crate) fn legal_len(&self) -> usize {
         self.legal.len()
+    }
+
+    /// Forget the previous append's spans. Called once per append, before
+    /// anything marks into them.
+    /// Forget which pixels were in the undecided band. Any full render
+    /// establishes the mask without recording one, so the next append has to
+    /// classify everything once to find it again.
+    pub(crate) fn invalidate_band(&mut self) {
+        self.band_valid = false;
+        self.band_pixels.clear();
+    }
+
+    pub(crate) fn reset_row_changes(&mut self, height: usize) {
+        self.row_change_lo.clear();
+        self.row_change_lo.resize(height, u32::MAX);
+        self.row_change_hi.clear();
+        self.row_change_hi.resize(height, 0);
+    }
+
+    pub(crate) fn mark_row_change(&mut self, row: usize, column: usize) {
+        let column = column as u32;
+        if column < self.row_change_lo[row] {
+            self.row_change_lo[row] = column;
+        }
+        if column > self.row_change_hi[row] {
+            self.row_change_hi[row] = column;
+        }
+    }
+
+    fn mark_row_span(&mut self, row: usize, low: usize, high: usize) {
+        if (low as u32) < self.row_change_lo[row] {
+            self.row_change_lo[row] = low as u32;
+        }
+        if (high as u32) > self.row_change_hi[row] {
+            self.row_change_hi[row] = high as u32;
+        }
+    }
+
+    fn row_change(&self, row: usize) -> Option<(usize, usize)> {
+        let (low, high) = (self.row_change_lo[row], self.row_change_hi[row]);
+        (low <= high).then(|| (low as usize, high as usize))
     }
 
     /// The squared sampled distance field, for a caller classifying `settled`
@@ -360,7 +418,25 @@ fn squared_distance_transform_incremental_into(
         for &owner in &scratch.row_owner_columns[..width] {
             scratch.row_owners[row * owner_words + owner / 64] |= 1 << (owner % 64);
         }
-        scratch.field[base..base + width].copy_from_slice(&scratch.results[..width]);
+        // Copy with a comparison rather than `copy_from_slice`, to learn which
+        // columns actually moved. A row is recomputed whenever any of its
+        // pixels is owned by a changed column, but the pixels that then differ
+        // are far fewer, and only those need reclassifying.
+        let mut low = usize::MAX;
+        let mut high = 0usize;
+        for column in 0..width {
+            let value = scratch.results[column];
+            if scratch.field[base + column] != value {
+                scratch.field[base + column] = value;
+                if low == usize::MAX {
+                    low = column;
+                }
+                high = column;
+            }
+        }
+        if low != usize::MAX {
+            scratch.mark_row_span(row, low, high);
+        }
     }
     true
 }
@@ -839,6 +915,44 @@ pub(crate) fn settled_mask_by_bounded_distance_into(
 /// pixels using a caller-maintained nearest-stone field. This is deliberately
 /// limited to the production oversample-1 path; captures and other changes use
 /// the full builder.
+/// One pixel of the bounded-distance test, reporting whether it landed in the
+/// undecided band.
+#[allow(clippy::too_many_arguments)]
+fn classify_settled_pixel(
+    position: &Position,
+    x: f64,
+    y: f64,
+    pixel: usize,
+    field: &[f64],
+    nearest_squares: &[f64],
+    spacing_squared: f64,
+    slack: f64,
+    index: &mut Option<LegalSetIndex>,
+    mask: &mut [bool],
+) -> bool {
+    let sampled_squared = field[pixel] * spacing_squared;
+    let sampled = sampled_squared.sqrt();
+    let sampled_minus_slack = sampled - slack;
+    if sampled_minus_slack > 0.0
+        && nearest_squares[pixel] <= sampled_minus_slack * sampled_minus_slack
+    {
+        mask[pixel] = true;
+        false
+    } else if nearest_squares[pixel] > sampled_squared {
+        mask[pixel] = false;
+        false
+    } else {
+        let known = index.get_or_insert_with(|| LegalSetIndex::build(position));
+        mask[pixel] = no_legal_point_closer_than_indexed(
+            position,
+            Point::new(x, y),
+            nearest_squares[pixel].sqrt(),
+            known,
+        );
+        true
+    }
+}
+
 pub(crate) fn settled_mask_by_incremental_append_into(
     position: &Position,
     config: RasterConfig,
@@ -893,6 +1007,9 @@ pub(crate) fn settled_mask_by_incremental_append_into(
         if !incremental {
             squared_distance_transform_into(&legal, width, height, scratch, true);
             incremental_rows.fill(true);
+            for row in 0..height {
+                scratch.mark_row_span(row, 0, width - 1);
+            }
         }
         scratch.legal = legal;
     }
@@ -910,38 +1027,92 @@ pub(crate) fn settled_mask_by_incremental_append_into(
     let spacing = 1.0 / width as f64;
     let spacing_squared = spacing * spacing;
     let slack = spacing * std::f64::consts::SQRT_2;
-    let mut vertices: Option<Vec<Point>> = None;
+    let mut index: Option<LegalSetIndex> = None;
+
+    // Which pixels have to be looked at again.
+    //
+    // The two cheap branches are pure functions of the sampled distance and the
+    // nearest stone, so a pixel where neither moved keeps its answer and can be
+    // skipped. The third is not: it calls `no_legal_point_closer_than`, which
+    // reads the position, and the append just changed the position. Adding a
+    // stone removes legal points, and the grid need not have sampled any of
+    // them, so a band pixel can flip with both of its own numbers untouched.
+    //
+    // That is what the hundred-append chain caught, sixteen appends in, when
+    // this loop trusted the spans alone. So the band from the previous pass is
+    // revisited whatever the spans say. Membership in it is decided by the same
+    // two numbers, so a pixel can only *enter* the band by being marked, and is
+    // caught on the spans; leaving one is covered by revisiting all of it.
+    let mut band = std::mem::take(&mut scratch.band_pixels);
+    let mut next_band = std::mem::take(&mut scratch.band_scratch);
+    next_band.clear();
+    let rebuild = !scratch.band_valid;
     for row in 0..height {
-        if !scratch.incremental_rows[row] {
+        let (low, high) = if rebuild {
+            (0, width - 1)
+        } else if !scratch.incremental_rows[row] {
             continue;
-        }
+        } else if let Some(span) = scratch.row_change(row) {
+            span
+        } else {
+            continue;
+        };
         let y = (row as f64 + 0.5) / height as f64;
-        let output_base = row * width;
-        let sampled_base = row * width;
-        for column in 0..width {
-            let x = scratch.column_xs[column];
-            let sampled_squared =
-                scratch.field[sampled_base + scratch.fine_columns[column]] * spacing_squared;
-            let sampled = sampled_squared.sqrt();
-            let sampled_minus_slack = sampled - slack;
-            let pixel = output_base + column;
-            mask[pixel] = if sampled_minus_slack > 0.0
-                && nearest_squares[pixel] <= sampled_minus_slack * sampled_minus_slack
-            {
-                true
-            } else if nearest_squares[pixel] > sampled_squared {
-                false
-            } else {
-                let known = vertices.get_or_insert_with(|| legal_set_vertices(position));
-                no_legal_point_closer_than(
-                    position,
-                    Point::new(x, y),
-                    nearest_squares[pixel].sqrt(),
-                    Some(known),
-                )
-            };
+        for column in low..=high {
+            let pixel = row * width + column;
+            if classify_settled_pixel(
+                position,
+                scratch.column_xs[column],
+                y,
+                pixel,
+                &scratch.field,
+                nearest_squares,
+                spacing_squared,
+                slack,
+                &mut index,
+                mask,
+            ) {
+                next_band.push(pixel as u32);
+            }
         }
     }
+    if !rebuild {
+        for slot in 0..band.len() {
+            let pixel = band[slot] as usize;
+            let row = pixel / width;
+            let column = pixel % width;
+            // Skip whatever the span loop already did, or it would be recorded
+            // in the band twice and the list would grow every append.
+            let mut done = false;
+            if scratch.incremental_rows[row] {
+                if let Some((low, high)) = scratch.row_change(row) {
+                    done = column >= low && column <= high;
+                }
+            }
+            if done {
+                continue;
+            }
+            let y = (row as f64 + 0.5) / height as f64;
+            if classify_settled_pixel(
+                position,
+                scratch.column_xs[column],
+                y,
+                pixel,
+                &scratch.field,
+                nearest_squares,
+                spacing_squared,
+                slack,
+                &mut index,
+                mask,
+            ) {
+                next_band.push(pixel as u32);
+            }
+        }
+    }
+    band.clear();
+    scratch.band_scratch = band;
+    scratch.band_pixels = next_band;
+    scratch.band_valid = true;
     true
 }
 
@@ -965,7 +1136,7 @@ pub(crate) fn settled_mask_by_incremental_append_into(
 pub(crate) struct SettledRows {
     spacing_squared: f64,
     slack: f64,
-    vertices: Option<Vec<Point>>,
+    index: Option<LegalSetIndex>,
     pub(crate) exact_tests: usize,
 }
 
@@ -983,7 +1154,7 @@ pub(crate) fn prepare_settled_rows(
     SettledRows {
         spacing_squared: spacing * spacing,
         slack: spacing * std::f64::consts::SQRT_2,
-        vertices: None,
+        index: None,
         exact_tests: 0,
     }
 }
@@ -1021,14 +1192,14 @@ impl SettledRows {
             } else {
                 self.exact_tests += 1;
                 let known = self
-                    .vertices
-                    .get_or_insert_with(|| legal_set_vertices(position));
+                    .index
+                    .get_or_insert_with(|| LegalSetIndex::build(position));
                 let nearest = nearest_squares[column].sqrt();
-                no_legal_point_closer_than(
+                no_legal_point_closer_than_indexed(
                     position,
                     Point::new(xs[column], y),
                     nearest,
-                    Some(known),
+                    known,
                 )
             };
         }
@@ -1089,10 +1260,10 @@ fn masks_by_bounded_distance_into(
     // where those constraints meet, and `legal_set_vertices` enumerates exactly
     // those points -- exactly, in f64, with no grid involved. Anything within
     // `r` of one is alive by definition, whether or not the grid saw it.
-    let mut vertices: Option<Vec<Point>> = None;
+    let mut index: Option<LegalSetIndex> = None;
     let near_vertex = if want_dead_zone {
-        let known = vertices.insert(legal_set_vertices(position));
-        stamped_discs(known, radius, config.width, config.height)
+        let known = index.insert(LegalSetIndex::build(position));
+        stamped_discs(known.vertices(), radius, config.width, config.height)
     } else {
         Vec::new()
     };
@@ -1184,8 +1355,9 @@ fn masks_by_bounded_distance_into(
                     true
                 } else {
                     exact_tests += 1;
-                    let known = vertices.get_or_insert_with(|| legal_set_vertices(position));
-                    distance_to_legal_set(position, Point::new(x, y), Some(known)) > radius
+                    let known = index.get_or_insert_with(|| LegalSetIndex::build(position));
+                    distance_to_legal_set(position, Point::new(x, y), Some(known.vertices()))
+                        > radius
                 };
             }
         }
@@ -1225,9 +1397,9 @@ fn masks_by_bounded_distance_into(
                 false
             } else {
                 exact_tests += 1;
-                let known = vertices.get_or_insert_with(|| legal_set_vertices(position));
+                let known = index.get_or_insert_with(|| LegalSetIndex::build(position));
                 let nearest = scratch.nearest_squares[column].sqrt();
-                no_legal_point_closer_than(position, Point::new(x, y), nearest, Some(known))
+                no_legal_point_closer_than_indexed(position, Point::new(x, y), nearest, known)
             };
         }
     }
