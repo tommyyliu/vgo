@@ -20,6 +20,7 @@ use vgo_core::{Position, legal_set_vertices};
 use vgo_raster::RasterConfig;
 
 const KERNEL: &str = include_str!("settled.cu");
+const EDT_KERNEL: &str = include_str!("settled_edt.cu");
 
 /// A compiled kernel bound to one device, reusable across positions.
 ///
@@ -265,6 +266,222 @@ impl SettledKernel {
     }
 }
 
+
+/// The same mask by separable distance transform, which is the CPU's algorithm.
+///
+/// [`SettledKernel`] evaluates the definition directly, at O(stones^2) per
+/// pixel. That is 62 million operations per mask at 28 stones and 256x256, and
+/// measured on this card it loses to the CPU eightfold. This is the O(stones)
+/// reformulation instead -- 4 million for the same mask -- run as four kernels:
+/// sample the legal set, transform down columns, transform across rows, then
+/// decide each pixel against the field.
+///
+/// The undecided band still gets the exact test, so this is no less correct
+/// than the direct kernel where they overlap; it just stops paying for the
+/// exact test at every pixel.
+pub struct EdtSettledKernel {
+    context: Arc<CudaContext>,
+    module: Arc<cudarc::driver::CudaModule>,
+}
+
+impl EdtSettledKernel {
+    pub fn compile(device: usize, precision: Precision) -> Result<Self, CudaError> {
+        let context = CudaContext::new(device).map_err(|e| CudaError::Unavailable(e.to_string()))?;
+        let source = match precision {
+            Precision::Single => format!("#define VGO_REAL float\n{EDT_KERNEL}"),
+            Precision::Double => EDT_KERNEL.to_string(),
+        };
+        let ptx = cudarc::nvrtc::compile_ptx(source)
+            .map_err(|e| CudaError::Compilation(e.to_string()))?;
+        let module = context
+            .load_module(ptx)
+            .map_err(|e| CudaError::Compilation(e.to_string()))?;
+        Ok(Self { context, module })
+    }
+
+    /// One rasterizer per thread, each with its own stream.
+    pub fn rasterizer(&self) -> Result<EdtSettledRasterizer, CudaError> {
+        let stream = self
+            .context
+            .new_stream()
+            .map_err(|e| CudaError::Unavailable(e.to_string()))?;
+        let function = |name: &str| {
+            self.module
+                .load_function(name)
+                .map_err(|e| CudaError::Compilation(e.to_string()))
+        };
+        Ok(EdtSettledRasterizer {
+            stream,
+            sample_legal: function("sample_legal")?,
+            edt_columns: function("edt_columns")?,
+            edt_rows: function("edt_rows")?,
+            settled_from_field: function("settled_from_field")?,
+        })
+    }
+}
+
+pub struct EdtSettledRasterizer {
+    stream: Arc<CudaStream>,
+    sample_legal: CudaFunction,
+    edt_columns: CudaFunction,
+    edt_rows: CudaFunction,
+    settled_from_field: CudaFunction,
+}
+
+impl EdtSettledRasterizer {
+    /// Settled masks for a batch, concatenated.
+    pub fn masks(
+        &self,
+        positions: &[&Position],
+        config: RasterConfig,
+    ) -> Result<Vec<Vec<bool>>, CudaError> {
+        if positions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pixels = config.pixels();
+        let items = positions.len();
+        let radius = positions[0].radius();
+        if let Some(odd) = positions.iter().find(|p| p.radius() != radius) {
+            return Err(CudaError::Launch(format!(
+                "batch mixes radii {radius} and {}; radius is part of run identity",
+                odd.radius()
+            )));
+        }
+
+        let mut stones: Vec<f64> = Vec::new();
+        let mut stone_offsets: Vec<i32> = Vec::with_capacity(items);
+        let mut stone_counts: Vec<i32> = Vec::with_capacity(items);
+        let mut vertices: Vec<f64> = Vec::new();
+        let mut vertex_offsets: Vec<i32> = Vec::with_capacity(items);
+        let mut vertex_counts: Vec<i32> = Vec::with_capacity(items);
+        for position in positions {
+            stone_offsets.push((stones.len() / 2) as i32);
+            stone_counts.push(position.stones().len() as i32);
+            for stone in position.stones() {
+                stones.push(stone.x);
+                stones.push(stone.y);
+            }
+            let found = legal_set_vertices(position);
+            vertex_offsets.push((vertices.len() / 2) as i32);
+            vertex_counts.push(found.len() as i32);
+            for vertex in &found {
+                vertices.push(vertex.x);
+                vertices.push(vertex.y);
+            }
+        }
+        if stones.is_empty() {
+            stones.extend_from_slice(&[0.0, 0.0]);
+        }
+        if vertices.is_empty() {
+            vertices.extend_from_slice(&[0.0, 0.0]);
+        }
+
+        let launch = |e: cudarc::driver::DriverError| CudaError::Launch(e.to_string());
+        let stone_buffer = self.stream.clone_htod(&stones).map_err(launch)?;
+        let vertex_buffer = self.stream.clone_htod(&vertices).map_err(launch)?;
+        let stone_offset_buffer = self.stream.clone_htod(&stone_offsets).map_err(launch)?;
+        let stone_count_buffer = self.stream.clone_htod(&stone_counts).map_err(launch)?;
+        let vertex_offset_buffer = self.stream.clone_htod(&vertex_offsets).map_err(launch)?;
+        let vertex_count_buffer = self.stream.clone_htod(&vertex_counts).map_err(launch)?;
+
+        let width = config.width as i32;
+        let height = config.height as i32;
+        let longest = config.width.max(config.height);
+        let mut field = self.stream.alloc_zeros::<f64>(pixels * items).map_err(launch)?;
+        // Per-line scratch for the lower envelope. The transform cannot run in
+        // place: its second loop reads `f[v[k]]` at indices the same loop has
+        // already written.
+        let lines = items * longest;
+        let mut source = self.stream.alloc_zeros::<f64>(lines * longest).map_err(launch)?;
+        let mut result = self.stream.alloc_zeros::<f64>(lines * longest).map_err(launch)?;
+        let mut envelope = self.stream.alloc_zeros::<i32>(lines * longest).map_err(launch)?;
+        let mut boundaries = self
+            .stream
+            .alloc_zeros::<f64>(lines * (longest + 1))
+            .map_err(launch)?;
+        let mut out = self.stream.alloc_zeros::<u8>(pixels * items).map_err(launch)?;
+
+        let pixel_block = (16u32, 16u32, 1u32);
+        let pixel_grid = (
+            (config.width as u32).div_ceil(pixel_block.0),
+            (config.height as u32).div_ceil(pixel_block.1),
+            items as u32,
+        );
+        let pixel_launch = LaunchConfig {
+            grid_dim: pixel_grid,
+            block_dim: pixel_block,
+            shared_mem_bytes: 0,
+        };
+
+        let mut builder = self.stream.launch_builder(&self.sample_legal);
+        builder
+            .arg(&stone_buffer)
+            .arg(&stone_offset_buffer)
+            .arg(&stone_count_buffer)
+            .arg(&radius)
+            .arg(&width)
+            .arg(&height)
+            .arg(&mut field);
+        unsafe { builder.launch(pixel_launch).map_err(launch)? };
+
+        // One thread per line. Occupancy is only `width` (or `height`) threads
+        // per batch item, which is thin for this card -- but the whole point is
+        // that there is 15x less work to do.
+        let line_launch = |count: usize| LaunchConfig {
+            grid_dim: ((count as u32).div_ceil(64), items as u32, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = self.stream.launch_builder(&self.edt_columns);
+        builder
+            .arg(&mut field)
+            .arg(&mut source)
+            .arg(&mut result)
+            .arg(&mut envelope)
+            .arg(&mut boundaries)
+            .arg(&width)
+            .arg(&height);
+        unsafe { builder.launch(line_launch(config.width)).map_err(launch)? };
+
+        let mut builder = self.stream.launch_builder(&self.edt_rows);
+        builder
+            .arg(&mut field)
+            .arg(&mut source)
+            .arg(&mut result)
+            .arg(&mut envelope)
+            .arg(&mut boundaries)
+            .arg(&width)
+            .arg(&height);
+        unsafe { builder.launch(line_launch(config.height)).map_err(launch)? };
+
+        let mut builder = self.stream.launch_builder(&self.settled_from_field);
+        builder
+            .arg(&stone_buffer)
+            .arg(&stone_offset_buffer)
+            .arg(&stone_count_buffer)
+            .arg(&vertex_buffer)
+            .arg(&vertex_offset_buffer)
+            .arg(&vertex_count_buffer)
+            .arg(&field)
+            .arg(&radius)
+            .arg(&width)
+            .arg(&height)
+            .arg(&mut out);
+        unsafe { builder.launch(pixel_launch).map_err(launch)? };
+
+        let bytes = self.stream.clone_dtoh(&out).map_err(launch)?;
+        Ok(bytes
+            .chunks_exact(pixels)
+            .map(|chunk| chunk.iter().map(|b| *b != 0).collect())
+            .collect())
+    }
+
+    /// One position.
+    pub fn mask(&self, position: &Position, config: RasterConfig) -> Result<Vec<bool>, CudaError> {
+        Ok(self.masks(&[position], config)?.remove(0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use vgo_core::{Color, Position, Stone};
@@ -274,6 +491,12 @@ mod tests {
 
     /// A lattice coarser than a diameter, so the position is playable.
     pub(super) fn lattice(count: usize, radius: f64) -> Position {
+        // `count == 0` is a real case -- an empty board -- and the loop below
+        // tests after incrementing, so it has to be handled here or zero fills
+        // the whole lattice.
+        if count == 0 {
+            return Position::new(radius, Vec::new(), Color::White).with_komi(0.104);
+        }
         let step = 2.5 * radius;
         let mut stones = Vec::new();
         let mut index = 0;
@@ -436,3 +659,90 @@ mod batch_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod edt_tests {
+    use std::time::Instant;
+
+    use vgo_raster::{RasterKind, settled_for_raster};
+
+    use super::tests::lattice;
+    use super::*;
+
+    /// The transform kernel has to agree with the CPU, which runs the same
+    /// algorithm. Unlike the direct kernel -- where disagreement was expected
+    /// and was the CPU's approximation error -- this one is a port of what the
+    /// CPU does, so any difference is a porting bug.
+    ///
+    /// Ignored: needs a CUDA device.
+    #[test]
+    #[ignore]
+    fn the_transform_kernel_matches_the_cpu() {
+        let radius = 1.0 / 18.0;
+        let config = RasterConfig::square_of(256, RasterKind::CompactRadius);
+        let kernel = EdtSettledKernel::compile(0, Precision::Double).expect("compile");
+        let rasterizer = kernel.rasterizer().expect("stream");
+
+        for count in [0usize, 8, 28, 52] {
+            let position = lattice(count, radius);
+            let cpu = settled_for_raster(&position, config);
+            let gpu = rasterizer.mask(&position, config).expect("mask");
+            assert_eq!(cpu.len(), gpu.len());
+            let differing = cpu.iter().zip(&gpu).filter(|(a, b)| a != b).count();
+            let settled_cpu = cpu.iter().filter(|b| **b).count();
+            let settled_gpu = gpu.iter().filter(|b| **b).count();
+            println!(
+                "  {count:>2} stones: {differing:>6} of {} differ   (cpu {settled_cpu} settled, gpu {settled_gpu})",
+                cpu.len()
+            );
+        }
+    }
+
+    /// Against the direct kernel it replaces.
+    ///
+    /// Ignored: needs an idle CUDA device.
+    #[test]
+    #[ignore]
+    fn the_transform_kernel_is_faster() {
+        let radius = 1.0 / 18.0;
+        let config = RasterConfig::square_of(256, RasterKind::CompactRadius);
+        let direct = SettledKernel::compile(0, Precision::Single)
+            .expect("compile direct")
+            .rasterizer()
+            .expect("stream");
+        let transform = EdtSettledKernel::compile(0, Precision::Single)
+            .expect("compile edt")
+            .rasterizer()
+            .expect("stream");
+
+        for count in [28usize, 52] {
+            let position = lattice(count, radius);
+            for batch in [1usize, 8, 32] {
+                let positions: Vec<&Position> = (0..batch).map(|_| &position).collect();
+                let rounds = (128 / batch).max(4);
+                direct.masks(&positions, config).expect("warm");
+                transform.masks(&positions, config).expect("warm");
+
+                let started = Instant::now();
+                for _ in 0..rounds {
+                    direct.masks(&positions, config).expect("direct");
+                }
+                let direct_ms = started.elapsed().as_secs_f64() * 1000.0 / (batch * rounds) as f64;
+
+                let started = Instant::now();
+                for _ in 0..rounds {
+                    transform.masks(&positions, config).expect("edt");
+                }
+                let edt_ms = started.elapsed().as_secs_f64() * 1000.0 / (batch * rounds) as f64;
+
+                println!(
+                    "  {count:>2} stones batch {batch:>2}: direct {direct_ms:.3} ms, transform {edt_ms:.3} ms  ({:.1}x)  -> {:.0} masks/s",
+                    direct_ms / edt_ms,
+                    1000.0 / edt_ms
+                );
+            }
+        }
+        println!("  CPU reference: 1.02 ms per mask per core (980/s); 32 cores = 31,000/s");
+    }
+}
+
