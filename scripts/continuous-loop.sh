@@ -64,6 +64,21 @@ simulations="${VGO_SIMULATIONS:-800}"
 #
 # Set VGO_PACKED_INPUT=0 to go back to the dense contract.
 packed_input="${VGO_PACKED_INPUT:-1}"
+# Uniform mass mixed into the root's candidate proposal, and only the root --
+# the training target is the root visit distribution, so that is the one place
+# diversifying the proposal changes what gets learned.
+#
+# On because the loop otherwise has no way to try a move the policy does not
+# already like: candidates are drawn from the policy's own map, at most a few
+# hundred of 16,384 cells, so without this it can sharpen what it believes and
+# never discover anything else.
+#
+# 0.10 rather than AlphaZero's 0.25, because this mixes in *uniform* mass over
+# every cell rather than Dirichlet noise over the legal moves, and uniform over
+# 16,384 cells is diffuse enough that a quarter of the proposals would be spent
+# far from anything playable. `beta` is recomputed from the mixture, so the
+# importance correction the policy target relies on stays exact either way.
+root_noise="${VGO_ROOT_NOISE:-0.10}"
 # Absolute, because training runs from `$root/training` and a relative path
 # would resolve against that instead of the repo root -- generation, which does
 # not cd, would keep working while every training step failed on a checkpoint
@@ -125,6 +140,7 @@ start_generator () {
     --coarse-pool 16 --widening-coefficient 4.0 --maximum-candidates 321 \
     --komi-low 0.017 --komi-high 0.137 \
     --temperature 1.0 --temperature-plies 30 \
+    --root-exploration-noise "$root_noise" \
     --leaf-batch 4 --maximum-batch 32 --delay-ms 1 --inference-slots 2 \
     --provider tensorrt --fp16 true \
     --cache-directory "$root/artifacts/onnx-cache" \
