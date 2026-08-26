@@ -6,9 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
+profiling = ["dep:pprof"]
 default = []
 
 [dependencies]
+# In-process sampling profiler, behind a feature so it costs nothing when off.
+# `perf` is not installed here and needs root to install; pprof samples with
+# SIGPROF from inside the process, which needs neither. Symbols are already in
+# the release build (`debug = true` in the profile, which costs binary size and
+# compile time but nothing at run time).
+pprof = { version = "0.15", features = ["flamegraph"], optional = true }
 clap.workspace = true
 sha2 = "0.10"
 vgo-core = { path = "../vgo-core" }

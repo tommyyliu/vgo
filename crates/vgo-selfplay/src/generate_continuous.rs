@@ -79,6 +79,26 @@ struct Config {
     /// Stop after this many games. Zero runs until the stop file appears.
     #[arg(long, default_value_t = 0)]
     maximum_games: u64,
+    /// Write a flamegraph here on exit, sampling every thread at 199 Hz.
+    ///
+    /// Requires the `profiling` feature; without it this errors rather than
+    /// running unprofiled, because a profiling run that silently produced no
+    /// profile would be indistinguishable from one that found nothing.
+    ///
+    /// 199 rather than 200: a prime sampling rate cannot beat against a loop
+    /// that happens to run at a round frequency, which is how a hot function
+    /// hides from a profiler entirely.
+    #[arg(long)]
+    profile_output: Option<PathBuf>,
+    /// Write the profile after this many seconds and exit.
+    ///
+    /// Without it the profile lands when the process does, and this process
+    /// exits only after every actor finishes the game in hand -- which on a
+    /// 38-unit board is over an hour. A profile of the search does not need a
+    /// whole game, it needs representative positions, so this takes a bounded
+    /// slice and stops. Zero waits for a normal exit.
+    #[arg(long, default_value_t = 0)]
+    profile_seconds: u64,
     /// First game index, so a restarted generation does not reuse seeds.
     #[arg(long, default_value_t = 0)]
     first_game: u64,
@@ -293,8 +313,91 @@ fn write_game(
     Ok(published.samples)
 }
 
+/// Stop the run after `--profile-seconds` so the profile can be written.
+///
+/// Drives the generator's own `stopping` and `cancelled` flags rather than
+/// calling `exit`: the flamegraph is written at the end of `main`, and exiting
+/// from a side thread would skip it. `cancelled` is the right one here -- a
+/// profiling run wants a bounded slice of search, not the games, and waiting
+/// for 32 actors to finish a 38-unit board would take over an hour.
+#[cfg(feature = "profiling")]
+fn arm_profile_deadline(
+    config: &Config,
+    stopping: &Arc<AtomicBool>,
+    cancelled: &Arc<AtomicBool>,
+) {
+    let seconds = config.profile_seconds;
+    if config.profile_output.is_none() || seconds == 0 {
+        return;
+    }
+    let stopping = Arc::clone(stopping);
+    let cancelled = Arc::clone(cancelled);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(seconds));
+        eprintln!("[profile] {seconds}s elapsed, abandoning games in flight");
+        stopping.store(true, Ordering::Release);
+        cancelled.store(true, Ordering::Release);
+    });
+}
+
+#[cfg(not(feature = "profiling"))]
+fn arm_profile_deadline(_: &Config, _: &Arc<AtomicBool>, _: &Arc<AtomicBool>) {}
+
+#[cfg(feature = "profiling")]
+type Profiler = Option<pprof::ProfilerGuard<'static>>;
+#[cfg(not(feature = "profiling"))]
+type Profiler = ();
+
+#[cfg(feature = "profiling")]
+fn start_profiler(output: Option<&std::path::Path>) -> io::Result<Profiler> {
+    let Some(_) = output else { return Ok(None) };
+    let guard = pprof::ProfilerGuardBuilder::default()
+        .frequency(199)
+        // Skip the runtime's own frames, which otherwise dominate a stack that
+        // is mostly blocked on inference.
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build()
+        .map_err(|error| io::Error::other(format!("start profiler: {error}")))?;
+    Ok(Some(guard))
+}
+
+#[cfg(feature = "profiling")]
+fn finish_profiler(profiler: Profiler, output: Option<&std::path::Path>) -> io::Result<()> {
+    let (Some(guard), Some(path)) = (profiler, output) else {
+        return Ok(());
+    };
+    let report = guard
+        .report()
+        .build()
+        .map_err(|error| io::Error::other(format!("build profile: {error}")))?;
+    let file = fs::File::create(path)?;
+    report
+        .flamegraph(file)
+        .map_err(|error| io::Error::other(format!("write flamegraph: {error}")))?;
+    eprintln!("[profile] wrote {}", path.display());
+    Ok(())
+}
+
+#[cfg(not(feature = "profiling"))]
+fn start_profiler(output: Option<&std::path::Path>) -> io::Result<Profiler> {
+    if output.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "--profile-output needs the `profiling` feature: \
+             cargo build --release -p vgo-selfplay --features profiling",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "profiling"))]
+fn finish_profiler(_: Profiler, _: Option<&std::path::Path>) -> io::Result<()> {
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     let config = Config::parse();
+    let profiler = start_profiler(config.profile_output.as_deref())?;
     if config.actors == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -352,6 +455,7 @@ fn main() -> io::Result<()> {
     // turns an orderly stop into a spurious failure in every other actor.
     let stopping = Arc::new(AtomicBool::new(false));
     let cancelled = Arc::new(AtomicBool::new(false));
+    arm_profile_deadline(&config, &stopping, &cancelled);
     let next_game = Arc::new(AtomicU64::new(config.first_game));
     let games_written = Arc::new(AtomicU64::new(0));
     let samples_written = Arc::new(AtomicU64::new(0));
@@ -431,8 +535,18 @@ fn main() -> io::Result<()> {
             }
         }
     }
+    // Before the failure check, not after: a profiling run ends by cancelling
+    // the actors, so the error path is the *expected* one there and returning
+    // early would discard the profile the run existed to produce.
+    finish_profiler(profiler, config.profile_output.as_deref())?;
+
     if let Some(error) = failure {
-        return Err(error);
+        // A deliberate profiling stop is not a failure. Anything else is.
+        if config.profile_seconds > 0 && config.profile_output.is_some() {
+            eprintln!("[profile] games in flight were abandoned, as intended");
+        } else {
+            return Err(error);
+        }
     }
 
     let stdout = io::stdout();
