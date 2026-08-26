@@ -1,4 +1,4 @@
-use crate::numeric::COORDINATE_EPSILON;
+use crate::numeric::{self, COORDINATE_EPSILON};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Color {
@@ -226,7 +226,14 @@ impl Position {
                 issues.push(ValidationIssue::StoneOutsideBoard { index });
             }
             for (other_index, other) in self.stones[..index].iter().enumerate() {
-                let distance = (stone.x - other.x).hypot(stone.y - other.y);
+                // `length`, not `hypot`: this runs O(n^2) per call and every
+                // rasterization asserts on it, so at 28 stones and 3000
+                // evaluations a second it is over a million hypots a second --
+                // 6% of the generator's CPU in a stack profile. `hypot` is
+                // correctly rounded and guards against intermediate overflow,
+                // neither of which board coordinates in [0, 1] need. See
+                // `numeric::length_agrees_with_hypot_over_board_coordinates`.
+                let distance = numeric::length(stone.x - other.x, stone.y - other.y);
                 if distance < 2.0 * radius - COORDINATE_EPSILON {
                     issues.push(ValidationIssue::OverlappingStones {
                         first: other_index,
