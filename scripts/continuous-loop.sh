@@ -192,6 +192,19 @@ for ((update = first_update; update < first_update + updates; update++)); do
   done
 
   checkpoint="$models/update-$(printf '%06d' "$update").pt"
+  # `--precision bfloat16`, which the default (float32) is not.
+  #
+  # Every update through 21 trained in float32 because this line did not exist.
+  # Measured on the same box and corpus: float32 w64/b16 ran 11.6 s per 1k
+  # samples, bfloat16 with `--compile` runs 7.5 s per 1k at *26M* parameters --
+  # 3.2x the network for two thirds of the cost. At equal size it is roughly a
+  # 1.5x speedup, and it cuts activation memory enough that w96/b24 fits in
+  # 2.4 GB where float32 could not fit at all: the first attempt died with a
+  # CUDA OOM at batch 64 on a 16 GB card.
+  #
+  # Kept out of the invocation below, like every other comment here: a `#` on a
+  # backslash-continued line comments out the remaining arguments and the
+  # command runs silently truncated.
   echo "[loop] update $update: training on the most recent $window samples"
   ( cd "$root/training" && "$python" "$root/scripts/train-once.py" \
       --games-root "$games" --window-samples "$window" \
@@ -199,7 +212,7 @@ for ((update = first_update; update < first_update + updates; update++)); do
       ${model:+--initial-checkpoint "${model%.onnx}.pt"} \
       --raster-kind compact-radius --architecture ddrnet \
       --model-width 64 --blocks 16 --context-attention-blocks 1 \
-      --attention-heads 8 --norm-groups 8 \
+      --attention-heads 8 --norm-groups 8 --precision bfloat16 \
       --epochs 1 --batch-size 64 --learning-rate 0.0005 \
       --value-weight 2.0 --ownership-weight 0.0 --validation-fraction 0.1 \
       --schedule wsd --warmup-epochs 0 --full-adam --compile \

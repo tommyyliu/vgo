@@ -1282,13 +1282,19 @@ fn masks_by_bounded_distance_into(
     let mut exact_tests = 0usize;
     // The nearest stone, a row at a time, stones outside and pixels inside.
     //
-    // This loop is 85% of `settled`, and `settled` is ~80% of the raster, so its
-    // shape is most of what rasterization costs. Sparse positions use the flat
-    // min below, over contiguous f64 that the autovectorizer handles; dense
-    // positions use the exact chunked grid query, which avoids work on distant
-    // stones. It is also the structure the four non-`settled` planes already
-    // use, and they compute two minima for both colours in a fraction of what
-    // this cost for one.
+    // This loop used to be 85% of `settled` and was documented as such. It is
+    // 24% now, measured at 240 stones -- the classification below is the larger
+    // half, and most of that is the exact test in the undecided band. Do not
+    // take the old figure as a reason to optimise here first.
+    //
+    // The packed writer no longer runs this at all: it classifies each row
+    // against the nearest-stone minimum its own sweep already computed, which
+    // is what the comment below hinted at and never acted on. This path serves
+    // the dense writer and stays the reference the fused one is pinned against.
+    //
+    // Sparse positions use the flat min below, over contiguous f64 that the
+    // autovectorizer handles; dense positions use the exact chunked grid query,
+    // which avoids work on distant stones.
     let row_width = config.width;
     scratch.column_xs.resize(row_width, 0.0);
     scratch.fine_columns.resize(row_width, 0);

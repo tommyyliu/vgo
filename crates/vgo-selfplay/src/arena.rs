@@ -105,8 +105,25 @@ struct Arguments {
     /// it unset keeps the seats identical.
     #[arg(long)]
     opponent_leaf_batch: Option<usize>,
+    /// Cap on game length.
+    ///
+    /// The default suits the mini board and nothing else. Generation scales its
+    /// own cap by `(reference / radius)^2` because a board holds about `1/r^2`
+    /// stones -- 70 plies at 1/18, 312 at 1/38 -- and this binary takes a flat
+    /// number instead, since it plays one fixed radius. Match what generation
+    /// would use for `--radius`, or the match is not measuring the same game:
+    /// set to 200 on a 1/18 board, two thirds of every game was both sides
+    /// shuffling in a full board, and White passed 78 of its 100 moves.
     #[arg(long = "max-plies", default_value_t = 48)]
     maximum_plies: u32,
+    /// Concurrent games.
+    ///
+    /// Eight is measured good. Sixteen aborted with `corrupted double-linked
+    /// list` during teardown on a 48-game match -- after the JSON was written,
+    /// so the result survived, but a heap that is already corrupt is not a
+    /// thing to trust the next run to. Raise it only with a run you are willing
+    /// to re-check, and read `failures` in the output rather than assuming a
+    /// clean exit.
     #[arg(long, default_value_t = 8)]
     threads: usize,
     /// Placement grid the policy head emits; independent of the render
