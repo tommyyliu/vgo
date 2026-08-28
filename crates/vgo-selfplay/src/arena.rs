@@ -118,12 +118,19 @@ struct Arguments {
     maximum_plies: u32,
     /// Concurrent games.
     ///
-    /// Eight is measured good. Sixteen aborted with `corrupted double-linked
-    /// list` during teardown on a 48-game match -- after the JSON was written,
-    /// so the result survived, but a heap that is already corrupt is not a
-    /// thing to trust the next run to. Raise it only with a run you are willing
-    /// to re-check, and read `failures` in the output rather than assuming a
-    /// clean exit.
+    /// This binary intermittently aborts with `corrupted double-linked list`
+    /// during teardown, at 8 threads and at 16. It happens *after* the JSON is
+    /// written, so results survive and `failures` still reads 0 -- three
+    /// 48-game matches at 8 threads, two exited cleanly and one aborted with
+    /// identical settings. A first pass at documenting this called 8 "measured
+    /// good" on the strength of the two clean runs; it is not, the fault is
+    /// simply intermittent.
+    ///
+    /// So: check the exit code, not just `failures`, and treat a run that
+    /// aborts as suspect even though its numbers look complete. The corruption
+    /// is in teardown rather than in play, which is why the games themselves
+    /// have matched expectations so far -- but that is an observation, not a
+    /// guarantee.
     #[arg(long, default_value_t = 8)]
     threads: usize,
     /// Placement grid the policy head emits; independent of the render
