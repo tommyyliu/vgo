@@ -54,6 +54,13 @@ set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 output="${VGO_OUTPUT:-$root/artifacts/vgo-bulk}"
+# Absolute, always. Training runs inside `( cd "$root/training" && ... )`, so a
+# relative --games-root resolves against the wrong directory and dies with
+# FileNotFoundError -- but only at the first retrain, hours after launch, with
+# generation having run correctly the whole time because the loop itself sits in
+# the repo root.
+mkdir -p "$output"
+output="$(cd "$output" && pwd)"
 games="$output/games"
 models="$output/models"
 
@@ -65,11 +72,43 @@ window="${VGO_WINDOW_SAMPLES:-150000}"
 # goes to training: 8 epochs at 0.50 is ~20%, at 0.30 it would be 33%. A fresher
 # model is worth less than it looks when each round already replaces half the
 # window, and training competes with the generation that feeds it.
-turnover="${VGO_TURNOVER:-0.50}"
+turnover="${VGO_TURNOVER:-0.15}"
 epochs="${VGO_EPOCHS:-8}"
 updates="${VGO_UPDATES:-200}"
 actors="${VGO_ACTORS:-32}"
-simulations="${VGO_SIMULATIONS:-800}"
+simulations="${VGO_SIMULATIONS:-1000}"
+# Soft resign. `resign_threshold` at 0.0 is what disables the whole rule, so
+# setting it is what turns this on.
+#
+# Past a soft concession the game keeps playing -- it is a discount on the tail,
+# not a skip -- at `resign_soft_simulations`. That default is 2400, which is
+# above the normal budget here, so leaving it alone would make conceded games
+# *more* expensive than ordinary ones. 400 against 1000 is the discount.
+#
+# 0.99 rather than the 0.98 tried before: at 0.98 two fifths of recorded samples
+# came from the cheap tail, and `--ply-sample-rate` is 1.0 so every one of them
+# is trained on. A higher bar fires later and keeps that share down.
+# Komi, as a fixed number of points on every board -- the same convention as
+# Go, where 7 points is roughly right from 9x9 to 19x19.
+#
+# `komi_centre = coefficient * radius^2`, and a board of radius r holds about
+# (1/2r)^2 stones, so `komi * points` is the constant and the coefficient is
+# four times it. 1/18 holds ~81 and 1/38 ~361, which is 9x9 and 19x19.
+#
+# 28.0 is 7 points. The previous 33.696 was 8.42, fit when the models were much
+# weaker. Komi is White's compensation -- `analysis.rs` scores
+# `black - white - komi` -- and 1/18 currently gives Black 18% of 358 games, so
+# it wants less komi, not more. 1/38 sits at 53% and moves a point the wrong way,
+# which is the smaller of the two errors.
+komi_area_coefficient="${VGO_KOMI_AREA_COEFFICIENT:-28.0}"
+resign_threshold="${VGO_RESIGN_THRESHOLD:-0.99}"
+resign_soft_simulations="${VGO_RESIGN_SOFT_SIMULATIONS:-400}"
+resign_window="${VGO_RESIGN_WINDOW:-5}"
+resign_minimum_ply="${VGO_RESIGN_MINIMUM_PLY:-20}"
+# Zero is right under soft resign: the disable fraction exists to sample games
+# that ignore the rule so false positives can be counted, and a soft concession
+# plays on to a real terminal state, so there is nothing to falsify.
+resign_disable_fraction="${VGO_RESIGN_DISABLE_FRACTION:-0.0}"
 packed_input="${VGO_PACKED_INPUT:-1}"
 root_noise="${VGO_ROOT_NOISE:-0.10}"
 # Measurement against a fixed anchor, every N rounds. Both seats always get the
@@ -77,6 +116,10 @@ root_noise="${VGO_ROOT_NOISE:-0.10}"
 # who is stronger.
 anchor_every="${VGO_ANCHOR_EVERY:-3}"
 anchor_pairs="${VGO_ANCHOR_PAIRS:-24}"
+# Held at 800 while generation moves to 1000. Both seats always match each
+# other, which is what makes a match fair; holding the number fixed across runs
+# is what makes the *series* comparable, and -44 / -89 / +280 were all measured
+# here.
 anchor_simulations="${VGO_ANCHOR_SIMULATIONS:-800}"
 # The anchor itself. Fixed for the life of the run: changing it discards every
 # game measured against the old one. Defaults to the seed model.
@@ -143,8 +186,14 @@ start_generator () {
     --resolution 256 --policy-resolution 128 --raster-kind compact-radius \
     --board-mix 50:38 --board-mix 25:18 --board-mix 25:18-38 \
     --ply-sample-rate 1.0 --max-plies 70 --radius 0.05555555555555555 \
-    --coarse-pool 16 --widening-coefficient 4.0 --maximum-candidates 321 \
+    --coarse-pool 16 --widening-coefficient 6.0 --maximum-candidates 321 \
+    --komi-area-coefficient "$komi_area_coefficient" \
     --komi-low 0.017 --komi-high 0.137 \
+    --resign-threshold "$resign_threshold" \
+    --resign-soft-simulations "$resign_soft_simulations" \
+    --resign-window "$resign_window" \
+    --resign-minimum-ply "$resign_minimum_ply" \
+    --resign-disable-fraction "$resign_disable_fraction" \
     --temperature 1.0 --temperature-plies 30 \
     --root-exploration-noise "$root_noise" \
     --leaf-batch 4 --maximum-batch 32 --delay-ms 1 --inference-slots 2 \
@@ -183,7 +232,13 @@ highest=$(find "$games" -maxdepth 2 -name 'game-*' -type d 2>/dev/null \
   | sed 's/.*game-0*\([0-9]\+\)$/\1/' | sort -n | tail -1)
 next_game=$(( 1000000 + first_update * 1000000 ))
 [ "${highest:-0}" -ge "$next_game" ] && next_game=$(( highest + 1000 ))
-label="gen-$(printf '%06d' "$generation")-seed"
+# Tagged with the launch time. Generation numbering restarts at zero every run,
+# so two runs against the same games directory used to write into one directory
+# -- `gen-000000-seed` held games from two of them. The window selector no
+# longer takes recency from these names, but merged directories are still a trap
+# for anything that reads them.
+run_tag="$(date '+%m%d%H%M')"
+label="gen-$(printf '%06d' "$generation")-$run_tag-seed"
 generator=$(start_generator "$label" "$model" "$next_game")
 echo "[loop] generation $generation started (pid $generator, model ${model:-none})"
 
@@ -239,7 +294,7 @@ for ((update = first_update; update < first_update + updates; update++)); do
 import hashlib,sys
 print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$onnx")
   previous_label="$label"
-  label="gen-$(printf '%06d' "$generation")-$sha"
+  label="gen-$(printf '%06d' "$generation")-$run_tag-$sha"
   generator=$(start_generator "$label" "$onnx" "$next_game")
   touch "$games/$previous_label.stop"
   model="$onnx"
