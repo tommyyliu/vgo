@@ -6,6 +6,13 @@
 //! exists to remove.
 //!
 //!     render_shard <shard.vgo> <out.bin> [resolution] [kind]
+//!
+//! Samples render in parallel across the machine. Rendering is the whole cost
+//! of loading a training window -- a 285,718-sample window took 22 minutes at
+//! one core of 32, while the feed benchmark measures this same rasterizer at
+//! 24,215 positions/s across 32 threads against 1,742 on one. Each sample owns
+//! its own slice of the output and its own scratch buffer, so the bytes written
+//! do not depend on the thread count.
 
 use std::fs;
 
@@ -55,6 +62,60 @@ fn read_u32(bytes: &[u8], at: usize) -> u32 {
 }
 fn read_f64(bytes: &[u8], at: usize) -> f64 {
     f64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
+/// Where each field sits in a record, computed once from the header.
+///
+/// v5 inserts komi after radius and shifts everything below it, so these
+/// offsets cannot be constants.
+struct Layout {
+    header: usize,
+    stride: usize,
+    version: u32,
+    komi_bytes: usize,
+    stones_at: usize,
+    count_at: usize,
+}
+
+/// Rebuilds one stored position. Reads only `blob`, so it is safe to call from
+/// several threads at once.
+fn position_at(blob: &[u8], layout: &Layout, index: usize) -> Position {
+    let base = layout.header + index * layout.stride;
+    let radius = read_f64(blob, base);
+    let komi = if layout.version >= 5 {
+        read_f64(blob, base + 8)
+    } else {
+        0.0
+    };
+    let to_move = if blob[base + 8 + layout.komi_bytes] == 0 {
+        Color::Black
+    } else {
+        Color::White
+    };
+    // Immediately after to_move, and dropped here until the raster grew a plane
+    // that needed it. A record stores it, so a reader that rebuilds the position
+    // without it renders `previous_pass` as zero for every sample -- which
+    // trains a channel that is always off and then meets a live one at
+    // inference.
+    let passes = read_u32(blob, base + 8 + layout.komi_bytes + 1);
+    let count = read_u32(blob, base + layout.count_at) as usize;
+    let mut stones = Vec::with_capacity(count);
+    for stone in 0..count {
+        let at = base + layout.stones_at + stone * STONE;
+        let colour = if blob[at + 16] == 0 {
+            Color::Black
+        } else {
+            Color::White
+        };
+        stones.push(Stone::new(
+            read_f64(blob, at),
+            read_f64(blob, at + 8),
+            colour,
+        ));
+    }
+    Position::new(radius, stones, to_move)
+        .with_komi(komi)
+        .with_passes(passes)
 }
 
 fn main() {
@@ -110,39 +171,40 @@ fn main() {
     let config = RasterConfig::square_of(resolution, kind);
     let channels = config.channels();
     let pixels = config.pixels();
-    let mut out = Vec::with_capacity(samples * channels * pixels * 4);
-    let mut data = vec![0.0_f32; channels * pixels];
+    let record_bytes = channels * pixels * 4;
 
-    for index in 0..samples {
-        let base = header + index * stride;
-        let radius = read_f64(&blob, base);
-        let komi = if version >= 5 { read_f64(&blob, base + 8) } else { 0.0 };
-        let to_move = if blob[base + 8 + komi_bytes] == 0 {
-            Color::Black
-        } else {
-            Color::White
-        };
-        // Immediately after to_move, and dropped here until the raster grew a
-        // plane that needed it. A record stores it, so a reader that rebuilds
-        // the position without it renders `previous_pass` as zero for every
-        // sample -- which trains a channel that is always off and then meets a
-        // live one at inference.
-        let passes = read_u32(&blob, base + 8 + komi_bytes + 1);
-        let count = read_u32(&blob, base + count_at) as usize;
-        let mut stones = Vec::with_capacity(count);
-        for stone in 0..count {
-            let at = base + stones_at + stone * STONE;
-            let colour = if blob[at + 16] == 0 { Color::Black } else { Color::White };
-            stones.push(Stone::new(read_f64(&blob, at), read_f64(&blob, at + 8), colour));
+    let layout = Layout { header, stride, version, komi_bytes, stones_at, count_at };
+    let mut out = vec![0_u8; samples * record_bytes];
+
+    // One thread per core, each taking a contiguous run of samples. Chunking
+    // `out` hands every thread a disjoint slice, so no sample can be written
+    // twice and the result is identical to rendering them in order.
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(samples.max(1));
+    let per_worker = samples.div_ceil(workers);
+    std::thread::scope(|scope| {
+        for (chunk_index, chunk) in out.chunks_mut(per_worker * record_bytes).enumerate() {
+            let blob = &blob;
+            let layout = &layout;
+            scope.spawn(move || {
+                // Scratch is per thread: `rasterize_any_into` overwrites it for
+                // every sample, so one shared buffer would race.
+                let mut data = vec![0.0_f32; channels * pixels];
+                let first = chunk_index * per_worker;
+                for local in 0..chunk.len() / record_bytes {
+                    let position = position_at(blob, layout, first + local);
+                    rasterize_any_into(&position, config, &mut data);
+                    let at = local * record_bytes;
+                    for (slot, value) in data.iter().enumerate() {
+                        chunk[at + slot * 4..at + slot * 4 + 4]
+                            .copy_from_slice(&value.to_le_bytes());
+                    }
+                }
+            });
         }
-        let position = Position::new(radius, stones, to_move)
-            .with_komi(komi)
-            .with_passes(passes);
-        rasterize_any_into(&position, config, &mut data);
-        for value in &data {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-    }
+    });
+
     fs::write(&destination, &out).expect("write rasters");
     println!("{samples} {channels} {resolution}");
 }
