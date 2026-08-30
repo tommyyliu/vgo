@@ -223,14 +223,17 @@ def full_legal_policy_masks(
     """
     if states.ndim != 4 or explored_masks.ndim != 2:
         raise ValueError("states must be rank four and policy masks rank two")
-    if explored_masks.shape[0] != states.shape[0]:
-        raise ValueError("policy mask batch does not match states")
-    placement_cells = explored_masks.shape[1] - 1
     slot = LEGAL_CLEARANCE_SLOT.get(states.shape[1])
     if slot is None:
         # No clearance channel in this layout: the stored candidate mask is the
-        # contract, as it is for every compact layout.
+        # contract, as it is for every compact layout. Answered before the batch
+        # check because a packed shard passes an empty `states` view here -- it
+        # is kept only for its dtype and channel count, and this branch never
+        # reads a row.
         return explored_masks.bool()
+    if explored_masks.shape[0] != states.shape[0]:
+        raise ValueError("policy mask batch does not match states")
+    placement_cells = explored_masks.shape[1] - 1
     clearance = states[:, slot].unsqueeze(1)
     raster_cells = states.shape[2] * states.shape[3]
     if placement_cells != raster_cells:
@@ -331,6 +334,9 @@ def prepare_policy_supervision(
         width=dataset.width,
         sources=dataset.sources,
         ownerships=getattr(dataset, "ownerships", None),
+        # Already packed when the shard was rendered straight into packed
+        # planes; `_pack_states` then sees this set and does nothing.
+        packed_states=getattr(dataset, "packed_states", None),
     )
 
 

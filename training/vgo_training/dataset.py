@@ -83,6 +83,14 @@ _LEGACY_KIND_BY_CHANNELS = {3: "rgb", 5: "compact", 12: "semantic"}
 _RUST_RENDERER = (
     Path(__file__).resolve().parents[2] / "target/release/examples/render_shard"
 )
+# Renders straight into the packed planes instead of dense f32. At 256x256x7
+# that is 152 KB per sample crossing the process boundary rather than 1.75 MB,
+# and the dense form is never built at all -- it existed only to be packed and
+# dropped. Byte-identical to `pack()` on the dense render; see
+# tests/test_pack_shard.py.
+_RUST_PACKER = (
+    Path(__file__).resolve().parents[2] / "target/release/examples/pack_shard"
+)
 HEADER = struct.Struct("<8s6I")
 # v7 appends the shard's policy capacity, so the record size is a property of
 # the file rather than of the reader's version table. Widening is a run-level
@@ -173,13 +181,21 @@ class RasterDataset:
     # policy_resolution**2. None for shards written before `final_stones`
     # existed, which the loss masks rather than treating as "nobody owns it".
     ownerships: "torch.Tensor | None" = None
+    # Set when the shard was rendered straight into packed planes, which is the
+    # normal path for a configured raster kind. `states` is then an empty view
+    # kept for its dtype and channel count, exactly as after `_pack_states`.
+    packed_states: "PackedStates | None" = None
 
     @property
     def samples(self) -> int:
+        if self.packed_states is not None:
+            return self.packed_states.samples
         return self.states.shape[0]
 
     @property
     def channels(self) -> int:
+        if self.packed_states is not None:
+            return self.packed_states.channels
         return self.states.shape[1]
 
 
@@ -362,6 +378,7 @@ def _load_legacy(
         zeros,
         zeros.copy(),
         zeros.copy(),
+        None,
     )
 
 
@@ -698,6 +715,68 @@ def _sparse_policies(cells: np.ndarray) -> np.ndarray:
     return out
 
 
+def _packed_states(
+    path: Path, resolution: int, raster_kind: str
+) -> "PackedStates | None":
+    """Render a shard directly into packed planes, or None if it cannot.
+
+    Returns None when the binary is missing or the layout has no packing
+    classification, so the caller falls back to the dense path rather than
+    failing. A shard that *should* pack but does not -- a plane that stopped
+    being binary, say -- makes the packer exit non-zero, which is also a
+    fallback rather than a crash: the dense path then re-derives the same
+    answer and `pack()` reports the mismatch properly.
+    """
+    from .packed_states import PackedStates, _LAYOUTS
+
+    if not _RUST_PACKER.exists():
+        return None
+    with tempfile.TemporaryDirectory() as directory:
+        destination = Path(directory) / "packed.bin"
+        try:
+            subprocess.run(
+                [str(_RUST_PACKER), str(path), str(destination), str(resolution),
+                 raster_kind],
+                check=True, capture_output=True, text=True,
+            )
+        except subprocess.CalledProcessError:
+            return None
+        raw = destination.read_bytes()
+    if len(raw) < 36 or raw[:8] != b"VGOPACK1":
+        return None
+    samples, channels, height, width, binary, continuous, scalar = struct.unpack(
+        "<7I", raw[8:36]
+    )
+    layout = _LAYOUTS.get(channels)
+    if layout is None or (len(layout.binary), len(layout.continuous), len(layout.scalar)) != (
+        binary, continuous, scalar
+    ):
+        return None
+    pixels = height * width
+    bit_bytes = -(-pixels // 8)
+    at = 36
+    bits = np.frombuffer(raw, np.uint8, samples * binary * bit_bytes, at)
+    at += samples * binary * bit_bytes
+    cont = np.frombuffer(raw, "<f2", samples * continuous * pixels, at)
+    at += samples * continuous * pixels * 2
+    scal = np.frombuffer(raw, "<f2", samples * scalar, at)
+    at += samples * scalar * 2
+    if at != len(raw):
+        raise ValueError(f"packed shard is {len(raw)} bytes, expected {at}")
+    # Copied off the mapping: `raw` is a transient temp file's contents and the
+    # window keeps these for the life of the shard.
+    return PackedStates(
+        bits=torch.from_numpy(bits.reshape(samples, binary, bit_bytes).copy()),
+        continuous=torch.from_numpy(
+            cont.reshape(samples, continuous, height, width).copy()
+        ),
+        scalars=torch.from_numpy(scal.reshape(samples, scalar).copy()),
+        height=height,
+        width=width,
+        layout=layout,
+    )
+
+
 def _load_replay_v4(
     path: Path,
     samples: int,
@@ -730,7 +809,16 @@ def _load_replay_v4(
     ):
         raise ValueError("replay record claims more stones than the capacity")
 
-    states = _render_states(path, records, channels, height, width, raster_kind)
+    # Pack in the renderer when we can. The dense raster exists only to be
+    # packed and dropped, so building it costs 11.8x the bytes for nothing; the
+    # fallback stays for layouts the packer has no classification for.
+    packed = _packed_states(path, width, raster_kind) if raster_kind else None
+    if packed is None:
+        states = _render_states(path, records, channels, height, width, raster_kind)
+    else:
+        # An empty view, kept for its dtype and channel count -- the same shape
+        # `_pack_states` leaves behind when packing happens after the fact.
+        states = np.zeros((0, channels, height, width), dtype=np.float32)
     policies, masks, visits, beta, proposal_counts = _expand_sparse_policy(
         records, samples, policy_size
     )
@@ -752,6 +840,7 @@ def _load_replay_v4(
         np.array(records["game"], copy=True).astype(np.int64),
         np.array(records["ply"], copy=True).astype(np.int64),
         np.array(records["seed"], copy=True).astype(np.int64),
+        packed,
     )
 
 
@@ -825,6 +914,7 @@ def _load_replay(
         np.array(records["game"], copy=True).astype(np.int64),
         np.array(records["ply"], copy=True).astype(np.int64),
         np.array(records["seed"], copy=True).astype(np.int64),
+        None,
     )
 
 
@@ -922,11 +1012,22 @@ def load_dataset(path: str | Path, *, raster_kind: str | None = None) -> RasterD
         games,
         plies,
         seeds,
+        packed,
     ) = arrays
-    states = states.reshape(samples, channels, height, width)
+    if packed is None:
+        states = states.reshape(samples, channels, height, width)
+    elif packed.samples != samples:
+        raise ValueError(
+            f"packed shard holds {packed.samples} samples, header says {samples}"
+        )
 
     if not np.isfinite(states).all() or not np.isfinite(policies).all():
         raise ValueError("dataset contains non-finite tensors")
+    # `states` is an empty view when packed, so the check above is vacuous for
+    # it. The continuous plane is the only float the packer carries through, and
+    # a NaN there would otherwise reach the loss unexamined.
+    if packed is not None and not torch.isfinite(packed.continuous).all():
+        raise ValueError("packed states contain non-finite values")
     if not np.isfinite(visits).all() or np.any(visits < 0.0):
         raise ValueError("visit counts must be finite and nonnegative")
     if not np.isfinite(beta).all() or np.any((beta < 0.0) | (beta > 1.0)):
@@ -1000,6 +1101,7 @@ def load_dataset(path: str | Path, *, raster_kind: str | None = None) -> RasterD
         height=height,
         width=width,
         sources=(str(path),),
+        packed_states=packed,
         ownerships=(
             None
             if (own := shard_ownership(path, samples, int(round((policy_size - 1) ** 0.5))))
