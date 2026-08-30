@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -40,12 +41,27 @@ def window_from_games(root: Path, window_samples: int) -> tuple[list[Path], int]
     in sample count for the same reason. What the learner actually spends, and
     what the gradient signal scales with, is samples.
 
-    Recency is directory order: generation labels sort chronologically and games
-    are numbered within them. Counts come from each manifest, so choosing a
-    window costs a few hundred small reads rather than loading any data.
+    Recency is the game number, not directory order. Generation labels restart
+    at `gen-000000` for every run and collide across them: the current tree has
+    six unrelated `gen-000001-*` directories, and one `gen-000000-seed` holding
+    games from two different runs. Sorting by label therefore put the newest
+    run *first*, and a window took the tail of the oldest generations still on
+    disk -- three consecutive bulk updates trained on the identical 759 stale
+    games while ~2,000 fresh ones sat unread, which reads as a flat loop rather
+    than as a bug.
+
+    Game numbers order correctly across runs because the generator assigns them
+    globally (`--first-game`, advanced past everything a previous process could
+    claim). They agree with file mtime on 98.8% of sampled pairs; the remainder
+    is 32 actors finishing games out of order within one batch, which is
+    unordered anyway. A directory that is not `game-<digits>` predates the
+    per-game writer and sorts oldest rather than being dropped.
+
+    Counts come from each manifest, so choosing a window costs a few hundred
+    small reads rather than loading any data.
     """
 
-    entries: list[tuple[Path, int]] = []
+    entries: list[tuple[int, str, Path, int]] = []
     for generation in sorted(p for p in root.iterdir() if p.is_dir()):
         for game in sorted(p for p in generation.iterdir() if p.is_dir()):
             manifest = game / "manifest.json"
@@ -56,12 +72,17 @@ def window_from_games(root: Path, window_samples: int) -> tuple[list[Path], int]
                 samples = int(json.loads(manifest.read_text())["samples"])
             except (ValueError, KeyError, OSError):
                 continue
-            if samples > 0:
-                entries.append((dataset, samples))
+            if samples <= 0:
+                continue
+            number = re.fullmatch(r"game-(\d+)", game.name)
+            entries.append(
+                (int(number.group(1)) if number else -1, game.name, dataset, samples)
+            )
+    entries.sort(key=lambda entry: (entry[0], entry[1]))
 
     chosen: list[Path] = []
     total = 0
-    for dataset, samples in reversed(entries):
+    for _, _, dataset, samples in reversed(entries):
         if total >= window_samples:
             break
         chosen.append(dataset)
