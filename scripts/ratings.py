@@ -25,6 +25,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "training"))
+from collections import defaultdict  # noqa: E402
+
 from vgo_training.bradley_terry import fit_ratings  # noqa: E402
 
 # Fixed reference points get ids outside the update range so they cannot collide
@@ -80,7 +82,27 @@ def main() -> None:
               + (f" ({skipped} records lacked a candidate_model field)" if skipped else ""))
         return
 
+    # A rating is only meaningful relative to players it is connected to. The
+    # fitter anchors one id at zero and fits everything else against the prior's
+    # phantom opponent, so a component with no path to the anchor still gets
+    # numbers -- on a different scale, and indistinguishable from real ones.
+    # Measured: sampling only recent models split the graph into {anchor, 28,
+    # 33, 36} and {31, 32, 34, 39}, and update 39 printed +28 against update
+    # 33's +676, which reads as a collapse and was an artifact.
+    adjacency: dict[int, set[int]] = defaultdict(set)
+    for m in matches:
+        adjacency[m["a"]].add(m["b"])
+        adjacency[m["b"]].add(m["a"])
+    anchored, stack = set(), [ANCHOR_ID]
+    while stack:
+        node = stack.pop()
+        if node in anchored:
+            continue
+        anchored.add(node)
+        stack.extend(adjacency[node] - anchored)
+
     ratings = fit_ratings(matches, anchor=ANCHOR_ID)
+    floating = sorted(set(ratings) - anchored)
     games = {}
     for m in matches:
         n = m["a_wins"] + m["b_wins"] + m["draws"]
@@ -92,7 +114,16 @@ def main() -> None:
         print(f"  {skipped} record(s) skipped for missing model names")
     print(f"\n  {'model':<20} {'rating':>8} {'games':>7}")
     for identifier, rating in sorted(ratings.items(), key=lambda kv: -kv[1]):
+        if identifier in floating:
+            continue
         print(f"  {label(identifier):<20} {rating:>+8.0f} {games.get(identifier, 0):>7}")
+    if floating:
+        print(f"\n  NOT COMPARABLE -- no match path to {label(ANCHOR_ID)}, so these are")
+        print("  fitted against the prior rather than the anchor and sit on their own")
+        print("  scale. They need a match against an anchored model to join.")
+        for identifier in sorted(floating, key=lambda i: -ratings[i]):
+            print(f"    {label(identifier):<18} {ratings[identifier]:>+8.0f} "
+                  f"{games.get(identifier, 0):>7}  (floating)")
 
 
 if __name__ == "__main__":

@@ -380,12 +380,30 @@ print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$onnx")
     # holding the zero. Deduplicated because `seed_model` is usually also the
     # newest entry in `models/`, and drawing it twice would spend a third of the
     # match on a repeat.
+    # One fixed reference every round, not left to the draw.
+    #
+    # Sampling purely from recent models makes them play each other and never the
+    # references, which splits the rating graph: the recent cluster has no edge
+    # to the anchor, so Bradley-Terry fits it against its own prior and reports
+    # numbers on a different scale from the anchored ones, with nothing marking
+    # them apart. That happened on the first real round -- update 39 came out at
+    # +28 while update 33 sat at +676, which reads as a collapse and was an
+    # artifact of two disconnected components.
+    #
+    # Reserving a slot keeps every round tied to the scale by construction, at
+    # the cost of one lopsided match in three. Defined before the pool because
+    # the pool filters it out: an empty `$reference` would make `grep -vF ""`
+    # match every line and leave nothing to sample.
+    reference="$anchor"
+    [ -z "$reference" ] && reference="$seed_model"
+
     mapfile -t pool < <(
       {
         ls -1 "$models"/update-*.onnx 2>/dev/null | tail -n "$anchor_pool"
         [ -n "$anchor" ] && echo "$anchor"
         [ -n "$seed_model" ] && echo "$seed_model"
-      } | grep -v "update-$(printf '%06d' "$update").onnx" | awk '!seen[$0]++'
+      } | grep -v "update-$(printf '%06d' "$update").onnx" \
+        | grep -vF "$reference" | awk '!seen[$0]++'
     )
     if [ "${#pool[@]}" -gt 0 ]; then
       # Seeded in Python rather than with `shuf --random-source`. A constant
@@ -394,14 +412,27 @@ print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$onnx")
       # would have drawn the identical opponents and the graph would never
       # connect. Seeding a PRNG on the update number is deterministic per update
       # (so a rerun repeats it) and actually varies between them.
+      # One fixed reference every round, not left to the draw.
+      #
+      # Sampling purely from recent models makes them play each other and never
+      # the references, which splits the rating graph: the recent cluster has no
+      # edge to the anchor, so Bradley-Terry fits it against its own prior and
+      # reports numbers on a different scale from the anchored ones, with nothing
+      # marking them apart. That happened on the first real round -- update 39
+      # came out at +28 while update 33 sat at +676, which reads as a collapse
+      # and was an artifact.
+      #
+      # Reserving one slot for a reference keeps every round connected to the
+      # scale by construction, at the cost of one lopsided match in three.
       mapfile -t chosen < <(
         "$python" -c "
 import random, sys
 pool = [line for line in sys.stdin.read().splitlines() if line]
 count = min(int(sys.argv[1]), len(pool))
 print('\n'.join(random.Random(int(sys.argv[2])).sample(pool, count)))
-" "$anchor_samples" "$update" <<< "$(printf '%s\n' "${pool[@]}")"
+" "$((anchor_samples - 1))" "$update" <<< "$(printf '%s\n' "${pool[@]}")"
       )
+      [ -n "$reference" ] && chosen=("$reference" "${chosen[@]}")
       opponent_flags=()
       for opponent in "${chosen[@]}"; do opponent_flags+=(--opponent "$opponent"); done
       echo "[loop] update $update: rating match against ${#chosen[@]} sampled models"
