@@ -86,8 +86,8 @@ simulations="${VGO_SIMULATIONS:-1000}"
 # *more* expensive than ordinary ones. 400 against 1000 is the discount.
 #
 # 0.99 rather than the 0.98 tried before: at 0.98 two fifths of recorded samples
-# came from the cheap tail, and `--ply-sample-rate` is 1.0 so every one of them
-# is trained on. A higher bar fires later and keeps that share down.
+# came from the cheap tail, and every ply is recorded, so all of them are
+# trained on. A higher bar fires later and keeps that share down.
 # Komi, as a fixed number of points on every board -- the same convention as
 # Go, where 7 points is roughly right from 9x9 to 19x19.
 #
@@ -101,7 +101,26 @@ simulations="${VGO_SIMULATIONS:-1000}"
 # it wants less komi, not more. 1/38 sits at 53% and moves a point the wrong way,
 # which is the smaller of the two errors.
 komi_area_coefficient="${VGO_KOMI_AREA_COEFFICIENT:-28.0}"
+# `resign_threshold` is the fallback, used until calibration says otherwise.
+#
+# The real value is chosen per generation from measured false positives. Every
+# game writes `resign-calibration.jsonl`: for each candidate (threshold, window),
+# whether the rule would have conceded, and whether that concession would have
+# been wrong. Under soft resignation the game plays on to a real terminal state,
+# so every game calibrates rather than only a sampled exemption.
+#
+# Re-picked before each generator rather than once per run, because calibration
+# describes the model that produced it and a model still learning invalidates its
+# own history -- one recorded run fired on 15 of 1625 games over fifteen shards
+# and 440 of 1686 over the next sixteen. This is what `pipeline.py` did per
+# shard; the bulk loop dropped it when it stopped using the pipeline, not
+# deliberately.
+#
+# Set the target to 0 to pin the threshold and switch adaptation off.
 resign_threshold="${VGO_RESIGN_THRESHOLD:-0.99}"
+resign_target_false_positive="${VGO_RESIGN_TARGET_FP:-0.03}"
+# Games pooled when picking. Wider is steadier but reaches back to weaker models.
+resign_calibration_games="${VGO_RESIGN_CALIBRATION_GAMES:-400}"
 resign_soft_simulations="${VGO_RESIGN_SOFT_SIMULATIONS:-400}"
 resign_window="${VGO_RESIGN_WINDOW:-5}"
 resign_minimum_ply="${VGO_RESIGN_MINIMUM_PLY:-20}"
@@ -115,7 +134,15 @@ root_noise="${VGO_ROOT_NOISE:-0.10}"
 # same simulation count: an unequal budget measures what search is worth, not
 # who is stronger.
 anchor_every="${VGO_ANCHOR_EVERY:-3}"
-anchor_pairs="${VGO_ANCHOR_PAIRS:-24}"
+# Three pairs against each of three sampled opponents: 18 games an update,
+# against 48 before. Any one of them resolves almost nothing; the rating fit
+# over the accumulated graph is what gets sharper.
+anchor_pairs="${VGO_ANCHOR_PAIRS:-3}"
+anchor_samples="${VGO_ANCHOR_SAMPLES:-3}"
+# How many recent models the sample is drawn from, alongside the fixed
+# references. Wider reaches further back for diversity; narrower keeps every
+# match close in strength and therefore informative.
+anchor_pool="${VGO_ANCHOR_POOL:-12}"
 # Held at 800 while generation moves to 1000. Both seats always match each
 # other, which is what makes a match fair; holding the number fixed across runs
 # is what makes the *series* comparable, and -44 / -89 / +280 were all measured
@@ -173,10 +200,33 @@ PY
 # backslash joins the next line, so a `#` on it comments out every remaining
 # argument and the binary starts with a silently truncated command line -- no
 # `--model` reads as a naive generator, which still runs and still writes games.
+# Lowest threshold whose measured false-positive rate clears the target, or the
+# configured fallback when nothing has enough evidence yet. Self-protecting: with
+# no calibration it changes nothing, so it is safe to leave on while the value
+# head is still learning and the rule would be worthless.
+pick_resign_threshold () {
+  local chosen
+  if [ "$(echo "$resign_target_false_positive > 0" | bc -l 2>/dev/null)" != "1" ]; then
+    echo "$resign_threshold"; return
+  fi
+  chosen=$("$python" "$root/scripts/resign-calibration.py" "$games" --pick \
+    --games "$resign_calibration_games" --window "$resign_window" \
+    --target "$resign_target_false_positive" --fallback "$resign_threshold" 2>/dev/null)
+  [ -z "$chosen" ] && chosen="$resign_threshold"
+  echo "$chosen"
+}
+
 start_generator () {
   local label="$1" model="$2" first_game="$3"
   local stop_file="$games/$label.stop"
   rm -f "$stop_file"
+  local threshold
+  threshold=$(pick_resign_threshold)
+  if [ "$threshold" = "$resign_threshold" ]; then
+    echo "[resign] $label: no threshold met $(echo "100*$resign_target_false_positive" | bc -l | cut -c1-4)% false positives; holding the $resign_threshold fallback" >&2
+  else
+    echo "[resign] $label: threshold $threshold chosen from calibration (target $(echo "100*$resign_target_false_positive" | bc -l | cut -c1-4)%)" >&2
+  fi
   local model_flag=()
   [ -n "$model" ] && model_flag=(--model "$model")
   setsid nohup "$root/target/release/vgo-generate-continuous" \
@@ -185,11 +235,11 @@ start_generator () {
     --actors "$actors" --simulations "$simulations" \
     --resolution 256 --policy-resolution 128 --raster-kind compact-radius \
     --board-mix 50:38 --board-mix 25:18 --board-mix 25:18-38 \
-    --ply-sample-rate 1.0 --max-plies 70 --radius 0.05555555555555555 \
+    --max-plies 70 --radius 0.05555555555555555 \
     --coarse-pool 16 --widening-coefficient 6.0 --maximum-candidates 321 \
     --komi-area-coefficient "$komi_area_coefficient" \
     --komi-low 0.017 --komi-high 0.137 \
-    --resign-threshold "$resign_threshold" \
+    --resign-threshold "$threshold" \
     --resign-soft-simulations "$resign_soft_simulations" \
     --resign-window "$resign_window" \
     --resign-minimum-ply "$resign_minimum_ply" \
@@ -302,24 +352,76 @@ print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$onnx")
   echo "[loop] update $update done: generation $generation started (pid $generator), $previous_label draining"
 
   # Measurement, not a gate. Adoption already happened above.
-  rounds=$(( update - first_update + 1 ))
-  if [ -n "$anchor" ] && [ $(( rounds % anchor_every )) -eq 0 ]; then
-    echo "[loop] update $update: measuring against the anchor"
-    "$root/target/release/vgo-arena" \
-      --candidate "$onnx" --opponent "$anchor" \
-      --candidate-raster-kind compact-radius \
-      --radius "$anchor_radius" --komi "$anchor_komi" \
-      --policy-resolution 128 --resolution 256 \
-      --simulations "$anchor_simulations" --pairs "$anchor_pairs" \
-      --max-plies "$anchor_max_plies" --threads 8 --maximum-batch 32 \
-      --coarse-pool 16 --widening-coefficient 4.0 --maximum-candidates 321 \
-      --seed $((500000 + update)) \
-      >> "$output/anchor.jsonl" 2>>"$output/anchor.log"
-    # The arena intermittently aborts in teardown after writing its JSON, at 8
-    # threads and at 16, so a non-zero exit here is not necessarily a bad
-    # measurement. It is recorded rather than acted on.
-    status=$?
-    [ "$status" -ne 0 ] && echo "[loop] anchor arena exited $status (results may still be valid)" >&2
+  #
+  # Keyed on the absolute update number, not on rounds since this process
+  # started. `first_update` moves with every restart, so a rounds-based cadence
+  # resets to zero each time -- across five restarts it fired exactly once, and
+  # every measurement in between had to be run by hand.
+  if [ -n "$anchor" ] && [ $(( update % anchor_every )) -eq 0 ]; then
+    # A pool, not a fixed opponent. One unchanging anchor stops measuring
+    # anything the moment it is outclassed: sl-w64b16 lost 48-0 twice running,
+    # which bounds the candidate from below and says nothing else, for 70
+    # minutes of GPU a time.
+    #
+    # Instead sample `anchor_samples` earlier models and play a short match
+    # against each. Any single match is noise at this size; what accumulates is
+    # a connected graph of pairwise results, and `scripts/ratings.py` fits every
+    # model's rating over the whole history at once. Sampling keeps the graph
+    # connected without anyone having to choose a ladder, and re-fitting from
+    # scratch means old matches keep informing new ratings.
+    # Recent models plus the fixed references, deduplicated.
+    #
+    # Recent, because a match against something far weaker is a sweep, and a
+    # sweep carries almost no information -- the rating prior already assumes a
+    # large gap. Neighbours are where the games actually discriminate.
+    #
+    # The fixed references stay in so the graph keeps a tie to the original
+    # scale; without one, ratings drift as a connected component with nothing
+    # holding the zero. Deduplicated because `seed_model` is usually also the
+    # newest entry in `models/`, and drawing it twice would spend a third of the
+    # match on a repeat.
+    mapfile -t pool < <(
+      {
+        ls -1 "$models"/update-*.onnx 2>/dev/null | tail -n "$anchor_pool"
+        [ -n "$anchor" ] && echo "$anchor"
+        [ -n "$seed_model" ] && echo "$seed_model"
+      } | grep -v "update-$(printf '%06d' "$update").onnx" | awk '!seen[$0]++'
+    )
+    if [ "${#pool[@]}" -gt 0 ]; then
+      # Seeded in Python rather than with `shuf --random-source`. A constant
+      # stream like `yes $update` has almost no entropy, so shuf returned the
+      # same permutation for every update -- three consecutive rating matches
+      # would have drawn the identical opponents and the graph would never
+      # connect. Seeding a PRNG on the update number is deterministic per update
+      # (so a rerun repeats it) and actually varies between them.
+      mapfile -t chosen < <(
+        "$python" -c "
+import random, sys
+pool = [line for line in sys.stdin.read().splitlines() if line]
+count = min(int(sys.argv[1]), len(pool))
+print('\n'.join(random.Random(int(sys.argv[2])).sample(pool, count)))
+" "$anchor_samples" "$update" <<< "$(printf '%s\n' "${pool[@]}")"
+      )
+      opponent_flags=()
+      for opponent in "${chosen[@]}"; do opponent_flags+=(--opponent "$opponent"); done
+      echo "[loop] update $update: rating match against ${#chosen[@]} sampled models"
+      printf '[loop]   %s\n' "${chosen[@]##*/}"
+      "$root/target/release/vgo-arena" \
+        --candidate "$onnx" "${opponent_flags[@]}" \
+        --candidate-raster-kind compact-radius \
+        --radius "$anchor_radius" --komi "$anchor_komi" \
+        --policy-resolution 128 --resolution 256 \
+        --simulations "$anchor_simulations" --pairs "$anchor_pairs" \
+        --max-plies "$anchor_max_plies" --threads 8 --maximum-batch 32 \
+        --coarse-pool 16 --widening-coefficient 4.0 --maximum-candidates 321 \
+        --seed $((500000 + update)) \
+        >> "$output/anchor.jsonl" 2>>"$output/anchor.log"
+      # The arena intermittently aborts in teardown after writing its JSON, at 8
+      # threads and at 16, so a non-zero exit here is not necessarily a bad
+      # measurement. It is recorded rather than acted on.
+      status=$?
+      [ "$status" -ne 0 ] && echo "[loop] rating arena exited $status (results may still be valid)" >&2
+    fi
   fi
 done
 
