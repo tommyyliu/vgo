@@ -592,6 +592,12 @@ fn run_match(
         concat!(
             "{{\n",
             "  \"schema\": \"vgo.arena.v1\",\n",
+            // Which model played the candidate seat. Without it a record says
+            // who was beaten but not by whom, so a history of matches cannot be
+            // assembled into a rating graph -- which is what
+            // `scripts/ratings.py` needs now that the loop samples opponents
+            // instead of always using one anchor.
+            "  \"candidate_model\": \"{}\",\n",
             "  \"opponent\": \"{}\",\n",
             "  \"opponent_model\": \"{}\",\n",
             "  \"pairs\": {},\n",
@@ -617,6 +623,7 @@ fn run_match(
             "  \"failures\": {}\n",
             "}}"
         ),
+        arguments.candidate.display(),
         opponent_name,
         opponent_model,
         arguments.pairs,
