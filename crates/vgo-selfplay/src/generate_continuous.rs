@@ -154,8 +154,6 @@ struct Config {
     komi_low: f64,
     #[arg(long, default_value_t = 0.137)]
     komi_high: f64,
-    #[arg(long, default_value_t = 1.0)]
-    ply_sample_rate: f64,
     #[arg(long, default_value = "vgo")]
     ruleset: Ruleset,
     #[arg(long, default_value_t = 0.0)]
@@ -211,7 +209,6 @@ impl Config {
             komi_area_coefficient: self.komi_area_coefficient,
             maximum_plies: self.maximum_plies,
             ruleset: self.ruleset,
-            ply_sample_rate: self.ply_sample_rate,
             resign_threshold: self.resign_threshold,
             resign_window: self.resign_window,
             resign_minimum_ply: self.resign_minimum_ply,
@@ -248,7 +245,7 @@ fn file_sha256(path: &Path) -> io::Result<String> {
 fn write_game(
     root: &Path,
     game_id: u64,
-    game: GameSamples,
+    mut game: GameSamples,
     config: &Config,
     raster: RasterConfig,
     policy_size: usize,
@@ -273,6 +270,27 @@ fn write_game(
         fs::remove_dir_all(&staging)?;
     }
     fs::create_dir_all(&staging)?;
+
+    // Taken before `game.samples` is moved into the stream below.
+    //
+    // One row per (threshold, window) the rule could have used, describing what
+    // it would have done to *this* game: whether it would have conceded, whether
+    // that concession would have been wrong, and how many plies it would have
+    // skipped. Under soft resignation every game calibrates, because the game
+    // plays on to a real terminal state and the counterfactual is therefore
+    // known rather than sampled.
+    //
+    // Written raw, per game, rather than pre-pooled. The generator does not know
+    // which window a future run will pool over, and a shard-level aggregate
+    // cannot be un-summed; 36 rows of small integers per game is cheaper than
+    // regenerating.
+    //
+    // `scripts/resign-calibration.py` is the consumer: it pools these over the
+    // trailing window, requires at least thirty firings before trusting a rate,
+    // and picks the lowest threshold whose false-positive rate stays under the
+    // target. Nothing qualifying leaves the fallback in place, which is what
+    // makes adaptation safe to leave on while the value head is still learning.
+    let calibration = std::mem::take(&mut game.calibration);
 
     let dataset = staging.join("dataset.vgo");
     let mut stream = ReplayStream::create(
@@ -304,6 +322,24 @@ fn write_game(
         writer.flush()?;
     }
 
+    if !calibration.is_empty() {
+        let mut writer =
+            BufWriter::new(fs::File::create(staging.join("resign-calibration.jsonl"))?);
+        for trial in &calibration {
+            writeln!(
+                writer,
+                r#"{{"threshold":{:.4},"window":{},"fired":{},"wrong":{},"plies_saved":{},"confidence":{:.4}}}"#,
+                trial.threshold,
+                trial.window,
+                u32::from(trial.fired),
+                u32::from(trial.wrong),
+                trial.plies_saved,
+                trial.fired_confidence,
+            )?;
+        }
+        writer.flush()?;
+    }
+
     let manifest = staging.join("manifest.json");
     let mut writer = BufWriter::new(fs::File::create(&manifest)?);
     writeln!(writer, "{{")?;
@@ -318,7 +354,6 @@ fn write_game(
     writeln!(writer, "  \"policy_size\": {},", policy_size)?;
     writeln!(writer, "  \"simulations\": {},", config.simulations)?;
     writeln!(writer, "  \"radius\": {},", config.radius)?;
-    writeln!(writer, "  \"ply_sample_rate\": {},", config.ply_sample_rate)?;
     if let Some(sha) = model_sha256 {
         writeln!(writer, "  \"behavior_model_sha256\": \"{sha}\",")?;
     }
