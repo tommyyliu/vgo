@@ -34,7 +34,7 @@ exec "$root/target/release/vgo-generate-continuous" \
   --actors "$actors" --simulations "$simulations" \
   --resolution 256 --policy-resolution 128 --raster-kind compact-radius \
   --board-mix 50:38 --board-mix 25:18 --board-mix 25:18-38 \
-  --ply-sample-rate 1.0 --max-plies 70 --radius 0.05555555555555555 \
+  --max-plies 70 --radius 0.05555555555555555 \
   --coarse-pool 16 --widening-coefficient 4.0 --maximum-candidates 321 \
   --komi-low 0.017 --komi-high 0.137 \
   --temperature 1.0 --temperature-plies 30 --leaf-batch 4 \

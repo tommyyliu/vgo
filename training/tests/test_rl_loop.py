@@ -1476,7 +1476,6 @@ class RunRecipeTest(unittest.TestCase):
         config = PipelineConfig(
             output="unused",
             board_mix=("50:38", "25:18", "25:18-50"),
-            ply_sample_rate=0.2,
         )
         config.validate()
         self.assertEqual(config.board_mix, ("50:38", "25:18", "25:18-50"))
@@ -1491,16 +1490,6 @@ class RunRecipeTest(unittest.TestCase):
                 config = PipelineConfig(output="unused", board_mix=(bad,))
                 with self.assertRaises(ValueError):
                     config.validate()
-
-    def test_ply_sample_rate_is_a_fraction(self) -> None:
-        from vgo_training.pipeline import PipelineConfig
-
-        for bad in (0.0, -0.5, 1.5):
-            with self.subTest(rate=bad):
-                config = PipelineConfig(output="unused", ply_sample_rate=bad)
-                with self.assertRaises(ValueError):
-                    config.validate()
-        PipelineConfig(output="unused", ply_sample_rate=1.0).validate()
 
     def test_tournament_recipes_are_not_mistaken_for_training_runs(self) -> None:
         # Guards the filter above: if a training recipe ever stopped naming the

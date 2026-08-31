@@ -255,19 +255,6 @@ struct Config {
     /// extrapolating into the regime that breaks it.
     #[arg(long = "board-mix")]
     board_mix: Vec<String>,
-    /// Positions recorded per game, as a fraction of its plies.
-    ///
-    /// A standard-board game runs past three hundred plies, and a shard sized
-    /// in *positions* would then hold about five games. The value head learns
-    /// from game-level labels only, so that starves the component that is
-    /// already weakest -- 62 games per shard was the old number and it was
-    /// already thin. Recording a fraction restores the game count at the same
-    /// shard size, and decorrelates the window besides: consecutive plies are
-    /// nearly the same position and contribute nearly the same gradient.
-    ///
-    /// One keeps every ply, which is what runs before this did.
-    #[arg(long, default_value_t = 1.0)]
-    ply_sample_rate: f64,
     /// Which rules to play. `vgo` is this repository's, `official` is
     /// voronoigo.com's -- see docs/OFFICIAL_RULES.md. Part of run identity: a
     /// replay window mixing the two holds games from two different games.
@@ -348,7 +335,6 @@ impl Config {
             komi_area_coefficient: self.komi_area_coefficient,
             maximum_plies: self.maximum_plies,
             ruleset: self.ruleset,
-            ply_sample_rate: self.ply_sample_rate,
             resign_threshold: self.resign_threshold,
             resign_window: self.resign_window,
             resign_minimum_ply: self.resign_minimum_ply,
@@ -1029,7 +1015,6 @@ fn write_manifest(
             config.komi_area_coefficient
         )?;
     }
-    writeln!(writer, "  \"ply_sample_rate\": {},", config.ply_sample_rate)?;
     // Dynamic komi shifts these per shard, so the effective bounds belong in
     // durable replay rather than only in the coordinator's initial config.
     writeln!(writer, "  \"komi_low\": {},", config.komi_low)?;

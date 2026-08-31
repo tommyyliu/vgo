@@ -42,7 +42,6 @@ pub struct GameSettings {
     pub komi_area_coefficient: f64,
     pub maximum_plies: u32,
     pub ruleset: Ruleset,
-    pub ply_sample_rate: f64,
     pub resign_threshold: f64,
     pub resign_window: u32,
     pub resign_minimum_ply: u32,
@@ -77,22 +76,6 @@ impl GameSettings {
         (radius, komi, plies)
     }
 
-    /// Whether this ply is recorded, at the configured rate.
-    ///
-    /// Drawn per (game, ply) so the kept set is spread through the game rather
-    /// than a prefix, and stable for a given seed.
-    #[must_use]
-    pub fn records_ply(&self, game_seed: u64, ply: u32) -> bool {
-        let rate = self.ply_sample_rate.clamp(0.0, 1.0);
-        if rate >= 1.0 {
-            return true;
-        }
-        seeded_unit(
-            game_seed
-                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-                .wrapping_add(u64::from(ply)),
-        ) < rate
-    }
 }
 
 use vgo_search::{Action, SearchConfig, SearchResult};
@@ -573,12 +556,6 @@ pub fn generate_game(
             // are different positions, and scoring a board several plies short
             // of the end awards the game on a state neither player played to.
             final_position.replace(Some(step.position.clone()));
-            // Keep a fraction of plies. The draw is per (game, ply) so the kept
-            // set is spread through the game rather than a prefix, and stable
-            // for a given seed.
-            if !settings.records_ply(game_seed, step.ply) {
-                return;
-            }
             let target = policy_target(step.search, policy_config);
             pending.push(PendingSample {
                 // Store the position; rendering is a training-time choice now,

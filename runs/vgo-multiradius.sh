@@ -71,13 +71,18 @@
 # heuristic. That is a choice, not a measurement -- if the first updates diverge,
 # this is the first thing to look at.
 #
-# ## Ply sampling, because the value head would starve
+# ## Ply sampling: removed
 #
-# A standard game runs past three hundred plies. Shards are sized in positions,
-# so 1600 of them would be about five games -- and the value head learns from
-# game-level labels only. `--ply-sample-rate 0.25` restores the game count at
-# the same shard size, and decorrelates the window besides: consecutive plies
-# are nearly the same position carrying nearly the same gradient.
+# This run subsampled plies at 0.25, reasoning that the value head learns from
+# game-level labels only and a 300-ply game therefore buys one label at three
+# hundred times the storage. That much is true -- a 200k window holds ~978 games
+# and so ~978 value labels, each repeated ~205 times.
+#
+# What it missed is what a wider window costs. Holding the sample count fixed,
+# quarter-rate sampling makes the window reach back four times as far: 78 hours
+# rather than 20, which at the current cadence is 27 updates. Training on games
+# from a model 27 updates weaker costs more than the extra labels are worth, and
+# the flag does not create any compute -- the plies are searched either way.
 #
 # The ply cap scales with the board for the same reason it exists: 70 plies is
 # about the mini board's capacity, and left there a standard game is cut off a
@@ -157,9 +162,7 @@ exec "$python" -m vgo_training.rl_loop \
   --coarse-pool 16 --generation-simulations 1600 \
   --widening-coefficient 4.0 --maximum-candidates 321 \
   --root-exploration-noise 0.0 \
-  --board-mix 50:38 --board-mix 25:18 --board-mix 25:18-38 \
-  --ply-sample-rate 0.25 \
-  --temperature 1.0 --temperature-plies 30 --maximum-plies 70 \
+  --board-mix 50:38 --board-mix 25:18 --board-mix 25:18-38 \  --temperature 1.0 --temperature-plies 30 --maximum-plies 70 \
   --resign-target-false-positive 0.02 --resign-soft-simulations 2400 \
   --resign-window 5 --resign-minimum-ply 20 --resign-disable-fraction 0.0 \
   --samples-per-shard 1600 --shards-per-update 1 --replay-window 32 \

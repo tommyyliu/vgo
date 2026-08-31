@@ -714,10 +714,6 @@ class PipelineConfig:
     # Coefficient in `komi = c * radius^2`. Only consulted when `board_mix` is
     # set. The default is what our own measurement fixes: 0.104 at r = 1/18.
     komi_area_coefficient: float = 0.104 * 18.0 * 18.0
-    # Fraction of each game's plies recorded. Standard-board games run past
-    # three hundred plies, and a shard sized in positions would hold about five
-    # games; the value head learns from game-level labels only.
-    ply_sample_rate: float = 1.0
     temperature: float = 1.0
     temperature_plies: int = 30
     actors: int = 64
@@ -921,8 +917,6 @@ class PipelineConfig:
                 )
         if not math.isfinite(self.komi_area_coefficient) or self.komi_area_coefficient <= 0:
             raise ValueError("komi_area_coefficient must be positive")
-        if not 0.0 < self.ply_sample_rate <= 1.0:
-            raise ValueError("ply_sample_rate must be in (0, 1]")
         if not 0.0 <= self.root_exploration_noise < 1.0:
             raise ValueError("root exploration noise must be in [0, 1)")
         if self.coarse_pool < 0 or self.coarse_pool > self.policy_resolution:
@@ -1725,8 +1719,6 @@ class Pipeline:
         command = self._rust_command("vgo-generate-demo") + [
             "--samples",
             str(config.samples_per_shard),
-            "--ply-sample-rate",
-            str(config.ply_sample_rate),
             "--resolution",
             str(config.resolution),
             "--policy-resolution",
@@ -3088,12 +3080,6 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=0.104 * 18.0 * 18.0,
         help="coefficient in komi = c * radius^2; only used with --board-mix",
-    )
-    parser.add_argument(
-        "--ply-sample-rate",
-        type=float,
-        default=1.0,
-        help="fraction of each game's plies recorded (1.0 keeps every ply)",
     )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--temperature-plies", type=int, default=30)
