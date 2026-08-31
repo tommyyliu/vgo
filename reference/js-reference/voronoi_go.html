@@ -146,6 +146,21 @@
     <hr>
     <div class="row mut"><span>stone radius</span><span id="radLbl"></span></div>
     <input type="range" id="rad" min="8" max="70" step="1" value="39">
+    <!-- The slider steps in whole reference pixels, and the board sizes that
+         matter are not whole pixels: 1/18 is 38.89 and snaps to 39, which is
+         radius 0.05571 rather than 0.055556. Models train at the exact value,
+         so these set it directly instead of going through the slider.
+         1/18 and 1/38 are the two the generator mixes; 1/26 sits between them.
+         Roughly 9x9, 13x13 and 19x19 by stone count, since a board of radius r
+         holds about (1/2r)^2 stones. -->
+    <div class="row" style="margin-top:6px">
+      <span class="mut">board</span>
+      <span>
+        <button class="radPreset" data-units="18">1/18</button>
+        <button class="radPreset" data-units="26">1/26</button>
+        <button class="radPreset" data-units="38">1/38</button>
+      </span>
+    </div>
     <!-- Komi is a fraction of the board, not a stone count, because the score
          it adjusts is one: 0.18 spots White eighteen percent of the board.
          Measured over games played to the ply cap Black led by a median of
@@ -1175,7 +1190,13 @@ function syncSliders() {
   const label = Number.isFinite(pixels)
     ? (Math.abs(pixels - Math.round(pixels)) < .01 ? Math.round(pixels) : pixels.toFixed(1)) + 'px'
     : 'invalid';
-  document.getElementById('radLbl').textContent = label;
+  // Also as 1/N, which is the unit every recipe, shard and arena flag uses.
+  // Only when it is genuinely close to a reciprocal, so a dragged slider does
+  // not claim a round number it is not sitting on.
+  const units = 1 / state.radius;
+  const exact = Number.isFinite(units) && Math.abs(units - Math.round(units)) < .02;
+  document.getElementById('radLbl').textContent =
+    exact ? `${label} \u00b7 1/${Math.round(units)}` : label;
   cv.style.borderRadius = (Number.isFinite(pixels) ? Math.max(0, pixels) : 0) + 'px';
 }
 const komiEl = document.getElementById('komi');
@@ -1210,13 +1231,20 @@ komiEl.onchange = () => {
 };
 // Changing the radius rewrites the board every move was made on, so it starts a
 // new record from the position on screen rather than editing one in place.
-radEl.oninput = () => {
-  const resized = VGO.model.update(state, { radius:(+radEl.value) / SIZE, passes:0, phase:'playing' });
+function applyRadius(radius) {
+  const resized = VGO.model.update(state, { radius, passes:0, phase:'playing' });
   pushUndo(snapshot());
   setDocument(VGO.gameTree.create(resized));
-  syncSliders();
+  syncControlsFromState();
   draw();
-};
+}
+radEl.oninput = () => applyRadius((+radEl.value) / SIZE);
+// A radius change replaces the tree rather than editing it -- every stone's
+// legality depends on r -- which is why these go through the same path as the
+// slider and land in undo the same way.
+for (const button of document.querySelectorAll('.radPreset')) {
+  button.onclick = () => applyRadius(1 / (+button.dataset.units));
+}
 
 /* ---- boot with a small illustrative position ---------------------------- */
 setDocument(VGO.gameTree.create(VGO.model.createPosition({ radius:(+radEl.value) / SIZE, stones:[

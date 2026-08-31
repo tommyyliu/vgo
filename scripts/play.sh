@@ -20,12 +20,30 @@ if [[ -z "$model" ]]; then
   # Newest checkpoint of the newest run that has one, rather than a run named
   # here: a hardcoded path goes stale every time a run is superseded, and this
   # one had been pointing at a directory with no models in it.
-  # Both layouts, newest first. Run separately and concatenated because an
-  # unmatched glob is passed through literally, `ls` then exits 2, and under
-  # `set -o pipefail` that kills the script before it prints anything.
-  model="$( { ls -1t "$root"/artifacts/*/updates/update-*/candidate.onnx 2>/dev/null || true
-              ls -1t "$root"/artifacts/*/updates/update-*/model/candidate.onnx 2>/dev/null || true
-            } | head -1 )"
+  # Three layouts now: the continuous loop writes `<run>/models/update-N.onnx`,
+  # while the older pipeline wrote `<run>/updates/update-N/candidate.onnx` with
+  # or without a `model/` level.
+  #
+  # Collected first and sorted afterwards, because concatenating separate `ls -t`
+  # runs sorts within each glob and not across them -- whichever pattern matched
+  # first won regardless of age, which is how this came to serve a model from a
+  # superseded run while a much newer one sat in `models/`. Unmatched globs are
+  # passed through literally and make `ls` exit non-zero, hence the `|| true`.
+  mapfile -t candidates < <(
+    ls -1 "$root"/artifacts/*/models/update-*.onnx \
+          "$root"/artifacts/*/updates/update-*/candidate.onnx \
+          "$root"/artifacts/*/updates/update-*/model/candidate.onnx \
+          2>/dev/null || true
+  )
+  #
+  # Read into an array rather than piping to `head`. With this many candidates
+  # `head` closes the pipe after one line, `ls` takes SIGPIPE, and `pipefail`
+  # plus `set -e` kills the script with 141 and no output at all -- it exits
+  # before printing so much as the model it chose.
+  if (( ${#candidates[@]} > 0 )); then
+    mapfile -t newest < <(ls -1t "${candidates[@]}" 2>/dev/null)
+    model="${newest[0]:-}"
+  fi
 fi
 if [[ -z "$model" || ! -f "$model" ]]; then
   echo "no model found; pass one explicitly: ./artifacts/play.sh <candidate.onnx>" >&2
@@ -103,6 +121,7 @@ widths = {
     "compact-pass": 6,
     "compact-dead-zone": 6,
     "compact-connected": 9,
+    "compact-radius": 7,
     "semantic": 12,
 }
 by_width: dict[int, list[str]] = {}
@@ -161,7 +180,7 @@ fi
 
 echo "model:       ${model#"$root/"}"
 echo "raster:      ${resolution}x${resolution} ${raster_kind}  policy ${policy_resolution}x${policy_resolution}  coarse-pool ${COARSE_POOL:-$coarse_pool}"
-echo "simulations: ${SIMULATIONS:-1600}"
+echo "simulations: ${SIMULATIONS:-1600}  widening ${WIDENING_COEFFICIENT:-6.0} cap ${MAXIMUM_CANDIDATES:-321}"
 echo "first start builds a TensorRT engine for this model and takes ~30s."
 echo
 
@@ -170,6 +189,8 @@ exec "$root/target/release/vgo-serve-move" \
   --simulations "${SIMULATIONS:-1600}" \
   --coarse-pool "${COARSE_POOL:-$coarse_pool}" \
   --leaf-batch 4 \
+  --widening-coefficient "${WIDENING_COEFFICIENT:-6.0}" \
+  --maximum-candidates "${MAXIMUM_CANDIDATES:-321}" \
   --resolution "$resolution" \
   --policy-resolution "$policy_resolution" \
   --raster-kind "$raster_kind" \
