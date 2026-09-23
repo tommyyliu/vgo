@@ -339,7 +339,7 @@ for ((update = first_update; update < first_update + updates; update++)); do
   ( cd "$root/training" && "$python" "$root/scripts/train-once.py" \
       --games-root "$games" --window-samples "$window" \
       --output "$checkpoint" \
-      --raster-kind compact-radius \
+      --raster-kind compact-radius --resolution "$resolution" \
       --model-width 64 --blocks 16 --context-attention-blocks 1 \
       --attention-heads 8 --norm-groups 8 --precision bfloat16 \
       --epochs "$epochs" --batch-size 64 --learning-rate 0.0005 \

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 import numpy as np
+import torch
 
 from vgo_training.dataset import (
     HEADER,
@@ -512,6 +513,28 @@ class V4PositionShardTests(unittest.TestCase):
         }
         (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
         return path
+
+    def test_a_shard_renders_at_a_requested_resolution(self) -> None:
+        """Games played at one size train a model at another."""
+        from vgo_training.dataset import load_dataset
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._shard(Path(directory))
+            native = load_dataset(path, raster_kind="compact-radius")
+            larger = load_dataset(path, raster_kind="compact-radius", resolution=16)
+        self.assertEqual(tuple(native.states.shape[-2:]), (8, 8))
+        self.assertEqual(tuple(larger.states.shape[-2:]), (16, 16))
+        # The targets live on the policy grid, which the raster does not change.
+        torch.testing.assert_close(native.policies, larger.policies)
+        torch.testing.assert_close(native.values, larger.values)
+
+    def test_the_policy_grid_cannot_exceed_the_raster(self) -> None:
+        from vgo_training.dataset import load_dataset
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._shard(Path(directory))
+            with self.assertRaisesRegex(ValueError, "cannot be pooled"):
+                load_dataset(path, raster_kind="compact-radius", resolution=4)
 
     def test_sparse_policy_expands_and_presence_is_the_mask(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

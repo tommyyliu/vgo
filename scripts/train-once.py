@@ -115,6 +115,11 @@ def main() -> None:
         choices=("semantic", "compact", "compact-radius"),
         help="which planes to render from each game; the loop uses compact-radius",
     )
+    parser.add_argument(
+        "--resolution", type=int, default=None,
+        help="square input size to render at; default is each game's own, "
+        "which is what generation ran at",
+    )
     parser.add_argument("--norm-groups", type=int, default=8)
     parser.add_argument(
         "--context-attention-blocks",
@@ -171,6 +176,7 @@ def main() -> None:
         model_width=arguments.model_width,
         blocks=arguments.blocks,
         raster_kind=arguments.raster_kind,
+        resolution=arguments.resolution,
         context_attention_blocks=arguments.context_attention_blocks,
         attention_heads=arguments.attention_heads,
         norm_groups=arguments.norm_groups,

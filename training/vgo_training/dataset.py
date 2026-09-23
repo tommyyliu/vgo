@@ -934,8 +934,18 @@ def _reject_stored_raster_mismatch(raster_kind: str | None, channels: int) -> No
         )
 
 
-def load_dataset(path: str | Path, *, raster_kind: str | None = None) -> RasterDataset:
+def load_dataset(
+    path: str | Path,
+    *,
+    raster_kind: str | None = None,
+    resolution: int | None = None,
+) -> RasterDataset:
     """Loads a shard, rendering its positions with `raster_kind`.
+
+    `resolution` renders at that square size instead of the one in the header,
+    which records what generation ran at. Like the kind, the raster is the
+    model's choice: games played at 256 train a 128 model as well as a 256 one.
+    Only position shards (v4 and later) can be re-rendered.
 
     The raster is a **training-time choice and a property of the model**, not of
     the data: a position shard stores the game, and which planes a network reads
@@ -953,6 +963,8 @@ def load_dataset(path: str | Path, *, raster_kind: str | None = None) -> RasterD
             f"unknown raster kind {raster_kind!r}; expected one of "
             f"{sorted(RASTER_CHANNELS)}"
         )
+    if resolution is not None and resolution <= 0:
+        raise ValueError(f"resolution must be positive, got {resolution}")
     path = Path(path).resolve(strict=True)
     (
         magic,
@@ -972,6 +984,14 @@ def load_dataset(path: str | Path, *, raster_kind: str | None = None) -> RasterD
             # which is a different question from what this training run wants.
             if raster_kind is not None:
                 channels = RASTER_CHANNELS[raster_kind]
+            if resolution is not None:
+                side = round((policy_size - 1) ** 0.5)
+                if side > resolution:
+                    raise ValueError(
+                        f"a {side}x{side} policy grid cannot be pooled from a "
+                        f"{resolution} raster"
+                    )
+                height = width = resolution
             arrays = _load_replay_v4(
                 path,
                 samples,
@@ -985,6 +1005,8 @@ def load_dataset(path: str | Path, *, raster_kind: str | None = None) -> RasterD
                 stone_capacity,
             )
         else:
+            if resolution is not None and resolution != height:
+                raise ValueError("only position shards (v4+) can be re-rendered")
             _reject_stored_raster_mismatch(raster_kind, channels)
             arrays = _load_replay(
                 path, version, samples, channels, height, width, policy_size

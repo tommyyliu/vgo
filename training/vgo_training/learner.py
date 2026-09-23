@@ -81,6 +81,10 @@ class LearnerConfig:
     # what generation happened to be set to, and two layouts of equal width can
     # mean different things. None keeps the old header-derived behaviour.
     raster_kind: str | None = None
+    # Square input size to render at. None renders at the size in each shard's
+    # header, which is what generation happened to run at; set it to train at a
+    # different resolution from the games' own.
+    resolution: int | None = None
     # GroupNorm groups per residual block; None leaves the block unnormalized.
     norm_groups: int | None = None
     # Weight on the auxiliary ownership loss, relative to policy at 1.0. Zero
@@ -119,6 +123,8 @@ class LearnerConfig:
             raise ValueError("epochs must be positive")
         if self.batch_size <= 0:
             raise ValueError("batch size must be positive")
+        if self.resolution is not None and self.resolution <= 0:
+            raise ValueError("resolution must be positive")
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0.0:
             raise ValueError("learning rate must be finite and positive")
         if not math.isfinite(self.value_weight) or self.value_weight < 0.0:
@@ -281,10 +287,13 @@ class ReplayCache:
         self._loader = loader
         self._entries: dict[Path, PreparedReplayShard] = {}
         self._raster_kind: str | None = None
+        self._resolution: int | None = None
         self.hits = 0
         self.misses = 0
 
-    def use_raster_kind(self, raster_kind: str | None) -> None:
+    def use_raster_kind(
+        self, raster_kind: str | None, resolution: int | None = None
+    ) -> None:
         """Render with `raster_kind` from here on, dropping anything else.
 
         The kind belongs to the *update*, not to this object: one learner
@@ -298,11 +307,15 @@ class ReplayCache:
         new entries only. In practice the kind is run identity and never changes
         mid-run, which is exactly why a silent mismatch would go unnoticed.
         """
-        if raster_kind == self._raster_kind:
+        if (raster_kind, resolution) == (self._raster_kind, self._resolution):
             return
         self._raster_kind = raster_kind
+        self._resolution = resolution
         self._entries.clear()
-        self._loader = partial(load_dataset, raster_kind=raster_kind)
+        keywords: dict[str, object] = {"raster_kind": raster_kind}
+        if resolution is not None:
+            keywords["resolution"] = resolution
+        self._loader = partial(load_dataset, **keywords)
 
     def get(self, path: str | Path, preparation_batch_size: int) -> PreparedReplayShard:
         resolved = Path(path).resolve(strict=True)
@@ -1054,7 +1067,9 @@ class PersistentLearner:
         self.replay_cache = replay_cache or ReplayCache()
         # Only a seed. Each update carries its own config and calls
         # `use_raster_kind` with it; see the note there.
-        self.replay_cache.use_raster_kind(self.defaults.raster_kind)
+        self.replay_cache.use_raster_kind(
+            self.defaults.raster_kind, self.defaults.resolution
+        )
         self._log = log or (lambda message: print(message, file=sys.stderr, flush=True))
         self.model: nn.Module | None = None
         self.optimizer: torch.optim.Optimizer | None = None
@@ -1388,7 +1403,7 @@ class PersistentLearner:
 
         hits_before = self.replay_cache.hits
         misses_before = self.replay_cache.misses
-        self.replay_cache.use_raster_kind(config.raster_kind)
+        self.replay_cache.use_raster_kind(config.raster_kind, config.resolution)
         window = self.replay_cache.window(request.datasets, config.batch_size)
         if config.ownership_weight == 0.0:
             # Release the targets the loss will not read. Done here rather than
