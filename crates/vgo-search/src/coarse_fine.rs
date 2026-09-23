@@ -55,15 +55,6 @@ impl FineGrid {
             .map(|i| self.legal_at(i))
             .collect()
     }
-    pub(crate) fn account_memory(&self, counter: &mut crate::memory::MemoryCounter) {
-        for allocation in [
-            crate::HeapAllocation::vector(&self.logits),
-            crate::HeapAllocation::vector(&self.legal),
-            crate::HeapAllocation::vector(&self.placement_overrides),
-        ] {
-            counter.allocation(allocation, false);
-        }
-    }
     // The production-like 128x128/35-stone fixture has 219 snapped cells. A
     // 256-entry slab avoids growth while occupying 6 KiB, versus the former
     // dense placement table's 256 KiB.

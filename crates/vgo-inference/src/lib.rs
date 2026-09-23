@@ -15,9 +15,6 @@ pub use protocol::{
 
 use std::{
     collections::{HashMap, VecDeque},
-    io::{BufReader, BufWriter, Write},
-    path::PathBuf,
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -30,47 +27,6 @@ use std::{
 use vgo_core::Position;
 use vgo_raster::{DensePolicy, RasterConfig, packed::rasterize_packed, rasterize};
 use vgo_search::{Evaluation, EvaluationError, Evaluator};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TorchDevice {
-    Cpu,
-    Cuda,
-}
-
-impl TorchDevice {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::Cuda => "cuda",
-        }
-    }
-}
-
-impl std::str::FromStr for TorchDevice {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "cpu" => Ok(Self::Cpu),
-            "cuda" => Ok(Self::Cuda),
-            _ => Err(format!("unsupported torch device: {value}")),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct PythonProcessConfig {
-    pub python: PathBuf,
-    pub working_directory: PathBuf,
-    pub checkpoint: PathBuf,
-    pub raster: RasterConfig,
-    pub policy: Option<RasterConfig>,
-    pub maximum_batch: usize,
-    pub torch_threads: usize,
-    pub device: TorchDevice,
-    pub compile: bool,
-}
 
 /// Renders one position into whatever form the backend asked for.
 ///
@@ -145,97 +101,6 @@ pub struct BrokerConfig {
     pub queue_capacity: usize,
 }
 
-pub struct PythonBatchService {
-    child: Child,
-    writer: Option<BufWriter<ChildStdin>>,
-    reader: BufReader<ChildStdout>,
-    contract: BatchContract,
-}
-
-impl PythonBatchService {
-    pub fn spawn(config: &PythonProcessConfig) -> Result<Self, EvaluationError> {
-        if config.maximum_batch == 0 || config.torch_threads == 0 {
-            return Err(EvaluationError::new(
-                "batch size and torch thread count must be positive",
-            ));
-        }
-        let working_directory =
-            std::path::absolute(&config.working_directory).map_err(|error| {
-                EvaluationError::new(format!("resolve training directory: {error}"))
-            })?;
-        let checkpoint = std::path::absolute(&config.checkpoint)
-            .map_err(|error| EvaluationError::new(format!("resolve checkpoint path: {error}")))?;
-        let mut child = Command::new(&config.python)
-            .current_dir(working_directory)
-            .arg("-m")
-            .arg("vgo_training.serve")
-            .arg("--checkpoint")
-            .arg(checkpoint)
-            .arg("--threads")
-            .arg(config.torch_threads.to_string())
-            .arg("--device")
-            .arg(config.device.as_str())
-            .arg(if config.compile {
-                "--compile"
-            } else {
-                "--no-compile"
-            })
-            .arg("--maximum-batch")
-            .arg(config.maximum_batch.to_string())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|error| EvaluationError::new(format!("start Python service: {error}")))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| EvaluationError::new("Python service has no stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| EvaluationError::new("Python service has no stdout"))?;
-        Ok(Self {
-            child,
-            writer: Some(BufWriter::new(stdin)),
-            reader: BufReader::new(stdout),
-            contract: BatchContract {
-                raster: config.raster,
-                policy: config.policy.unwrap_or(config.raster),
-                maximum_batch: config.maximum_batch,
-                // The request frame carries dense float32 planes, so this
-                // backend cannot take the packed form; `encode_request_frame`
-                // refuses one rather than widening it back.
-                input_layout: InputLayout::Dense,
-            },
-        })
-    }
-}
-
-impl BatchService for PythonBatchService {
-    fn contract(&self) -> BatchContract {
-        self.contract
-    }
-
-    fn infer(&mut self, batch: &[InferenceInput]) -> Result<Vec<InferenceOutput>, EvaluationError> {
-        let frame = encode_request_frame(batch)?;
-        let writer = self
-            .writer
-            .as_mut()
-            .expect("writer exists while service is alive");
-        writer.write_all(&frame).map_err(io_error)?;
-        writer.flush().map_err(io_error)?;
-        read_response_frame_with_policy(&mut self.reader, batch, self.contract.policy)
-    }
-}
-
-impl Drop for PythonBatchService {
-    fn drop(&mut self) {
-        self.writer.take();
-        let _ = self.child.wait();
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BrokerMetrics {
     pub requests: u64,
@@ -269,14 +134,6 @@ pub struct BrokerMetrics {
 }
 
 impl BrokerMetrics {
-    #[must_use]
-    pub fn inference_unattributed_nanoseconds(self) -> u64 {
-        self.inference_nanoseconds.saturating_sub(
-            self.input_packing_nanoseconds
-                .saturating_add(self.session_run_nanoseconds)
-                .saturating_add(self.output_materialization_nanoseconds),
-        )
-    }
 
     #[must_use]
     pub fn delta_since(self, earlier: Self) -> Self {
@@ -1391,10 +1248,6 @@ fn run_pool_broker<S: BatchService + 'static>(
             let _ = pending.response.send(Ok(ordered));
         }
     }
-}
-
-fn io_error(error: std::io::Error) -> EvaluationError {
-    EvaluationError::new(format!("inference transport: {error}"))
 }
 
 #[cfg(test)]

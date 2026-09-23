@@ -26,10 +26,8 @@ LEGAL_CLEARANCE_CHANNEL = 7
 # Keyed on the layout rather than on `shape[1] <= LEGAL_CLEARANCE_CHANNEL`,
 # which is what this replaces. That test read "narrower than semantic, so it has
 # no clearance channel" -- true while every compact layout was under seven
-# planes, and silently false the moment one was not. `compact-connected` has
-# nine, so it took the semantic branch and read slot 7 as clearance when slot 7
-# is `komi`: a constant plane, thresholded into a legality mask, which cost its
-# first training run a policy_kl of 1.90 against 0.65 for the arms beside it.
+# planes, and silently false once a nine-plane layout read slot 7 (`komi`) as
+# clearance, which cost its first training run a policy_kl of 1.90 against 0.65.
 #
 # A width absent here falls back to the stored mask, which is always sound.
 # Both semantic widths carry it at the same slot: 12 is the engine's layout and

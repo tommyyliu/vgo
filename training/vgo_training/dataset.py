@@ -55,17 +55,15 @@ def policy_capacity(version: int) -> int:
 
 CHANNEL_COUNT = 10
 
-# Built by `cargo build --release -p vgo-raster --example render_shard`.
+# Built by `cargo build --release -p vgo-raster`.
 
 # Raster kind -> how many planes it writes. Mirrors `RasterKind::channels` in
 # crates/vgo-raster/src/lib.rs, which is the source of truth.
 RASTER_CHANNELS = {
     "semantic": 12,
-    "rgb": 3,
     "compact": 5,
     "compact-pass": 6,
     "compact-dead-zone": 6,
-    "compact-connected": 9,
     "compact-radius": 7,
 }
 
@@ -78,10 +76,10 @@ RASTER_CHANNELS = {
 # being a usable proxy the moment two layouts shared a width. `compact-pass` and
 # `compact-dead-zone` are both six planes and differ in the capture predicate,
 # so nothing here can tell them apart, and nothing should try: pass the kind.
-_LEGACY_KIND_BY_CHANNELS = {3: "rgb", 5: "compact", 12: "semantic"}
+_LEGACY_KIND_BY_CHANNELS = {5: "compact", 12: "semantic"}
 
 _RUST_RENDERER = (
-    Path(__file__).resolve().parents[2] / "target/release/examples/render_shard"
+    Path(__file__).resolve().parents[2] / "target/release/vgo-render-shard"
 )
 # Renders straight into the packed planes instead of dense f32. At 256x256x7
 # that is 152 KB per sample crossing the process boundary rather than 1.75 MB,
@@ -89,7 +87,7 @@ _RUST_RENDERER = (
 # dropped. Byte-identical to `pack()` on the dense render; see
 # tests/test_pack_shard.py.
 _RUST_PACKER = (
-    Path(__file__).resolve().parents[2] / "target/release/examples/pack_shard"
+    Path(__file__).resolve().parents[2] / "target/release/vgo-pack-shard"
 )
 HEADER = struct.Struct("<8s6I")
 # v7 appends the shard's policy capacity, so the record size is a property of
@@ -423,7 +421,7 @@ def _render_states(
         raise ValueError(
             f"{channels} channels needs the Rust rasterizer at {binary}; "
             "build it with "
-            "`cargo build --release -p vgo-raster --example render_shard`"
+            "`cargo build --release -p vgo-raster`"
         )
     with tempfile.TemporaryDirectory() as directory:
         destination = Path(directory) / "rasters.bin"

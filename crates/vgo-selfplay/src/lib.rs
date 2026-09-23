@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-pub mod render_svg;
 /// The replay record format, shared by every generator.
 ///
 /// Lived inside `generate_demo` when there was one generator. A second one that
@@ -21,68 +20,6 @@ use vgo_core::{Analysis, Color, GameEvent, Outcome, Phase, Position};
 /// is enough to reject a position genuinely oscillating around even.
 pub const ADJUDICATION_PLIES: usize = 8;
 
-/// How far apart the two areas must be, as a fraction of the whole board.
-///
-/// Those same games sat at margins of 0.49-0.80 from their halfway point on, so
-/// this rejects only positions that really are close. The board totals 1.0.
-pub const ADJUDICATION_MARGIN: f64 = 0.10;
-
-/// Awards a truncated game to whoever holds the board.
-///
-/// A game that runs out of plies has no played-out result, but by that point
-/// the territory is usually long settled: the late game is capture-and-replace
-/// churn in a contested pocket, not development. Across a shard the average
-/// game gains 7.4 stones over its entire second half while producing 65 stone
-/// changes -- nine changes per net stone -- so the area has stopped moving well
-/// before the cap.
-///
-/// This scores the position the same way a finished game is scored, by Voronoi
-/// area, rather than asking the network. The value head agrees with outcomes
-/// only ~76% of the time; the area is ground truth under the same rule that
-/// decides a real result.
-///
-/// Returns `None` -- leaving the game undecided -- unless the same player leads
-/// by at least `margin` on every one of the closing `plies`.
-///
-/// Shared with the arena rather than living in the generator. An arena that
-/// discards what self-play adjudicates does not merely lose games, it loses
-/// them selectively: 69% of arena games were dropped at a 100-ply cap, and the
-/// survivors are the ones that happened to resolve quickly, which is a property
-/// of playing style rather than of strength.
-#[must_use]
-pub fn adjudicate_positions(
-    positions: &[Position],
-    plies: usize,
-    margin: f64,
-) -> Option<Outcome> {
-    if positions.len() < plies {
-        return None;
-    }
-    let mut leader: Option<Color> = None;
-    for position in &positions[positions.len() - plies..] {
-        let analysis = Analysis::new(position);
-        let delta = analysis.score.black - analysis.score.white;
-        if delta.abs() < margin {
-            return None;
-        }
-        let ply_leader = if delta > 0.0 {
-            Color::Black
-        } else {
-            Color::White
-        };
-        match leader {
-            None => leader = Some(ply_leader),
-            Some(current) if current == ply_leader => {}
-            // The lead changed hands inside the window: not settled.
-            Some(_) => return None,
-        }
-    }
-    leader.map(|winner| Outcome {
-        winner: Some(winner),
-        // No final count was played out, so there is no margin to report.
-        margin: 0.0,
-    })
-}
 /// Awards a truncated game on its final position alone.
 ///
 /// [`adjudicate_positions`] can refuse -- on a margin, or on the lead changing
@@ -194,7 +131,7 @@ impl ResignRule {
     }
 
     #[must_use]
-    pub fn is_enabled(&self) -> bool {
+    pub(crate) fn is_enabled(&self) -> bool {
         self.window != u32::MAX && self.threshold < 1.0
     }
 }
@@ -373,7 +310,7 @@ pub fn play_game_with_resignation<E>(
 }
 
 
-pub fn accumulate_search_stats(total: &mut SearchStats, next: SearchStats) {
+pub(crate) fn accumulate_search_stats(total: &mut SearchStats, next: SearchStats) {
     total.simulations += next.simulations;
     total.evaluations += next.evaluations;
     total.expanded_nodes += next.expanded_nodes;

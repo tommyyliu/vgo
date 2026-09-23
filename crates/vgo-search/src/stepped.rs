@@ -80,16 +80,6 @@ enum Stage {
 }
 
 impl SteppedSearch {
-    /// Retained tree payload only; excludes pending batches, driver state,
-    /// allocator headers, and caches explicitly reported as unknown.
-    pub fn tree_memory(&self) -> crate::TreeMemory {
-        match &self.stage {
-            Stage::Root => crate::TreeMemory::default(),
-            Stage::Ready { root, .. } | Stage::Round { root, .. } | Stage::Finished { root } => {
-                root.memory_usage()
-            }
-        }
-    }
     /// Begin a search. Nothing is evaluated until [`Self::next_batch`].
     ///
     /// # Panics

@@ -1,11 +1,7 @@
 #![forbid(unsafe_code)]
 
-use vgo_core::{Color, Point, Position, SettledRegion, legal_set_vertices};
+use vgo_core::{Color, Position, SettledRegion, legal_set_vertices};
 
-#[cfg(feature = "gpu")]
-mod gpu;
-#[cfg(feature = "gpu")]
-pub use gpu::settled_mask_gpu;
 
 pub mod edt;
 pub mod packed;
@@ -41,13 +37,10 @@ pub const CHANNEL_COUNT: usize = 12;
 /// name channels by index without the semantic writer emitting them. Growing
 /// this is safe; growing `CHANNEL_COUNT` is not, because that number is the
 /// semantic tensor's shape and is baked into inference frames and ONNX profiles.
-pub const CHANNEL_SPEC_COUNT: usize = 15;
-
-/// Channels written by [`rasterize_rgb_into`]: red, green, blue.
-pub const RGB_CHANNEL_COUNT: usize = 3;
+pub(crate) const CHANNEL_SPEC_COUNT: usize = 15;
 
 /// Indices into [`CHANNELS`] that [`RasterKind::Compact`] keeps.
-pub const COMPACT_CHANNELS: [usize; 5] = [
+pub(crate) const COMPACT_CHANNELS: [usize; 5] = [
     0,  // current_stones
     1,  // opponent_stones
     6,  // voronoi_ridge
@@ -75,7 +68,7 @@ pub const COMPACT_CHANNELS: [usize; 5] = [
 /// The plane holds `2r`, the stone diameter, matching what the semantic
 /// rasterizer writes at index 8. That is in `[0, 1]` for every playable radius
 /// and reads directly as "how much of the board does one stone span".
-pub const COMPACT_RADIUS_CHANNELS: [usize; 7] = [
+pub(crate) const COMPACT_RADIUS_CHANNELS: [usize; 7] = [
     0,  // current_stones
     1,  // opponent_stones
     6,  // voronoi_ridge
@@ -85,7 +78,7 @@ pub const COMPACT_RADIUS_CHANNELS: [usize; 7] = [
     8,  // radius
 ];
 
-pub const COMPACT_PASS_CHANNELS: [usize; 6] = [
+pub(crate) const COMPACT_PASS_CHANNELS: [usize; 6] = [
     0,  // current_stones
     1,  // opponent_stones
     6,  // voronoi_ridge
@@ -103,28 +96,7 @@ pub const COMPACT_PASS_CHANNELS: [usize; 6] = [
 /// other with every other input plane keeping its meaning and its weights. It
 /// also makes the comparison between the two rulesets a one-plane A/B rather
 /// than a change of representation.
-/// Indices [`RasterKind::CompactConnected`] keeps.
-///
-/// Both capture fields and the connection lines. `settled` returned after being
-/// dropped from the six-plane official layout, where it was cut on the grounds
-/// that it is the wrong capture predicate there -- true, and beside the point.
-/// It is also the only plane that says which board can still change hands, which
-/// is ownership rather than legality and is worth knowing under either ruleset.
-/// The cost argument for dropping it did not survive either: the raster was
-/// already four times faster than production, so there was budget for both.
-pub const COMPACT_CONNECTED_CHANNELS: [usize; 9] = [
-    0,  // current_stones
-    1,  // opponent_stones
-    6,  // voronoi_ridge
-    10, // settled               <- can anyone still take our area
-    12, // dead_zone             <- can anyone still reach us
-    13, // current_connections   <- our stones that cannot be split apart
-    14, // opponent_connections
-    11, // komi
-    9,  // previous_pass
-];
-
-pub const COMPACT_DEAD_ZONE_CHANNELS: [usize; 6] = [
+pub(crate) const COMPACT_DEAD_ZONE_CHANNELS: [usize; 6] = [
     0,  // current_stones
     1,  // opponent_stones
     6,  // voronoi_ridge
@@ -132,8 +104,6 @@ pub const COMPACT_DEAD_ZONE_CHANNELS: [usize; 6] = [
     11, // komi
     9,  // previous_pass
 ];
-pub const DATASET_MAGIC: [u8; 8] = *b"VGODATA1";
-pub const DATASET_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelScale {
@@ -212,15 +182,13 @@ pub const CHANNELS: [ChannelSpec; CHANNEL_SPEC_COUNT] = [
 
 /// Which channel layout a raster carries.
 ///
-/// `Semantic` is the ten engineered channels. `Rgb` is the board as a player
-/// sees it -- stone discs over Voronoi territory fill, three channels, no
-/// derived fields. The two are not interchangeable inputs: a model trained on
-/// one cannot read the other, so this belongs to a run's identity.
+/// `Semantic` is the ten engineered channels; the compact layouts are subsets
+/// of them. A model trained on one cannot read another, so this belongs to a
+/// run's identity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RasterKind {
     #[default]
     Semantic,
-    Rgb,
     /// The four channels an ablation preferred, plus komi.
     ///
     /// Measured over 24 epochs on 30720 samples: current_stones,
@@ -253,19 +221,11 @@ pub enum RasterKind {
     /// aggressive rule, so a net given only `settled` has to infer the
     /// condition it is actually judged by.
     ///
-    /// `settled` is dropped rather than kept alongside. See
-    /// [`CompactConnected`](Self::CompactConnected), which puts it back. It is the wrong
+    /// `settled` is dropped rather than kept alongside. It is the wrong
     /// predicate here, and it is not a cheap passenger: measured at 128 square,
     /// it is 60-80% of the raster's cost, so carrying it for a ruleset that does
     /// not use it would more than double the price of every position.
     CompactDeadZone,
-    /// Both capture fields, plus which same-colour stones cannot be split.
-    ///
-    /// A Voronoi diagram shows who owns what but not what is *safe*: whether an
-    /// enemy pair can be wedged between two of your stones is a two-placement
-    /// search, and nothing in the other planes exposes it. This is the plane a
-    /// player reads off the board and the network otherwise has to infer.
-    CompactConnected,
     /// [`CompactPass`](Self::CompactPass) plus the radius.
     ///
     /// The layout for training across board sizes. See
@@ -279,11 +239,9 @@ impl RasterKind {
     pub const fn channels(self) -> usize {
         match self {
             Self::Semantic => CHANNEL_COUNT,
-            Self::Rgb => RGB_CHANNEL_COUNT,
             Self::Compact => COMPACT_CHANNELS.len(),
             Self::CompactPass => COMPACT_PASS_CHANNELS.len(),
             Self::CompactDeadZone => COMPACT_DEAD_ZONE_CHANNELS.len(),
-            Self::CompactConnected => COMPACT_CONNECTED_CHANNELS.len(),
             Self::CompactRadius => COMPACT_RADIUS_CHANNELS.len(),
         }
     }
@@ -292,11 +250,10 @@ impl RasterKind {
     #[must_use]
     pub const fn indices(self) -> &'static [usize] {
         match self {
-            Self::Semantic | Self::Rgb => &[],
+            Self::Semantic => &[],
             Self::Compact => &COMPACT_CHANNELS,
             Self::CompactPass => &COMPACT_PASS_CHANNELS,
             Self::CompactDeadZone => &COMPACT_DEAD_ZONE_CHANNELS,
-            Self::CompactConnected => &COMPACT_CONNECTED_CHANNELS,
             Self::CompactRadius => &COMPACT_RADIUS_CHANNELS,
         }
     }
@@ -311,11 +268,9 @@ impl RasterKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Semantic => "semantic",
-            Self::Rgb => "rgb",
             Self::Compact => "compact",
             Self::CompactPass => "compact-pass",
             Self::CompactDeadZone => "compact-dead-zone",
-            Self::CompactConnected => "compact-connected",
             Self::CompactRadius => "compact-radius",
         }
     }
@@ -327,11 +282,9 @@ impl std::str::FromStr for RasterKind {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "semantic" => Ok(Self::Semantic),
-            "rgb" => Ok(Self::Rgb),
             "compact" => Ok(Self::Compact),
             "compact-pass" => Ok(Self::CompactPass),
             "compact-dead-zone" => Ok(Self::CompactDeadZone),
-            "compact-connected" => Ok(Self::CompactConnected),
             "compact-radius" => Ok(Self::CompactRadius),
             _ => Err(format!("unsupported raster kind: {value}")),
         }
@@ -408,11 +361,6 @@ impl SemanticRaster {
     }
 
     #[must_use]
-    pub fn into_data(self) -> Vec<f32> {
-        self.data
-    }
-
-    #[must_use]
     pub fn channel(&self, channel: usize) -> &[f32] {
         let pixels = self.config.pixels();
         &self.data[channel * pixels..(channel + 1) * pixels]
@@ -423,50 +371,6 @@ impl SemanticRaster {
         self.channel(channel)[row * self.config.width + column]
     }
 
-    #[must_use]
-    pub fn channel_rgb(&self, channel: usize) -> Vec<u8> {
-        let spec = CHANNELS[channel];
-        let mut rgb = Vec::with_capacity(self.config.pixels() * 3);
-        for &value in self.channel(channel) {
-            let color = match spec.scale {
-                ChannelScale::Unit => unit_color(value),
-                ChannelScale::Signed => signed_color(value),
-            };
-            rgb.extend_from_slice(&color);
-        }
-        rgb
-    }
-
-    #[must_use]
-    pub fn overview_rgb(&self) -> Vec<u8> {
-        let mut rgb = Vec::with_capacity(self.config.pixels() * 3);
-        for pixel in 0..self.config.pixels() {
-            let current_stone = self.channel(0)[pixel];
-            let opponent_stone = self.channel(1)[pixel];
-            let current_area = self.channel(2)[pixel];
-            let opponent_area = self.channel(3)[pixel];
-            let ridge = self.channel(6)[pixel];
-            let legal = self.channel(7)[pixel];
-
-            let mut color = [232.0_f32, 235.0, 229.0];
-            blend(&mut color, [39.0, 145.0, 154.0], 0.38 * current_area);
-            blend(&mut color, [218.0, 91.0, 75.0], 0.38 * opponent_area);
-            if legal < 0.0 {
-                blend(&mut color, [42.0, 44.0, 48.0], 0.34 * -legal);
-            } else {
-                blend(&mut color, [238.0, 242.0, 226.0], 0.18 * legal);
-            }
-            blend(&mut color, [255.0, 255.0, 255.0], 0.34 * ridge);
-            if current_stone > 0.0 {
-                blend(&mut color, [10.0, 83.0, 91.0], current_stone);
-            }
-            if opponent_stone > 0.0 {
-                blend(&mut color, [145.0, 37.0, 34.0], opponent_stone);
-            }
-            rgb.extend(color.map(to_u8));
-        }
-        rgb
-    }
 }
 
 /// Rasterize a position into whichever layout `config.kind` names.
@@ -486,105 +390,11 @@ pub fn rasterize(position: &Position, config: RasterConfig) -> SemanticRaster {
 pub fn rasterize_any_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
     match config.kind {
         RasterKind::Semantic => rasterize_into(position, config, data),
-        RasterKind::Rgb => rasterize_rgb_into(position, config, data),
         RasterKind::Compact => rasterize_compact_into(position, config, data),
         RasterKind::CompactPass | RasterKind::CompactDeadZone => {
             rasterize_compact_six_into(position, config, data);
         }
-        RasterKind::CompactConnected => rasterize_compact_connected_into(position, config, data),
         RasterKind::CompactRadius => rasterize_compact_radius_into(position, config, data),
-    }
-}
-
-/// Writes [`RasterKind::CompactConnected`]: both capture fields, the connection
-/// lines, and the two scalars.
-///
-/// `settled` and the dead zone are two thresholds on one distance field, so they
-/// cost one transform between them rather than two.
-pub fn rasterize_compact_connected_into(
-    position: &Position,
-    config: RasterConfig,
-    data: &mut [f32],
-) {
-    let pixels = config.pixels();
-    assert_eq!(data.len(), COMPACT_CONNECTED_CHANNELS.len() * pixels);
-    let (settled, dead_zone, _) = edt::settled_and_dead_zone(position, config, 1);
-
-    let compact = RasterConfig {
-        kind: RasterKind::Compact,
-        ..config
-    };
-    // Slots 0-2 and the settled predicate come from the five-plane writer; komi
-    // lands in its slot 4 and is then overwritten below, which costs one fill
-    // and keeps this from restating the geometry.
-    rasterize_compact_with_predicate_into(
-        position,
-        compact,
-        &settled,
-        &mut data[..COMPACT_CHANNELS.len() * pixels],
-    );
-    for (target, dead) in data[4 * pixels..5 * pixels].iter_mut().zip(&dead_zone) {
-        *target = f32::from(u8::from(*dead));
-    }
-    connections_into(position, config, &mut data[5 * pixels..7 * pixels]);
-    let mover_komi = match position.to_move() {
-        Color::Black => position.komi() as f32,
-        Color::White => -position.komi() as f32,
-    };
-    data[7 * pixels..8 * pixels].fill(mover_komi);
-    data[8 * pixels..9 * pixels].fill(f32::from(position.consecutive_passes() > 0));
-}
-
-/// Paints the connection lines into two planes: the mover's, then the
-/// opponent's.
-///
-/// Two planes rather than one signed plane, for two reasons of unequal weight.
-///
-/// The one that decides it is packing. A signed plane is three-valued, so it
-/// cannot go to bits and stays at fp16 -- sixteen bits per pixel where two
-/// binary planes cost two. It also matches the stone planes, which are already
-/// split by side rather than signed.
-///
-/// The other is correctness, and it is smaller than it first looks. Connection
-/// lines of opposite colours can cross, and a single signed plane resolves a
-/// crossing by whichever pair was drawn last, so one connection disappears and
-/// which one depends on iteration order. Measured, that happens in about 1% of
-/// positions -- 2 of 240 -- so it is a real defect rather than a decisive one.
-///
-/// Each line is a segment between the two stone centres, one raster cell wide.
-/// The line exists to be seen by a convolution, so it wants to be thin and
-/// continuous: at this stone radius a wider one starts covering what it connects.
-fn connections_into(position: &Position, config: RasterConfig, planes: &mut [f32]) {
-    let pixels = config.pixels();
-    planes.fill(0.0);
-    let stones = position.stones();
-    let mover = position.to_move();
-    let half = 1.0 / config.width.min(config.height) as f64;
-    for (a, b) in vgo_core::connected_pairs(position) {
-        let (first, second) = (stones[a], stones[b]);
-        let base = if first.color == mover { 0 } else { pixels };
-        let low_x = (first.x.min(second.x) - half) * config.width as f64;
-        let high_x = (first.x.max(second.x) + half) * config.width as f64;
-        let low_y = (first.y.min(second.y) - half) * config.height as f64;
-        let high_y = (first.y.max(second.y) + half) * config.height as f64;
-        let columns =
-            (low_x.floor().max(0.0) as usize)..=(high_x.ceil() as usize).min(config.width - 1);
-        let rows =
-            (low_y.floor().max(0.0) as usize)..=(high_y.ceil() as usize).min(config.height - 1);
-        for row in rows {
-            let y = (row as f64 + 0.5) / config.height as f64;
-            for column in columns.clone() {
-                let x = (column as f64 + 0.5) / config.width as f64;
-                let distance = vgo_core::distance_to_segment(
-                    Point::new(x, y),
-                    Point::new(first.x, first.y),
-                    Point::new(second.x, second.y),
-                );
-                if distance <= half {
-                    planes[base + row * config.width + column] = 1.0;
-                }
-            }
-        }
     }
 }
 
@@ -600,7 +410,7 @@ fn connections_into(position: &Position, config: RasterConfig, planes: &mut [f32
 /// The pass plane is constant over the board. Two passes end the game, so a
 /// position that is still being played has a count of 0 or 1 and the boolean is
 /// the count rather than a summary of it.
-pub fn rasterize_compact_six_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
+pub(crate) fn rasterize_compact_six_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
     let pixels = config.pixels();
     assert_eq!(data.len(), COMPACT_PASS_CHANNELS.len() * pixels);
     let predicate = match config.kind {
@@ -697,7 +507,7 @@ pub(crate) fn settled_for_raster_into(
     }
 }
 
-pub fn rasterize_compact_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
+pub(crate) fn rasterize_compact_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
     let settled = settled_for_raster(position, config);
     rasterize_compact_with_predicate_into(position, config, &settled, data);
 }
@@ -719,7 +529,7 @@ pub fn rasterize_compact_into(position: &Position, config: RasterConfig, data: &
 ///
 /// The mask must be `config.pixels()` long and indexed row-major, exactly as
 /// [`settled_mask`] returns it.
-pub fn rasterize_compact_with_predicate_into(
+pub(crate) fn rasterize_compact_with_predicate_into(
     position: &Position,
     config: RasterConfig,
     settled: &[bool],
@@ -829,97 +639,11 @@ pub fn rasterize_compact_with_predicate_into(
     }
 }
 
-/// The compact raster as `compact.wgsl` computes it: f32 throughout.
-///
-/// `rasterize_compact_into` is authoritative and works in f64. WGSL has no f64,
-/// so the shader is a deliberate narrowing, and this function is the same
-/// arithmetic in the same order so the cost of that narrowing can be measured
-/// on the host. It is not a second implementation of the raster -- it exists to
-/// be compared against the f64 writer, and `compact.wgsl` must be kept in step
-/// with it. See docs/CLIENT_BOT.md.
-///
-/// `settled` is taken as a caller-supplied mask rather than recomputed: on the
-/// GPU that channel is uploaded, because its cost is per-stone contour geometry
-/// rather than per-pixel work and it does not belong in a pixel shader.
-pub fn rasterize_compact_shader_reference_into(
-    position: &Position,
-    config: RasterConfig,
-    settled: &[bool],
-    data: &mut [f32],
-) {
-    assert!(config.width > 0 && config.height > 0);
-    let pixels = config.pixels();
-    assert_eq!(data.len(), COMPACT_CHANNELS.len() * pixels);
-    assert_eq!(settled.len(), pixels);
-
-    // Matches `const NONE` in compact.wgsl: coordinates are normalised, so the
-    // largest real squared distance is 2 and any sentinel far above it reads as
-    // "no stone seen yet".
-    const NONE: f32 = 1.0e30;
-
-    let radius = position.radius() as f32;
-    let radius_square = radius * radius;
-    let to_move = position.to_move();
-    let mover_komi = match to_move {
-        Color::Black => position.komi() as f32,
-        Color::White => -(position.komi() as f32),
-    };
-    let (current_stones, opponent_stones) = relative_stones(position, to_move);
-
-    for row in 0..config.height {
-        let y = (row as f32 + 0.5) / config.height as f32;
-        for column in 0..config.width {
-            let x = (column as f32 + 0.5) / config.width as f32;
-            let pixel = row * config.width + column;
-
-            let mut current_square = NONE;
-            let mut opponent_square = NONE;
-            let mut nearest_square = NONE;
-            let mut second_square = NONE;
-
-            for &(stone_x, stone_y) in &current_stones {
-                let dx = x - stone_x as f32;
-                let dy = y - stone_y as f32;
-                let square = dx * dx + dy * dy;
-                current_square = current_square.min(square);
-                if square < nearest_square {
-                    second_square = nearest_square;
-                    nearest_square = square;
-                } else if square < second_square {
-                    second_square = square;
-                }
-            }
-            for &(stone_x, stone_y) in &opponent_stones {
-                let dx = x - stone_x as f32;
-                let dy = y - stone_y as f32;
-                let square = dx * dx + dy * dy;
-                opponent_square = opponent_square.min(square);
-                if square < nearest_square {
-                    second_square = nearest_square;
-                    nearest_square = square;
-                } else if square < second_square {
-                    second_square = square;
-                }
-            }
-
-            data[pixel] = f32::from(current_square <= radius_square);
-            data[pixels + pixel] = f32::from(opponent_square <= radius_square);
-            data[2 * pixels + pixel] = if second_square < NONE {
-                (1.0 - (second_square.sqrt() - nearest_square.sqrt()) / radius).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            data[3 * pixels + pixel] = f32::from(settled[pixel]);
-            data[4 * pixels + pixel] = mover_komi;
-        }
-    }
-}
-
 /// Writes a semantic raster into caller-owned contiguous channel-first storage.
 ///
 /// Reusable or pinned inference buffers can use this entry point to avoid an
 /// intermediate per-position allocation and host-side gather.
-pub fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
+pub(crate) fn rasterize_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
     assert!(config.width > 0 && config.height > 0);
     // Caller invariant, not this function's business, and an O(n^2)
     // sweep per rasterization if checked in release. See `game::place`.
@@ -1176,144 +900,6 @@ pub fn action_pixel(x: f64, y: f64, config: RasterConfig) -> usize {
     row.min(config.height - 1) * config.width + column.min(config.width - 1)
 }
 
-/// The player-facing palette, taken from `reference/js-reference/voronoi_go.html`
-/// (`COLORS`, line 199) so the network sees the same picture a human does.
-/// Values are 0-255 to keep them legible against the source; the raster is
-/// normalized to unit range on write.
-///
-/// The JS names the two sides Black and White but draws them blue and orange.
-/// Here they are relative to the side to move, matching every other channel in
-/// this crate: `CURRENT_*` is whoever is about to play.
-const CURRENT_STONE: [f32; 3] = [90.0, 162.0, 236.0]; // #5aa2ec
-const CURRENT_REGION: [f32; 3] = [34.0, 64.0, 92.0]; // #22405c
-const OPPONENT_STONE: [f32; 3] = [240.0, 151.0, 90.0]; // #f0975a
-const OPPONENT_REGION: [f32; 3] = [104.0, 57.0, 26.0]; // #68391a
-const BOARD_BACKGROUND: [f32; 3] = [14.0, 17.0, 22.0]; // #0e1116
-
-/// The legal-placement overlay from `freeMaskSVG` (voronoi_go.html line 369):
-/// legal cells tinted `rgb(205,214,232)` at alpha 42/255, illegal left bare.
-const LEGAL_TINT: [f32; 3] = [205.0, 214.0, 232.0];
-const LEGAL_TINT_ALPHA: f32 = 42.0 / 255.0;
-
-/// Renders the board as a player sees it: three channels, stone discs over
-/// Voronoi territory fill.
-///
-/// This deliberately carries no derived fields -- no distance transform, no
-/// ridge, no legality map. The question it exists to answer is whether a
-/// convolutional tower can recover that structure from the picture alone, so
-/// handing it any of those channels would defeat the experiment. See
-/// `docs/RGB_REPRESENTATION_EXPERIMENT.md`.
-///
-/// Geometry is shared with [`rasterize_into`]: territory is the nearer-stone
-/// test and a stone is the disc within `radius`, so the two rasters agree about
-/// the position and differ only in what they expose.
-pub fn rasterize_rgb_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
-    assert!(config.width > 0 && config.height > 0);
-    // Caller invariant, not this function's business, and an O(n^2)
-    // sweep per rasterization if checked in release. See `game::place`.
-    debug_assert!(position.validate().is_playable());
-    let pixels = config.pixels();
-    assert_eq!(data.len(), RGB_CHANNEL_COUNT * pixels);
-    let radius = position.radius();
-
-    let to_move = position.to_move();
-    let mut current_stones = Vec::with_capacity(position.stones().len());
-    let mut opponent_stones = Vec::with_capacity(position.stones().len());
-    for stone in position.stones() {
-        if stone.color == to_move {
-            current_stones.push((stone.x, stone.y));
-        } else {
-            opponent_stones.push((stone.x, stone.y));
-        }
-    }
-
-    for row in 0..config.height {
-        let y = (row as f64 + 0.5) / config.height as f64;
-        for column in 0..config.width {
-            let x = (column as f64 + 0.5) / config.width as f64;
-            let pixel = row * config.width + column;
-
-            // Squared distances for the same reason as the semantic raster: the
-            // ordering is unchanged and it keeps a hypot out of the inner loop.
-            let mut current_square = f64::INFINITY;
-            let mut opponent_square = f64::INFINITY;
-            for &(sx, sy) in &current_stones {
-                let dx = x - sx;
-                let dy = y - sy;
-                let square = dx * dx + dy * dy;
-                if square < current_square {
-                    current_square = square;
-                }
-            }
-            for &(sx, sy) in &opponent_stones {
-                let dx = x - sx;
-                let dy = y - sy;
-                let square = dx * dx + dy * dy;
-                if square < opponent_square {
-                    opponent_square = square;
-                }
-            }
-            // Nearest stone of either colour, which is what legality turns on.
-            let nearest_square = current_square.min(opponent_square);
-
-            let mut color = BOARD_BACKGROUND;
-            // Draw order follows renderBoard(): filled cells, then the legal
-            // mask, then stones on top.
-            //
-            // The legal overlay is the reason this is worth carrying. A plain
-            // picture of stones and territory does not say where a move is
-            // *allowed*, so a model reading it has to infer the placement rule
-            // from scratch -- and the first RGB run predicted MCTS targets well
-            // (policy_kl 1.21 against semantic's 4.48) while losing the
-            // head-to-head 0.271, which is what a policy proposing unplayable
-            // moves during search would look like.
-            //
-            // Legality is the same predicate `legal_clearance` computes above:
-            // a placement is legal when it clears the board edge and sits at
-            // least two radii from every stone.
-            //
-            // `ownership` only compares its two arguments and tests them for
-            // finiteness, and squaring preserves both on nonnegative reals
-            // (INFINITY squared is still INFINITY), so squared distances give
-            // the same answer without the square roots.
-            let (current_area, opponent_area) = ownership(current_square, opponent_square);
-            blend(&mut color, CURRENT_REGION, current_area);
-            blend(&mut color, OPPONENT_REGION, opponent_area);
-
-            let board_clearance = (x - radius)
-                .min(1.0 - radius - x)
-                .min(y - radius)
-                .min(1.0 - radius - y);
-            let stone_clearance = if nearest_square.is_finite() {
-                nearest_square.sqrt() - 2.0 * radius
-            } else {
-                f64::INFINITY
-            };
-            if board_clearance.min(stone_clearance) > 0.0 {
-                blend(&mut color, LEGAL_TINT, LEGAL_TINT_ALPHA);
-            }
-
-            if current_square <= radius * radius {
-                blend(&mut color, CURRENT_STONE, 1.0);
-            }
-            if opponent_square <= radius * radius {
-                blend(&mut color, OPPONENT_STONE, 1.0);
-            }
-
-            for (channel, value) in color.iter().enumerate() {
-                set(data, pixels, channel, pixel, value / 255.0);
-            }
-        }
-    }
-}
-
-#[must_use]
-pub fn rasterize_rgb(position: &Position, config: RasterConfig) -> Vec<f32> {
-    let mut data = vec![0.0_f32; RGB_CHANNEL_COUNT * config.pixels()];
-    rasterize_rgb_into(position, config, &mut data);
-    data
-}
-
 fn set(data: &mut [f32], pixels: usize, channel: usize, pixel: usize, value: f32) {
     data[channel * pixels + pixel] = value;
 }
@@ -1342,52 +928,13 @@ fn normalized_distance(distance: f64, scale: f64) -> f32 {
     }
 }
 
-fn unit_color(value: f32) -> [u8; 3] {
-    let value = value.clamp(0.0, 1.0);
-    [
-        to_u8(22.0 + 226.0 * value),
-        to_u8(31.0 + 193.0 * value),
-        to_u8(48.0 + 64.0 * (1.0 - value)),
-    ]
-}
-
-fn signed_color(value: f32) -> [u8; 3] {
-    let value = value.clamp(-1.0, 1.0);
-    if value < 0.0 {
-        let amount = -value;
-        [
-            to_u8(245.0),
-            to_u8(241.0 * (1.0 - amount) + 66.0 * amount),
-            to_u8(235.0 * (1.0 - amount) + 63.0 * amount),
-        ]
-    } else {
-        [
-            to_u8(245.0 * (1.0 - value) + 42.0 * value),
-            to_u8(241.0 * (1.0 - value) + 157.0 * value),
-            to_u8(235.0 * (1.0 - value) + 108.0 * value),
-        ]
-    }
-}
-
-fn blend(target: &mut [f32; 3], source: [f32; 3], alpha: f32) {
-    let alpha = alpha.clamp(0.0, 1.0);
-    for channel in 0..3 {
-        target[channel] = target[channel].mul_add(1.0 - alpha, source[channel] * alpha);
-    }
-}
-
-fn to_u8(value: f32) -> u8 {
-    value.round().clamp(0.0, 255.0) as u8
-}
-
 #[cfg(test)]
 mod tests {
     use vgo_core::{Color, Position, Stone};
 
     use super::{
-        CHANNEL_COUNT, CHANNELS, COMPACT_CHANNELS, RGB_CHANNEL_COUNT, RasterConfig, RasterKind,
-        action_pixel, rasterize, rasterize_any_into, rasterize_compact_into,
-        rasterize_compact_shader_reference_into, rasterize_into, rasterize_rgb, settled_for_raster,
+        CHANNEL_COUNT, CHANNELS, COMPACT_CHANNELS, RasterConfig, RasterKind, action_pixel,
+        rasterize, rasterize_any_into, rasterize_into,
     };
 
     /// The pre-optimization formulation: one `hypot` per (pixel, stone) pair.
@@ -1621,101 +1168,6 @@ mod tests {
         }
     }
 
-    /// The direct compact writer must stay bit-for-bit identical to the
-    /// semantic planes it names across sparse and dense positions.
-    #[test]
-    fn the_shader_reference_matches_the_f64_writer() {
-        // compact.wgsl computes in f32 because WGSL has no f64. This measures
-        // what that costs against the authoritative writer, over positions
-        // shaped like real ones: the median game carries 28 stones and the
-        // longest 52.
-        //
-        // The two disc channels are threshold tests, so a pixel centre landing
-        // within f32 epsilon of a stone's edge can legitimately fall either
-        // way. Those are counted and required to be vanishingly rare rather
-        // than forbidden -- forbidding them would be pinning luck. The ridge is
-        // continuous and is held to a tolerance.
-        let radius = 0.055_714_285_714_285_716;
-        let config = RasterConfig::square_of(128, RasterKind::Compact);
-        let pixels = config.pixels();
-        let mut state = 0x243f_6a88_85a3_08d3_u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 11) as f64 / (1u64 << 53) as f64
-        };
-
-        let mut boundary_disagreements = 0usize;
-        let mut worst_ridge = 0.0_f32;
-        let mut compared = 0usize;
-
-        for count in [1usize, 2, 7, 28, 52] {
-            let mut stones = Vec::new();
-            let mut attempts = 0;
-            while stones.len() < count && attempts < 4000 {
-                attempts += 1;
-                let x = 0.06 + next() * 0.88;
-                let y = 0.06 + next() * 0.88;
-                // Stones may not overlap within 2r, which is what the exact
-                // simulator enforces; a fixture that violates it is not a
-                // position the shader will ever see.
-                if stones.iter().any(|s: &Stone| {
-                    let (dx, dy) = (s.x - x, s.y - y);
-                    dx * dx + dy * dy < (2.0 * radius) * (2.0 * radius)
-                }) {
-                    continue;
-                }
-                let colour = if stones.len() % 2 == 0 { Color::Black } else { Color::White };
-                stones.push(Stone::new(x, y, colour));
-            }
-            if stones.len() < count {
-                continue;
-            }
-            let to_move = if count % 2 == 0 { Color::Black } else { Color::White };
-            let position = Position::new(radius, stones, to_move).with_komi(0.104);
-            if !position.validate().is_playable() {
-                continue;
-            }
-
-            let mut exact = vec![0.0_f32; COMPACT_CHANNELS.len() * pixels];
-            rasterize_compact_into(&position, config, &mut exact);
-            let settled = settled_for_raster(&position, config);
-            let mut narrowed = vec![0.0_f32; COMPACT_CHANNELS.len() * pixels];
-            rasterize_compact_shader_reference_into(&position, config, &settled, &mut narrowed);
-
-            compared += 1;
-            for pixel in 0..pixels {
-                for channel in [0usize, 1] {
-                    if exact[channel * pixels + pixel] != narrowed[channel * pixels + pixel] {
-                        boundary_disagreements += 1;
-                    }
-                }
-                let delta = (exact[2 * pixels + pixel] - narrowed[2 * pixels + pixel]).abs();
-                worst_ridge = worst_ridge.max(delta);
-                // settled and komi are copied, not computed, so they must be exact.
-                assert_eq!(exact[3 * pixels + pixel], narrowed[3 * pixels + pixel]);
-                assert_eq!(exact[4 * pixels + pixel], narrowed[4 * pixels + pixel]);
-            }
-        }
-
-        assert!(compared >= 4, "fixture generation failed, only {compared} positions");
-        let total = compared * pixels * 2;
-        assert!(
-            boundary_disagreements * 100_000 < total,
-            "f32 flipped {boundary_disagreements} of {total} disc-channel pixels, \
-             which is more than edge cases"
-        );
-        assert!(
-            worst_ridge < 1.0e-4,
-            "ridge drifted by {worst_ridge} in f32, beyond rounding"
-        );
-        println!(
-            "f32 vs f64 over {compared} positions: {boundary_disagreements}/{total} disc pixels \
-             differ, worst ridge delta {worst_ridge:.3e}"
-        );
-    }
-
     #[test]
     fn compact_is_a_subset_of_the_semantic_raster() {
         for (width, height) in [(48, 48), (63, 47), (128, 128)] {
@@ -1752,188 +1204,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    fn two_stone_position() -> Position {
-        Position::new(
-            0.1,
-            vec![
-                Stone::new(0.25, 0.25, Color::Black),
-                Stone::new(0.75, 0.75, Color::White),
-            ],
-            Color::Black,
-        )
-    }
-
-    #[test]
-    fn rgb_raster_has_three_channels_in_unit_range() {
-        let raster = rasterize_rgb(&two_stone_position(), RasterConfig::square(32));
-        assert_eq!(raster.len(), RGB_CHANNEL_COUNT * 32 * 32);
-        assert_eq!(RasterKind::Rgb.channels(), RGB_CHANNEL_COUNT);
-        assert_eq!(RasterKind::Semantic.channels(), CHANNEL_COUNT);
-        assert!(raster.iter().all(|value| *value >= 0.0 && *value <= 1.0));
-    }
-
-    #[test]
-    fn rgb_raster_paints_each_stone_in_its_own_colour() {
-        let config = RasterConfig::square(64);
-        let raster = rasterize_rgb(&two_stone_position(), config);
-        let pixels = config.pixels();
-        let sample = |x: f64, y: f64| {
-            let column = (x * config.width as f64) as usize;
-            let row = (y * config.height as f64) as usize;
-            let pixel = row * config.width + column;
-            [
-                raster[pixel],
-                raster[pixels + pixel],
-                raster[2 * pixels + pixel],
-            ]
-        };
-
-        // The side to move is Black, so its stone takes the current colour and
-        // White's takes the opponent colour. CURRENT_STONE is blue-dominant and
-        // OPPONENT_STONE is red-dominant, which is the cheapest stable way to
-        // tell them apart without pinning exact palette values.
-        let current = sample(0.25, 0.25);
-        assert!(
-            current[2] > current[0],
-            "current stone should be blue-dominant, got {current:?}"
-        );
-        let opponent = sample(0.75, 0.75);
-        assert!(
-            opponent[0] > opponent[2],
-            "opponent stone should be red-dominant, got {opponent:?}"
-        );
-    }
-
-    #[test]
-    fn rgb_and_semantic_rasters_agree_about_stones_and_territory() {
-        // The experiment only means anything if both rasters describe the same
-        // position; they must differ in what they expose, not in what they show.
-        let config = RasterConfig::square(48);
-        let position = two_stone_position();
-        let semantic = rasterize(&position, config);
-        let rgb = rasterize_rgb(&position, config);
-        let pixels = config.pixels();
-
-        for pixel in 0..pixels {
-            let current_stone = semantic.channel(0)[pixel] > 0.0;
-            let opponent_stone = semantic.channel(1)[pixel] > 0.0;
-            let color = [rgb[pixel], rgb[pixels + pixel], rgb[2 * pixels + pixel]];
-            if current_stone {
-                assert!(
-                    color[2] > color[0],
-                    "pixel {pixel} is a current stone in the semantic raster but not blue-dominant in RGB"
-                );
-            }
-            if opponent_stone {
-                assert!(
-                    color[0] > color[2],
-                    "pixel {pixel} is an opponent stone in the semantic raster but not red-dominant in RGB"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn rgb_legal_overlay_agrees_with_the_semantic_clearance_channel() {
-        // The overlay exists so the picture states where a move is allowed.
-        // Both rasters must agree about legality, or the RGB model is being
-        // taught a different rule than the search enforces.
-        //
-        // Territory fill varies the base colour across the board, so this
-        // compares the two populations rather than each pixel against a fixed
-        // background: every legal cell is brighter than every illegal one that
-        // shares its territory owner.
-        let config = RasterConfig::square(48);
-        let rgb_config = RasterConfig::square_of(48, RasterKind::Rgb);
-        let position = two_stone_position();
-        let semantic = rasterize(&position, config);
-        let rgb = rasterize_rgb(&position, rgb_config);
-        let pixels = config.pixels();
-
-        let mut legal_brightness: Vec<f32> = Vec::new();
-        let mut illegal_brightness: Vec<f32> = Vec::new();
-        for pixel in 0..pixels {
-            // Skip stones: a disc paints over the tint, so legality is not
-            // readable there in either raster. Skip the current player's
-            // territory too, so both populations share one base colour.
-            if semantic.channel(0)[pixel] > 0.0
-                || semantic.channel(1)[pixel] > 0.0
-                || semantic.channel(2)[pixel] > 0.0
-            {
-                continue;
-            }
-            let clearance = semantic.channel(7)[pixel];
-            // Near the boundary a half-pixel of sampling difference decides the
-            // sign, so only compare where the predicate is unambiguous.
-            if clearance.abs() < 0.05 {
-                continue;
-            }
-            let brightness: f32 = (0..3).map(|c| rgb[c * pixels + pixel]).sum();
-            if clearance > 0.0 {
-                legal_brightness.push(brightness);
-            } else {
-                illegal_brightness.push(brightness);
-            }
-        }
-
-        assert!(
-            legal_brightness.len() > 50 && illegal_brightness.len() > 50,
-            "expected a meaningful sample of each: {} legal, {} illegal",
-            legal_brightness.len(),
-            illegal_brightness.len()
-        );
-        let dimmest_legal = legal_brightness.iter().copied().fold(f32::MAX, f32::min);
-        let brightest_illegal = illegal_brightness.iter().copied().fold(f32::MIN, f32::max);
-        assert!(
-            dimmest_legal > brightest_illegal,
-            "legal cells must be tinted brighter than illegal ones: \
-             dimmest legal {dimmest_legal}, brightest illegal {brightest_illegal}"
-        );
-    }
-
-    #[test]
-    fn rgb_raster_is_a_relative_view_like_every_other_channel() {
-        // Swapping both the stone colours and the side to move leaves the
-        // position identical from the mover's seat, so the picture must not move.
-        let config = RasterConfig::square(32);
-        let black_to_play = rasterize_rgb(&two_stone_position(), config);
-        let white_to_play = rasterize_rgb(
-            &Position::new(
-                0.1,
-                vec![
-                    Stone::new(0.25, 0.25, Color::White),
-                    Stone::new(0.75, 0.75, Color::Black),
-                ],
-                Color::White,
-            ),
-            config,
-        );
-        assert_eq!(black_to_play, white_to_play);
-    }
-
-    #[test]
-    fn raster_has_stable_shape_and_ranges() {
-        let position = Position::new(
-            0.1,
-            vec![
-                Stone::new(0.25, 0.25, Color::Black),
-                Stone::new(0.75, 0.75, Color::White),
-            ],
-            Color::Black,
-        );
-        let raster = rasterize(&position, RasterConfig::square(32));
-        assert_eq!(raster.data().len(), CHANNEL_COUNT * 32 * 32);
-        for (channel, values) in (0..CHANNEL_COUNT).map(|index| (index, raster.channel(index))) {
-            let minimum = if channel == 7 { -1.0 } else { 0.0 };
-            assert!(
-                values
-                    .iter()
-                    .all(|value| *value >= minimum && *value <= 1.0)
-            );
-        }
-        assert_eq!(raster.overview_rgb().len(), 32 * 32 * 3);
     }
 
     #[test]
@@ -2065,51 +1335,6 @@ mod tests {
         }
     }
 
-    /// Connections land in the plane for their side, and both stay binary.
-    ///
-    /// Binary is the property that matters: it is what lets them pack to bits
-    /// rather than fp16. Crossing lines, the other argument for splitting them,
-    /// are real but rare -- 2 positions in 240 -- so they are not what this
-    /// pins.
-    #[test]
-    fn connections_split_by_side() {
-        let radius = 1.0 / 18.0;
-        // Two black stones close enough to be uncuttable outright, and two white
-        // ones likewise, well away from each other.
-        let position = Position::new(
-            radius,
-            vec![
-                Stone::new(0.25, 0.25, Color::Black),
-                Stone::new(0.25 + 2.5 * radius, 0.25, Color::Black),
-                Stone::new(0.75, 0.75, Color::White),
-                Stone::new(0.75 - 2.5 * radius, 0.75, Color::White),
-            ],
-            Color::Black,
-        );
-    assert!(position.validate().is_playable());
-        let config = RasterConfig::square_of(128, RasterKind::CompactConnected);
-        let pixels = config.pixels();
-        let mut data = vec![f32::NAN; config.channels() * pixels];
-        super::rasterize_any_into(&position, config, &mut data);
-
-        let ours = &data[5 * pixels..6 * pixels];
-        let theirs = &data[6 * pixels..7 * pixels];
-        let lit = |p: &[f32]| p.iter().filter(|v| **v > 0.5).count();
-        assert!(lit(ours) > 0, "the mover's connection must be painted");
-        assert!(lit(theirs) > 0, "the opponent's connection must be painted");
-        assert!(
-            data[5 * pixels..7 * pixels].iter().all(|v| *v == 0.0 || *v == 1.0),
-            "both planes are binary, which is what keeps them packable to bits"
-        );
-
-        // Mover-relative, like the stone planes: swapping the turn swaps them.
-        let flipped = Position::new(radius, position.stones().to_vec(), Color::White);
-        let mut other = vec![f32::NAN; config.channels() * pixels];
-        super::rasterize_any_into(&flipped, config, &mut other);
-        assert_eq!(lit(&other[5 * pixels..6 * pixels]), lit(theirs));
-        assert_eq!(lit(&other[6 * pixels..7 * pixels]), lit(ours));
-    }
-
     /// Every plane of the eight-channel layout is what its name says.
     /// The whole reason the layout exists: two board sizes must not render
     /// identically. An empty board is the case that matters, because it is
@@ -2177,25 +1402,26 @@ mod tests {
         assert_eq!(&wide[..narrow.len()], &narrow[..]);
     }
 
+
     #[test]
-    fn the_connected_layout_carries_every_plane_it_names() {
-        let names: Vec<&str> = RasterKind::CompactConnected
-            .indices()
-            .iter()
-            .map(|&i| CHANNELS[i].name)
-            .collect();
-        assert_eq!(
-            names,
+    fn raster_has_stable_shape_and_ranges() {
+        let position = Position::new(
+            0.1,
             vec![
-                "current_stones", "opponent_stones", "voronoi_ridge",
-                "settled", "dead_zone", "current_connections",
-                "opponent_connections", "komi", "previous_pass",
-            ]
+                Stone::new(0.25, 0.25, Color::Black),
+                Stone::new(0.75, 0.75, Color::White),
+            ],
+            Color::Black,
         );
-        // The first four match `compact`, so a compact model still warm-starts.
-        assert_eq!(
-            &RasterKind::CompactConnected.indices()[..3],
-            &COMPACT_CHANNELS[..3]
-        );
+        let raster = rasterize(&position, RasterConfig::square(32));
+        assert_eq!(raster.data().len(), CHANNEL_COUNT * 32 * 32);
+        for (channel, values) in (0..CHANNEL_COUNT).map(|index| (index, raster.channel(index))) {
+            let minimum = if channel == 7 { -1.0 } else { 0.0 };
+            assert!(
+                values
+                    .iter()
+                    .all(|value| *value >= minimum && *value <= 1.0)
+            );
+        }
     }
 }

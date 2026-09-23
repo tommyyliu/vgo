@@ -447,13 +447,58 @@ fn finish_profiler(_: Profiler, _: Option<&std::path::Path>) -> io::Result<()> {
     Ok(())
 }
 
+/// Ask the driver to block, rather than spin, while waiting for the GPU.
+///
+/// CUDA offers two waiting strategies. Spinning busy-polls a memory location
+/// until the GPU signals: a microsecond or two of latency, and a core pinned at
+/// 100% for the whole wait. Blocking sleeps on a driver semaphore and is woken
+/// by an interrupt: tens of microseconds to wake, and the core is free
+/// meanwhile. The default is "auto", which spins when threads do not outnumber
+/// cores.
+///
+/// For this generator that default is exactly backwards. A profile of the
+/// generator put 43% of all CPU samples inside `ort::session::run` across two
+/// inference threads, both at 100% CPU, while the GPU sat pinned at 296 W --
+/// they were not computing, they were spinning. Sessions take ~7.6 ms, so a
+/// 50-microsecond wakeup is under a percent of added latency, and it buys back
+/// two whole cores. On this box those cores are idle anyway; on the 8-vCPU
+/// machines a rented GPU comes attached to, it is a quarter of the CPU.
+///
+/// # Ordering
+///
+/// This sets a flag on the device's *primary* context, which the driver
+/// refuses to change while that context is active. ONNX Runtime retains the
+/// same primary context, so this has to run before any session is built --
+/// hence `CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE` is reported plainly rather than
+/// swallowed: silently failing would leave the threads spinning while the log
+/// said the flag was set.
+fn use_blocking_sync(device: usize) -> Result<(), String> {
+    use cudarc::driver::sys;
+    // SAFETY: `cuInit` is idempotent and `device` is validated by `device::get`
+    // before use; both are the documented preconditions.
+    unsafe {
+        sys::cuInit(0)
+            .result()
+            .map_err(|e| e.to_string())?;
+        let handle = cudarc::driver::result::device::get(device as i32)
+            .map_err(|e| e.to_string())?;
+        sys::cuDevicePrimaryCtxSetFlags_v2(
+            handle,
+            sys::CUctx_flags_enum::CU_CTX_SCHED_BLOCKING_SYNC as u32,
+        )
+        .result()
+        .map_err(|e| format!("set blocking sync: {e}"))?;
+    }
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     let config = Config::parse();
     // Before anything touches CUDA: the driver refuses to change this flag once
     // the primary context is active, and ONNX Runtime retains that same
     // context when the first session is built.
     if config.blocking_sync {
-        match vgo_raster_cuda::use_blocking_sync(config.device_id.max(0) as usize) {
+        match use_blocking_sync(config.device_id.max(0) as usize) {
             Ok(()) => eprintln!("[cuda] waiting on the GPU will block, not spin"),
             Err(error) => eprintln!("[cuda] blocking sync unavailable, continuing: {error}"),
         }

@@ -86,48 +86,6 @@ fn transform_1d(f: &[f64], d: &mut [f64], v: &mut [usize], z: &mut [f64]) {
     }
 }
 
-fn transform_1d_with_owners(
-    f: &[f64],
-    d: &mut [f64],
-    v: &mut [usize],
-    z: &mut [f64],
-    owners: &mut [usize],
-) {
-    let n = f.len();
-    if n == 0 {
-        return;
-    }
-    let mut k = 0usize;
-    v[0] = 0;
-    z[0] = f64::NEG_INFINITY;
-    z[1] = f64::INFINITY;
-    for q in 1..n {
-        let mut s = intersection(f, q, v[k]);
-        while k > 0 && s <= z[k] {
-            k -= 1;
-            s = intersection(f, q, v[k]);
-        }
-        if k == 0 && s <= z[0] {
-            v[0] = q;
-            z[1] = f64::INFINITY;
-            continue;
-        }
-        k += 1;
-        v[k] = q;
-        z[k] = s;
-        z[k + 1] = f64::INFINITY;
-    }
-    let mut k = 0usize;
-    for q in 0..n {
-        while z[k + 1] < q as f64 {
-            k += 1;
-        }
-        owners[q] = v[k];
-        let offset = q as f64 - v[k] as f64;
-        d[q] = offset * offset + f[v[k]];
-    }
-}
-
 fn intersection(f: &[f64], q: usize, vk: usize) -> f64 {
     let (fq, fv) = (f[q], f[vk]);
     let (qf, vf) = (q as f64, vk as f64);
@@ -163,7 +121,6 @@ const NEAREST_SEARCH_MINIMUM_STONES: usize = 96;
 pub(crate) struct EdtScratch {
     legal: Vec<bool>,
     field: Vec<f64>,
-    column_field: Vec<f64>,
     sources: Vec<f64>,
     results: Vec<f64>,
     vertices: Vec<usize>,
@@ -173,73 +130,9 @@ pub(crate) struct EdtScratch {
     column_xs: Vec<f64>,
     fine_columns: Vec<usize>,
     nearest_squares: Vec<f64>,
-    row_owners: Vec<u64>,
-    row_owner_columns: Vec<usize>,
-    pub(crate) incremental_rows: Vec<bool>,
-    /// Per row, the first and last column whose classification inputs moved on
-    /// this append. `lo > hi` means nothing in the row did.
-    ///
-    /// A settled pixel is decided by two numbers: the sampled distance to the
-    /// legal set, and the distance to the nearest stone. An append moves the
-    /// first only where the distance transform's output actually changed, and
-    /// the second only inside the new stone's disc. Both are local, but the row
-    /// flag they used to share is not -- 94% of rows carry at least one moved
-    /// pixel, so classifying by row reclassified nearly the whole board to find
-    /// the tenth of it that could have changed.
-    row_change_lo: Vec<u32>,
-    row_change_hi: Vec<u32>,
-    /// Pixels that took the exact test last time, and whether that record can
-    /// be trusted. See the classification loop for why they are special.
-    band_pixels: Vec<u32>,
-    band_scratch: Vec<u32>,
-    band_valid: bool,
 }
 
 impl EdtScratch {
-    pub(crate) fn legal_len(&self) -> usize {
-        self.legal.len()
-    }
-
-    /// Forget the previous append's spans. Called once per append, before
-    /// anything marks into them.
-    /// Forget which pixels were in the undecided band. Any full render
-    /// establishes the mask without recording one, so the next append has to
-    /// classify everything once to find it again.
-    pub(crate) fn invalidate_band(&mut self) {
-        self.band_valid = false;
-        self.band_pixels.clear();
-    }
-
-    pub(crate) fn reset_row_changes(&mut self, height: usize) {
-        self.row_change_lo.clear();
-        self.row_change_lo.resize(height, u32::MAX);
-        self.row_change_hi.clear();
-        self.row_change_hi.resize(height, 0);
-    }
-
-    pub(crate) fn mark_row_change(&mut self, row: usize, column: usize) {
-        let column = column as u32;
-        if column < self.row_change_lo[row] {
-            self.row_change_lo[row] = column;
-        }
-        if column > self.row_change_hi[row] {
-            self.row_change_hi[row] = column;
-        }
-    }
-
-    fn mark_row_span(&mut self, row: usize, low: usize, high: usize) {
-        if (low as u32) < self.row_change_lo[row] {
-            self.row_change_lo[row] = low as u32;
-        }
-        if (high as u32) > self.row_change_hi[row] {
-            self.row_change_hi[row] = high as u32;
-        }
-    }
-
-    fn row_change(&self, row: usize) -> Option<(usize, usize)> {
-        let (low, high) = (self.row_change_lo[row], self.row_change_hi[row]);
-        (low <= high).then(|| (low as usize, high as usize))
-    }
 
     /// The squared sampled distance field, for a caller classifying `settled`
     /// a row at a time.
@@ -247,30 +140,13 @@ impl EdtScratch {
         &self.field
     }
 
-    pub(crate) fn invalidate_legal(&mut self) {
-        self.legal.clear();
-    }
-}
-
-pub(crate) fn prime_incremental_transform(
-    scratch: &mut EdtScratch,
-    width: usize,
-    height: usize,
-) -> bool {
-    if scratch.legal.len() != width * height {
-        return false;
-    }
-    let legal = std::mem::take(&mut scratch.legal);
-    squared_distance_transform_into(&legal, width, height, scratch, true);
-    scratch.legal = legal;
-    true
 }
 
 /// Exposed for `vgo-raster-bench`. See `sampled_legal_set`.
 #[doc(hidden)]
-pub fn squared_distance_transform(mask: &[bool], width: usize, height: usize) -> Vec<f64> {
+pub(crate) fn squared_distance_transform(mask: &[bool], width: usize, height: usize) -> Vec<f64> {
     let mut scratch = EdtScratch::default();
-    squared_distance_transform_into(mask, width, height, &mut scratch, false);
+    squared_distance_transform_into(mask, width, height, &mut scratch);
     scratch.field
 }
 
@@ -279,7 +155,6 @@ fn squared_distance_transform_into(
     width: usize,
     height: usize,
     scratch: &mut EdtScratch,
-    track_incremental: bool,
 ) {
     scratch.field.resize(mask.len(), 0.0);
     for (value, inside) in scratch.field.iter_mut().zip(mask) {
@@ -321,143 +196,17 @@ fn squared_distance_transform_into(
     }
 
     // Rows are already contiguous, so they need none of that.
-    if track_incremental {
-        let owner_words = width.div_ceil(64);
-        scratch.column_field.resize(mask.len(), 0.0);
-        scratch.column_field.copy_from_slice(&scratch.field);
-        scratch.row_owners.resize(height * owner_words, 0);
-        scratch.row_owner_columns.resize(width, usize::MAX);
-        for row in 0..height {
-            let base = row * width;
-            scratch.sources[..width].copy_from_slice(&scratch.column_field[base..base + width]);
-            transform_1d_with_owners(
-                &scratch.sources[..width],
-                &mut scratch.results[..width],
-                &mut scratch.vertices,
-                &mut scratch.boundaries,
-                &mut scratch.row_owner_columns[..width],
-            );
-            scratch.row_owners[row * owner_words..(row + 1) * owner_words].fill(0);
-            for &owner in &scratch.row_owner_columns[..width] {
-                scratch.row_owners[row * owner_words + owner / 64] |= 1 << (owner % 64);
-            }
-            scratch.field[base..base + width].copy_from_slice(&scratch.results[..width]);
-        }
-    } else {
-        for row in 0..height {
-            let base = row * width;
-            scratch.sources[..width].copy_from_slice(&scratch.field[base..base + width]);
-            transform_1d(
-                &scratch.sources[..width],
-                &mut scratch.results[..width],
-                &mut scratch.vertices,
-                &mut scratch.boundaries,
-            );
-            scratch.field[base..base + width].copy_from_slice(&scratch.results[..width]);
-        }
-    }
-}
-
-fn squared_distance_transform_incremental_into(
-    mask: &[bool],
-    width: usize,
-    height: usize,
-    low_column: usize,
-    high_column: usize,
-    scratch: &mut EdtScratch,
-    changed_rows: &mut [bool],
-) -> bool {
-    if scratch.column_field.len() != mask.len() {
-        return false;
-    }
-    let owner_words = width.div_ceil(64);
-    if scratch.row_owners.len() != height * owner_words {
-        return false;
-    }
-    if changed_rows.len() != height {
-        return false;
-    }
-    scratch.row_owner_columns.resize(width, usize::MAX);
-    for column in low_column..=high_column {
-        for row in 0..height {
-            scratch.sources[row] = if mask[row * width + column] {
-                0.0
-            } else {
-                ABSENT
-            };
-        }
-        transform_1d(
-            &scratch.sources[..height],
-            &mut scratch.results[..height],
-            &mut scratch.vertices,
-            &mut scratch.boundaries,
-        );
-        for row in 0..height {
-            scratch.column_field[row * width + column] = scratch.results[row];
-        }
-    }
     for row in 0..height {
-        if !owner_mask_intersects(
-            &scratch.row_owners[row * owner_words..(row + 1) * owner_words],
-            low_column,
-            high_column,
-        ) {
-            continue;
-        }
-        changed_rows[row] = true;
         let base = row * width;
-        scratch.sources[..width].copy_from_slice(&scratch.column_field[base..base + width]);
-        transform_1d_with_owners(
+        scratch.sources[..width].copy_from_slice(&scratch.field[base..base + width]);
+        transform_1d(
             &scratch.sources[..width],
             &mut scratch.results[..width],
             &mut scratch.vertices,
             &mut scratch.boundaries,
-            &mut scratch.row_owner_columns[..width],
         );
-        scratch.row_owners[row * owner_words..(row + 1) * owner_words].fill(0);
-        for &owner in &scratch.row_owner_columns[..width] {
-            scratch.row_owners[row * owner_words + owner / 64] |= 1 << (owner % 64);
-        }
-        // Copy with a comparison rather than `copy_from_slice`, to learn which
-        // columns actually moved. A row is recomputed whenever any of its
-        // pixels is owned by a changed column, but the pixels that then differ
-        // are far fewer, and only those need reclassifying.
-        let mut low = usize::MAX;
-        let mut high = 0usize;
-        for column in 0..width {
-            let value = scratch.results[column];
-            if scratch.field[base + column] != value {
-                scratch.field[base + column] = value;
-                if low == usize::MAX {
-                    low = column;
-                }
-                high = column;
-            }
-        }
-        if low != usize::MAX {
-            scratch.mark_row_span(row, low, high);
-        }
+        scratch.field[base..base + width].copy_from_slice(&scratch.results[..width]);
     }
-    true
-}
-
-fn owner_mask_intersects(mask: &[u64], low: usize, high: usize) -> bool {
-    let first_word = low / 64;
-    let last_word = high / 64;
-    for word in first_word..=last_word {
-        let low_bit = if word == first_word { low % 64 } else { 0 };
-        let high_bit = if word == last_word { high % 64 } else { 63 };
-        let low_mask = u64::MAX << low_bit;
-        let high_mask = if high_bit == 63 {
-            u64::MAX
-        } else {
-            (1u64 << (high_bit + 1)) - 1
-        };
-        if mask[word] & low_mask & high_mask != 0 {
-            return true;
-        }
-    }
-    false
 }
 
 /// Stones bucketed into a uniform grid for nearest-distance queries.
@@ -594,7 +343,7 @@ fn nearest_row_chunked(
 /// they can be optimised one at a time. Not part of the API: the signature
 /// tracks whatever the transform needs and will change without notice.
 #[doc(hidden)]
-pub fn sampled_legal_set(position: &Position, fine_width: usize, fine_height: usize) -> Vec<bool> {
+pub(crate) fn sampled_legal_set(position: &Position, fine_width: usize, fine_height: usize) -> Vec<bool> {
     let mut scratch = EdtScratch::default();
     sampled_legal_set_into(position, fine_width, fine_height, &mut scratch);
     scratch.legal
@@ -911,211 +660,6 @@ pub(crate) fn settled_mask_by_bounded_distance_into(
     );
 }
 
-/// Update the sampled legal set for one appended stone and classify settled
-/// pixels using a caller-maintained nearest-stone field. This is deliberately
-/// limited to the production oversample-1 path; captures and other changes use
-/// the full builder.
-/// One pixel of the bounded-distance test, reporting whether it landed in the
-/// undecided band.
-#[allow(clippy::too_many_arguments)]
-fn classify_settled_pixel(
-    position: &Position,
-    x: f64,
-    y: f64,
-    pixel: usize,
-    field: &[f64],
-    nearest_squares: &[f64],
-    spacing_squared: f64,
-    slack: f64,
-    index: &mut Option<LegalSetIndex>,
-    mask: &mut [bool],
-) -> bool {
-    let sampled_squared = field[pixel] * spacing_squared;
-    let sampled = sampled_squared.sqrt();
-    let sampled_minus_slack = sampled - slack;
-    if sampled_minus_slack > 0.0
-        && nearest_squares[pixel] <= sampled_minus_slack * sampled_minus_slack
-    {
-        mask[pixel] = true;
-        false
-    } else if nearest_squares[pixel] > sampled_squared {
-        mask[pixel] = false;
-        false
-    } else {
-        let known = index.get_or_insert_with(|| LegalSetIndex::build(position));
-        mask[pixel] = no_legal_point_closer_than_indexed(
-            position,
-            Point::new(x, y),
-            nearest_squares[pixel].sqrt(),
-            known,
-        );
-        true
-    }
-}
-
-pub(crate) fn settled_mask_by_incremental_append_into(
-    position: &Position,
-    config: RasterConfig,
-    stone: Point,
-    nearest_squares: &[f64],
-    scratch: &mut EdtScratch,
-    mask: &mut Vec<bool>,
-) -> bool {
-    let pixels = config.pixels();
-    if scratch.legal.len() != pixels || nearest_squares.len() != pixels {
-        return false;
-    }
-    let radius = position.radius();
-    let exclusion = 2.0 * radius - COORDINATE_EPSILON;
-    let exclusion_squared = exclusion * exclusion;
-    let width = config.width;
-    let height = config.height;
-    let mut incremental_rows = std::mem::take(&mut scratch.incremental_rows);
-    incremental_rows.resize(height, false);
-    let low_row = (((stone.y - exclusion) * height as f64 - 0.5).floor()).max(0.0) as usize;
-    let high_row =
-        ((((stone.y + exclusion) * height as f64 - 0.5).ceil()) as usize).min(height - 1);
-    let low_column = (((stone.x - exclusion) * width as f64 - 0.5).floor()).max(0.0) as usize;
-    let high_column =
-        ((((stone.x + exclusion) * width as f64 - 0.5).ceil()) as usize).min(width - 1);
-    let mut legal_changed = false;
-    for row in low_row..=high_row {
-        let y = (row as f64 + 0.5) / height as f64;
-        let dy = y - stone.y;
-        let dy_squared = dy * dy;
-        for column in low_column..=high_column {
-            let x = (column as f64 + 0.5) / width as f64;
-            let dx = x - stone.x;
-            if dx.mul_add(dx, dy_squared) < exclusion_squared {
-                let pixel = row * width + column;
-                legal_changed |= scratch.legal[pixel];
-                scratch.legal[pixel] = false;
-            }
-        }
-    }
-    if legal_changed {
-        let legal = std::mem::take(&mut scratch.legal);
-        let incremental = squared_distance_transform_incremental_into(
-            &legal,
-            width,
-            height,
-            low_column,
-            high_column,
-            scratch,
-            &mut incremental_rows,
-        );
-        if !incremental {
-            squared_distance_transform_into(&legal, width, height, scratch, true);
-            incremental_rows.fill(true);
-            for row in 0..height {
-                scratch.mark_row_span(row, 0, width - 1);
-            }
-        }
-        scratch.legal = legal;
-    }
-    scratch.incremental_rows = incremental_rows;
-
-    if scratch.column_xs.len() != width || scratch.fine_columns.len() != width {
-        scratch.column_xs.resize(width, 0.0);
-        scratch.fine_columns.resize(width, 0);
-        for (column, x) in scratch.column_xs.iter_mut().enumerate() {
-            *x = (column as f64 + 0.5) / width as f64;
-            scratch.fine_columns[column] = column;
-        }
-    }
-    mask.resize(pixels, false);
-    let spacing = 1.0 / width as f64;
-    let spacing_squared = spacing * spacing;
-    let slack = spacing * std::f64::consts::SQRT_2;
-    let mut index: Option<LegalSetIndex> = None;
-
-    // Which pixels have to be looked at again.
-    //
-    // The two cheap branches are pure functions of the sampled distance and the
-    // nearest stone, so a pixel where neither moved keeps its answer and can be
-    // skipped. The third is not: it calls `no_legal_point_closer_than`, which
-    // reads the position, and the append just changed the position. Adding a
-    // stone removes legal points, and the grid need not have sampled any of
-    // them, so a band pixel can flip with both of its own numbers untouched.
-    //
-    // That is what the hundred-append chain caught, sixteen appends in, when
-    // this loop trusted the spans alone. So the band from the previous pass is
-    // revisited whatever the spans say. Membership in it is decided by the same
-    // two numbers, so a pixel can only *enter* the band by being marked, and is
-    // caught on the spans; leaving one is covered by revisiting all of it.
-    let mut band = std::mem::take(&mut scratch.band_pixels);
-    let mut next_band = std::mem::take(&mut scratch.band_scratch);
-    next_band.clear();
-    let rebuild = !scratch.band_valid;
-    for row in 0..height {
-        let (low, high) = if rebuild {
-            (0, width - 1)
-        } else if !scratch.incremental_rows[row] {
-            continue;
-        } else if let Some(span) = scratch.row_change(row) {
-            span
-        } else {
-            continue;
-        };
-        let y = (row as f64 + 0.5) / height as f64;
-        for column in low..=high {
-            let pixel = row * width + column;
-            if classify_settled_pixel(
-                position,
-                scratch.column_xs[column],
-                y,
-                pixel,
-                &scratch.field,
-                nearest_squares,
-                spacing_squared,
-                slack,
-                &mut index,
-                mask,
-            ) {
-                next_band.push(pixel as u32);
-            }
-        }
-    }
-    if !rebuild {
-        for slot in 0..band.len() {
-            let pixel = band[slot] as usize;
-            let row = pixel / width;
-            let column = pixel % width;
-            // Skip whatever the span loop already did, or it would be recorded
-            // in the band twice and the list would grow every append.
-            let mut done = false;
-            if scratch.incremental_rows[row] {
-                if let Some((low, high)) = scratch.row_change(row) {
-                    done = column >= low && column <= high;
-                }
-            }
-            if done {
-                continue;
-            }
-            let y = (row as f64 + 0.5) / height as f64;
-            if classify_settled_pixel(
-                position,
-                scratch.column_xs[column],
-                y,
-                pixel,
-                &scratch.field,
-                nearest_squares,
-                spacing_squared,
-                slack,
-                &mut index,
-                mask,
-            ) {
-                next_band.push(pixel as u32);
-            }
-        }
-    }
-    band.clear();
-    scratch.band_scratch = band;
-    scratch.band_pixels = next_band;
-    scratch.band_valid = true;
-    true
-}
-
 /// The bounded-distance `settled` test, split so a caller can supply the
 /// nearest-stone field instead of having one computed for it.
 ///
@@ -1148,7 +692,7 @@ pub(crate) fn prepare_settled_rows(
     let (width, height) = (config.width, config.height);
     sampled_legal_set_into(position, width, height, scratch);
     let legal = std::mem::take(&mut scratch.legal);
-    squared_distance_transform_into(&legal, width, height, scratch, false);
+    squared_distance_transform_into(&legal, width, height, scratch);
     scratch.legal = legal;
     let spacing = 1.0 / width as f64;
     SettledRows {
@@ -1229,7 +773,7 @@ fn masks_by_bounded_distance_into(
     let (fine_width, fine_height) = (config.width * scale, config.height * scale);
     sampled_legal_set_into(position, fine_width, fine_height, scratch);
     let legal = std::mem::take(&mut scratch.legal);
-    squared_distance_transform_into(&legal, fine_width, fine_height, scratch, false);
+    squared_distance_transform_into(&legal, fine_width, fine_height, scratch);
     scratch.legal = legal;
     let spacing = 1.0 / fine_width as f64;
     let spacing_squared = spacing * spacing;

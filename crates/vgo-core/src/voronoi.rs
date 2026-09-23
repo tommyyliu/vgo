@@ -40,13 +40,6 @@ pub struct Edge {
 }
 
 impl Edge {
-    #[must_use]
-    pub fn other_stone(&self) -> Option<usize> {
-        match self.source {
-            Some(EdgeSource::Bisector { other, .. }) => Some(other),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

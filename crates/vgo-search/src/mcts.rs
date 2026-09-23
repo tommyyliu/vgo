@@ -249,29 +249,6 @@ enum FineGridCache {
 }
 
 impl Node {
-    pub(crate) fn memory_usage(&self) -> crate::TreeMemory {
-        fn visit(node: &Node, counter: &mut crate::memory::MemoryCounter) {
-            counter.report.nodes += 1;
-            counter.report.node_bytes += size_of::<Node>();
-            counter.report.edge_capacity_bytes += node.children.capacity() * size_of::<Child>();
-            counter.report.position_bytes += std::mem::size_of_val(node.position.stones());
-            counter.report.unreported_candidate_caches += usize::from(node.candidates.is_some());
-            if let Some(evaluation) = &node.evaluation {
-                evaluation.account_memory(counter);
-            }
-            if let FineGridCache::Ready(grid) = &node.fine_grid {
-                grid.account_memory(counter);
-            }
-            for child in &node.children {
-                if let Some(node) = &child.node {
-                    visit(node, counter);
-                }
-            }
-        }
-        let mut counter = crate::memory::MemoryCounter::default();
-        visit(self, &mut counter);
-        counter.report
-    }
     /// Build a node whose evaluation was already computed elsewhere.
     ///
     /// The batched path evaluates a round of leaves together, so by the time a

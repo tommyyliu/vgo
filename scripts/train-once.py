@@ -112,7 +112,7 @@ def main() -> None:
     parser.add_argument(
         "--raster-kind",
         default=None,
-        choices=("semantic", "compact", "compact-pass", "compact-dead-zone", "compact-connected", "compact-radius", "rgb"),
+        choices=("semantic", "compact", "compact-pass", "compact-dead-zone", "compact-radius"),
         help=(
             "which planes to render from each shard. A property of the model "
             "rather than of the data: shards store positions, so the raster is "

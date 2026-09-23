@@ -14,7 +14,9 @@ default = []
 # For `use_blocking_sync` only -- the driver flag that stops the inference
 # threads busy-polling while the GPU works. cudarc loads libcuda at runtime, so
 # this adds no link-time CUDA requirement.
-vgo-raster-cuda = { path = "../vgo-raster-cuda" }
+cudarc = { version = "0.19", default-features = false, features = [
+    "driver", "cuda-13000", "fallback-dynamic-loading", "std",
+] }
 # In-process sampling profiler, behind a feature so it costs nothing when off.
 # `perf` is not installed here and needs root to install; pprof samples with
 # SIGPROF from inside the process, which needs neither. Symbols are already in
@@ -32,18 +34,6 @@ vgo-search = { path = "../vgo-search" }
 path = "src/lib.rs"
 
 [[bin]]
-name = "vgo-canary"
-path = "src/main.rs"
-
-[[bin]]
-name = "vgo-model-smoke"
-path = "src/model_smoke.rs"
-
-[[bin]]
-name = "vgo-generate-demo"
-path = "src/generate_demo.rs"
-
-[[bin]]
 name = "vgo-generate-continuous"
 path = "src/generate_continuous.rs"
 
@@ -52,25 +42,5 @@ name = "vgo-arena"
 path = "src/arena.rs"
 
 [[bin]]
-name = "vgo-playout-duel"
-path = "src/playout_duel.rs"
-
-[[bin]]
-name = "vgo-render-board"
-path = "src/render_board.rs"
-
-[[bin]]
 name = "vgo-serve-move"
 path = "src/serve_move.rs"
-
-[[bin]]
-name = "vgo-generation-bench"
-path = "src/generation_bench.rs"
-
-[[bin]]
-name = "vgo-feed-bench"
-path = "src/feed_bench.rs"
-
-[[bin]]
-name = "vgo-tournament"
-path = "src/tournament.rs"

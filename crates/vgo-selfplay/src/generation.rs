@@ -57,7 +57,7 @@ impl GameSettings {
     /// many stones the board holds. Derived together so no caller can set one
     /// without the others.
     #[must_use]
-    pub fn board_for_game(&self, game_seed: u64) -> (f64, f64, u32) {
+    pub(crate) fn board_for_game(&self, game_seed: u64) -> (f64, f64, u32) {
         let radius = sampled_radius(game_seed, &self.board_mix, self.radius);
         let komi = if self.board_mix.is_empty() {
             sampled_komi(game_seed, self.komi_low, self.komi_high)
@@ -80,7 +80,7 @@ impl GameSettings {
 
 use vgo_search::{Action, SearchConfig, SearchResult};
 
-pub struct PolicyTarget {
+pub(crate) struct PolicyTarget {
     /// Normalized visit distribution over cells (the legacy target).
     pub policy: Vec<f32>,
     /// 1.0 for any cell that received a candidate, else 0.0.
@@ -104,7 +104,7 @@ pub struct PolicyTarget {
 /// Shares `resign_exempt`'s SplitMix64 finalizer but with a different constant,
 /// so a game's komi and its exemption are independent -- reusing the stream
 /// would correlate the two and make every exempt game share a komi.
-pub fn seeded_unit(game_seed: u64) -> f64 {
+pub(crate) fn seeded_unit(game_seed: u64) -> f64 {
     let mut value = game_seed ^ 0x2545_f491_4f6c_dd1d;
     value ^= value >> 30;
     value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -144,7 +144,7 @@ pub struct BoardBand {
 /// Smallest board this will play, in stone diameters across.
 ///
 /// Below here the game changes character rather than merely getting smaller.
-pub const MINIMUM_BOARD_UNITS: f64 = 18.0;
+pub(crate) const MINIMUM_BOARD_UNITS: f64 = 18.0;
 
 /// Parse `WEIGHT:UNITS` or `WEIGHT:LOW-HIGH`.
 pub fn parse_board_mix(specs: &[String]) -> Result<Vec<BoardBand>, String> {
@@ -194,7 +194,7 @@ pub fn parse_board_mix(specs: &[String]) -> Result<Vec<BoardBand>, String> {
 ///
 /// Uniform in *units* within a band, so a wide band spreads across board sizes
 /// evenly rather than concentrating in its smallest boards.
-pub fn sampled_radius(game_seed: u64, bands: &[BoardBand], fallback: f64) -> f64 {
+pub(crate) fn sampled_radius(game_seed: u64, bands: &[BoardBand], fallback: f64) -> f64 {
     if bands.is_empty() {
         return fallback;
     }
@@ -231,7 +231,7 @@ pub fn sampled_radius(game_seed: u64, bands: &[BoardBand], fallback: f64) -> f64
 pub const KOMI_AREA_COEFFICIENT: f64 = 0.104 * 18.0 * 18.0;
 
 #[must_use]
-pub fn komi_centre_for_radius(radius: f64, coefficient: f64) -> f64 {
+pub(crate) fn komi_centre_for_radius(radius: f64, coefficient: f64) -> f64 {
     coefficient * radius * radius
 }
 
@@ -242,7 +242,7 @@ pub fn komi_centre_for_radius(radius: f64, coefficient: f64) -> f64 {
 /// standard game is cut off around a fifth of the way in, and every value
 /// target from it is a truncation artifact rather than a result.
 #[must_use]
-pub fn maximum_plies_for_radius(radius: f64, plies_at_reference: u32, reference: f64) -> u32 {
+pub(crate) fn maximum_plies_for_radius(radius: f64, plies_at_reference: u32, reference: f64) -> u32 {
     if !(radius > 0.0 && reference > 0.0) {
         return plies_at_reference;
     }
@@ -250,7 +250,7 @@ pub fn maximum_plies_for_radius(radius: f64, plies_at_reference: u32, reference:
     ((plies_at_reference as f64) * scale).ceil().min(4096.0) as u32
 }
 
-pub fn sampled_komi(game_seed: u64, low: f64, high: f64) -> f64 {
+pub(crate) fn sampled_komi(game_seed: u64, low: f64, high: f64) -> f64 {
     if !(low.is_finite() && high.is_finite()) || high <= low {
         return low.max(0.0).min(high.max(0.0));
     }
@@ -264,7 +264,7 @@ pub fn sampled_komi(game_seed: u64, low: f64, high: f64) -> f64 {
     (centre + sigma * normal).clamp(low, high)
 }
 
-pub fn policy_target(result: &SearchResult, config: RasterConfig) -> PolicyTarget {
+pub(crate) fn policy_target(result: &SearchResult, config: RasterConfig) -> PolicyTarget {
     let size = config.pixels() + 1;
     let mut policy = vec![0.0_f32; size];
     let mut mask = vec![0.0_f32; size];
@@ -300,7 +300,7 @@ pub fn policy_target(result: &SearchResult, config: RasterConfig) -> PolicyTarge
     }
 }
 
-pub fn action_index(action: Action, config: RasterConfig) -> u32 {
+pub(crate) fn action_index(action: Action, config: RasterConfig) -> u32 {
     match action {
         Action::Pass => config.pixels() as u32,
         Action::Place(point) => action_pixel(point.x, point.y, config) as u32,
@@ -349,7 +349,7 @@ pub fn replay_capacity_for(maximum_candidates: usize, policy_size: usize) -> usi
     rounded.min(policy_size)
 }
 
-pub struct PendingSample {
+pub(crate) struct PendingSample {
     pub position: Position,
     pub root_black_value: f64,
     pub policy: Vec<f32>,
@@ -451,9 +451,9 @@ pub struct GameSamples {
 /// more consecutive plies of agreement is a different lever -- it asks the
 /// losing seat to keep conceding across more of its own turns, which noise
 /// clears far less easily than one confident evaluation.
-pub const CALIBRATION_WINDOWS: [u32; 4] = [5, 8, 12, 16];
+pub(crate) const CALIBRATION_WINDOWS: [u32; 4] = [5, 8, 12, 16];
 
-pub const CALIBRATION_THRESHOLDS: [f64; 9] = [0.70, 0.80, 0.85, 0.90, 0.95, 0.98, 0.99, 0.995, 0.999];
+pub(crate) const CALIBRATION_THRESHOLDS: [f64; 9] = [0.70, 0.80, 0.85, 0.90, 0.95, 0.98, 0.99, 0.995, 0.999];
 
 /// What resignation would have done to one calibrating game at one threshold.
 #[derive(Clone, Copy, Debug)]
@@ -704,7 +704,7 @@ pub fn generate_game(
 /// A low error rate there is partly the rule agreeing with a playout it shaped.
 /// Games exempted by `--resign-disable-fraction` are the only ones measured at
 /// full strength throughout.
-pub fn calibration_trials(
+pub(crate) fn calibration_trials(
     pending: &[PendingSample],
     _window: u32,
     black_won: bool,
@@ -775,7 +775,7 @@ pub fn calibration_trials(
 /// across reruns and independent of actor scheduling, which matters because
 /// these games are the calibration sample: they have to be a fair draw, not
 /// whichever games happened to land on a particular worker.
-pub fn resign_exempt(game_seed: u64, fraction: f64) -> bool {
+pub(crate) fn resign_exempt(game_seed: u64, fraction: f64) -> bool {
     if fraction <= 0.0 {
         return false;
     }

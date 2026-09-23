@@ -3,7 +3,6 @@ members = [
     "crates/vgo-core",
     "crates/vgo-inference",
     "crates/vgo-raster",
-    "crates/vgo-raster-cuda",
     "crates/vgo-search",
     "crates/vgo-wasm",
     "crates/vgo-selfplay",

@@ -86,22 +86,13 @@ ok "C compiler present"
 if ! $check_only; then
   step "Build"
   # Building now rather than letting the first update do it: .cargo/config.toml
-  # sets -C target-cpu=native, so this must happen on the machine that runs it,
-  # and a cold cache would otherwise compile in the middle of the first shard.
-  #
-  # --examples matters and is easy to miss: the learner rasterizes compact
-  # (5-channel) states by shelling out to the vgo-raster *example*
-  # render_shard, and `cargo build --release` alone does not build examples.
-  # Without it the first training step fails, several minutes into the run.
-  cargo build --release --examples
+  # sets -C target-cpu=native, so this must happen on the machine that runs it.
   cargo build --release
 fi
-for binary in vgo-generate-demo vgo-arena vgo-tournament vgo-serve-move; do
+for binary in vgo-generate-continuous vgo-arena vgo-serve-move vgo-render-shard vgo-pack-shard; do
   [[ -x "target/release/$binary" ]] || die "target/release/$binary missing; run without --check"
 done
-[[ -x target/release/examples/render_shard ]] \
-  || die "target/release/examples/render_shard missing; the compact rasterizer needs it (cargo build --release --examples)"
-ok "release binaries and examples present"
+ok "release binaries present"
 
 # ------------------------------------------------------------- the ORT dlopen
 step "ONNX Runtime"
@@ -123,11 +114,7 @@ ok "providers: $providers"
 
 step "Ready"
 cat <<'EOF'
-    Next: prove the box end to end before committing hours to a run.
+    Next: launch the loop.
 
-      ./scripts/smoke.sh
-
-    Then launch a run (see runs/ for recipes):
-
-      ./runs/ddrnet-attn.sh artifacts/my-run
+      ./scripts/bulk-loop.sh
 EOF

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use vgo_core::{Color, Phase, Position};
 use vgo_raster::{RasterConfig, SemanticRaster, rasterize};
 
-pub const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
+pub(crate) const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
 // v2 added raw per-cell visit counts and coarse->fine sampling probability
 // (beta). v3 additionally records the empirical proposal multiplicity per cell.
 //
@@ -48,7 +48,7 @@ pub const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
 // time, after the games are played. Sizing one global constant for the widest
 // board anyone might play would pad every mini shard to match, which is exactly
 // the argument v7 made.
-pub const REPLAY_VERSION: u32 = 8;
+pub(crate) const REPLAY_VERSION: u32 = 8;
 
 /// Default stones a record holds, when nothing sizes it from the board.
 ///
@@ -84,7 +84,7 @@ pub fn stone_capacity_for_radius(radius: f64) -> usize {
 
 /// Bytes per stored policy cell in v7: index u16, visits u32, beta f32,
 /// proposal_counts u16.
-pub const V7_CELL_BYTES: usize = 12;
+pub(crate) const V7_CELL_BYTES: usize = 12;
 
 /// Policy cells dropped because a node's search outgrew the shard's capacity.
 ///
@@ -93,7 +93,7 @@ pub const V7_CELL_BYTES: usize = 12;
 /// which is the point of tracking it -- truncation trades target fidelity for a
 /// shard that still writes, and that trade should be visible in the manifest
 /// rather than inferred later from a policy target that looks oddly narrow.
-pub static CELLS_DROPPED: std::sync::atomic::AtomicUsize =
+pub(crate) static CELLS_DROPPED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 pub struct LabeledSample {
@@ -246,20 +246,6 @@ impl ReplayStream {
 
     pub const fn is_full(&self) -> bool {
         self.samples_written >= self.target_samples
-    }
-
-    /// Accept games past the target instead of truncating them.
-    ///
-    /// A shard's actors all have a game in flight when the target is reached.
-    /// Cutting there discards that work -- roughly one partial game per actor,
-    /// which at small shard sizes costs more than the shard contains. Draining
-    /// instead lets those games finish and writes them, so the shard overshoots
-    /// its target by however much the tail carried.
-    ///
-    /// `target_samples` stays where it was so `publish` still rejects a shard
-    /// that never reached it; only the per-game truncation is lifted.
-    pub fn allow_overshoot(&mut self) {
-        self.overshoot = true;
     }
 
     pub fn write_game(&mut self, samples: Vec<LabeledSample>) -> io::Result<GameWrite> {
@@ -587,7 +573,7 @@ fn temporary_path(path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-pub fn sync_parent_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent_directory(path: &Path) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     File::open(parent)?.sync_all()
 }

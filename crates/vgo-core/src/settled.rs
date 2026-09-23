@@ -106,7 +106,7 @@ impl<'a> SettledRegion<'a> {
     /// leaves the board: a convex board is left once (A16), so truncating there
     /// loses nothing inside it.
     #[must_use]
-    pub fn radius_along(&self, ux: f64, uy: f64, cap: f64) -> f64 {
+    pub(crate) fn radius_along(&self, ux: f64, uy: f64, cap: f64) -> f64 {
         if self.unbounded {
             return f64::INFINITY;
         }
@@ -259,7 +259,7 @@ impl<'a> SettledRegion<'a> {
     /// rendering at 128x128 -- where a pixel spans 1/128 -- can stop far
     /// earlier, and subdivision is most of the cost.
     #[must_use]
-    pub fn contour_within(&self, tolerance: f64) -> Vec<Point> {
+    pub(crate) fn contour_within(&self, tolerance: f64) -> Vec<Point> {
         let mut points = Vec::new();
         self.contour_within_into(tolerance, &mut points);
         points

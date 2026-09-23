@@ -10,7 +10,7 @@ normally, which is the train/serve skew the position format exists to prevent.
 Both binaries are built from the same rasteriser, so this pins the *packing*,
 not the geometry:
 
-    cargo build --release --example render_shard --example pack_shard
+    cargo build --release -p vgo-raster
 """
 
 from __future__ import annotations
@@ -32,8 +32,8 @@ from vgo_training.packed_states import pack
 from tests import test_dataset as _dataset_tests
 
 _ROOT = Path(__file__).resolve().parents[2]
-_RENDERER = _ROOT / "target/release/examples/render_shard"
-_PACKER = _ROOT / "target/release/examples/pack_shard"
+_RENDERER = _ROOT / "target/release/vgo-render-shard"
+_PACKER = _ROOT / "target/release/vgo-pack-shard"
 # Small enough to keep the test quick; a multiple of eight so the bit planes end
 # on a byte boundary, which is the interesting case for `np.packbits`.
 _RESOLUTION = 16
@@ -43,7 +43,7 @@ _CHANNELS = 7
 
 @unittest.skipUnless(
     _RENDERER.exists() and _PACKER.exists(),
-    "needs `cargo build --release --example render_shard --example pack_shard`",
+    "needs `cargo build --release -p vgo-raster`",
 )
 class PackShardMatchesThePythonPacker(unittest.TestCase):
     def _shard(self, directory: Path) -> Path:

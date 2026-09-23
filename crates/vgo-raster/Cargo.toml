@@ -8,34 +8,21 @@ rust-version.workspace = true
 [features]
 default = []
 iteration-lab = ["vgo-search/iteration-lab"]
-# wgpu/WGSL: the browser path (docs/CLIENT_BOT.md).
-gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
 
 
 [dependencies]
 half = "2.7"
 vgo-core = { path = "../vgo-core" }
 vgo-search = { path = "../vgo-search" }
-wgpu = { version = "30.0.0", default-features = false, features = ["std", "wgsl", "vulkan"], optional = true }
-bytemuck = { version = "1.25", optional = true }
-pollster = { version = "0.4", optional = true }
 
 [lib]
 path = "src/lib.rs"
-[[bench]]
-name = "compact"
-path = "benches/compact.rs"
-harness = false
 
-[[example]]
-name = "settled_gpu"
-path = "examples/settled_gpu.rs"
-required-features = ["gpu"]
-
-[[example]]
-name = "settled_edt"
-path = "examples/settled_edt.rs"
+# Called by training/vgo_training/dataset.py to rasterize and pack shards.
+[[bin]]
+name = "vgo-render-shard"
+path = "src/bin/render_shard.rs"
 
 [[bin]]
-name = "vgo-raster-bench"
-path = "src/bin/raster_bench.rs"
+name = "vgo-pack-shard"
+path = "src/bin/pack_shard.rs"

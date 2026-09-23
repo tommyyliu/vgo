@@ -622,7 +622,7 @@ class LegalityMaskKnowsItsLayout(unittest.TestCase):
 
     `full_legal_policy_masks` used to decide by `shape[1] <= 7`, meaning "narrower
     than semantic, so no clearance channel". That held while every compact layout
-    was under seven planes. `compact-connected` has nine and took the semantic
+    was under seven planes. A nine-plane layout (since removed) took the semantic
     branch, reading slot 7 -- `komi`, a constant -- as a legality field.
     """
 

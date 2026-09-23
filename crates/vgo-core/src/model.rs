@@ -356,6 +356,7 @@ impl Validation {
         self.issues.is_empty()
     }
 
+
     #[must_use]
     pub fn issues(&self) -> &[ValidationIssue] {
         &self.issues

@@ -4,10 +4,8 @@ mod candidates;
 mod coarse_fine;
 mod evaluator;
 mod mcts;
-mod memory;
 #[cfg(feature = "iteration-lab")]
 pub mod transition_lab;
-pub use memory::{HeapAllocation, TreeMemory};
 
 pub use candidates::{Action, Candidate, CandidateSequence, CandidateSource, generate_candidates};
 pub use coarse_fine::{CandidateSample, FineGrid, sample_candidates};
