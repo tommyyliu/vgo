@@ -84,6 +84,10 @@ epochs="${VGO_EPOCHS:-8}"
 updates="${VGO_UPDATES:-200}"
 actors="${VGO_ACTORS:-32}"
 simulations="${VGO_SIMULATIONS:-1000}"
+# The naive evaluator's value is a heuristic, so deep search on it buys little,
+# and with no model the whole generator runs on CPU while the GPU idles. A
+# from-scratch run spends its first generation here, so keep it cheap.
+naive_simulations="${VGO_NAIVE_SIMULATIONS:-200}"
 # Soft resign. `resign_threshold` at 0.0 is what disables the whole rule, so
 # setting it is what turns this on.
 #
@@ -224,6 +228,11 @@ pick_resign_threshold () {
 
 start_generator () {
   local label="$1" model="$2" first_game="$3"
+  local budget="$simulations"
+  [ -z "$model" ] && budget="$naive_simulations"
+  # A conceded game's tail must stay cheaper than a normal move.
+  local soft="$resign_soft_simulations"
+  [ "$soft" -gt "$budget" ] && soft="$budget"
   local stop_file="$games/$label.stop"
   rm -f "$stop_file"
   local threshold
@@ -238,7 +247,7 @@ start_generator () {
   setsid nohup "$root/target/release/vgo-generate-continuous" \
     --output-root "$games" --label "$label" \
     --stop-file "$stop_file" --first-game "$first_game" \
-    --actors "$actors" --simulations "$simulations" \
+    --actors "$actors" --simulations "$budget" \
     --resolution "$resolution" --policy-resolution 128 --raster-kind compact-radius \
     "${board_mix_flags[@]}" \
     --max-plies 70 --radius 0.05555555555555555 \
@@ -246,7 +255,7 @@ start_generator () {
     --komi-area-coefficient "$komi_area_coefficient" \
     --komi-low 0.017 --komi-high 0.137 \
     --resign-threshold "$threshold" \
-    --resign-soft-simulations "$resign_soft_simulations" \
+    --resign-soft-simulations "$soft" \
     --resign-window "$resign_window" \
     --resign-minimum-ply "$resign_minimum_ply" \
     --resign-disable-fraction "$resign_disable_fraction" \
