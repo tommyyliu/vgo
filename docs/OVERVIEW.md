@@ -86,10 +86,10 @@ centre of every pixel. The layouts that remain:
 
 | kind | planes | used by |
 |---|---|---|
-| `compact-radius` | 7: current/opponent stones, voronoi ridge, settled, komi, previous pass, radius | **the loop**, 256x256 |
-| `compact-pass` | 6: the same without radius | the browser client's model |
-| `compact-dead-zone` | 6: dead zone in place of settled, for the official rules | [`OFFICIAL_RULES.md`](OFFICIAL_RULES.md) |
+| `compact-radius` | 7: current/opponent stones, voronoi ridge, settled, komi, previous pass, radius | every model: the loop, arena, client |
 | `semantic` | 12 engineered channels | shard tooling, legality masks, tests |
+
+(`compact`, the first five planes, remains as the internal building block.)
 
 The radius plane exists because board size *is* the radius (the board is always
 the unit square). An empty board renders identically at every radius without

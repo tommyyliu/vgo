@@ -59,22 +59,12 @@ pictures and the raster is rendered at load.
 
 | Kind | Ch | Channels |
 |---|---:|---|
-| `semantic` | 12 | the first twelve of the catalogue |
-| `rgb` | 3 | the board as a player sees it; no derived fields |
+| `semantic` | 12 | the whole catalogue |
 | `compact` | 5 | `current_stones`, `opponent_stones`, `voronoi_ridge`, `settled`, `komi` |
-| `compact-pass` | 6 | `compact` + `previous_pass` |
-| `compact-dead-zone` | 6 | `compact-pass` with `dead_zone` in place of `settled` |
-| `compact-connected` | 9 | both capture fields, both connection planes, and the two scalars |
+| `compact-radius` | 7 | `compact` + `previous_pass` + `radius`: what every model trains on |
 
-`compact-pass` and `compact-dead-zone` differ in exactly one slot, which is
-deliberate: slot 3 is *the capture predicate*, so a model crosses between
-rulesets by reinitialising one input slice, and comparing the two rulesets is a
-one-plane A/B rather than a change of representation. A test asserts it.
-
-`compact-connected` breaks that symmetry on purpose. `settled` is the wrong
-capture predicate under the official rules, but it is also the only plane that
-says which board can still change hands, which is ownership rather than legality
-and is worth having under either ruleset.
+The rgb, compact-pass, compact-dead-zone and compact-connected layouts were
+removed on 2026-09-23 and are on the `archive/pre-prune` branch.
 
 ### Cost
 
@@ -84,11 +74,9 @@ At 128 square, milliseconds per position, one thread:
 |---|---:|---:|---:|
 | `semantic` 12ch | 0.70 | 0.81 | 1.27 |
 | `compact` 5ch | 0.37 | 0.51 | 0.77 |
-| `compact-dead-zone` 6ch | 0.35 | 0.36 | 0.60 |
 
-`settled` and `dead_zone` are two thresholds on one distance field, so a layout
-carrying both pays for one transform. `crates/vgo-raster/examples/raster_cost.rs`
-is the measurement.
+Measured with `raster_cost` (on `archive/pre-prune`), before the settled plane
+moved to the distance transform, which cut it a further 2.8-7.2x.
 
 ## Numeric precision
 

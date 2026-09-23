@@ -84,24 +84,17 @@ class PackedStateTests(unittest.TestCase):
             pack(states)
 
     def test_rejects_a_foreign_channel_count(self) -> None:
-        # A width with no layout. Deliberately not COMPACT_CHANNEL_COUNT + 1:
-        # six planes is `compact-pass` / `compact-dead-zone` and is supported,
-        # so using it here would assert the opposite of what this test is for.
+        # A width with no layout.
         unknown = max(_LAYOUTS) + 1
         states = torch.zeros((2, unknown, 4, 4), dtype=torch.float16)
         self.assertFalse(is_packable(states))
 
-    def test_packs_the_six_plane_layouts(self) -> None:
-        """Both six-plane rasters pack, and `previous_pass` costs a scalar.
-
-        The two share a layout because they differ only in *which* capture
-        predicate sits in slot 3, and both are binary -- so the storage classes
-        are identical and only the meaning changes.
-        """
+    def test_packs_the_radius_layout(self) -> None:
+        """`compact-radius` packs: three bit planes, and pass and radius as scalars."""
         samples, height, width = 6, 8, 8
-        states = torch.zeros((samples, 6, height, width), dtype=torch.float16)
+        states = torch.zeros((samples, 7, height, width), dtype=torch.float16)
         generator = torch.Generator().manual_seed(7)
-        for channel in (0, 1, 3):  # stones, stones, capture predicate
+        for channel in (0, 1, 3):  # stones, stones, settled
             states[:, channel] = torch.randint(
                 0, 2, (samples, height, width), generator=generator
             ).to(torch.float16)
@@ -111,16 +104,14 @@ class PackedStateTests(unittest.TestCase):
         for sample in range(samples):
             states[sample, 4] = 0.104 * sample          # komi
             states[sample, 5] = float(sample % 2)       # previous_pass
+            states[sample, 6] = 2.0 / 38.0              # radius
 
         self.assertTrue(is_packable(states))
         packed = pack(states)
-        self.assertEqual(packed.channels, 6)
-        self.assertEqual(packed.shape, (samples, 6, height, width))
+        self.assertEqual(packed.channels, 7)
+        self.assertEqual(packed.shape, (samples, 7, height, width))
         self.assertTrue(torch.equal(packed.expand(), states))
-
-        # A scalar, not a bit plane: one value per sample for each of komi and
-        # previous_pass, and bits for the three genuinely spatial binaries.
-        self.assertEqual(packed.scalars.shape, (samples, 2))
+        self.assertEqual(packed.scalars.shape, (samples, 3))
         self.assertEqual(packed.bits.shape[1], 3)
 
     def test_a_non_constant_pass_plane_falls_back(self) -> None:

@@ -62,8 +62,6 @@ CHANNEL_COUNT = 10
 RASTER_CHANNELS = {
     "semantic": 12,
     "compact": 5,
-    "compact-pass": 6,
-    "compact-dead-zone": 6,
     "compact-radius": 7,
 }
 
@@ -73,8 +71,8 @@ RASTER_CHANNELS = {
 # rather than pictures, so which raster to render is a training-time choice and
 # belongs to the model -- the header's channel count records what *generation*
 # happened to be configured with, which is a different question and stopped
-# being a usable proxy the moment two layouts shared a width. `compact-pass` and
-# `compact-dead-zone` are both six planes and differ in the capture predicate,
+# being a usable proxy the moment two layouts shared a width (two six-plane
+# layouts once differed only in the capture predicate),
 # so nothing here can tell them apart, and nothing should try: pass the kind.
 _LEGACY_KIND_BY_CHANNELS = {5: "compact", 12: "semantic"}
 
@@ -945,9 +943,7 @@ def load_dataset(path: str | Path, *, raster_kind: str | None = None) -> RasterD
 
     `None` falls back to reading the header's channel count, which is a legacy
     convenience for shards and tests that predate the question. It cannot be
-    relied on -- `compact-pass` and `compact-dead-zone` are both six planes and
-    differ in which capture predicate they carry, so the count identifies
-    neither.
+    relied on: two layouts of equal width can mean different things.
     """
     # Checked before the file is touched: a misspelled kind is the caller's
     # mistake, and reporting it as a bad shard sends the reader to the wrong

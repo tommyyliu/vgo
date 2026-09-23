@@ -8,7 +8,7 @@ pub mod packed;
 mod policy;
 pub use policy::DensePolicy;
 pub use edt::{
-    dead_zone_mask, settled_and_dead_zone, settled_mask_by_bounded_distance,
+    settled_mask_by_bounded_distance,
     settled_mask_by_distance,
 };
 
@@ -30,14 +30,6 @@ const DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS: f64 = 6.0;
 
 pub const CHANNEL_COUNT: usize = 12;
 
-/// Entries in [`CHANNELS`], which is a *catalogue* rather than a layout.
-///
-/// It is deliberately larger than [`CHANNEL_COUNT`]: the semantic raster is the
-/// first [`CHANNEL_COUNT`] of these, and later entries exist for layouts that
-/// name channels by index without the semantic writer emitting them. Growing
-/// this is safe; growing `CHANNEL_COUNT` is not, because that number is the
-/// semantic tensor's shape and is baked into inference frames and ONNX profiles.
-pub(crate) const CHANNEL_SPEC_COUNT: usize = 15;
 
 /// Indices into [`CHANNELS`] that [`RasterKind::Compact`] keeps.
 pub(crate) const COMPACT_CHANNELS: [usize; 5] = [
@@ -48,18 +40,16 @@ pub(crate) const COMPACT_CHANNELS: [usize; 5] = [
     11, // komi
 ];
 
-/// Indices [`RasterKind::CompactPass`] keeps: [`COMPACT_CHANNELS`], then
-/// whether the previous move was a pass.
+/// Indices [`RasterKind::CompactRadius`] keeps: [`COMPACT_CHANNELS`], then
+/// whether the previous move was a pass, then the radius.
 ///
-/// `Compact` cannot see a pending pass, so a net reading it cannot tell that
-/// passing now would end the game -- it can neither pass to close out a win nor
-/// see that passing while behind hands over the result. The plane is constant
-/// over the board and therefore costs nothing to write.
-/// [`RasterKind::CompactPass`] plus the radius plane.
+/// Without the pass plane a net cannot tell that passing now would end the
+/// game -- it can neither pass to close out a win nor see that passing while
+/// behind hands over the result.
 ///
 /// The board is the unit square whatever the stone size, so radius *is* the
 /// board size: `voronoigo.com` plays 18, 26 and 38 units across, which are
-/// radii of 1/18, 1/26 and 1/38 here. Nothing in `CompactPass` carries it. An
+/// radii of 1/18, 1/26 and 1/38 here. Nothing else in the layout carries it. An
 /// empty board renders identically at every radius -- no stones, so no ridge,
 /// no settled region, and the two scalars say nothing about scale -- and a net
 /// asked to open on a board whose size it cannot see is guessing which game it
@@ -78,33 +68,6 @@ pub(crate) const COMPACT_RADIUS_CHANNELS: [usize; 7] = [
     8,  // radius
 ];
 
-pub(crate) const COMPACT_PASS_CHANNELS: [usize; 6] = [
-    0,  // current_stones
-    1,  // opponent_stones
-    6,  // voronoi_ridge
-    10, // settled          <- the capture predicate
-    11, // komi
-    9,  // previous_pass
-];
-
-/// Indices [`RasterKind::CompactDeadZone`] keeps: [`COMPACT_PASS_CHANNELS`]
-/// with the dead zone in place of `settled`.
-///
-/// The two layouts differ in exactly one slot, and that is the point. Slot 3 is
-/// "the capture predicate", `settled` for this repository's rules and
-/// `dead_zone` for the official ones, so a model warm-starts from one onto the
-/// other with every other input plane keeping its meaning and its weights. It
-/// also makes the comparison between the two rulesets a one-plane A/B rather
-/// than a change of representation.
-pub(crate) const COMPACT_DEAD_ZONE_CHANNELS: [usize; 6] = [
-    0,  // current_stones
-    1,  // opponent_stones
-    6,  // voronoi_ridge
-    12, // dead_zone        <- the capture predicate
-    11, // komi
-    9,  // previous_pass
-];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelScale {
     Unit,
@@ -117,7 +80,7 @@ pub struct ChannelSpec {
     pub scale: ChannelScale,
 }
 
-pub const CHANNELS: [ChannelSpec; CHANNEL_SPEC_COUNT] = [
+pub const CHANNELS: [ChannelSpec; CHANNEL_COUNT] = [
     ChannelSpec {
         name: "current_stones",
         scale: ChannelScale::Unit,
@@ -166,23 +129,11 @@ pub const CHANNELS: [ChannelSpec; CHANNEL_SPEC_COUNT] = [
         name: "komi",
         scale: ChannelScale::Signed,
     },
-    ChannelSpec {
-        name: "dead_zone",
-        scale: ChannelScale::Unit,
-    },
-    ChannelSpec {
-        name: "current_connections",
-        scale: ChannelScale::Unit,
-    },
-    ChannelSpec {
-        name: "opponent_connections",
-        scale: ChannelScale::Unit,
-    },
 ];
 
 /// Which channel layout a raster carries.
 ///
-/// `Semantic` is the ten engineered channels; the compact layouts are subsets
+/// `Semantic` is the twelve engineered channels; the compact layouts are subsets
 /// of them. A model trained on one cannot read another, so this belongs to a
 /// run's identity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -202,33 +153,8 @@ pub enum RasterKind {
     /// Komi joins them because a net that cannot see what it must win by
     /// cannot evaluate a position.
     Compact,
-    /// [`Compact`](Self::Compact), plus whether the previous move was a pass.
-    ///
-    /// This repository's rules, with the one thing `Compact` cannot express.
-    /// Two passes end the game under every ruleset here, so a net that cannot
-    /// see a pending pass is evaluating a different game than the one being
-    /// played -- and only in the endgame, which is where the value head is
-    /// asked the questions that decide results.
-    CompactPass,
-    /// [`CompactPass`](Self::CompactPass) with the dead zone in place of
-    /// `settled`: the official rules' capture predicate.
-    ///
-    /// `settled` encodes *this* repository's capture rule -- a group lives
-    /// while some future stone can still take area from it. The rules at
-    /// `voronoigo.com` ask a different question: a group lives while a future
-    /// stone could still be placed touching its territory, and dies once that
-    /// territory is covered by the dead zone. That is a strictly more
-    /// aggressive rule, so a net given only `settled` has to infer the
-    /// condition it is actually judged by.
-    ///
-    /// `settled` is dropped rather than kept alongside. It is the wrong
-    /// predicate here, and it is not a cheap passenger: measured at 128 square,
-    /// it is 60-80% of the raster's cost, so carrying it for a ruleset that does
-    /// not use it would more than double the price of every position.
-    CompactDeadZone,
-    /// [`CompactPass`](Self::CompactPass) plus the radius.
-    ///
-    /// The layout for training across board sizes. See
+    /// [`Compact`](Self::Compact) plus the previous-pass and radius planes:
+    /// the layout every model trains on. See
     /// [`COMPACT_RADIUS_CHANNELS`] for why the plane is needed rather than
     /// inferable.
     CompactRadius,
@@ -240,8 +166,6 @@ impl RasterKind {
         match self {
             Self::Semantic => CHANNEL_COUNT,
             Self::Compact => COMPACT_CHANNELS.len(),
-            Self::CompactPass => COMPACT_PASS_CHANNELS.len(),
-            Self::CompactDeadZone => COMPACT_DEAD_ZONE_CHANNELS.len(),
             Self::CompactRadius => COMPACT_RADIUS_CHANNELS.len(),
         }
     }
@@ -252,16 +176,8 @@ impl RasterKind {
         match self {
             Self::Semantic => &[],
             Self::Compact => &COMPACT_CHANNELS,
-            Self::CompactPass => &COMPACT_PASS_CHANNELS,
-            Self::CompactDeadZone => &COMPACT_DEAD_ZONE_CHANNELS,
             Self::CompactRadius => &COMPACT_RADIUS_CHANNELS,
         }
-    }
-
-    /// Whether this layout carries the `dead_zone` plane.
-    #[must_use]
-    pub const fn has_dead_zone(self) -> bool {
-        matches!(self, Self::CompactDeadZone)
     }
 
     #[must_use]
@@ -269,8 +185,6 @@ impl RasterKind {
         match self {
             Self::Semantic => "semantic",
             Self::Compact => "compact",
-            Self::CompactPass => "compact-pass",
-            Self::CompactDeadZone => "compact-dead-zone",
             Self::CompactRadius => "compact-radius",
         }
     }
@@ -283,8 +197,6 @@ impl std::str::FromStr for RasterKind {
         match value {
             "semantic" => Ok(Self::Semantic),
             "compact" => Ok(Self::Compact),
-            "compact-pass" => Ok(Self::CompactPass),
-            "compact-dead-zone" => Ok(Self::CompactDeadZone),
             "compact-radius" => Ok(Self::CompactRadius),
             _ => Err(format!("unsupported raster kind: {value}")),
         }
@@ -391,47 +303,14 @@ pub fn rasterize_any_into(position: &Position, config: RasterConfig, data: &mut 
     match config.kind {
         RasterKind::Semantic => rasterize_into(position, config, data),
         RasterKind::Compact => rasterize_compact_into(position, config, data),
-        RasterKind::CompactPass | RasterKind::CompactDeadZone => {
-            rasterize_compact_six_into(position, config, data);
-        }
         RasterKind::CompactRadius => rasterize_compact_radius_into(position, config, data),
     }
 }
 
-/// Writes the six-plane layouts: [`RasterKind::CompactPass`] and
-/// [`RasterKind::CompactDeadZone`].
-///
-/// The two differ only in slot 3, the capture predicate, so they share
-/// everything here and diverge on one mask. `settled` and the dead zone are
-/// both thresholds on the distance to the legal set, and each is asked for
-/// alone: computing the pair and discarding one costs 60-80% of the raster for
-/// nothing.
-///
-/// The pass plane is constant over the board. Two passes end the game, so a
-/// position that is still being played has a count of 0 or 1 and the boolean is
-/// the count rather than a summary of it.
-pub(crate) fn rasterize_compact_six_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
-    let pixels = config.pixels();
-    assert_eq!(data.len(), COMPACT_PASS_CHANNELS.len() * pixels);
-    let predicate = match config.kind {
-        RasterKind::CompactDeadZone => edt::dead_zone_mask(position, config, 1).0,
-        _ => settled_for_raster(position, config),
-    };
-    let compact = RasterConfig {
-        kind: RasterKind::Compact,
-        ..config
-    };
-    let (head, tail) = data.split_at_mut(COMPACT_CHANNELS.len() * pixels);
-    rasterize_compact_with_predicate_into(position, compact, &predicate, head);
-    tail.fill(f32::from(position.consecutive_passes() > 0));
-}
-
-/// Writes [`RasterKind::CompactRadius`]: the six-plane layout plus the radius.
+/// Writes [`RasterKind::CompactRadius`]: the compact planes plus pass and radius.
 ///
 /// Both trailing planes are constant over the board, so they are filled rather
-/// than rendered. The first five come from the shared compact writer, which is
-/// what keeps this layout from disagreeing with `CompactPass` about any plane
-/// they have in common.
+/// than rendered. The first five come from the shared compact writer.
 pub fn rasterize_compact_radius_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
     let pixels = config.pixels();
     assert_eq!(data.len(), COMPACT_RADIUS_CHANNELS.len() * pixels);
@@ -1250,29 +1129,6 @@ mod tests {
         assert_eq!(data, expected.data());
     }
 
-    /// The two six-plane layouts must differ in exactly one slot, and it must be
-    /// the capture predicate.
-    ///
-    /// This is what lets a model move between rulesets by reinitialising one
-    /// input slice instead of relearning what every plane means, and what makes
-    /// a ruleset comparison a one-plane A/B. It is an easy property to break by
-    /// appending a channel to one list and not the other, so it is asserted
-    /// rather than left to the comment above the constants.
-    #[test]
-    fn the_two_rulesets_differ_in_one_plane() {
-        let ours = RasterKind::CompactPass.indices();
-        let theirs = RasterKind::CompactDeadZone.indices();
-        assert_eq!(ours.len(), theirs.len());
-        let differing: Vec<usize> = (0..ours.len()).filter(|i| ours[*i] != theirs[*i]).collect();
-        assert_eq!(differing, vec![3], "only slot 3 may differ");
-        assert_eq!(CHANNELS[ours[3]].name, "settled");
-        assert_eq!(CHANNELS[theirs[3]].name, "dead_zone");
-
-        // And the first five of ours are Compact's, so a Compact model warm
-        // starts by adding a plane rather than by permuting the ones it has.
-        assert_eq!(&ours[..COMPACT_CHANNELS.len()], &COMPACT_CHANNELS[..]);
-        assert_eq!(CHANNELS[ours[5]].name, "previous_pass");
-    }
 
     /// The pass plane is the pass count, not a lossy summary of it: two passes
     /// end the game, so a live position is only ever at zero or one.
@@ -1283,7 +1139,7 @@ mod tests {
             vec![Stone::new(0.3, 0.3, Color::Black), Stone::new(0.7, 0.7, Color::White)],
             Color::Black,
         );
-        let config = RasterConfig::square_of(16, RasterKind::CompactPass);
+        let config = RasterConfig::square_of(16, RasterKind::CompactRadius);
         let pixels = config.pixels();
         let slot = 5 * pixels;
 
@@ -1298,42 +1154,7 @@ mod tests {
         }
     }
 
-    /// Both six-plane layouts agree everywhere except the predicate, on a real
-    /// position rather than by construction.
-    #[test]
-    fn the_rulesets_share_every_plane_but_the_predicate() {
-        let position = Position::new(
-            1.0 / 18.0,
-            vec![
-                Stone::new(0.3, 0.35, Color::Black),
-                Stone::new(0.45, 0.3, Color::Black),
-                Stone::new(0.7, 0.65, Color::White),
-                Stone::new(0.6, 0.78, Color::White),
-            ],
-            Color::Black,
-        )
-        .with_komi(0.104);
-    assert!(position.validate().is_playable());
-        let size = 64;
-        let pixels = size * size;
 
-        let mut ours = vec![0.0_f32; 6 * pixels];
-        let mut theirs = vec![0.0_f32; 6 * pixels];
-        super::rasterize_any_into(&position, RasterConfig::square_of(size, RasterKind::CompactPass), &mut ours);
-        super::rasterize_any_into(
-            &position,
-            RasterConfig::square_of(size, RasterKind::CompactDeadZone),
-            &mut theirs,
-        );
-
-        for slot in 0..6 {
-            let range = slot * pixels..(slot + 1) * pixels;
-            let same = ours[range.clone()] == theirs[range];
-            assert_eq!(same, slot != 3, "slot {slot} sameness");
-        }
-    }
-
-    /// Every plane of the eight-channel layout is what its name says.
     /// The whole reason the layout exists: two board sizes must not render
     /// identically. An empty board is the case that matters, because it is
     /// where every other plane is zero and the net has nothing else to go on.
@@ -1354,23 +1175,6 @@ mod tests {
         );
         assert_ne!(mini, standard, "empty boards must differ by radius");
 
-        // And the six-plane layout genuinely cannot tell them apart, which is
-        // what makes the extra plane necessary rather than merely convenient.
-        let six = RasterConfig::square_of(64, RasterKind::CompactPass);
-        let mut mini_six = vec![0.0f32; six.channels() * six.pixels()];
-        let mut standard_six = vec![0.0f32; six.channels() * six.pixels()];
-        rasterize_any_into(
-            &Position::new(1.0 / 18.0, Vec::new(), Color::Black),
-            six,
-            &mut mini_six,
-        );
-        rasterize_any_into(
-            &Position::new(1.0 / 38.0, Vec::new(), Color::Black),
-            six,
-            &mut standard_six,
-        );
-        assert_eq!(mini_six, standard_six, "compact-pass is scale-blind");
-
         // The plane holds the stone diameter, the same value the semantic
         // rasterizer writes at index 8.
         let pixels = config.pixels();
@@ -1378,27 +1182,6 @@ mod tests {
         assert!(plane.iter().all(|&v| (v - (2.0 / 38.0) as f32).abs() < 1e-6));
     }
 
-    /// Everything `compact-pass` renders must survive unchanged, or the two
-    /// layouts would disagree about planes they share.
-    #[test]
-    fn the_radius_layout_extends_compact_pass() {
-        let position = Position::new(
-            1.0 / 18.0,
-            vec![
-                Stone::new(0.30, 0.30, Color::Black),
-                Stone::new(0.62, 0.44, Color::White),
-                Stone::new(0.45, 0.70, Color::Black),
-            ],
-            Color::White,
-        );
-        let seven = RasterConfig::square_of(64, RasterKind::CompactRadius);
-        let six = RasterConfig::square_of(64, RasterKind::CompactPass);
-        let mut wide = vec![0.0f32; seven.channels() * seven.pixels()];
-        let mut narrow = vec![0.0f32; six.channels() * six.pixels()];
-        rasterize_any_into(&position, seven, &mut wide);
-        rasterize_any_into(&position, six, &mut narrow);
-        assert_eq!(&wide[..narrow.len()], &narrow[..]);
-    }
 
 
     #[test]

@@ -111,16 +111,9 @@ def main() -> None:
     parser.add_argument("--blocks", type=int, default=16)
     parser.add_argument(
         "--raster-kind",
-        default=None,
-        choices=("semantic", "compact", "compact-pass", "compact-dead-zone", "compact-radius"),
-        help=(
-            "which planes to render from each shard. A property of the model "
-            "rather than of the data: shards store positions, so the raster is "
-            "produced at load time and two runs over the same shards can train "
-            "different encodings. Omit to fall back to the shard header, which "
-            "cannot distinguish compact-pass from compact-dead-zone -- both are "
-            "six planes and differ only in the capture predicate"
-        ),
+        default="compact-radius",
+        choices=("semantic", "compact", "compact-radius"),
+        help="which planes to render from each game; the loop uses compact-radius",
     )
     parser.add_argument("--norm-groups", type=int, default=8)
     parser.add_argument(

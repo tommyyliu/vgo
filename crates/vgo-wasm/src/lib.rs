@@ -72,28 +72,15 @@ pub struct StoneView {
 
 #[wasm_bindgen]
 impl Game {
-    /// An empty board.
-    ///
-    /// `rasterKind` names the channel layout the model reads and defaults to
-    /// `compact-pass`, which is what every model since the pass plane was added
-    /// is trained on. It has to match the export: a network given a layout it
-    /// did not learn reads a different meaning off each plane and plays blind.
-    /// Unlike a shape mismatch, which onnxruntime rejects, that failure is
-    /// silent whenever the two layouts happen to share a width -- `compact-pass`
-    /// and `compact-dead-zone` are both six planes.
+    /// An empty board. The model input is always `compact-radius`, the layout
+    /// every model trains on.
     #[wasm_bindgen(constructor)]
-    pub fn new(radius: f64, komi: f64, raster_kind: Option<String>) -> Result<Game, JsValue> {
-        let raster_kind = match raster_kind {
-            Some(name) => name
-                .parse::<RasterKind>()
-                .map_err(|error| JsValue::from_str(&error))?,
-            None => RasterKind::CompactPass,
-        };
-        Ok(Game {
+    pub fn new(radius: f64, komi: f64) -> Game {
+        Game {
             position: Position::new(radius, Vec::new(), Color::Black).with_komi(komi),
             ply: 0,
-            raster_kind,
-        })
+            raster_kind: RasterKind::CompactRadius,
+        }
     }
 
     /// The layout this game rasterizes, as its canonical name.

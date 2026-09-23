@@ -144,9 +144,7 @@ def export(arguments: argparse.Namespace) -> dict[str, object]:
             "architecture": "ddrnet",
             # Which planes this network expects, carried so a serving path can
             # rasterize the way it was trained. `channels` above says how many;
-            # it does not say what they mean, and two layouts share a width --
-            # `compact-pass` and `compact-dead-zone` are both six planes and
-            # differ in the capture predicate. Feeding the wrong one is a
+            # it does not say what they mean. Feeding the wrong layout is a
             # silent failure at inference, unlike in training, where the shape
             # check catches most of it.
             #

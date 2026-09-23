@@ -28,7 +28,7 @@
 //! shrink that; `examples/settled_edt.rs` measures what it costs.
 
 use vgo_core::{
-    COORDINATE_EPSILON, LegalSetIndex, Point, Position, distance_to_legal_set,
+    COORDINATE_EPSILON, LegalSetIndex, Point, Position,
     no_legal_point_closer_than_indexed,
 };
 
@@ -415,41 +415,6 @@ fn sampled_legal_set_into(
     }
 }
 
-/// Cells whose centre lies within `radius` of any of `centres`.
-///
-/// Scattered from each centre's bounding box rather than tested per pixel, for
-/// the same reason `sampled_legal_set` scatters: the work is proportional to the
-/// area the discs actually cover, not to the grid times the list.
-fn stamped_discs(centres: &[Point], radius: f64, width: usize, height: usize) -> Vec<bool> {
-    let mut mask = vec![false; width * height];
-    let radius_squared = radius * radius;
-    for centre in centres {
-        let low_row = (((centre.y - radius) * height as f64 - 0.5).floor()).max(0.0) as usize;
-        let high_row =
-            ((((centre.y + radius) * height as f64 - 0.5).ceil()) as usize).min(height - 1);
-        let low_column = (((centre.x - radius) * width as f64 - 0.5).floor()).max(0.0) as usize;
-        let high_column =
-            ((((centre.x + radius) * width as f64 - 0.5).ceil()) as usize).min(width - 1);
-        for row in low_row..=high_row {
-            let y = (row as f64 + 0.5) / height as f64;
-            let dy = y - centre.y;
-            let dy_squared = dy * dy;
-            if dy_squared > radius_squared {
-                continue;
-            }
-            let base = row * width;
-            for column in low_column..=high_column {
-                let x = (column as f64 + 0.5) / width as f64;
-                let dx = x - centre.x;
-                if dx.mul_add(dx, dy_squared) <= radius_squared {
-                    mask[base + column] = true;
-                }
-            }
-        }
-    }
-    mask
-}
-
 /// The settled mask, via distance transforms.
 ///
 /// `oversample` multiplies the grid the legal-set distance is measured on; 1
@@ -542,103 +507,10 @@ pub fn settled_mask_by_bounded_distance(
     config: RasterConfig,
     oversample: usize,
 ) -> (Vec<bool>, usize) {
-    let (settled, _, tests) = masks_by_bounded_distance(position, config, oversample, true, false);
-    (settled, tests)
-}
-
-/// The dead zone: board a stone can no longer be placed *on top of*.
-///
-/// This is the field the official rules capture with. `voronoigo.com` draws the
-/// alive zone dilated by one stone radius -- the swept area of every stone that
-/// could still be played -- and a group dies exactly when its territory is
-/// covered by the complement of that. So
-///
-/// ```text
-///     dead(x)  <=>  dist(x, L) > r
-/// ```
-///
-/// where `L` is the legal set of stone *centres*. It is a strictly more
-/// aggressive capture rule than this repository's `settled`: if a legal centre
-/// `p` sits within `r` of a point `x`, then `d_S(x) >= d_S(p) - ||x - p|| >=
-/// 2r - r = r >= ||x - p||`, so `p` challenges `x` and `settled` calls the group
-/// alive too -- while the converse fails, since `p` can be `3r` away and still
-/// take area from a large cell.
-///
-/// Two things fall out of that for free and are worth knowing:
-///
-///   * **An empty board has dead corners.** `L` is the board inset by `r`, so
-///     each corner is `r*sqrt(2) > r` from it and no stone can ever cover it.
-///     That is correct and matches what the site draws.
-///   * **A full board is entirely dead.** An empty `L` puts every point at
-///     infinite distance from it.
-///
-/// Bounded as [`settled_mask_by_bounded_distance`] is, against the same sampled
-/// overestimate -- `D_grid - slack > r` is certainly dead, `D_grid <= r` is
-/// certainly alive, and the band between gets the exact continuous test -- plus
-/// a vertex pass the settled mask does not need. See the comment on that pass:
-/// the grid can miss a whole component of `L`, and this threshold is far more
-/// sensitive to that than `settled` is.
-///
-/// Exact on every fixture measured, including the lattice that defeats sampling
-/// alone. `examples/dead_zone_probe.rs` is that measurement.
-///
-/// Cost, at 128 square with both masks taken from one distance transform
-/// (`examples/dead_zone_cost.rs`): +19% over the compact raster at 28 stones and
-/// +28% at 52. Against the *default* build, where `settled` takes the per-stone
-/// geometric solve, adding this plane makes the raster 2.0x faster at 28 stones
-/// and 4.5x at 52, because it forces the distance-transform path. The empty
-/// board is the one regression -- 0.012 ms to 0.146 -- since there is no cheap
-/// case to fall back to.
-#[must_use]
-pub fn dead_zone_mask(
-    position: &Position,
-    config: RasterConfig,
-    oversample: usize,
-) -> (Vec<bool>, usize) {
-    let (_, dead, tests) = masks_by_bounded_distance(position, config, oversample, false, true);
-    (dead, tests)
-}
-
-/// Both masks from one distance field, for a raster that wants each.
-///
-/// The Euclidean transform is the expensive part and neither mask needs its own,
-/// so a caller wanting both should ask once. Returns
-/// `(settled, dead_zone, exact_tests)`.
-#[must_use]
-pub fn settled_and_dead_zone(
-    position: &Position,
-    config: RasterConfig,
-    oversample: usize,
-) -> (Vec<bool>, Vec<bool>, usize) {
-    masks_by_bounded_distance(position, config, oversample, true, true)
-}
-
-/// `settled`, and optionally the dead zone, from one pass over one field.
-///
-/// `settled` is empty of meaning on a stoneless board -- nothing owns anything --
-/// but the dead zone is not, so the early return is conditional on which masks
-/// the caller asked for.
-fn masks_by_bounded_distance(
-    position: &Position,
-    config: RasterConfig,
-    oversample: usize,
-    want_settled: bool,
-    want_dead_zone: bool,
-) -> (Vec<bool>, Vec<bool>, usize) {
     let mut scratch = EdtScratch::default();
     let mut mask = Vec::new();
-    let mut dead = Vec::new();
-    let exact_tests = masks_by_bounded_distance_into(
-        position,
-        config,
-        oversample,
-        want_settled,
-        want_dead_zone,
-        &mut scratch,
-        &mut mask,
-        &mut dead,
-    );
-    (mask, dead, exact_tests)
+    let tests = settled_by_bounded_distance_into(position, config, oversample, &mut scratch, &mut mask);
+    (mask, tests)
 }
 
 pub(crate) fn settled_mask_by_bounded_distance_into(
@@ -648,16 +520,13 @@ pub(crate) fn settled_mask_by_bounded_distance_into(
     scratch: &mut EdtScratch,
     mask: &mut Vec<bool>,
 ) {
-    let mut dead = Vec::new();
-    masks_by_bounded_distance_into(
-        position, config, oversample, true, false, scratch, mask, &mut dead,
-    );
+    settled_by_bounded_distance_into(position, config, oversample, scratch, mask);
 }
 
 /// The bounded-distance `settled` test, split so a caller can supply the
 /// nearest-stone field instead of having one computed for it.
 ///
-/// `masks_by_bounded_distance_into` sweeps every stone against every pixel to
+/// `settled_by_bounded_distance_into` sweeps every stone against every pixel to
 /// find the nearest one -- and the packed writer then sweeps them all again for
 /// the ridge, which needs that same minimum. Measured at 240 stones the settled
 /// sweep is 0.397 ms of a 1.56 ms raster, spent recomputing a field the caller
@@ -744,22 +613,19 @@ impl SettledRows {
     }
 }
 
-fn masks_by_bounded_distance_into(
+fn settled_by_bounded_distance_into(
     position: &Position,
     config: RasterConfig,
     oversample: usize,
-    want_settled: bool,
-    want_dead_zone: bool,
     scratch: &mut EdtScratch,
     mask: &mut Vec<bool>,
-    dead: &mut Vec<bool>,
 ) -> usize {
     let pixels = config.pixels();
     let stones = position.stones();
-    if (stones.is_empty() || !want_settled) && !want_dead_zone {
-        mask.resize(pixels, false);
-        mask.fill(false);
-        dead.clear();
+    mask.resize(pixels, false);
+    mask.fill(false);
+    // Nothing owns anything on a stoneless board.
+    if stones.is_empty() {
         return 0;
     }
     let radius = position.radius();
@@ -772,8 +638,6 @@ fn masks_by_bounded_distance_into(
     let spacing = 1.0 / fine_width as f64;
     let spacing_squared = spacing * spacing;
     let slack = spacing * std::f64::consts::SQRT_2;
-    let radius_squared = radius * radius;
-    let radius_plus_slack_squared = (radius + slack) * (radius + slack);
     // How far the sampled distance can overstate the true one.
     //
     // Half a cell diagonal is the tempting answer and it is wrong: it assumes
@@ -783,40 +647,7 @@ fn masks_by_bounded_distance_into(
     // wrong pixels at eight stones, where slivers cannot be the explanation.
     // A full diagonal covers the boundary case; nothing covers a sliver
     // narrower than a cell, which is why this function is not exact.
-    // Sampling can only *miss* parts of the legal set, never invent them, so
-    // `sampled` is an overestimate and every error runs one way: a pixel called
-    // dead that is really alive. The slack above covers being off by where a
-    // cell centre sits. It does not cover a component of `L` that contains no
-    // cell centre at all, and that is not a corner case -- a lattice of stones
-    // at 1.08x the exclusion diameter leaves a legal gap between every four
-    // neighbours about one cell wide, and missing them made 12% of the board
-    // wrongly dead. Oversampling does not fix it either: at 5x the lattice
-    // pitch beats against the sample pitch and the error came back.
-    //
-    // Every such component has a *vertex*, though. `L` is an intersection of
-    // half-planes and disc complements, so a bounded component is cornered
-    // where those constraints meet, and `legal_set_vertices` enumerates exactly
-    // those points -- exactly, in f64, with no grid involved. Anything within
-    // `r` of one is alive by definition, whether or not the grid saw it.
     let mut index: Option<LegalSetIndex> = None;
-    let near_vertex = if want_dead_zone {
-        let known = index.insert(LegalSetIndex::build(position));
-        stamped_discs(known.vertices(), radius, config.width, config.height)
-    } else {
-        Vec::new()
-    };
-    if want_settled {
-        mask.resize(pixels, false);
-        mask.fill(false);
-    } else {
-        mask.clear();
-    }
-    if want_dead_zone {
-        dead.resize(pixels, false);
-        dead.fill(false);
-    } else {
-        dead.clear();
-    }
     let mut exact_tests = 0usize;
     // The nearest stone, a row at a time, stones outside and pixels inside.
     //
@@ -841,7 +672,7 @@ fn masks_by_bounded_distance_into(
         scratch.fine_columns[column] = (column * scale + scale / 2).min(fine_width - 1);
     }
     scratch.nearest_squares.resize(row_width, f64::INFINITY);
-    let nearest_grid = if want_settled && stones.len() >= NEAREST_SEARCH_MINIMUM_STONES {
+    let nearest_grid = if stones.len() >= NEAREST_SEARCH_MINIMUM_STONES {
         let cell = (2.0 * radius).max(1.0 / (stones.len() as f64).sqrt());
         Some(StoneGrid::build(position, cell))
     } else {
@@ -852,7 +683,7 @@ fn masks_by_bounded_distance_into(
         let fine_row = (row * scale + scale / 2).min(fine_height - 1);
         let output_base = row * config.width;
         let sampled_base = fine_row * fine_width;
-        if want_settled && !stones.is_empty() {
+        {
             if let Some(grid) = nearest_grid.as_ref() {
                 nearest_row_chunked(
                     position,
@@ -885,28 +716,6 @@ fn masks_by_bounded_distance_into(
                     }
                 }
             }
-        }
-        if want_dead_zone {
-            for column in 0..config.width {
-                let x = scratch.column_xs[column];
-                let sampled_squared =
-                    scratch.field[sampled_base + scratch.fine_columns[column]] * spacing_squared;
-                dead[output_base + column] = if near_vertex[output_base + column] {
-                    false
-                } else if sampled_squared <= radius_squared {
-                    false
-                } else if sampled_squared > radius_plus_slack_squared {
-                    true
-                } else {
-                    exact_tests += 1;
-                    let known = index.get_or_insert_with(|| LegalSetIndex::build(position));
-                    distance_to_legal_set(position, Point::new(x, y), Some(known.vertices()))
-                        > radius
-                };
-            }
-        }
-        if stones.is_empty() || !want_settled {
-            continue;
         }
         for column in 0..config.width {
             let x = scratch.column_xs[column];
@@ -1086,99 +895,6 @@ mod tests {
         assert_eq!(settled_mask(&position, config), mask);
     }
 
-    /// The dead zone is what the official rules capture with, so it is pinned
-    /// against the definition rather than against another implementation:
-    /// `dist(x, L) > r`, evaluated exactly in f64 at every pixel.
-    ///
-    /// `fixture` is a perfect lattice at 1.08x the exclusion diameter, which is
-    /// the demanding case rather than an arbitrary one: every gap between four
-    /// neighbours is legal and about one cell wide, and none of them contains a
-    /// sample point. Before the vertex pass this fixture put 492 pixels of 16384
-    /// wrongly in the dead zone at 28 stones, and 1972 -- 12% of the board -- at
-    /// 49. Oversampling did not fix it; at 5x the lattice pitch beat against the
-    /// sample pitch and the error came back larger than at 3x.
-    #[test]
-    fn the_dead_zone_agrees_with_the_definition() {
-        let radius = 1.0 / 18.0;
-        let config = RasterConfig::square_of(128, RasterKind::Compact);
-        for count in [0usize, 8, 28, 52] {
-            let position = fixture(count, radius);
-            if !position.validate().is_playable() {
-                continue;
-            }
-            let vertices = legal_set_vertices(&position);
-            let (dead, exact_tests) = dead_zone_mask(&position, config, 1);
-
-            let mut wrong = 0usize;
-            for pixel in 0..config.pixels() {
-                let x = ((pixel % config.width) as f64 + 0.5) / config.width as f64;
-                let y = ((pixel / config.width) as f64 + 0.5) / config.height as f64;
-                let truth =
-                    distance_to_legal_set(&position, Point::new(x, y), Some(&vertices)) > radius;
-                if truth != dead[pixel] {
-                    wrong += 1;
-                }
-            }
-            assert_eq!(
-                wrong, 0,
-                "{count} stones: {wrong} pixels disagree with the definition"
-            );
-            assert!(
-                exact_tests * 8 < config.pixels(),
-                "{count} stones: {exact_tests} exact tests is too many to be a fallback"
-            );
-        }
-    }
-
-    /// Two properties that look like bugs and are the rule working.
-    ///
-    /// An empty board has dead corners -- the legal set is the board inset by
-    /// `r`, so a corner is `r*sqrt(2)` from it and no stone can ever cover it --
-    /// and the centre of an empty board is not dead. A `settled` mask is empty
-    /// on the same position, which is why the two cannot share an early return.
-    #[test]
-    fn an_empty_board_has_dead_corners_and_a_live_centre() {
-        let radius = 1.0 / 18.0;
-        let config = RasterConfig::square_of(128, RasterKind::Compact);
-        let position = Position::new(radius, Vec::new(), Color::Black);
-        let (dead, _) = dead_zone_mask(&position, config, 1);
-
-        let at = |x: f64, y: f64| {
-            let column = (x * config.width as f64) as usize;
-            let row = (y * config.height as f64) as usize;
-            dead[row * config.width + column]
-        };
-        assert!(
-            at(0.002, 0.002),
-            "the corner can never be covered by a stone"
-        );
-        assert!(!at(0.5, 0.5), "the centre of an empty board is reachable");
-        assert!(
-            !at(0.5, 0.002),
-            "mid-edge is within a radius of the inset line"
-        );
-
-        let (settled, _) = settled_mask_by_bounded_distance(&position, config, 1);
-        assert!(
-            settled.iter().all(|s| !s),
-            "no stones means nothing is settled"
-        );
-    }
-
-    /// A board with no legal placements left is entirely dead.
-    #[test]
-    fn a_position_with_no_legal_moves_is_all_dead() {
-        // One stone on a board barely wider than its own exclusion disc leaves
-        // nowhere legal, so the whole board is unreachable.
-        let position = Position::new(0.26, vec![Stone::new(0.5, 0.5, Color::Black)], Color::White);
-        assert!(position.validate().is_playable());
-        let config = RasterConfig::square_of(32, RasterKind::Compact);
-        let (dead, _) = dead_zone_mask(&position, config, 1);
-        assert!(
-            dead.iter().all(|d| *d),
-            "an empty legal set makes every point dead"
-        );
-    }
 }
 
 #[cfg(test)]

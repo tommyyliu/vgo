@@ -47,20 +47,15 @@ class Layout:
 # Keyed by channel count, from the `COMPACT*_CHANNELS` lists in
 # crates/vgo-raster/src/lib.rs.
 #
-# The six-plane layouts -- `compact-pass` and `compact-dead-zone` -- share an
-# entry, and that is sound rather than a shortcut: they differ only in *which*
-# capture predicate sits in slot 3, and both are binary, so the storage classes
-# are identical. `_validate` checks the structure it assumes on the data itself,
-# so a layout that ever stopped fitting falls back to dense rather than being
-# silently corrupted.
+# `_validate` checks the structure it assumes on the data itself, so a layout
+# that ever stopped fitting falls back to dense rather than being silently
+# corrupted.
 #
 # `previous_pass` is a scalar rather than a bit plane. It is binary, but it is
 # also constant across the plane, and one fp16 beats 2 KB of bits.
 _LAYOUTS: dict[int, Layout] = {
     # current_stones, opponent_stones, voronoi_ridge, settled, komi
     5: Layout(channels=5, binary=(0, 1, 3), scalar=(4,), continuous=(2,)),
-    # ..., komi, previous_pass
-    6: Layout(channels=6, binary=(0, 1, 3), scalar=(4, 5), continuous=(2,)),
     # ..., komi, previous_pass, radius -- `compact-radius`.
     #
     # `radius` joins komi and previous_pass as a scalar: the Rust fills the
@@ -68,16 +63,6 @@ _LAYOUTS: dict[int, Layout] = {
     # the multi-radius run's only structural addition, so a run that trains on
     # mixed board sizes packs exactly as tightly as one that does not.
     7: Layout(channels=7, binary=(0, 1, 3), scalar=(4, 5, 6), continuous=(2,)),
-    # current_stones, opponent_stones, voronoi_ridge, settled, dead_zone,
-    # connections, komi, previous_pass.
-    #
-    # `connections` is signed rather than binary -- +1 for the mover's, -1 for
-    # the opponent's -- so it keeps full precision. Everything else splits as
-    # before.
-    # ..., settled, dead_zone, current_connections, opponent_connections, komi,
-    # previous_pass. Six binary planes: splitting connections by side rather than
-    # signing them is what keeps them packable, 2 bits against fp16's 16.
-    9: Layout(channels=9, binary=(0, 1, 3, 4, 5, 6), scalar=(7, 8), continuous=(2,)),
 }
 
 # The compact planes by name, for readers and for tests. The six-plane layouts

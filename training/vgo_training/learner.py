@@ -78,12 +78,8 @@ class LearnerConfig:
     # time, so two runs over the same shards can train different encodings.
     #
     # It has to be configured rather than inferred. The shard header records
-    # what generation happened to be set to, which stopped identifying a layout
-    # the moment two shared a width -- `compact-pass` and `compact-dead-zone`
-    # are both six planes and differ only in which capture predicate they
-    # carry, so the count cannot tell them apart and a wrong guess feeds a model
-    # a plane meaning something else. None keeps the old header-derived
-    # behaviour, for runs that predate the question.
+    # what generation happened to be set to, and two layouts of equal width can
+    # mean different things. None keeps the old header-derived behaviour.
     raster_kind: str | None = None
     # GroupNorm groups per residual block; None leaves the block unnormalized.
     norm_groups: int | None = None
@@ -1209,12 +1205,8 @@ class PersistentLearner:
                     policy_resolution,
                 ):
                     raise ValueError("initial checkpoint does not match replay tensor shape")
-                # The shape check above does not cover this. Two layouts can
-                # share a width and differ in what a plane *means* --
-                # `compact-pass` and `compact-dead-zone` are both six planes and
-                # disagree only on the capture predicate -- so a swap between
-                # them passes every dimension test and quietly feeds the loaded
-                # weights a channel trained to mean something else.
+                # The shape check above does not cover this: two layouts can
+                # share a width and differ in what a plane *means*.
                 parent_kind = checkpoint.get("raster_kind")
                 if (
                     config.raster_kind is not None

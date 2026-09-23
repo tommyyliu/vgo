@@ -560,14 +560,6 @@ class RasterKindIsATrainingChoice(unittest.TestCase):
     stopped identifying a layout once two of them shared a width.
     """
 
-    def test_the_channel_count_cannot_identify_a_six_plane_layout(self) -> None:
-        from vgo_training.dataset import RASTER_CHANNELS, _LEGACY_KIND_BY_CHANNELS
-
-        self.assertEqual(RASTER_CHANNELS["compact-pass"], 6)
-        self.assertEqual(RASTER_CHANNELS["compact-dead-zone"], 6)
-        # So the legacy reverse map must not claim to know which one 6 means.
-        self.assertNotIn(6, _LEGACY_KIND_BY_CHANNELS)
-
     def test_an_unknown_kind_is_refused_by_name(self) -> None:
         from vgo_training.dataset import load_dataset
 
@@ -575,18 +567,18 @@ class RasterKindIsATrainingChoice(unittest.TestCase):
             path = Path(directory) / "shard.vgo"
             path.write_bytes(b"\0" * 64)
             with self.assertRaises(ValueError) as caught:
-                load_dataset(path, raster_kind="compact-deadzone")
+                load_dataset(path, raster_kind="compact-radiuz")
             self.assertIn("unknown raster kind", str(caught.exception))
 
     def test_the_learner_binds_the_kind_into_its_loader(self) -> None:
         from vgo_training.learner import LearnerConfig, PersistentLearner
 
         learner = PersistentLearner(
-            defaults=LearnerConfig(raster_kind="compact-dead-zone")
+            defaults=LearnerConfig(raster_kind="compact-radius")
         )
         # Bound rather than threaded: the cache's loader is `(path) -> dataset`.
         self.assertEqual(
-            learner.replay_cache._loader.keywords, {"raster_kind": "compact-dead-zone"}
+            learner.replay_cache._loader.keywords, {"raster_kind": "compact-radius"}
         )
 
 
@@ -602,18 +594,18 @@ class RasterKindReachesTheLearner(unittest.TestCase):
         from vgo_training.learner import ReplayCache
 
         cache = ReplayCache()
-        cache.use_raster_kind("compact-dead-zone")
-        self.assertEqual(cache._loader.keywords, {"raster_kind": "compact-dead-zone"})
+        cache.use_raster_kind("compact-radius")
+        self.assertEqual(cache._loader.keywords, {"raster_kind": "compact-radius"})
 
         # A different kind must not leave shards rendered under the old one.
         cache._entries[Path("/nonexistent")] = object()  # type: ignore[assignment]
-        cache.use_raster_kind("compact-pass")
+        cache.use_raster_kind("compact")
         self.assertEqual(cache._entries, {})
-        self.assertEqual(cache._loader.keywords, {"raster_kind": "compact-pass"})
+        self.assertEqual(cache._loader.keywords, {"raster_kind": "compact"})
 
         # Re-stating the same kind is a no-op, so the cache survives an update.
         cache._entries[Path("/nonexistent")] = object()  # type: ignore[assignment]
-        cache.use_raster_kind("compact-pass")
+        cache.use_raster_kind("compact")
         self.assertEqual(len(cache._entries), 1)
 
 

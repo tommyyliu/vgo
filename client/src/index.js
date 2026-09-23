@@ -63,25 +63,9 @@ const INLINE_WASM_BASE64 = null;
 /// radius regardless.
 export const DEFAULT_RADIUS = 1 / 18;
 
-/// What every run in `runs/` has trained and measured at, for callers that want
-/// to reproduce a training position exactly rather than play the live game.
-export const TRAINING_RADIUS = 39 / 700;
-
-/// Raster size the model reads, fixed by the exported network rather than
-/// chosen here.
-const RASTER = 128;
-
-/// Channel layout the model reads. `compact-pass` is the five compact planes
-/// plus "the previous move was a pass", and is what every model since that
-/// plane was added is trained on.
-///
-/// This has to match the export. A shape mismatch onnxruntime rejects outright;
-/// what it cannot catch is two layouts of the same width -- `compact-pass` and
-/// `compact-dead-zone` are both six planes and differ in the capture predicate,
-/// so the wrong one loads cleanly and plays blind. `createBot` checks the width
-/// it produces against the model's own input and refuses a mismatch, which
-/// catches every case except that one.
-const DEFAULT_RASTER_KIND = 'compact-pass';
+/// Raster size used when the model does not declare one. Normally it is read
+/// from the model's input shape, so a 128 and a 256 export both just work.
+const DEFAULT_RASTER = 128;
 
 /// Leaf batch. Measured in Chrome on a discrete GPU: one inference costs
 /// ~10-13 ms almost regardless of how many positions are in it, so per-position
@@ -262,9 +246,6 @@ async function resolveOrt(options) {
 ///   leafBatch           positions per inference. Default 8.
 ///   coarsePool          policy sampling factor. Default 4. See above; this is
 ///                       a property of the trained model, not a preference.
-///   rasterKind          channel layout the model reads. Default
-///                       'compact-pass'. A property of the export, not a
-///                       preference; see DEFAULT_RASTER_KIND.
 export async function createBot(options = {}) {
   const { modelUrl, modelBuffer } = options;
   if (!modelUrl && !modelBuffer) {
@@ -281,34 +262,26 @@ export async function createBot(options = {}) {
   } catch (error) {
     throw new VgoBotError('inference', `could not load the model: ${error?.message ?? error}`, error);
   }
-  // Ask the engine how wide this layout is, and check it against the model.
-  // Getting this wrong is otherwise discovered on the first move, several
-  // seconds of model download later, as an opaque shape error from onnxruntime.
-  const rasterKind = options.rasterKind ?? DEFAULT_RASTER_KIND;
-  let channels;
-  try {
-    const probe = new Game(DEFAULT_RADIUS, 0, rasterKind);
-    channels = probe.rasterChannels();
-  } catch (error) {
-    throw new VgoBotError('unsupported', `unknown rasterKind ${JSON.stringify(rasterKind)}`, error);
-  }
-  const declared = modelChannels(session);
-  if (declared !== null && declared !== channels) {
+  // The engine always writes `compact-radius`, the layout every model trains
+  // on. Check the model agrees now rather than on the first move, several
+  // seconds of download later, as an opaque shape error from onnxruntime.
+  const channels = new Game(DEFAULT_RADIUS, 0).rasterChannels();
+  const declared = modelInputShape(session);
+  if (declared !== null && declared.channels !== channels) {
     throw new VgoBotError(
       'unsupported',
-      `the model takes ${declared} channels but ${rasterKind} produces ${channels}. ` +
-      'Pass the rasterKind this model was exported with.',
+      `the model takes ${declared.channels} channels but compact-radius has ${channels}; ` +
+      'it was exported from an older layout.',
     );
   }
-  return new Bot(ort, session, options, channels);
+  return new Bot(ort, session, options, channels, declared?.raster ?? DEFAULT_RASTER);
 }
 
-/// The model's declared input channel count, or null when the session does not
-/// expose one. Older onnxruntime-web builds have no `inputMetadata`, and a
-/// dynamic dimension comes back as a string, so both are treated as "unknown"
-/// rather than as a mismatch -- this check refuses a model it can prove wrong,
-/// never one it merely cannot read.
-function modelChannels(session) {
+/// The model's declared channel count and raster size, or null when the session
+/// does not expose them. Older onnxruntime-web builds have no `inputMetadata`,
+/// and a dynamic dimension comes back as a string, so both are treated as
+/// "unknown" rather than as a mismatch.
+function modelInputShape(session) {
   const meta = session.inputMetadata;
   if (!meta) return null;
   const name = session.inputNames[0];
@@ -321,21 +294,23 @@ function modelChannels(session) {
   if (!Array.isArray(dims) || dims.length !== 4) return null;
   // A symbolic dimension arrives as a string; only a concrete positive number
   // is proof of anything.
-  return typeof dims[1] === 'number' && dims[1] > 0 ? dims[1] : null;
+  const known = (value) => typeof value === 'number' && value > 0;
+  if (!known(dims[1])) return null;
+  return { channels: dims[1], raster: known(dims[2]) ? dims[2] : null };
 }
 
 class Bot {
   #ort; #session; #inputName; #policySize; #leafBatch; #coarsePool;
-  #rasterKind; #channels; #disposed = false;
+  #channels; #raster; #disposed = false;
 
-  constructor(ort, session, options, channels) {
+  constructor(ort, session, options, channels, raster) {
     this.#ort = ort;
     this.#session = session;
     this.#inputName = session.inputNames[0];
     this.#leafBatch = Math.max(1, Math.floor(options.leafBatch ?? DEFAULT_LEAF_BATCH));
     this.#coarsePool = Math.max(0, Math.floor(options.coarsePool ?? DEFAULT_COARSE_POOL));
-    this.#rasterKind = options.rasterKind ?? DEFAULT_RASTER_KIND;
     this.#channels = channels;
+    this.#raster = raster;
     this.#policySize = null;
   }
 
@@ -348,8 +323,8 @@ class Bot {
       policySize: this.#policySize,
       leafBatch: this.#leafBatch,
       coarsePool: this.#coarsePool,
-      raster: RASTER,
-      rasterKind: this.#rasterKind,
+      raster: this.#raster,
+      rasterKind: 'compact-radius',
       channels: this.#channels,
     };
   }
@@ -398,7 +373,7 @@ class Bot {
     } = options;
 
     const parsed = readPosition(position);
-    const game = new Game(parsed.radius, parsed.komi, this.#rasterKind);
+    const game = new Game(parsed.radius, parsed.komi);
     try {
       game.setStones(parsed.stones, parsed.toMove, parsed.ply, parsed.passes);
     } catch (error) {
@@ -427,9 +402,9 @@ class Bot {
 
     while (!search.finished && performance.now() < deadline) {
       if (signal?.aborted) throw new VgoBotError('aborted', 'the search was aborted');
-      const batch = search.nextBatch(RASTER);
+      const batch = search.nextBatch(this.#raster);
       if (batch.length === 0) break;
-      const count = batch.length / (this.#channels * RASTER * RASTER);
+      const count = batch.length / (this.#channels * this.#raster * this.#raster);
       const outputs = await this.#run(batch, count);
       search.submit(
         toFloat32(outputs.values.data),
@@ -464,7 +439,7 @@ class Bot {
     try {
       return await this.#session.run({
         [this.#inputName]:
-          new this.#ort.Tensor('float32', batch, [count, this.#channels, RASTER, RASTER]),
+          new this.#ort.Tensor('float32', batch, [count, this.#channels, this.#raster, this.#raster]),
       });
     } catch (error) {
       throw new VgoBotError('inference', `the model failed to run: ${error?.message ?? error}`, error);
@@ -472,7 +447,7 @@ class Bot {
   }
 
   async #probePolicySize() {
-    const empty = new Float32Array(this.#channels * RASTER * RASTER);
+    const empty = new Float32Array(this.#channels * this.#raster * this.#raster);
     const outputs = await this.#run(empty, 1);
     return outputs.policy_logits.dims.at(-1);
   }

@@ -89,30 +89,23 @@ slower fallback. `serve.js` sets both, for development.
 | `executionProviders` | `['webgpu','wasm']` | ORT takes the first that initialises |
 | `leafBatch` | 8 | positions per inference |
 | `coarsePool` | 16 | how candidates are drawn from the policy map |
-| `rasterKind` | `'compact-pass'` | channel layout the model reads; a property of the export |
 | `wasm` | inlined | override for the engine binary; only needed in unusual hosting |
 
 Expensive, and worth doing once when a board loads rather than when a player
 asks for a move: it fetches tens of megabytes of model and compiles a WebGPU
 pipeline.
 
-**`rasterKind` must match the export.** `compact-pass` -- the five compact planes
-plus "the previous move was a pass" -- is what every model since that plane was
-added is trained on, and is the default. Older exports are five-channel
-`compact`. `createBot` compares the width the layout produces against the
-model's own declared input and refuses a mismatch, so the usual failure is a
-clear error at load rather than a bad bot. The case it cannot catch is two
-layouts of the same width: `compact-pass` and `compact-dead-zone` are both six
-planes and differ in the capture predicate, so passing the wrong one there loads
-cleanly and plays blind.
+**The model must be a `compact-radius` export.** That is the only layout the
+engine writes. The raster size is read from the model's input shape, so 128 and
+256 exports both work; `createBot` refuses a model whose channel count does not
+match.
 
 **Leave `coarsePool` alone unless you know why you are changing it.** Zero is not
 "off" — it makes the search draw candidate moves from a quasi-random sequence
 instead of the network's policy map, so the policy head stops guiding where the
 search looks at all, and the bot goes on playing legal, plausible-looking, much
 weaker moves. Any other value searches the model through a different sampler than
-the one its strength was measured with. Sixteen is what every recipe in `runs/`
-uses.
+the one its strength was measured with. Sixteen is what the loop uses.
 
 `leafBatch` is a throughput choice and is safe to lower on a machine where memory
 matters more than speed; see *Known limits*.
@@ -135,13 +128,8 @@ it is drawn, so scale your own pixels and nothing here depends on the display.
 `voronoigo.com` uses an 18-unit board with radius 1, so divide its coordinates
 by `boardSize` and its radius becomes exactly 1/18.
 
-**The models were not trained at 1/18.** Every run so far used `39/700`, 0.286%
-larger — a board 17.95 stone-radii wide rather than 18. That is not a game
-constant; it is the reference client's radius slider sitting at its default of 39
-pixels on a 700-pixel board, which is where the training recipes took it from.
-`DEFAULT_RADIUS` is the game's value and `TRAINING_RADIUS` is the other one, so
-whichever you want you can name. Send your own `radius` and the question does not
-arise.
+The loop trains across radii from 1/38 to 1/18, and the model reads the radius
+as an input plane, so send the radius of the board you are playing.
 
 Stone colours may be `c` or `color`, and `'B'`/`'W'` or `'black'`/`'white'` —
 this repository contains three implementations using two conventions, and making
