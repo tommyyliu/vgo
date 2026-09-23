@@ -28,6 +28,29 @@ const DISTANCE_SETTLED_MINIMUM_STONES: usize = 20;
 /// safe side; it is calibrated, not derived.
 const DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS: f64 = 6.0;
 
+/// Largest oversample the distance-transform mask will use to reach
+/// [`DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS`]. Odd, because the fine grid's
+/// centre sample must coincide with the output pixel's centre.
+const DISTANCE_SETTLED_MAXIMUM_OVERSAMPLE: usize = 5;
+
+/// How finely the distance-transform `settled` mask must sample the legal set
+/// for this raster, or `None` when the per-stone solve should run instead.
+///
+/// A coarse raster on a big board -- 128 at r = 1/38 is 3.4 cells per radius --
+/// used to fall back to the O(stones^2) solve, which at ~300 stones cost 2.3x a
+/// 256 raster of the same position. Oversampling the legality grid alone keeps
+/// the O(pixels) path: 3x at 128 samples as finely as 384 would, while every
+/// other plane stays at 128.
+pub(crate) fn settled_oversample(position: &Position, config: RasterConfig) -> Option<usize> {
+    if position.stones().len() < DISTANCE_SETTLED_MINIMUM_STONES {
+        return None;
+    }
+    let cells_per_radius = config.width.min(config.height) as f64 * position.radius();
+    (1..=DISTANCE_SETTLED_MAXIMUM_OVERSAMPLE)
+        .step_by(2)
+        .find(|&scale| scale as f64 * cells_per_radius >= DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS)
+}
+
 pub const CHANNEL_COUNT: usize = 12;
 
 
@@ -360,13 +383,10 @@ pub fn settled_for_raster(position: &Position, config: RasterConfig) -> Vec<bool
     //     nothing.
     //
     // So the fast path is simply the path now, and there is no flag to forget.
-    let cells_per_radius = config.width.min(config.height) as f64 * position.radius();
-    if position.stones().len() >= DISTANCE_SETTLED_MINIMUM_STONES
-        && cells_per_radius >= DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS
-    {
-        return edt::settled_mask_by_bounded_distance(position, config, 1).0;
+    match settled_oversample(position, config) {
+        Some(scale) => edt::settled_mask_by_bounded_distance(position, config, scale).0,
+        None => settled_mask(position, config),
     }
-    settled_mask(position, config)
 }
 
 pub(crate) fn settled_for_raster_into(
@@ -375,11 +395,8 @@ pub(crate) fn settled_for_raster_into(
     scratch: &mut edt::EdtScratch,
     output: &mut Vec<bool>,
 ) {
-    let cells_per_radius = config.width.min(config.height) as f64 * position.radius();
-    if position.stones().len() >= DISTANCE_SETTLED_MINIMUM_STONES
-        && cells_per_radius >= DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS
-    {
-        edt::settled_mask_by_bounded_distance_into(position, config, 1, scratch, output);
+    if let Some(scale) = settled_oversample(position, config) {
+        edt::settled_mask_by_bounded_distance_into(position, config, scale, scratch, output);
     } else {
         output.clear();
         output.extend_from_slice(&settled_for_raster(position, config));
@@ -1206,3 +1223,4 @@ mod tests {
         }
     }
 }
+

@@ -339,14 +339,28 @@ fn nearest_row_chunked(
 /// The legal set sampled onto a grid, built by stamping exclusion discs.
 pub(crate) fn sampled_legal_set(position: &Position, fine_width: usize, fine_height: usize) -> Vec<bool> {
     let mut scratch = EdtScratch::default();
-    sampled_legal_set_into(position, fine_width, fine_height, &mut scratch);
+    sampled_legal_set_into(position, fine_width, fine_height, &[], &mut scratch);
     scratch.legal
 }
 
+/// The legal set sampled at cell centres, plus the cell holding each of
+/// `vertices`.
+///
+/// Sampling alone misses any legal component that contains no cell centre, and
+/// that is not rare: two stones a hair over `2r` apart leave a sliver of legal
+/// board between them, which is exactly the contestable gap a boundary move
+/// lives in. Missing one makes the distance to the legal set an overestimate,
+/// so the settled test calls the region beside it settled. Measured on real
+/// 1/38 positions, that was 1.2% of every 256 raster's pixels, all of them
+/// false "settled". Every bounded component has a vertex, so marking the vertex
+/// cells means every component is seen. A marked centre is within half a cell
+/// diagonal of a legal point rather than on one, which the caller's
+/// "certainly unsettled" test allows for.
 fn sampled_legal_set_into(
     position: &Position,
     fine_width: usize,
     fine_height: usize,
+    vertices: &[Point],
     scratch: &mut EdtScratch,
 ) {
     let stones = position.stones();
@@ -412,6 +426,11 @@ fn sampled_legal_set_into(
                 }
             }
         }
+    }
+    for vertex in vertices {
+        let column = ((vertex.x * fine_width as f64) as usize).min(fine_width - 1);
+        let row = ((vertex.y * fine_height as f64) as usize).min(fine_height - 1);
+        scratch.legal[row * fine_width + column] = true;
     }
 }
 
@@ -539,8 +558,12 @@ pub(crate) fn settled_mask_by_bounded_distance_into(
 /// quantises to f16 and swallows a last-ulp difference -- one ulp here is a
 /// different pixel.
 ///
-/// Oversample is fixed at 1, the production path, as in the incremental builder.
+/// `oversample` is chosen by `settled_oversample`, the same as the reference.
 pub(crate) struct SettledRows {
+    scale: usize,
+    fine_width: usize,
+    fine_height: usize,
+    half_diagonal: f64,
     spacing_squared: f64,
     slack: f64,
     index: Option<LegalSetIndex>,
@@ -550,18 +573,25 @@ pub(crate) struct SettledRows {
 pub(crate) fn prepare_settled_rows(
     position: &Position,
     config: RasterConfig,
+    oversample: usize,
     scratch: &mut EdtScratch,
 ) -> SettledRows {
-    let (width, height) = (config.width, config.height);
-    sampled_legal_set_into(position, width, height, scratch);
+    let scale = oversample.max(1) | 1;
+    let (fine_width, fine_height) = (config.width * scale, config.height * scale);
+    let index = LegalSetIndex::build(position);
+    sampled_legal_set_into(position, fine_width, fine_height, index.vertices(), scratch);
     let legal = std::mem::take(&mut scratch.legal);
-    squared_distance_transform_into(&legal, width, height, scratch);
+    squared_distance_transform_into(&legal, fine_width, fine_height, scratch);
     scratch.legal = legal;
-    let spacing = 1.0 / width as f64;
+    let spacing = 1.0 / fine_width as f64;
     SettledRows {
+        scale,
+        fine_width,
+        fine_height,
+        half_diagonal: 0.5 * spacing * std::f64::consts::SQRT_2,
         spacing_squared: spacing * spacing,
         slack: spacing * std::f64::consts::SQRT_2,
-        index: None,
+        index: Some(index),
         exact_tests: 0,
     }
 }
@@ -585,16 +615,21 @@ impl SettledRows {
         field: &[f64],
         out: &mut [bool],
     ) {
-        let base = row * width;
+        let scale = self.scale;
+        let fine_row = (row * scale + scale / 2).min(self.fine_height - 1);
+        let base = fine_row * self.fine_width;
         for column in 0..width {
-            let sampled_squared = field[base + column] * self.spacing_squared;
+            let fine_column = (column * scale + scale / 2).min(self.fine_width - 1);
+            let sampled_squared = field[base + fine_column] * self.spacing_squared;
             let sampled = sampled_squared.sqrt();
             let sampled_minus_slack = sampled - self.slack;
             out[column] = if sampled_minus_slack > 0.0
                 && nearest_squares[column] <= sampled_minus_slack * sampled_minus_slack
             {
                 true
-            } else if nearest_squares[column] > sampled_squared {
+            } else if nearest_squares[column]
+                > (sampled + self.half_diagonal) * (sampled + self.half_diagonal)
+            {
                 false
             } else {
                 self.exact_tests += 1;
@@ -631,13 +666,15 @@ fn settled_by_bounded_distance_into(
     let radius = position.radius();
     let scale = oversample.max(1) | 1;
     let (fine_width, fine_height) = (config.width * scale, config.height * scale);
-    sampled_legal_set_into(position, fine_width, fine_height, scratch);
+    let known_index = LegalSetIndex::build(position);
+    sampled_legal_set_into(position, fine_width, fine_height, known_index.vertices(), scratch);
     let legal = std::mem::take(&mut scratch.legal);
     squared_distance_transform_into(&legal, fine_width, fine_height, scratch);
     scratch.legal = legal;
     let spacing = 1.0 / fine_width as f64;
     let spacing_squared = spacing * spacing;
     let slack = spacing * std::f64::consts::SQRT_2;
+    let half_diagonal = 0.5 * slack;
     // How far the sampled distance can overstate the true one.
     //
     // Half a cell diagonal is the tempting answer and it is wrong: it assumes
@@ -647,7 +684,7 @@ fn settled_by_bounded_distance_into(
     // wrong pixels at eight stones, where slivers cannot be the explanation.
     // A full diagonal covers the boundary case; nothing covers a sliver
     // narrower than a cell, which is why this function is not exact.
-    let mut index: Option<LegalSetIndex> = None;
+    let mut index: Option<LegalSetIndex> = Some(known_index);
     let mut exact_tests = 0usize;
     // The nearest stone, a row at a time, stones outside and pixels inside.
     //
@@ -746,7 +783,9 @@ fn settled_by_bounded_distance_into(
                 && scratch.nearest_squares[column] <= sampled_minus_slack * sampled_minus_slack
             {
                 true
-            } else if scratch.nearest_squares[column] > sampled_squared {
+            } else if scratch.nearest_squares[column]
+                > (sampled + half_diagonal) * (sampled + half_diagonal)
+            {
                 false
             } else {
                 exact_tests += 1;
@@ -785,6 +824,101 @@ mod tests {
             stones.push(Stone::new(x, y, colour));
         }
         Position::new(radius, stones, Color::Black).with_komi(0.104)
+    }
+
+    /// Random sequential packing, the case the regular lattice fixtures miss.
+    ///
+    /// Stones placed at random leave many near-tangent pairs, and each one is a
+    /// sliver of legal board that no cell centre falls in. Before the legal-set
+    /// vertices were marked on the sampled grid, every such sliver made the
+    /// region beside it read as settled: 1.6% of a 256 raster here, and 1.2% on
+    /// real 1/38 game positions -- all false "settled", all within two pixels of
+    /// a vertex.
+    #[test]
+    fn random_packings_agree_with_the_definition() {
+        fn packing(radius: f64, target: usize, seed: u64) -> Position {
+            let mut state = 0x9e37_79b9_7f4a_7c15_u64 ^ seed;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 11) as f64 / (1_u64 << 53) as f64
+            };
+            let mut stones: Vec<Stone> = Vec::new();
+            for _ in 0..200_000 {
+                if stones.len() == target {
+                    break;
+                }
+                let x = radius + next() * (1.0 - 2.0 * radius);
+                let y = radius + next() * (1.0 - 2.0 * radius);
+                let clear = stones.iter().all(|s| {
+                    ((s.x - x).powi(2) + (s.y - y).powi(2)).sqrt() > 2.0 * radius * 1.0001
+                });
+                if clear {
+                    let colour = if stones.len() % 2 == 0 { Color::Black } else { Color::White };
+                    stones.push(Stone::new(x, y, colour));
+                }
+            }
+            Position::new(radius, stones, Color::Black)
+        }
+        for (size, radius, target) in [(128usize, 1.0 / 38.0, 250usize), (128, 1.0 / 38.0, 400), (96, 1.0 / 18.0, 90)] {
+            let config = RasterConfig::square_of(size, RasterKind::CompactRadius);
+            let position = packing(radius, target, target as u64);
+            let scale = crate::settled_oversample(&position, config).expect("distance path");
+            let vertices = legal_set_vertices(&position);
+            let (mask, _) = settled_mask_by_bounded_distance(&position, config, scale);
+            let mut wrong = 0usize;
+            for pixel in 0..config.pixels() {
+                let x = ((pixel % size) as f64 + 0.5) / size as f64;
+                let y = ((pixel / size) as f64 + 0.5) / size as f64;
+                let nearest = position
+                    .stones()
+                    .iter()
+                    .map(|s| ((s.x - x).powi(2) + (s.y - y).powi(2)).sqrt())
+                    .fold(f64::INFINITY, f64::min);
+                let truth =
+                    nearest <= distance_to_legal_set(&position, Point::new(x, y), Some(&vertices));
+                if truth != mask[pixel] {
+                    wrong += 1;
+                }
+            }
+            assert_eq!(wrong, 0, "{size}px, {target} stones: {wrong} pixels disagree");
+        }
+    }
+
+    /// A coarse raster on a big board -- 128 at r = 1/38, 3.4 cells per radius --
+    /// reaches the distance-transform path only by oversampling the legality
+    /// grid. It must still agree with the definition, including on the lattice
+    /// whose legal gaps are about one cell wide.
+    #[test]
+    fn oversampled_coarse_raster_agrees_with_the_definition() {
+        let radius = 1.0 / 38.0;
+        let config = RasterConfig::square_of(128, RasterKind::CompactRadius);
+        for count in [28usize, 120, 240] {
+            let position = fixture(count, radius);
+            assert!(position.validate().is_playable());
+            let scale = crate::settled_oversample(&position, config)
+                .expect("a coarse raster must oversample rather than fall back");
+            assert_eq!(scale, 3);
+            let vertices = legal_set_vertices(&position);
+            let (mask, _) = settled_mask_by_bounded_distance(&position, config, scale);
+            let mut wrong = 0usize;
+            for pixel in 0..config.pixels() {
+                let x = ((pixel % config.width) as f64 + 0.5) / config.width as f64;
+                let y = ((pixel / config.width) as f64 + 0.5) / config.height as f64;
+                let nearest = position
+                    .stones()
+                    .iter()
+                    .map(|s| ((s.x - x).powi(2) + (s.y - y).powi(2)).sqrt())
+                    .fold(f64::INFINITY, f64::min);
+                let truth =
+                    nearest <= distance_to_legal_set(&position, Point::new(x, y), Some(&vertices));
+                if truth != mask[pixel] {
+                    wrong += 1;
+                }
+            }
+            assert_eq!(wrong, 0, "{count} stones: {wrong} pixels disagree with the definition");
+        }
     }
 
     /// The bounded form must agree with the definition, not merely with the

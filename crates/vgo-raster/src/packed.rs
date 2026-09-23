@@ -21,10 +21,7 @@ use half::f16;
 use vgo_core::{Color, Position};
 
 use crate::edt::{EdtScratch, prepare_settled_rows};
-use crate::{
-    DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS, DISTANCE_SETTLED_MINIMUM_STONES, RasterConfig,
-    RasterKind, settled_for_raster_into,
-};
+use crate::{RasterConfig, RasterKind, settled_for_raster_into, settled_oversample};
 
 /// Which planes of a layout are binary, continuous, and constant.
 ///
@@ -576,13 +573,10 @@ pub(crate) fn rasterize_compact_radius_packed_into(
     // every stone a second time to recompute it. See `SettledRows`. The other
     // branch is the small-board O(stones^2) solve, which has no such field to
     // share, so it still builds the whole mask up front.
-    let cells_per_radius = config.width.min(config.height) as f64 * radius;
-    let mut settled_rows = if position.stones().len() >= DISTANCE_SETTLED_MINIMUM_STONES
-        && cells_per_radius >= DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS
-    {
+    let mut settled_rows = if let Some(scale) = settled_oversample(position, config) {
         settled.clear();
         settled.resize(pixels, false);
-        Some(prepare_settled_rows(position, config, edt))
+        Some(prepare_settled_rows(position, config, scale, edt))
     } else {
         settled_for_raster_into(position, config, edt, settled);
         None
@@ -920,9 +914,16 @@ mod tests {
     /// dispatch at `SEARCH_MINIMUM_STONES` as well.
     #[test]
     fn fused_settled_matches_the_reference_builder() {
+        // 256 samples the legal set directly; 128 at this radius oversamples it.
+        for width in [256usize, 128] {
+            fused_settled_matches_at(width);
+        }
+    }
+
+    fn fused_settled_matches_at(width: usize) {
         let config = RasterConfig {
-            width: 256,
-            height: 256,
+            width,
+            height: width,
             kind: RasterKind::CompactRadius,
         };
         let radius = 1.0 / 38.0;
@@ -961,7 +962,7 @@ mod tests {
             }
             assert!(
                 wrong.is_empty(),
-                "{count} stones: {} settled pixels disagree with the reference, first at {:?}",
+                "{width}px, {count} stones: {} settled pixels disagree with the reference, first at {:?}",
                 wrong.len(),
                 wrong.first()
             );
