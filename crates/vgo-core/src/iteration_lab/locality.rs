@@ -69,6 +69,53 @@ fn a_cell_can_lose_its_liberty_without_any_capture() {
 }
 
 #[test]
+fn a_stone_at_7_4918_r_can_change_individual_cell_status() {
+    // Exact decimal construction and independent rational certificate:
+    // docs/LOCAL_CONTESTABILITY_FLOOR.md, diagnostics/check_locality_floor.py.
+    let r = 1.0 / 12.0;
+    let coordinates = [
+        (1.0, 1.0),
+        (1.0, 3.0),
+        (3.2371, 2.8783),
+        (5.2070, 2.5322),
+        (8.4918, 1.0),
+    ];
+    let stones: Vec<_> = coordinates
+        .iter()
+        .enumerate()
+        .map(|(index, &(x, y))| {
+            Stone::new(
+                x * r,
+                y * r,
+                if index == 0 { Color::Black } else { Color::White },
+            )
+        })
+        .collect();
+    let full = Position::new(r, stones.clone(), Color::White);
+    let reduced = Position::new(r, stones[..4].to_vec(), Color::White);
+    for (position, expected) in [(&full, false), (&reduced, true)] {
+        assert!(position.validate().is_playable());
+        assert_eq!(
+            cell_alive(
+                position,
+                0,
+                &voronoi::compute(position),
+                &legal_set::vertices(position),
+            ),
+            expected,
+        );
+    }
+    let witness = Point::new(6.4928 * r, r);
+    assert!(!legal_set::contains(&full, witness.x, witness.y));
+    assert!(legal_set::contains(&reduced, witness.x, witness.y));
+    assert!(crate::Analysis::new(&reduced).settled_groups.is_empty());
+    let result = crate::place(&reduced, stones[4].x, stones[4].y).unwrap();
+    assert_eq!(result.captured, 1);
+    assert!(!result.position.stones().contains(&stones[0]));
+    assert_eq!(result.position.stones().len(), 4);
+}
+
+#[test]
 fn removing_distant_stones_preserves_individual_cell_status() {
     // Compare the original, adaptive, and sharper D = (2+4sqrt(2))r bounds.
     // Include a small outward slack in this probe;

@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="460" viewBox="0 0 800 460" role="img" aria-labelledby="title description">
+  <title id="title">A 7.4918r locality lower bound</title>
+  <desc id="description">Five stones of radius r near the lower-left corner of a square board. The black owner s is at (1,1), guard g at (1,3), b1 at (3.2371,2.8783), b2 at (5.207,2.5322), and distant white blocker t at (8.4918,1), in units of r. Removing t makes p=(6.4928,1) legal and able to contest the owner's cell at v. The owner's cell is unchanged. The diagram shows the provisional position before capture resolution.</desc>
+  <defs>
+    <clipPath id="inset">
+      <rect x="115" y="45" width="640" height="235"/>
+    </clipPath>
+  </defs>
+  <rect width="800" height="460" fill="white"/>
+  <g font-family="Arial, Helvetica, sans-serif" fill="#20252b">
+    <text x="50" y="29" font-size="22">A stone 7.4918r away can decide safety</text>
+
+    <!-- Equal x/y scale: 65 pixels per stone radius. Physical y points up. -->
+    <polygon points="50,345 293.534659716,345 184.384867574,215 50,215" fill="#dcecfb"/>
+    <g clip-path="url(#inset)">
+      <circle cx="293.534659716" cy="345" r="189.999012418" fill="#def2e3" stroke="#39965b" stroke-width="1.3"/>
+      <circle cx="601.967" cy="280" r="130" fill="#fff0df" fill-opacity="0.85" stroke="#d47822" stroke-width="1.5" stroke-dasharray="6 5"/>
+    </g>
+
+    <path d="M 50,45 V 345 H 755" fill="none" stroke="#20252b" stroke-width="1.5"/>
+    <path d="M 50,280 H 755" fill="none" stroke="#89929a" stroke-width="1" stroke-dasharray="4 5"/>
+    <text x="747" y="273" text-anchor="end" font-size="12" fill="#626a73">y = r</text>
+
+    <!-- Stones: s is Black; g, b1, b2, and t are White. -->
+    <g stroke="#20252b" stroke-width="1.8">
+      <circle cx="115" cy="280" r="65" fill="#20252b"/>
+      <circle cx="115" cy="150" r="65" fill="white"/>
+      <circle cx="260.4115" cy="157.9105" r="65" fill="white"/>
+      <circle cx="388.455" cy="180.407" r="65" fill="white"/>
+      <circle cx="601.967" cy="280" r="65" fill="white" stroke="#d47822" stroke-width="2"/>
+    </g>
+    <g text-anchor="middle" font-size="20">
+      <text x="115" y="287" fill="white">s</text>
+      <text x="115" y="157">g</text>
+      <text x="260.4115" y="165">b₁</text>
+      <text x="388.455" y="187">b₂</text>
+      <text x="601.967" y="287">t</text>
+    </g>
+
+    <circle cx="293.534659716" cy="345" r="4" fill="#2874b7"/>
+    <text x="293.534659716" y="365" text-anchor="middle" font-size="16">v</text>
+    <circle cx="472.032" cy="280" r="4.5" fill="#39965b" stroke="white" stroke-width="1"/>
+    <text x="479" y="302" font-size="16">p</text>
+    <text x="540" y="117" font-size="14" fill="#ad5b16">t’s radius-2r exclusion</text>
+
+    <path d="M 115,383 V 397 M 115,390 H 601.967 M 601.967,383 V 397" fill="none" stroke="#20252b" stroke-width="1.2"/>
+    <text x="358.4835" y="382" text-anchor="middle" font-size="17">|t − s| = 7.4918r</text>
+
+    <rect x="50" y="420" width="13" height="13" fill="#dcecfb"/>
+    <text x="71" y="432" font-size="14">Owner’s cell</text>
+    <rect x="215" y="420" width="13" height="13" fill="#def2e3"/>
+    <text x="236" y="432" font-size="14">Centers that contest v</text>
+    <text x="50" y="453" font-size="13" fill="#626a73">Remove t: p becomes legal and contests s’s unchanged cell. All stones are drawn to scale.</text>
+  </g>
+</svg>

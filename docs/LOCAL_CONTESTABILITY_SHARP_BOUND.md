@@ -135,8 +135,9 @@ the theorem, including simultaneous removal of all stones beyond D.
 The proof preserves the strict contest inequality and permits legal tangency
 at separation 2. Keep stones at exactly D when applying the stated cutoff.
 
-The constant is an upper bound, not a proof of optimality. Taking the reported
-7.484r construction as given leaves a gap of about 0.173r. Claude's scratch
+The constant is an upper bound, not a proof of optimality. The subsequently
+[certified five-stone construction](LOCAL_CONTESTABILITY_FLOOR.md) establishes
+a 7.4918r lower bound, leaving a gap of about 0.1651r. Claude's scratch
 write-up already identifies the same constant for straight-edge blocking; the
 additional result here is the full square-board removal-invariance proof,
 including corners and distant stones that could cut the reduced cell.
