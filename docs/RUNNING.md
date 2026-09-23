@@ -129,6 +129,28 @@ To play the current model yourself:
 ./scripts/play.sh path/to/model.onnx
 ```
 
+## Performance history
+
+`scripts/bench.py` times each large CPU path single-threaded on the fixed real
+positions in `benchmarks/positions.txt` (16 at 1/38, 16 at 1/18): move
+application, board analysis, the legal-set index, the settled plane and packed
+raster at 128 and 256, the fine grid, and a 200-simulation search with a fixed
+policy standing in for the network. It compares with the last record from the
+same machine and appends to `benchmarks/history.jsonl`, which is committed.
+
+```bash
+scripts/bench.py              # run, compare, record (needs a clean tree)
+scripts/bench.py --no-record  # try a change before committing it
+scripts/bench.py --check      # exit 1 on a regression
+scripts/bench.py --show       # the history for this machine
+```
+
+Run it before merging anything that touches rules, geometry, the raster or
+search, and commit the new record with the change. A path is flagged only when
+it is more than 10% slower *and* slower by more than the two runs' combined
+spread. It refuses to run above load 2, because a running generator inflates
+every number. Records from different machines are never compared.
+
 ## Traps
 
 **Match processes by `/proc/PID/comm`, never by command line.** A `pgrep -f`
