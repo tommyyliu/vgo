@@ -8,12 +8,10 @@ import torch
 
 from vgo_training.model import (
     DDRNetPolicyValueNet,
-    RasterPolicyValueNet,
-    ResidualBlock,
     build_model,
+    load_model,
 )
-from vgo_training.serve import load_model
-from vgo_training.train_demo import (
+from vgo_training.supervision import (
     DIHEDRAL_TRANSFORMS,
     apply_dihedral,
     build_scheduler,
@@ -32,7 +30,7 @@ class ModelTests(unittest.TestCase):
         keep emitting it; the loss reads the logits. Collapsing in both modes
         hands cross-entropy a scalar, which fails far from here.
         """
-        model = RasterPolicyValueNet(channels=10, width=8, blocks=1)
+        model = build_model(channels=10, width=8, blocks=1)
 
         model.eval()
         policy, value = model(torch.zeros(2, 10, 8, 8))
@@ -42,7 +40,7 @@ class ModelTests(unittest.TestCase):
         self.assertTrue(torch.all(value <= 1.0))
 
         model.train()
-        _, logits = model(torch.zeros(2, 10, 8, 8))
+        logits = model(torch.zeros(2, 10, 8, 8))[1]
         self.assertEqual(tuple(logits.shape), (2, 2))
 
     def test_ddrnet_handles_odd_rasters_and_backpropagates_both_fusions(self) -> None:
@@ -99,49 +97,8 @@ class ModelTests(unittest.TestCase):
         model.eval()
         self.assertEqual(len(model(torch.randn(2, 10, 19, 23))), 2)
 
-    def test_variance_scaling_adds_no_parameters_and_changes_output(self) -> None:
-        """K constants are fixed scalars, not weights.
-
-        The state dict must be unchanged so a scaled model exports and loads by
-        the same path, while the computed function genuinely differs -- which is
-        why the flag has to be recorded in the checkpoint.
-        """
-        torch.manual_seed(0)
-        scaled = DDRNetPolicyValueNet(
-            channels=10, width=16, blocks=2, variance_scaled=True
-        ).eval()
-        torch.manual_seed(0)
-        plain = DDRNetPolicyValueNet(
-            channels=10, width=16, blocks=2, variance_scaled=False
-        ).eval()
-        self.assertEqual(
-            set(scaled.state_dict()), set(plain.state_dict())
-        )
-
-        plain.load_state_dict(scaled.state_dict())
-        states = torch.randn(2, 10, 19, 23)
-        with torch.no_grad():
-            scaled_policy, _ = scaled(states)
-            plain_policy, _ = plain(states)
-        self.assertFalse(torch.allclose(scaled_policy, plain_policy, atol=1e-4))
-
-        scales = [
-            block.residual_scale
-            for block in scaled.modules()
-            if isinstance(block, ResidualBlock)
-        ]
-        self.assertTrue(all(scale is not None for scale in scales))
-        self.assertTrue(
-            all(
-                block.residual_scale is None
-                for block in plain.modules()
-                if isinstance(block, ResidualBlock)
-            )
-        )
-
     def test_ddrnet_emits_decoupled_policy_grid(self) -> None:
         model = build_model(
-            "ddrnet",
             channels=10,
             width=16,
             blocks=2,
@@ -198,10 +155,6 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(metadata["architecture"], "ddrnet")
         torch.testing.assert_close(actual[0], expected[0])
         torch.testing.assert_close(actual[1], expected[1])
-
-    def test_unknown_architecture_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "unknown model architecture"):
-            build_model("unknown", channels=10, width=8, blocks=1)
 
     def test_full_legal_loss_pushes_down_unexplored_legal_cells(self) -> None:
         states = torch.zeros(1, 10, 1, 3)
@@ -496,15 +449,15 @@ class CompileTests(unittest.TestCase):
 
         `torch.compile(model)` returns a wrapper whose state_dict prefixes every
         key with `_orig_mod.`. Saving that would produce checkpoints neither
-        `serve.load_model` nor the ONNX exporter can read, so training compiles
+        `load_model` nor the ONNX exporter can read, so training compiles
         in place instead.
         """
-        model = build_model("ddrnet", channels=10, width=8, blocks=1, policy_resolution=5)
+        model = build_model(channels=10, width=8, blocks=1, policy_resolution=5)
         before = set(model.state_dict())
         self.assertIsNone(model.compile())
         self.assertEqual(set(model.state_dict()), before)
 
-        wrapped = torch.compile(build_model("flat", channels=10, width=8, blocks=1))
+        wrapped = torch.compile(build_model(channels=10, width=8, blocks=1))
         self.assertTrue(any(key.startswith("_orig_mod") for key in wrapped.state_dict()))
 
 
@@ -519,7 +472,8 @@ class OptimizerStateTests(unittest.TestCase):
 
     @staticmethod
     def _stepped_optimizer() -> tuple[torch.nn.Module, torch.optim.Optimizer]:
-        model = build_model("flat", channels=10, width=8, blocks=1)
+        # Eval mode: the inference heads alone are enough to populate moments.
+        model = build_model(channels=10, width=8, blocks=1).eval()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         for _ in range(3):
             policy, value = model(torch.randn(2, 10, 8, 8))
@@ -544,11 +498,11 @@ class OptimizerStateTests(unittest.TestCase):
         self.assertGreater(int(first["step"]), 0)
 
     def test_mismatched_state_is_rejected_not_silently_applied(self) -> None:
-        # A different architecture has a different parameter count, so restoring
-        # must raise rather than quietly produce nonsense; train_demo catches
+        # A different shape has a different parameter count, so restoring
+        # must raise rather than quietly produce nonsense; the learner catches
         # this and falls back to a cold optimizer.
         _, optimizer = self._stepped_optimizer()
-        wider = build_model("flat", channels=10, width=16, blocks=2)
-        target = torch.optim.Adam(wider.parameters(), lr=1e-3)
+        deeper = build_model(channels=10, width=8, blocks=8)
+        target = torch.optim.Adam(deeper.parameters(), lr=1e-3)
         with self.assertRaises(ValueError):
             target.load_state_dict(optimizer.state_dict())

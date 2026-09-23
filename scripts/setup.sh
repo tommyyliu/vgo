@@ -75,25 +75,12 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 ok "cargo $(cargo --version | awk '{print $2}') (rust-toolchain.toml pins the version)"
 
-# The pipeline shells out to `cargo run --release` for every generation, arena
-# and warmup stage rather than calling prebuilt binaries, so cargo has to be on
-# PATH at run time too -- not just here.
-
 # torch.compile is on by default and needs a C compiler for inductor. Minimal
 # cloud images often ship without one, and the failure surfaces inside the first
 # training step rather than at startup.
 command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 \
   || die "no C compiler. torch.compile needs one; install build-essential/gcc, or pass --no-compile."
 ok "C compiler present"
-
-# zstd is only used by shard retirement, and _retire_aged_shards swallows its
-# failures (pipeline.py) -- so a box without it does not crash, it silently
-# stops reclaiming disk. Warn rather than fail, but say what the consequence is.
-if command -v zstd >/dev/null 2>&1; then
-  ok "zstd $(zstd --version | grep -oP 'v\K[0-9.]+' | head -1)"
-else
-  warn "zstd not found: --retire-shards will fail silently and replay disk will grow unbounded"
-fi
 
 # ------------------------------------------------------------------ the build
 if ! $check_only; then
@@ -124,18 +111,7 @@ step "ONNX Runtime"
 # load still holds. The process then sits at 0% CPU with a few MB resident,
 # indistinguishable from a deadlock. Catching it here turns hours of confusion
 # into one line.
-eval "$(
-  training/.venv/bin/python3 -c "
-import shlex, sys
-sys.path.insert(0, 'training')
-from vgo_training.pipeline import runtime_environment
-environment = runtime_environment()
-for key in ('ORT_DYLIB_PATH', 'LD_LIBRARY_PATH'):
-    value = environment.get(key)
-    if value:
-        print(f'export {key}={shlex.quote(value)}')
-"
-)"
+source scripts/env/ort.sh
 [[ -n "${ORT_DYLIB_PATH:-}" && -f "${ORT_DYLIB_PATH}" ]] \
   || die "ORT_DYLIB_PATH did not resolve (${ORT_DYLIB_PATH:-unset}); is the venv synced?"
 ok "${ORT_DYLIB_PATH#"$root/"}"
@@ -143,7 +119,7 @@ providers=$(training/.venv/bin/python3 -c \
   "import onnxruntime; print(','.join(onnxruntime.get_available_providers()))")
 ok "providers: $providers"
 [[ "$providers" == *Tensorrt* ]] \
-  || warn "no TensorRT provider; pass --provider cuda, as the pipeline defaults to tensorrt and aborts without it"
+  || warn "no TensorRT provider; pass --provider cuda, as the loop defaults to tensorrt and aborts without it"
 
 step "Ready"
 cat <<'EOF'

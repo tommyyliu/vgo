@@ -319,12 +319,12 @@ for ((update = first_update; update < first_update + updates; update++)); do
   ( cd "$root/training" && "$python" "$root/scripts/train-once.py" \
       --games-root "$games" --window-samples "$window" \
       --output "$checkpoint" \
-      --raster-kind compact-radius --architecture ddrnet \
+      --raster-kind compact-radius \
       --model-width 64 --blocks 16 --context-attention-blocks 1 \
       --attention-heads 8 --norm-groups 8 --precision bfloat16 \
       --epochs "$epochs" --batch-size 64 --learning-rate 0.0005 \
       --value-weight 2.0 --ownership-weight 0.0 --validation-fraction 0.1 \
-      --schedule wsd --warmup-epochs 0 --full-adam --compile \
+      --schedule wsd --warmup-epochs 0 --compile \
       --seed $((90000 + update)) --report-every 1 \
   ) >> "$output/train.log" 2>&1 || { echo "[loop] training failed" >&2; exit 1; }
 

@@ -4,14 +4,14 @@ import argparse
 import copy
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 import os
 from pathlib import Path
 import sys
 import time
-from typing import Callable, Iterable, Iterator, Mapping, TextIO
+from typing import Callable, Iterable, Iterator
 
 import numpy as np
 import torch
@@ -23,15 +23,14 @@ from .dataset import (
     file_sha256,
     load_dataset,
 )
-from .model import MODEL_ARCHITECTURES, build_model
+from .model import build_model
 from .packed_states import is_packable, pack as pack_states
 from .packed_policy import (
     is_packable as is_policy_packable,
     pack as pack_policy,
 )
-from .recency import row_weights
-from .serve import load_model
-from .train_demo import (
+from .model import load_model
+from .supervision import (
     DIHEDRAL_TRANSFORMS,
     apply_dihedral,
     atomic_write_text,
@@ -63,7 +62,7 @@ class LearnerConfig:
 
     A service accepts these fields on every update. Parameters which do not
     affect model identity (epochs, learning rate, reporting, and sampling) may
-    change freely. A device, compilation, architecture, or shape change causes
+    change freely. A device, compilation, or shape change causes
     a deliberate model reinitialization unless an explicit checkpoint supplies
     the new model.
     """
@@ -74,7 +73,6 @@ class LearnerConfig:
     value_weight: float = 1.0
     model_width: int = 32
     blocks: int = 3
-    architecture: str = "flat"
     # Which planes the network reads. A property of the *model*, not of the
     # data: a position shard stores the game, and the raster is rendered at load
     # time, so two runs over the same shards can train different encodings.
@@ -87,12 +85,7 @@ class LearnerConfig:
     # a plane meaning something else. None keeps the old header-derived
     # behaviour, for runs that predate the question.
     raster_kind: str | None = None
-    # Fixed-variance init plus He-scale convs (ddrnet). Changes the computed
-    # function, so it is recorded in the checkpoint and cannot be toggled on a
-    # warm start.
-    variance_scaled: bool = False
     # GroupNorm groups per residual block; None leaves the block unnormalized.
-    # Supersedes variance_scaled, which stands in the same place.
     norm_groups: int | None = None
     # Weight on the auxiliary ownership loss, relative to policy at 1.0. Zero
     # disables the head's supervision *and* stops the window holding its
@@ -100,11 +93,6 @@ class LearnerConfig:
     # head still exists and still exports as nothing, so this is reversible
     # without touching model identity.
     ownership_weight: float = OWNERSHIP_WEIGHT
-    # Per-shard sampling decay: 1.0 samples the whole window uniformly, 0.9
-    # makes each older shard 10% less likely than its successor. Lets a long
-    # window stay diverse while the gradient follows recent play. Identity
-    # config -- it changes what the model trains on.
-    recency_decay: float = 1.0
     # Trailing residual blocks in each ddrnet context stage to replace with
     # transformer blocks. Identity config at 0, which is byte-identical to a
     # net built without it. Attention is the one part of this model that is
@@ -112,22 +100,6 @@ class LearnerConfig:
     # checkpoint carrying it is fixed to the raster it was constructed for.
     context_attention_blocks: int = 0
     attention_heads: int = 8
-    # Muon on the conv/linear trunk, Adam on heads, norms and biases.
-    # Measured on the 25-shard window, the same w96 model reached policy_kl
-    # 0.845 at epoch 1 under plain Adam against 0.736 under Muon, and the
-    # architecture sweep that chose w64 ran entirely under Muon -- so a run
-    # comparing itself to those numbers has to use it. `full_adam` opts out
-    # and puts every parameter on Adam at `learning_rate`.
-    muon_learning_rate: float = 0.01
-    full_adam: bool = False
-    # Overrides the `full_adam` pair when set, so every existing recipe keeps
-    # its meaning. "ranger21" is AdamW plus lookahead, gradient centralization,
-    # adaptive gradient clipping, norm loss and stable weight decay -- a bundle,
-    # so a win by it does not isolate which of those did the work. Its own
-    # warmup and warmdown are switched off in `_build_optimizer`, which leaves
-    # `schedule` driving every arm and makes the comparison about the optimizer
-    # rather than about two different learning-rate curves.
-    optimizer: str | None = None
     threads: int = 4
     device: str = "cuda"
     precision: str = "float32"
@@ -157,20 +129,12 @@ class LearnerConfig:
             raise ValueError("value weight must be finite and nonnegative")
         if self.model_width <= 0 or self.blocks <= 0:
             raise ValueError("model width and blocks must be positive")
-        if self.architecture not in MODEL_ARCHITECTURES:
-            raise ValueError(f"unknown model architecture: {self.architecture!r}")
         if self.threads <= 0:
             raise ValueError("thread count must be positive")
         if self.precision not in ("float32", "bfloat16"):
             raise ValueError(f"unknown training precision: {self.precision!r}")
         if self.schedule not in ("wsd", "cosine"):
             raise ValueError(f"unknown learning-rate schedule: {self.schedule!r}")
-        if self.optimizer is not None and self.optimizer not in (
-            "adam",
-            "muon",
-            "ranger21",
-        ):
-            raise ValueError(f"unknown optimizer: {self.optimizer!r}")
         if self.warmup_epochs < 0:
             raise ValueError("warmup epochs must be nonnegative")
         if not 0.0 <= self.decay_fraction <= 1.0:
@@ -183,25 +147,6 @@ class LearnerConfig:
             raise ValueError("validation fraction must be in [0, 1)")
         if not math.isfinite(self.ownership_weight) or self.ownership_weight < 0.0:
             raise ValueError("ownership weight must be finite and nonnegative")
-        if not 0.0 < self.recency_decay <= 1.0:
-            raise ValueError("recency decay must be in (0, 1]")
-
-    @classmethod
-    def from_mapping(
-        cls,
-        values: Mapping[str, object],
-        *,
-        defaults: LearnerConfig | None = None,
-    ) -> LearnerConfig:
-        names = {field.name for field in fields(cls)}
-        unknown = set(values) - names
-        if unknown:
-            raise ValueError(f"unknown learner options: {sorted(unknown)}")
-        merged = asdict(defaults or cls())
-        merged.update(values)
-        config = cls(**merged)
-        config.validate()
-        return config
 
 
 @dataclass(frozen=True)
@@ -210,50 +155,6 @@ class LearnerUpdate:
     output: Path
     initial_checkpoint: Path | None
     config: LearnerConfig
-
-    @classmethod
-    def from_mapping(
-        cls,
-        message: Mapping[str, object],
-        *,
-        defaults: LearnerConfig | None = None,
-    ) -> LearnerUpdate:
-        if "datasets" not in message or "output" not in message:
-            raise ValueError("update requires datasets and output")
-        raw_datasets = message["datasets"]
-        if not isinstance(raw_datasets, list) or not raw_datasets:
-            raise ValueError("datasets must be a non-empty JSON list")
-        nested = message.get("config", {})
-        if not isinstance(nested, dict):
-            raise ValueError("config must be a JSON object")
-        option_names = {field.name for field in fields(LearnerConfig)}
-        options = dict(nested)
-        options.update(
-            {
-                key: value
-                for key, value in message.items()
-                if key in option_names
-            }
-        )
-        allowed = {
-            "command",
-            "request_id",
-            "datasets",
-            "output",
-            "initial_checkpoint",
-            "config",
-            *option_names,
-        }
-        unknown = set(message) - allowed
-        if unknown:
-            raise ValueError(f"unknown update fields: {sorted(unknown)}")
-        initial = message.get("initial_checkpoint")
-        return cls(
-            datasets=tuple(Path(str(path)) for path in raw_datasets),
-            output=Path(str(message["output"])),
-            initial_checkpoint=None if initial is None else Path(str(initial)),
-            config=LearnerConfig.from_mapping(options, defaults=defaults),
-        )
 
 
 @dataclass(frozen=True)
@@ -535,15 +436,8 @@ class ReplayView:
         shuffle: bool,
         generator: torch.Generator | None = None,
         augment: bool = False,
-        weights: torch.Tensor | None = None,
     ) -> list[BatchSpec]:
-        """Batch specs over this view.
-
-        `weights` is one frequency weight per row of the concatenated view,
-        averaging 1.0. Rows are repeated by those weights before shuffling, so
-        an epoch keeps its length in expectation while its composition shifts.
-        See vgo_training/recency.py.
-        """
+        """Batch specs over this view."""
         if batch_size <= 0:
             raise ValueError("batch size must be positive")
         shard_ids = torch.cat(
@@ -557,21 +451,6 @@ class ReplayView:
             ]
         )
         rows = torch.cat([selection.rows for selection in self.selections])
-        if weights is not None:
-            if weights.numel() != rows.numel():
-                raise ValueError(
-                    f"weights cover {weights.numel()} rows, view has {rows.numel()}"
-                )
-            # floor(w) copies plus one more with the fractional probability,
-            # which is unbiased in expectation.
-            floor = weights.floor()
-            extra = torch.rand(weights.shape, generator=generator) < (weights - floor)
-            counts = (floor + extra.to(weights.dtype)).to(torch.long)
-            repeat = torch.repeat_interleave(
-                torch.arange(counts.numel()), counts
-            )
-            shard_ids = shard_ids[repeat]
-            rows = rows[repeat]
         if shuffle and rows.numel() > 1:
             order = torch.randperm(rows.numel(), generator=generator)
             shard_ids = shard_ids[order]
@@ -1160,66 +1039,8 @@ def _atomic_torch_save(value: object, output: Path) -> None:
             os.close(descriptor)
 
 
-def _build_optimizer(
-    model: nn.Module,
-    config: "LearnerConfig",
-    log: "Callable[[str], None]",
-) -> torch.optim.Optimizer:
-    """Adam, or Muon on the trunk with Adam on everything else.
-
-    `full_adam` puts every parameter on Adam, which is what every run before
-    Muon landed used. Otherwise 2D+ weights that are not an output head go to
-    Muon: the heads are 1x1 convs and thin linears, which are rank-degenerate
-    and so meaningless to orthogonalize, and norm weights are 1D.
-
-    `config.optimizer`, when set, overrides that pair by name so an A/B can
-    select an arm without recipes having to know about `full_adam`.
-    """
-    choice = config.optimizer or ("adam" if config.full_adam else "muon")
-
-    if choice == "ranger21":
-        # Ranger21 schedules its own warmup and warmdown from num_epochs and
-        # num_batches_per_epoch, and refuses to construct without them. Both are
-        # switched off here so `schedule` still drives the rate, which is what
-        # keeps an optimizer A/B from silently comparing two different curves;
-        # with scheduling off the counts are unused, so the epoch count is
-        # passed for its logging and the batch count is nominal.
-        from ranger21 import Ranger21
-
-        return Ranger21(
-            model.parameters(),
-            lr=config.learning_rate,
-            num_epochs=max(1, config.epochs),
-            num_batches_per_epoch=1,
-            use_warmup=False,
-            warmdown_active=False,
-        )
-
-    if choice == "adam":
-        return torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-
-    from .muon import HybridMuon
-
-    trunk, rest = [], []
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
-        head = any(
-            token in name
-            for token in ("policy_map", "pass_head", "value_head", "ownership_map")
-        )
-        (trunk if parameter.ndim >= 2 and not head else rest).append(parameter)
-    log(
-        f"muon: {sum(p.numel() for p in trunk):,} trunk params @ lr "
-        f"{config.muon_learning_rate}, {sum(p.numel() for p in rest):,} on Adam "
-        f"@ lr {config.learning_rate}"
-    )
-    return HybridMuon(
-        [
-            {"params": trunk, "lr": config.muon_learning_rate, "use_muon": True},
-            {"params": rest, "lr": config.learning_rate, "use_muon": False},
-        ]
-    )
+def _build_optimizer(model: nn.Module, config: "LearnerConfig") -> torch.optim.Optimizer:
+    return torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
 
 class PersistentLearner:
@@ -1358,7 +1179,6 @@ class PersistentLearner:
                     window.width,
                     policy_resolution,
                 )
-                and str(metadata.get("architecture")) == config.architecture
                 and int(metadata.get("model_width", -1)) == config.model_width
                 and int(metadata.get("blocks", -1)) == config.blocks
             )
@@ -1413,18 +1233,11 @@ class PersistentLearner:
                     "policy_resolution": policy_resolution,
                     "model_width": int(checkpoint["model_width"]),
                     "blocks": int(checkpoint["blocks"]),
-                    "architecture": str(checkpoint.get("architecture", "flat")),
+                    "architecture": "ddrnet",
                     "raster_kind": config.raster_kind or parent_kind,
-                    # Follows the parent, not the config: the K constants are
-                    # part of the function the loaded weights were trained for,
-                    # so a warm start cannot switch this on or off.
-                    "variance_scaled": bool(
-                        checkpoint.get("variance_scaled", False)
-                    ),
+                    # These follow the parent, not the config: they are part of
+                    # the function the loaded weights were trained for.
                     "norm_groups": checkpoint.get("norm_groups"),
-                    # Follows the parent for the same reason as the K
-                    # constants: the attention blocks are part of the function
-                    # the loaded weights were trained for.
                     "context_attention_blocks": int(
                         checkpoint.get("context_attention_blocks", 0)
                     ),
@@ -1432,12 +1245,10 @@ class PersistentLearner:
                 }
             else:
                 model = build_model(
-                    architecture=config.architecture,
                     channels=window.channels,
                     width=config.model_width,
                     blocks=config.blocks,
                     policy_resolution=decoupled,
-                    variance_scaled=config.variance_scaled,
                     norm_groups=config.norm_groups,
                     context_attention_blocks=config.context_attention_blocks,
                     attention_heads=config.attention_heads,
@@ -1451,9 +1262,8 @@ class PersistentLearner:
                     "policy_resolution": policy_resolution,
                     "model_width": config.model_width,
                     "blocks": config.blocks,
-                    "architecture": config.architecture,
+                    "architecture": "ddrnet",
                     "raster_kind": config.raster_kind,
-                    "variance_scaled": config.variance_scaled,
                     "norm_groups": config.norm_groups,
                     "context_attention_blocks": config.context_attention_blocks,
                     "attention_heads": config.attention_heads,
@@ -1478,7 +1288,7 @@ class PersistentLearner:
                 except (RuntimeError, AttributeError) as error:
                     self._log(f"[learner] torch.compile unavailable, continuing: {error}")
                     compiled = False
-            optimizer = _build_optimizer(model, config, self._log)
+            optimizer = _build_optimizer(model, config)
             if config.restore_optimizer and checkpoint.get("optimizer_state_dict") is not None:
                 try:
                     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -1503,20 +1313,13 @@ class PersistentLearner:
             optimizer_restored = config.restore_optimizer
             if not config.restore_optimizer:
                 assert self.model is not None
-                self.optimizer = _build_optimizer(self.model, config, self._log)
+                self.optimizer = _build_optimizer(self.model, config)
 
         assert self.optimizer is not None
         for group in self.optimizer.param_groups:
-            # A Muon group keeps its own rate. Stamping the Adam rate over every
-            # group would silently drop the trunk from 0.01 to 1e-3, and the
-            # scheduler multiplies from `initial_lr`, so both have to survive.
-            rate = (
-                config.muon_learning_rate
-                if group.get("use_muon")
-                else config.learning_rate
-            )
-            group["lr"] = rate
-            group["initial_lr"] = rate
+            # The scheduler multiplies from `initial_lr`, so both are reset.
+            group["lr"] = config.learning_rate
+            group["initial_lr"] = config.learning_rate
         return optimizer_restored, parent_checkpoint, parent_checkpoint_digest
 
     def _ensure_stager(
@@ -1653,26 +1456,7 @@ class PersistentLearner:
         best_epoch = 0
         best = initial_validation
         best_score = selection_score(best)
-        best_state = {
-            name: value.detach().cpu().clone()
-            for name, value in self.model.state_dict().items()
-        }
-        best_optimizer_state = _cpu_clone(self.optimizer.state_dict())
         optimization_started = time.perf_counter()
-
-        # One weight per training row, from shard age. The window arrives
-        # oldest-first, so the last shard is the newest.
-        training_weights = None
-        if config.recency_decay < 1.0:
-            # row_weights expects newest-first; the window is oldest-first, so
-            # build it reversed and flip the result back into window order.
-            sizes = [
-                int(selection.rows.numel())
-                for selection in reversed(split.training.selections)
-            ]
-            training_weights = torch.flip(
-                row_weights(sizes, config.recency_decay), dims=(0,)
-            )
 
         self.model.train()
         for epoch in range(1, config.epochs + 1):
@@ -1681,7 +1465,6 @@ class PersistentLearner:
                 shuffle=True,
                 generator=generator,
                 augment=config.augment,
-                weights=training_weights,
             )
             for (
                 states,
@@ -1773,11 +1556,6 @@ class PersistentLearner:
                     best_epoch = epoch
                     best = current
                     best_score = score
-                    best_state = {
-                        name: value.detach().cpu().clone()
-                        for name, value in self.model.state_dict().items()
-                    }
-                    best_optimizer_state = _cpu_clone(self.optimizer.state_dict())
                 self._log(
                     f"epoch={epoch:4d} policy_kl={current['policy_kl']:.5f} "
                     f"top1={current['policy_top1']:.3f} "
@@ -1941,11 +1719,6 @@ class PersistentLearner:
             torch.cuda.empty_cache()
         return report
 
-    def update_from_mapping(self, message: Mapping[str, object]) -> dict[str, object]:
-        return self.update(
-            LearnerUpdate.from_mapping(message, defaults=self.defaults)
-        )
-
     def status(self) -> dict[str, object]:
         metadata = None if self._model_metadata is None else dict(self._model_metadata)
         return {
@@ -1967,126 +1740,3 @@ class PersistentLearner:
         if self._stager is not None:
             self._stager.close()
         self._closed = True
-
-
-def _write_response(stream: TextIO, response: Mapping[str, object]) -> None:
-    stream.write(json.dumps(response, separators=(",", ":"), allow_nan=False) + "\n")
-    stream.flush()
-
-
-def serve_json_lines(
-    learner: PersistentLearner,
-    *,
-    input_stream: TextIO = sys.stdin,
-    output_stream: TextIO = sys.stdout,
-    error_stream: TextIO = sys.stderr,
-) -> None:
-    """Serve one JSON response line per command; all progress stays on stderr."""
-
-    _write_response(
-        output_stream,
-        {
-            "schema": PROTOCOL_SCHEMA,
-            "event": "ready",
-            "status": "ready",
-            "pid": os.getpid(),
-        },
-    )
-    try:
-        for line in input_stream:
-            if not line.strip():
-                continue
-            request_id: object = None
-            command: object = None
-            try:
-                message = json.loads(line)
-                if not isinstance(message, dict):
-                    raise ValueError("request must be a JSON object")
-                request_id = message.get("request_id")
-                command = message.get("command")
-                if command == "update":
-                    result: object = learner.update_from_mapping(message)
-                elif command == "status":
-                    result = learner.status()
-                elif command == "shutdown":
-                    learner.close()
-                    _write_response(
-                        output_stream,
-                        {
-                            "schema": PROTOCOL_SCHEMA,
-                            "status": "ok",
-                            "ok": True,
-                            "command": command,
-                            "request_id": request_id,
-                            "result": learner.status(),
-                        },
-                    )
-                    return
-                else:
-                    raise ValueError(f"unknown learner command: {command!r}")
-                response = {
-                    "schema": PROTOCOL_SCHEMA,
-                    "status": "ok",
-                    "ok": True,
-                    "command": command,
-                    "request_id": request_id,
-                    "result": result,
-                }
-                # Pipeline callers historically named this payload `report`.
-                # Keep the generic result field for protocol uniformity and the
-                # explicit alias so supervisors never mistake the envelope for
-                # the atomic training report.
-                if command == "update":
-                    response["report"] = result
-                _write_response(output_stream, response)
-            except Exception as error:
-                print(
-                    f"learner command failed: {type(error).__name__}: {error}",
-                    file=error_stream,
-                    flush=True,
-                )
-                _write_response(
-                    output_stream,
-                    {
-                        "schema": PROTOCOL_SCHEMA,
-                        "status": "error",
-                        "ok": False,
-                        "command": command,
-                        "request_id": request_id,
-                        "error_type": type(error).__name__,
-                        "error": str(error),
-                    },
-                )
-    finally:
-        learner.close()
-
-
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Persistent JSON-lines VGO learner service"
-    )
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "--serve",
-        action="store_true",
-        help="accepted for an explicit service invocation; serving is the default",
-    )
-    parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument(
-        "--compile", action=argparse.BooleanOptionalAction, default=True
-    )
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--muon-learning-rate", type=float, default=0.01)
-    parser.add_argument("--full-adam", action="store_true")
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    arguments = parse_arguments()
-    defaults = LearnerConfig(
-        device=arguments.device,
-        threads=arguments.threads,
-        compile=arguments.compile,
-        batch_size=arguments.batch_size,
-    )
-    serve_json_lines(PersistentLearner(defaults=defaults))

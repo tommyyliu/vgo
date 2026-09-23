@@ -593,12 +593,9 @@ class RasterKindIsATrainingChoice(unittest.TestCase):
 class RasterKindReachesTheLearner(unittest.TestCase):
     """The kind belongs to the update, not to the learner process.
 
-    `scripts/train-once.py` builds a `PersistentLearner` whose defaults already
-    carry the kind, so it worked. The pipeline runs one long-lived learner and
-    sends a fresh config per update, so a kind bound at construction is the
-    process defaults -- nothing -- and every update rendered by the header
-    instead. That reached production and killed a run after generation had
-    already succeeded.
+    A long-lived learner receives a fresh config per update, so a kind bound
+    at construction would be the process defaults -- nothing -- and every
+    update would render by the shard header instead.
     """
 
     def test_an_update_rebinds_the_cache(self) -> None:
@@ -619,19 +616,6 @@ class RasterKindReachesTheLearner(unittest.TestCase):
         cache.use_raster_kind("compact-pass")
         self.assertEqual(len(cache._entries), 1)
 
-    def test_the_pipeline_sends_the_raster_kind(self) -> None:
-        """The learner cannot use what the pipeline does not send."""
-        import inspect
-        from vgo_training import pipeline
-
-        source = inspect.getsource(pipeline)
-        self.assertIn(
-            '"raster_kind": self.config.raster_kind',
-            source,
-            "the training request must carry raster_kind, or the learner falls "
-            "back to the shard header and refuses six channels",
-        )
-
 
 class LegalityMaskKnowsItsLayout(unittest.TestCase):
     """The clearance slot is a property of the layout, not of its width.
@@ -644,7 +628,7 @@ class LegalityMaskKnowsItsLayout(unittest.TestCase):
 
     def test_only_semantic_layouts_claim_a_clearance_slot(self) -> None:
         from vgo_training.dataset import RASTER_CHANNELS
-        from vgo_training.train_demo import LEGAL_CLEARANCE_SLOT
+        from vgo_training.supervision import LEGAL_CLEARANCE_SLOT
 
         # 10 is the legacy width `rasterize_records` renders and also carries it.
         self.assertEqual(LEGAL_CLEARANCE_SLOT.get(10), 7)
@@ -666,7 +650,7 @@ class LegalityMaskKnowsItsLayout(unittest.TestCase):
         """Cross-language: the slot must name `legal_clearance` in the engine."""
         import re
         from pathlib import Path
-        from vgo_training.train_demo import LEGAL_CLEARANCE_SLOT
+        from vgo_training.supervision import LEGAL_CLEARANCE_SLOT
 
         source = (Path(__file__).resolve().parents[2]
                   / "crates/vgo-raster/src/lib.rs").read_text(encoding="utf-8")

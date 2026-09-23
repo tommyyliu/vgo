@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 from torch import nn
 
 from .attention import BoardTransformerBlock
 
-
-MODEL_ARCHITECTURES = ("flat", "unet", "ddrnet")
 
 
 def _group_count(width: int, preferred: int) -> int:
@@ -23,30 +23,26 @@ def _group_count(width: int, preferred: int) -> int:
     return 1
 
 
-def residual_stack(
-    width: int,
-    blocks: int,
-    variance_scaled: bool,
-    start: int = 1,
-    groups: int | None = None,
-) -> list["ResidualBlock"]:
-    """Blocks for one stack, scaled by depth when variance scaling is on.
+def residual_stack(width: int, blocks: int, groups: int | None) -> list["ResidualBlock"]:
+    return [ResidualBlock(width, groups=groups) for _ in range(blocks)]
 
-    ``start`` is the trunk variance already accumulated when the stack begins,
-    so a stack that continues an existing trunk keeps counting rather than
-    restarting at 1. It is unused under normalization, which needs no notion of
-    accumulated variance.
-    """
-    return [
-        ResidualBlock(
-            width,
-            residual_scale=(
-                (index**-0.5) if (variance_scaled and groups is None) else None
-            ),
-            groups=groups,
-        )
-        for index in range(start, start + blocks)
-    ]
+
+def value_head(channels: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(channels, channels),
+        nn.ReLU(),
+        # Two logits -- P(mover wins), P(mover loses) -- rather than a scalar
+        # through tanh. tanh + MSE has gradient 2*(v - target)*(1 - v^2), and
+        # that last factor is what killed learning: measured on 512 real
+        # positions, the median damping was 0.0004 -- a 2500x weaker gradient.
+        # Softmax cross-entropy has gradient (p - target) in logit space, so
+        # being wrong and certain is exactly the case that learns fastest.
+        #
+        # Two classes rather than KataGo's three: it carries a no-result class
+        # for ko and timeout, and our ties need black - white - komi inside
+        # f64::EPSILON on continuous areas. Zero ties in 1400 games.
+        nn.Linear(channels, 2),
+    )
 
 
 def apply_he_initialization(module: nn.Module) -> None:
@@ -55,11 +51,7 @@ def apply_he_initialization(module: nn.Module) -> None:
     ``nn.Conv2d`` defaults to Kaiming-uniform with ``a=sqrt(5)``, which is about
     2.4x below He scale for ReLU. Measured on a fresh DDRNet that leaves every
     block contractive -- the residual branch carries a fifth of the variance the
-    skip does -- so training has to inflate weights merely to propagate signal,
-    and then overshoots. Fixed-variance scaling assumes variance-preserving
-    convolutions, so the two changes only make sense together: He alone raises
-    the fresh peak to 4514, and scaling alone corrects growth that is not
-    happening yet.
+    skip does -- so training has to inflate weights merely to propagate signal.
     """
     for child in module.modules():
         if isinstance(child, nn.Conv2d):
@@ -84,46 +76,17 @@ def value_utility(logits: torch.Tensor) -> torch.Tensor:
 
 
 class ResidualBlock(nn.Module):
-    """Residual block, optionally variance-scaled or normalized.
+    """Residual block, optionally with a GroupNorm after each convolution.
 
-    ``residual_scale`` is KataGo's fixed-variance initialization: a constant
-    where a normalization layer would otherwise sit, chosen so the idealized
-    variance leaving the block is 1. Treating each conv-activation pair as
-    variance-preserving and the skip sum as adding variances, a trunk whose
-    blocks each contribute variance 1 reaches variance ``n`` at the nth block,
-    so that block scales its residual branch by ``1/sqrt(n)``.
-
-    ``groups`` instead puts a GroupNorm after each convolution, which is what
-    the reference DDRNet does and what the scaling was standing in for.
-
-    The two differ in what they can promise. A fixed constant is chosen once,
-    from the weights' scale at initialization, and cannot respond when training
-    moves them: measured on ddrnet-vs, weight scale grows sublinearly -- the
-    context branch's He ratio fits sqrt(updates) with r=0.99 and its slope
-    decays from 0.23 to 0.04 per update -- yet peak activation still compounds
-    at 1.07x per update after update 30, because peak follows the *product* of
-    per-layer gains and eight sublinear factors still multiply. Scaling every
-    conv weight by 1.5 takes the scaled model from 308 to 665088, past fp16's
-    65504; the same perturbation takes the normalized model from 9.7 to 15.3.
-    Normalization divides the drift out at every block, so growth is polynomial
-    rather than exponential.
-
-    Cost is small: +4.9% forward in eager PyTorch, backward unchanged, +0.01M
-    parameters, and it lowers to ONNX ``InstanceNormalization``.
+    Normalization divides weight drift out at every block. Without it, peak
+    activation compounds with the product of per-layer gains: scaling every
+    conv weight by 1.5 took an unnormalized model from 308 to 665088, past
+    fp16's 65504, and the normalized one from 9.7 to 15.3. Cost is +4.9%
+    forward in eager PyTorch, and it lowers to ONNX ``InstanceNormalization``.
     """
 
-    def __init__(
-        self,
-        width: int,
-        residual_scale: float | None = None,
-        groups: int | None = None,
-    ) -> None:
+    def __init__(self, width: int, groups: int | None = None) -> None:
         super().__init__()
-        if groups is not None and residual_scale is not None:
-            raise ValueError(
-                "a normalized block does not also take a residual scale"
-            )
-        self.residual_scale = residual_scale
         if groups is None:
             self.layers = nn.Sequential(
                 nn.Conv2d(width, width, kernel_size=3, padding=1),
@@ -141,71 +104,7 @@ class ResidualBlock(nn.Module):
             )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        residual = self.layers(inputs)
-        if self.residual_scale is not None:
-            residual = residual * self.residual_scale
-        return torch.relu(inputs + residual)
-
-
-class RasterPolicyValueNet(nn.Module):
-    def __init__(
-        self,
-        channels: int,
-        width: int = 32,
-        blocks: int = 3,
-        policy_resolution: int | None = None,
-    ) -> None:
-        super().__init__()
-        # See UNetPolicyValueNet: the placement grid may be coarser than the
-        # raster the tower reads. None keeps them equal.
-        self.policy_resolution = policy_resolution
-        self.stem = nn.Sequential(
-            nn.Conv2d(channels, width, kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
-        self.blocks = nn.Sequential(*(ResidualBlock(width) for _ in range(blocks)))
-        self.policy_map = nn.Conv2d(width, 1, kernel_size=1)
-        self.pass_head = nn.Linear(width, 1)
-        self.value_head = nn.Sequential(
-            nn.Linear(width, width),
-            nn.ReLU(),
-            # Two logits -- P(mover wins), P(mover loses) -- rather than a
-            # scalar through tanh. The outcome is categorical, so a
-            # distribution over categories is what the data actually is.
-            #
-            # tanh + MSE has gradient 2*(v - target)*(1 - v^2), and that last
-            # factor is what killed learning: measured on 512 real positions
-            # from update 11, the median damping was 0.0004 -- a 2500x weaker
-            # gradient -- with 65% of positions under 0.01. A confidently wrong
-            # evaluation produced almost no signal to correct it. Softmax
-            # cross-entropy has gradient (p - target) in logit space, with no
-            # such factor, so being wrong and certain is exactly the case that
-            # learns fastest.
-            #
-            # Two classes rather than KataGo's three: it carries a no-result
-            # class for ko and timeout, and our ties need black - white - komi
-            # inside f64::EPSILON on continuous areas. Zero ties in 1400 games.
-            nn.Linear(width, 2),
-        )
-
-    def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        features = self.blocks(self.stem(states))
-        pooled = features.mean(dim=(-2, -1))
-        if self.policy_resolution is not None:
-            features = nn.functional.adaptive_avg_pool2d(
-                features, (self.policy_resolution, self.policy_resolution)
-            )
-        placement_logits = self.policy_map(features).flatten(start_dim=1)
-        pass_logit = self.pass_head(pooled)
-        policy_logits = torch.cat((placement_logits, pass_logit), dim=1)
-        # Logits while training, the scalar utility at inference -- the same
-        # contract DDRNet follows. Collapsing unconditionally would hand the
-        # loss a scalar where it expects two classes, which fails as
-        # "value head emitted a scalar" rather than as a shape error.
-        values = self.value_head(pooled)
-        if self.training:
-            return policy_logits, values
-        return policy_logits, value_utility(values)
+        return torch.relu(inputs + self.layers(inputs))
 
 
 class _Down(nn.Module):
@@ -223,8 +122,6 @@ class _Down(nn.Module):
         channels_in: int,
         channels_out: int,
         blocks: int,
-        variance_scaled: bool = False,
-        start: int = 1,
         groups: int | None = None,
         attention_blocks: int = 0,
         attention_heads: int = 8,
@@ -243,7 +140,7 @@ class _Down(nn.Module):
         )
         kept = blocks - attention_blocks
         self.body = nn.Sequential(
-            *residual_stack(channels_out, kept, variance_scaled, start, groups)
+            *residual_stack(channels_out, kept, groups)
         )
         # Held apart from `body` because a transformer block takes an optional
         # mask that nn.Sequential cannot thread through.
@@ -260,110 +157,6 @@ class _Down(nn.Module):
         for block in self.attention:
             features = block(features)
         return features
-
-
-class _Up(nn.Module):
-    """Bilinear upsample, concatenate the skip connection, fuse, then residual blocks."""
-
-    def __init__(self, channels_in: int, channels_skip: int, channels_out: int, blocks: int) -> None:
-        super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
-        self.fuse = nn.Sequential(
-            nn.Conv2d(channels_in + channels_skip, channels_out, kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
-        self.body = nn.Sequential(*(ResidualBlock(channels_out) for _ in range(blocks)))
-
-    def forward(self, inputs: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        upsampled = torch.cat((self.up(inputs), skip), dim=1)
-        return self.body(self.fuse(upsampled))
-
-
-class UNetPolicyValueNet(nn.Module):
-    """Encoder/bottleneck/decoder policy-value net with the same contract as
-    RasterPolicyValueNet: input [B, C, H, W] -> policy_logits [B, H*W + 1], values [B].
-
-    Full-resolution stages stay thin (placement detail only); nearly all residual
-    blocks and channels live at the 4x-downsampled bottleneck, where convolution is
-    ~16x cheaper per block. The policy map reads the full-resolution decoder output
-    (placement precision preserved through skip connections); the pass and value
-    heads read the bottleneck for global context.
-    """
-
-    def __init__(
-        self,
-        channels: int,
-        width: int = 64,
-        blocks: int = 8,
-        policy_resolution: int | None = None,
-    ) -> None:
-        super().__init__()
-        # The policy head may emit a coarser placement grid than the raster it
-        # reads. The encoder/decoder still runs at full resolution, so the
-        # Voronoi boundary channels keep their detail; only the placement output
-        # is coarsened, which concentrates the coarse->fine proposal budget over
-        # far fewer cells. None keeps the policy grid equal to the input raster.
-        self.policy_resolution = policy_resolution
-        shallow = max(16, width // 2)
-        middle = width
-        bottleneck = width * 2
-        self.stem = nn.Sequential(
-            nn.Conv2d(channels, shallow, kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
-        self.enc0 = nn.Sequential(ResidualBlock(shallow))
-        self.down1 = _Down(shallow, middle, 1)
-        self.down2 = _Down(middle, bottleneck, blocks)
-        self.up1 = _Up(bottleneck, middle, middle, 1)
-        self.up2 = _Up(middle, shallow, shallow, 1)
-        self.policy_map = nn.Conv2d(shallow, 1, kernel_size=1)
-        self.pass_head = nn.Linear(bottleneck, 1)
-        self.value_head = nn.Sequential(
-            nn.Linear(bottleneck, bottleneck),
-            nn.ReLU(),
-            # Two logits -- P(mover wins), P(mover loses) -- rather than a
-            # scalar through tanh. The outcome is categorical, so a
-            # distribution over categories is what the data actually is.
-            #
-            # tanh + MSE has gradient 2*(v - target)*(1 - v^2), and that last
-            # factor is what killed learning: measured on 512 real positions
-            # from update 11, the median damping was 0.0004 -- a 2500x weaker
-            # gradient -- with 65% of positions under 0.01. A confidently wrong
-            # evaluation produced almost no signal to correct it. Softmax
-            # cross-entropy has gradient (p - target) in logit space, with no
-            # such factor, so being wrong and certain is exactly the case that
-            # learns fastest.
-            #
-            # Two classes rather than KataGo's three: it carries a no-result
-            # class for ko and timeout, and our ties need black - white - komi
-            # inside f64::EPSILON on continuous areas. Zero ties in 1400 games.
-            nn.Linear(bottleneck, 2),
-        )
-
-    def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        skip_full = self.enc0(self.stem(states))
-        skip_mid = self.down1(skip_full)
-        bottleneck = self.down2(skip_mid)
-        decoded = self.up2(self.up1(bottleneck, skip_mid), skip_full)
-        if self.policy_resolution is not None:
-            # Pool the features, not the logits: averaging feature channels
-            # before the 1x1 projection keeps more signal than averaging the
-            # scalar logits it would otherwise produce.
-            decoded = nn.functional.adaptive_avg_pool2d(
-                decoded, (self.policy_resolution, self.policy_resolution)
-            )
-        placement_logits = self.policy_map(decoded).flatten(start_dim=1)
-        pooled = bottleneck.mean(dim=(-2, -1))
-        pass_logit = self.pass_head(pooled)
-        policy_logits = torch.cat((placement_logits, pass_logit), dim=1)
-        # Logits while training, the scalar utility at inference -- the same
-        # contract DDRNet follows. Collapsing unconditionally would hand the
-        # loss a scalar where it expects two classes, which fails as
-        # "value head emitted a scalar" rather than as a shape error.
-        values = self.value_head(pooled)
-        if self.training:
-            return policy_logits, values
-        return policy_logits, value_utility(values)
 
 
 class _DDRContext(nn.Module):
@@ -432,8 +225,7 @@ class DDRNetPolicyValueNet(nn.Module):
     at stride 4 while semantic context runs at strides 8 and 16. Two bilateral
     fusions repeatedly exchange precise placement geometry and global context.
 
-    ``blocks`` remains checkpoint metadata shared by every architecture. Here it
-    controls the number of residual blocks in each DDRNet stage in groups of
+    ``blocks`` controls the number of residual blocks in each DDRNet stage in groups of
     four: 1-4 -> one block, 5-8 -> two blocks, and so on. Thus the common
     ``width=64, blocks=8`` setting corresponds to the two-block stages of
     DDRNet-23-slim without copying its scene-specific stride schedule.
@@ -449,7 +241,6 @@ class DDRNetPolicyValueNet(nn.Module):
         blocks: int = 8,
         policy_resolution: int | None = None,
         stem_stride: int = 4,
-        variance_scaled: bool = False,
         norm_groups: int | None = None,
         context_attention_blocks: int = 0,
         attention_heads: int = 8,
@@ -474,11 +265,7 @@ class DDRNetPolicyValueNet(nn.Module):
         trunk = None if raster_resolution is None else raster_resolution // stem_stride
         context1_board = None if trunk is None else (trunk // 2, trunk // 2)
         context2_board = None if trunk is None else (trunk // 4, trunk // 4)
-        # Normalization supersedes the fixed scaling: both stand where a norm
-        # would go, and a block takes one or the other.
-        self.variance_scaled = variance_scaled and norm_groups is None
         self.norm_groups = norm_groups
-        variance_scaled = self.variance_scaled
         stem_channels = max(8, width // 2)
         detail_channels = width
         context_channels = width * 2
@@ -510,26 +297,17 @@ class DDRNetPolicyValueNet(nn.Module):
             ),
             nn.ReLU(),
         )
-        # The detail branch is one continuous trunk across its three stacks, so
-        # the variance count carries over rather than restarting per stack.
         self.detail_entry = nn.Sequential(
-            *residual_stack(detail_channels, stage_blocks, variance_scaled, 1, norm_groups)
+            *residual_stack(detail_channels, stage_blocks, norm_groups)
         )
 
         self.detail_stage1 = nn.Sequential(
-            *residual_stack(
-                detail_channels,
-                stage_blocks,
-                variance_scaled,
-                1 + stage_blocks,
-                norm_groups,
-            )
+            *residual_stack(detail_channels, stage_blocks, norm_groups)
         )
         self.context_stage1 = _Down(
             detail_channels,
             context_channels,
             stage_blocks,
-            variance_scaled,
             groups=norm_groups,
             attention_blocks=context_attention_blocks,
             attention_heads=attention_heads,
@@ -547,20 +325,12 @@ class DDRNetPolicyValueNet(nn.Module):
         )
 
         self.detail_stage2 = nn.Sequential(
-            *residual_stack(
-                detail_channels,
-                stage_blocks,
-                variance_scaled,
-                1 + 2 * stage_blocks,
-                norm_groups,
-            )
+            *residual_stack(detail_channels, stage_blocks, norm_groups)
         )
         self.context_stage2 = _Down(
             context_channels,
             deep_channels,
             stage_blocks,
-            variance_scaled,
-            start=1 + stage_blocks,
             groups=norm_groups,
             attention_blocks=context_attention_blocks,
             attention_heads=attention_heads,
@@ -615,7 +385,7 @@ class DDRNetPolicyValueNet(nn.Module):
         self.detail_tail = nn.Sequential(
             nn.Conv2d(detail_channels, context_channels, kernel_size=1),
             nn.ReLU(),
-            *residual_stack(context_channels, 1, variance_scaled, 1, norm_groups),
+            *residual_stack(context_channels, 1, norm_groups),
         )
         self.policy_features = nn.Sequential(
             nn.Conv2d(
@@ -636,27 +406,7 @@ class DDRNetPolicyValueNet(nn.Module):
         )
         self.ownership_map = nn.Conv2d(detail_channels, 1, kernel_size=1)
         self.pass_head = nn.Linear(context_channels, 1)
-        self.value_head = nn.Sequential(
-            nn.Linear(context_channels, context_channels),
-            nn.ReLU(),
-            # Two logits -- P(mover wins), P(mover loses) -- rather than a
-            # scalar through tanh. The outcome is categorical, so a
-            # distribution over categories is what the data actually is.
-            #
-            # tanh + MSE has gradient 2*(v - target)*(1 - v^2), and that last
-            # factor is what killed learning: measured on 512 real positions
-            # from update 11, the median damping was 0.0004 -- a 2500x weaker
-            # gradient -- with 65% of positions under 0.01. A confidently wrong
-            # evaluation produced almost no signal to correct it. Softmax
-            # cross-entropy has gradient (p - target) in logit space, with no
-            # such factor, so being wrong and certain is exactly the case that
-            # learns fastest.
-            #
-            # Two classes rather than KataGo's three: it carries a no-result
-            # class for ko and timeout, and our ties need black - white - komi
-            # inside f64::EPSILON on continuous areas. Zero ties in 1400 games.
-            nn.Linear(context_channels, 2),
-        )
+        self.value_head = value_head(context_channels)
 
         # The normalized twins. These see batch-normalized features and take the
         # bulk of the loss, so they drive optimization; the heads above learn the
@@ -674,31 +424,10 @@ class DDRNetPolicyValueNet(nn.Module):
         )
         self.ownership_map_normed = nn.Conv2d(detail_channels, 1, kernel_size=1)
         self.pass_head_normed = nn.Linear(context_channels, 1)
-        self.value_head_normed = nn.Sequential(
-            nn.Linear(context_channels, context_channels),
-            nn.ReLU(),
-            # Two logits -- P(mover wins), P(mover loses) -- rather than a
-            # scalar through tanh. The outcome is categorical, so a
-            # distribution over categories is what the data actually is.
-            #
-            # tanh + MSE has gradient 2*(v - target)*(1 - v^2), and that last
-            # factor is what killed learning: measured on 512 real positions
-            # from update 11, the median damping was 0.0004 -- a 2500x weaker
-            # gradient -- with 65% of positions under 0.01. A confidently wrong
-            # evaluation produced almost no signal to correct it. Softmax
-            # cross-entropy has gradient (p - target) in logit space, with no
-            # such factor, so being wrong and certain is exactly the case that
-            # learns fastest.
-            #
-            # Two classes rather than KataGo's three: it carries a no-result
-            # class for ko and timeout, and our ties need black - white - komi
-            # inside f64::EPSILON on continuous areas. Zero ties in 1400 games.
-            nn.Linear(context_channels, 2),
-        )
+        self.value_head_normed = value_head(context_channels)
 
-        # He scale is what both schemes assume: the fixed constants are derived
-        # from it, and a normalized block wants unit-variance convolutions too.
-        if variance_scaled or norm_groups is not None:
+        # A normalized block wants unit-variance convolutions.
+        if norm_groups is not None:
             apply_he_initialization(self)
 
     @staticmethod
@@ -844,49 +573,73 @@ class DDRNetPolicyValueNet(nn.Module):
 
 
 def build_model(
-    architecture: str,
     channels: int,
     width: int,
     blocks: int,
     policy_resolution: int | None = None,
     stem_stride: int = 4,
-    variance_scaled: bool = False,
     norm_groups: int | None = None,
     context_attention_blocks: int = 0,
     attention_heads: int = 8,
     raster_resolution: int | None = None,
-) -> nn.Module:
-    """Construct a policy-value net by architecture name. Older checkpoints without
-    an architecture field are the flat residual tower.
+) -> DDRNetPolicyValueNet:
+    """`policy_resolution` coarsens the placement grid the policy head emits
+    while leaving the input raster untouched; None keeps them equal.
 
-    `policy_resolution` coarsens the placement grid the policy head emits while
-    leaving the input raster untouched; None keeps them equal.
+    `norm_groups` changes the function the network computes, so it must be
+    recorded in the checkpoint and passed back when rebuilding for export."""
+    return DDRNetPolicyValueNet(
+        channels=channels,
+        width=width,
+        blocks=blocks,
+        policy_resolution=policy_resolution,
+        stem_stride=stem_stride,
+        norm_groups=norm_groups,
+        context_attention_blocks=context_attention_blocks,
+        attention_heads=attention_heads,
+        raster_resolution=raster_resolution,
+    )
 
-    `variance_scaled` applies fixed-variance initialization and He-scale convs
-    (ddrnet only). `norm_groups` instead puts GroupNorm in every residual block
-    and supersedes it. Both change the function the network computes, so both
-    must be recorded in the checkpoint and passed back when rebuilding for
-    export -- rebuilding without them silently drops the constants or the
-    normalization layers."""
-    if architecture in ("", "flat", "raster"):
-        return RasterPolicyValueNet(
-            channels=channels, width=width, blocks=blocks, policy_resolution=policy_resolution
+
+def load_model(checkpoint_path: Path) -> tuple[DDRNetPolicyValueNet, dict[str, object]]:
+    """Rebuild a checkpoint's network in eval mode, returning it and the raw checkpoint."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    architecture = checkpoint.get("architecture")
+    if architecture != "ddrnet" or checkpoint.get("variance_scaled"):
+        raise ValueError(
+            f"{checkpoint_path}: only normalized ddrnet checkpoints load here "
+            f"(architecture={architecture!r}); older models need the "
+            "archive/pre-prune branch"
         )
-    if architecture == "unet":
-        return UNetPolicyValueNet(
-            channels=channels, width=width, blocks=blocks, policy_resolution=policy_resolution
+    height = int(checkpoint["height"])
+    stored_policy = checkpoint.get("policy_resolution")
+    model = build_model(
+        channels=int(checkpoint["channels"]),
+        width=int(checkpoint["model_width"]),
+        blocks=int(checkpoint["blocks"]),
+        policy_resolution=(
+            int(stored_policy)
+            if stored_policy is not None and int(stored_policy) != height
+            else None
+        ),
+        norm_groups=checkpoint.get("norm_groups"),
+        context_attention_blocks=int(checkpoint.get("context_attention_blocks", 0)),
+        attention_heads=int(checkpoint.get("attention_heads", 8)),
+        raster_resolution=height,
+    )
+    # The batch-normalized twin heads and the ownership head exist only while
+    # training, so an exported model lacks them. Everything inference reads
+    # still has to be present.
+    missing, _ = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    required = [
+        name
+        for name in missing
+        if not ("_normed" in name or "_norm." in name or name.startswith("ownership_"))
+    ]
+    if required:
+        raise RuntimeError(
+            f"checkpoint is missing {len(required)} inference weight(s), "
+            f"starting with {required[0]}"
         )
-    if architecture == "ddrnet":
-        return DDRNetPolicyValueNet(
-            channels=channels,
-            width=width,
-            blocks=blocks,
-            policy_resolution=policy_resolution,
-            stem_stride=stem_stride,
-            variance_scaled=variance_scaled,
-            norm_groups=norm_groups,
-            context_attention_blocks=context_attention_blocks,
-            attention_heads=attention_heads,
-            raster_resolution=raster_resolution,
-        )
-    raise ValueError(f"unknown model architecture: {architecture!r}")
+    model.eval()
+    return model, checkpoint

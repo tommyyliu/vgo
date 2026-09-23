@@ -1,8 +1,10 @@
+"""Policy and value supervision shared by the learner: targets, losses, metrics,
+batching and the LR schedule."""
 from __future__ import annotations
 
 import argparse
+
 from dataclasses import dataclass
-import json
 import os
 from pathlib import Path
 
@@ -11,7 +13,6 @@ import torch
 from torch import nn
 
 from .dataset import PreparedRasterDataset, RasterDataset
-from .model import MODEL_ARCHITECTURES, build_model
 
 
 LEGAL_CLEARANCE_CHANNEL = 7
@@ -548,124 +549,3 @@ def build_scheduler(
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, scale)
 
-
-def train(arguments: argparse.Namespace) -> dict[str, object]:
-    # Keep the historical CLI as a one-update adapter. The implementation lives
-    # in PersistentLearner so the RL loop can keep model weights, Adam moments,
-    # compiled code, prepared shards, and staging buffers alive between updates.
-    from .learner import LearnerConfig, LearnerUpdate, PersistentLearner
-
-    config = LearnerConfig(
-        epochs=arguments.epochs,
-        batch_size=arguments.batch_size,
-        learning_rate=arguments.learning_rate,
-        value_weight=arguments.value_weight,
-        model_width=arguments.model_width,
-        blocks=arguments.blocks,
-        architecture=arguments.architecture,
-        threads=arguments.threads,
-        device=arguments.device,
-        precision=arguments.precision,
-        seed=arguments.seed,
-        compile=arguments.compile,
-        restore_optimizer=arguments.restore_optimizer,
-        schedule=arguments.schedule,
-        warmup_epochs=arguments.warmup_epochs,
-        decay_fraction=arguments.decay_fraction,
-        final_learning_rate_fraction=arguments.final_learning_rate_fraction,
-        report_every=arguments.report_every,
-        validation_fraction=arguments.validation_fraction,
-        augment=arguments.augment,
-    )
-    learner = PersistentLearner(defaults=config)
-    try:
-        report = learner.update(
-            LearnerUpdate(
-                datasets=tuple(arguments.datasets),
-                output=Path(arguments.output),
-                initial_checkpoint=arguments.initial_checkpoint,
-                config=config,
-            )
-        )
-    finally:
-        learner.close()
-    print(json.dumps(report, indent=2))
-    return report
-
-
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("datasets", type=Path, nargs="+")
-    parser.add_argument("--output", type=Path, default=Path("../artifacts/raster-demo/model.pt"))
-    parser.add_argument("--initial-checkpoint", type=Path)
-    parser.add_argument("--epochs", type=int, default=120)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--learning-rate", type=float, default=3e-3)
-    parser.add_argument("--value-weight", type=float, default=1.0)
-    parser.add_argument("--model-width", type=int, default=32)
-    parser.add_argument("--blocks", type=int, default=3)
-    parser.add_argument(
-        "--architecture", choices=MODEL_ARCHITECTURES, default="flat"
-    )
-    parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "--precision",
-        choices=("float32", "bfloat16"),
-        default="float32",
-    )
-    parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument(
-        "--compile",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="compile the training model and enable TF32 matmuls (CUDA only)",
-    )
-    parser.add_argument(
-        "--restore-optimizer",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="restore Adam moments from --initial-checkpoint instead of starting "
-        "them at zero. Matters most for short runs: beta2=0.999 needs ~2000 "
-        "steps of history, and a 10-epoch iteration is only ~4300",
-    )
-    parser.add_argument(
-        "--schedule",
-        choices=("wsd", "cosine"),
-        default="wsd",
-        help="learning-rate schedule; wsd holds a constant rate and anneals "
-        "only at the end, so a longer run needs no reshaping",
-    )
-    parser.add_argument(
-        "--warmup-epochs",
-        type=float,
-        default=5,
-        help="wsd only: epochs ramping linearly to the full rate; fractional "
-        "values are meaningful, and necessary at low epoch counts where a "
-        "whole epoch of warmup would consume the entire run",
-    )
-    parser.add_argument(
-        "--decay-fraction",
-        type=float,
-        default=0.2,
-        help="wsd only: trailing fraction of the run spent annealing",
-    )
-    parser.add_argument(
-        "--final-learning-rate-fraction",
-        type=float,
-        default=0.01,
-        help="floor as a fraction of --learning-rate, for both schedules",
-    )
-    parser.add_argument("--report-every", type=int, default=20)
-    parser.add_argument("--validation-fraction", type=float, default=0.1)
-    parser.add_argument(
-        "--augment",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="apply the eight dihedral symmetries of the square board to training batches",
-    )
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    train(parse_arguments())

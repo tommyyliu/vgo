@@ -10,7 +10,7 @@
 # must not pool into either scale. Same reasoning as artifacts-official/.
 /artifacts-control/
 /.idea/
-.venv/
+.venv
 /.agents/
 /.uv-cache/
 Screenshot*.png

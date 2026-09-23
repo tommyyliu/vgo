@@ -5,8 +5,8 @@ import weakref
 import torch
 
 from vgo_training.dataset import PreparedRasterDataset, RasterDataset
-from vgo_training.model import RasterPolicyValueNet
-from vgo_training.train_demo import metrics, prepare_policy_supervision, subset
+from vgo_training.model import build_model
+from vgo_training.supervision import metrics, prepare_policy_supervision, subset
 
 
 def raw_fixture(
@@ -61,7 +61,7 @@ class MetricsBatchingTests(unittest.TestCase):
 
     def setUp(self) -> None:
         torch.manual_seed(7)
-        self.model = RasterPolicyValueNet(channels=10, width=8, blocks=1)
+        self.model = build_model(channels=10, width=8, blocks=1)
         self.device = torch.device("cpu")
         self.value_weight = 0.25
 

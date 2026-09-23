@@ -1,4 +1,4 @@
-# The environment the pipeline builds for Rust binaries, for ad-hoc runs.
+# The environment every Rust binary that loads a model needs.
 #
 # Without ORT_DYLIB_PATH an ONNX binary hangs silently -- it looks exactly like
 # a slow TensorRT engine build -- and without the rest the TensorRT provider
@@ -10,8 +10,9 @@
 #
 #   source scripts/env/ort.sh
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-for sp in "$root"/training/.venv/lib64/python3.14/site-packages \
-          "$root"/training/.venv/lib/python3.14/site-packages; do
+# Globbed rather than naming the interpreter: the venv is not always python3.14,
+# and the wheel ships only a versioned libonnxruntime.so.N with no symlink.
+for sp in "$root"/training/.venv/lib{64,}/python3.*/site-packages; do
   [ -d "$sp" ] || continue
   export LD_LIBRARY_PATH="$sp/onnxruntime/capi:$sp/tensorrt_libs:$sp/nvidia/cu13/lib:$sp/nvidia/cudnn/lib:$sp/torch/lib:${LD_LIBRARY_PATH:-}"
   [ -n "${ORT_DYLIB_PATH:-}" ] || ORT_DYLIB_PATH=$(ls "$sp"/onnxruntime/capi/libonnxruntime.so.* 2>/dev/null | tail -1)

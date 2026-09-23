@@ -12,8 +12,8 @@ import torch
 
 from .packed_input import PackedInputModel
 from .packed_states import _LAYOUTS
-from .serve import load_model
-from .train_demo import atomic_write_text
+from .model import load_model
+from .supervision import atomic_write_text
 
 
 for stream in (sys.stdout, sys.stderr):
@@ -141,7 +141,7 @@ def export(arguments: argparse.Namespace) -> dict[str, object]:
             {"name": "values", "dtype": "float32", "shape": ["batch"]},
         ],
         "model": {
-            "architecture": str(checkpoint.get("architecture", "flat")),
+            "architecture": "ddrnet",
             # Which planes this network expects, carried so a serving path can
             # rasterize the way it was trained. `channels` above says how many;
             # it does not say what they mean, and two layouts share a width --

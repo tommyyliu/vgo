@@ -1,21 +1,11 @@
 #!/usr/bin/env python3
-"""One-off training run on existing shards, outside the RL loop.
-
-`train_demo.py`'s CLI is a thin adapter over `LearnerConfig` / `PersistentLearner`
-that only forwards a subset of fields -- notably not `norm_groups`,
-`ownership_weight`, or `raster_kind` (`resolution` is still taken from the
-dataset itself rather than configured). This calls the same
-`PersistentLearner.update` used by the RL loop and `train_demo.py`, with full
-field coverage, so a checkpoint's architecture and loss weights can be matched
-exactly instead of falling back to `LearnerConfig` defaults.
+"""Train one model on a window of games: the training step of the RL loop.
 
 Usage:
 
-    scripts/train-once.py \\
-        artifacts/ddrnet-tonight/replay/shard-*/dataset.vgo \\
-        --output artifacts/ddrnet-tonight/manual-updates/update-000/candidate.pt \\
-        --initial-checkpoint artifacts/ddrnet-tonight/updates/update-000038/candidate.pt \\
-        --epochs 10 --warmup-epochs 0
+    scripts/train-once.py --games-root artifacts/vgo-continuous/games \\
+        --window-samples 1200000 --output artifacts/scratch/model.pt \\
+        --raster-kind compact-radius --epochs 4
 """
 
 from __future__ import annotations
@@ -109,30 +99,16 @@ def main() -> None:
     parser.add_argument(
         "--initial-checkpoint", type=Path, default=None,
         help="warm start from this checkpoint; omit to train from scratch, in "
-        "which case --model-width/--blocks/--architecture/--norm-groups take "
+        "which case --model-width/--blocks/--norm-groups take "
         "effect (with a checkpoint, its own shape is used instead)",
     )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=256)
-    # Without these the optimizer silently follows LearnerConfig's defaults,
-    # which is Muon -- so a script meant to hold the optimizer fixed across an
-    # A/B would quietly pick one of the two arms being compared.
-    parser.add_argument("--muon-learning-rate", type=float, default=0.01)
-    parser.add_argument("--full-adam", action="store_true",
-                        help="put every parameter on Adam instead of Muon-on-trunk")
-    parser.add_argument(
-        "--optimizer", choices=("adam", "muon", "ranger21"), default=None,
-        help="overrides --full-adam when given. ranger21 needs the optional "
-        "'optimizers' dependency group and runs with its own warmup/warmdown "
-        "off, so --schedule drives every arm and the comparison is about the "
-        "optimizer rather than about two different learning-rate curves",
-    )
     parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--value-weight", type=float, default=2.0)
     parser.add_argument("--ownership-weight", type=float, default=0.0)
     parser.add_argument("--model-width", type=int, default=96)
     parser.add_argument("--blocks", type=int, default=16)
-    parser.add_argument("--architecture", default="ddrnet")
     parser.add_argument(
         "--raster-kind",
         default=None,
@@ -201,7 +177,6 @@ def main() -> None:
         ownership_weight=arguments.ownership_weight,
         model_width=arguments.model_width,
         blocks=arguments.blocks,
-        architecture=arguments.architecture,
         raster_kind=arguments.raster_kind,
         context_attention_blocks=arguments.context_attention_blocks,
         attention_heads=arguments.attention_heads,
@@ -219,9 +194,6 @@ def main() -> None:
         report_every=arguments.report_every,
         validation_fraction=arguments.validation_fraction,
         augment=arguments.augment,
-        muon_learning_rate=arguments.muon_learning_rate,
-        full_adam=arguments.full_adam,
-        optimizer=arguments.optimizer,
     )
 
     arguments.output.parent.mkdir(parents=True, exist_ok=True)

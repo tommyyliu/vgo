@@ -18,15 +18,17 @@ from vgo_training.learner import (
     LearnerUpdate,
     PersistentLearner,
     ReplayCache,
-    serve_json_lines,
 )
 
 
 def raw_fixture(
     samples: int = 12,
     *,
-    height: int = 4,
-    width: int = 4,
+    # 32, not smaller: DDRNet's context branch is 1/16 of the raster, and its
+    # training-only BatchNorm needs more than one value per channel when the
+    # last batch of an epoch holds a single sample.
+    height: int = 32,
+    width: int = 32,
 ) -> RasterDataset:
     generator = torch.Generator().manual_seed(123)
     channels = 10
@@ -297,15 +299,6 @@ class PersistentLearnerTests(unittest.TestCase):
     def test_failed_update_discards_partial_runtime_before_implicit_retry(
         self,
     ) -> None:
-        # Both optimizers, because the failure is injected by patching the
-        # optimizer's `step` and only one of them is ever constructed. This
-        # test silently stopped firing when Muon became the default: it
-        # patched Adam, the learner built HybridMuon, and nothing raised.
-        for full_adam in (True, False):
-            with self.subTest(full_adam=full_adam):
-                self._failed_update_discards_partial_runtime(full_adam)
-
-    def _failed_update_discards_partial_runtime(self, full_adam: bool) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             cache, path, _ = cache_fixture(root)
@@ -321,14 +314,11 @@ class PersistentLearnerTests(unittest.TestCase):
                 report_every=1,
                 validation_fraction=0.0,
                 augment=False,
-                full_adam=full_adam,
             )
             learner = PersistentLearner(
                 defaults=config, replay_cache=cache, log=lambda _: None
             )
-            from vgo_training.muon import HybridMuon
-
-            optimizer_class = torch.optim.Adam if full_adam else HybridMuon
+            optimizer_class = torch.optim.Adam
             original_step = optimizer_class.step
 
             def fail_after_step(optimizer, closure=None):
@@ -435,52 +425,6 @@ class PersistentLearnerTests(unittest.TestCase):
                     )
             finally:
                 learner.close()
-
-
-class ProtocolTests(unittest.TestCase):
-    def test_protocol_is_one_json_line_per_command(self) -> None:
-        class FakeLearner:
-            def __init__(self) -> None:
-                self.closed = False
-
-            def update_from_mapping(self, message):
-                return {"checkpoint": message["output"]}
-
-            def status(self):
-                return {"closed": self.closed}
-
-            def close(self):
-                self.closed = True
-
-        requests = StringIO(
-            "\n".join(
-                (
-                    '{"command":"status","request_id":1}',
-                    '{"command":"unknown","request_id":2}',
-                    '{"command":"shutdown","request_id":3}',
-                )
-            )
-            + "\n"
-        )
-        responses = StringIO()
-        errors = StringIO()
-        serve_json_lines(
-            FakeLearner(),
-            input_stream=requests,
-            output_stream=responses,
-            error_stream=errors,
-        )
-        messages = [
-            json.loads(line) for line in responses.getvalue().splitlines()
-        ]
-
-        self.assertEqual(len(messages), 4)
-        self.assertEqual(messages[0]["event"], "ready")
-        self.assertTrue(messages[1]["ok"])
-        self.assertFalse(messages[2]["ok"])
-        self.assertIn("unknown learner command", errors.getvalue())
-        self.assertTrue(messages[3]["ok"])
-        self.assertEqual(messages[3]["result"], {"closed": True})
 
 
 class OwnershipWeightTests(unittest.TestCase):

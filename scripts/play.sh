@@ -5,12 +5,11 @@
 # libonnxruntime.so from ORT_DYLIB_PATH at runtime and need the venv's CUDA and
 # TensorRT libraries on LD_LIBRARY_PATH. Without those they block in library
 # loading with no output and no error -- the process simply appears to hang
-# before it ever reaches the listen call. rl_loop sets this environment for the
-# stages it spawns, which is why arenas work inside the loop and not outside it.
+# before it ever reaches the listen call. scripts/env/ort.sh sets it up.
 #
-#   ./artifacts/play.sh                          # newest ddrnet-fast3 model
-#   ./artifacts/play.sh path/to/candidate.onnx   # a specific model
-#   SIMULATIONS=256 ./artifacts/play.sh          # stronger, slower
+#   ./scripts/play.sh                          # newest model of any run
+#   ./scripts/play.sh path/to/candidate.onnx   # a specific model
+#   SIMULATIONS=256 ./scripts/play.sh          # stronger, slower
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,30 +45,11 @@ if [[ -z "$model" ]]; then
   fi
 fi
 if [[ -z "$model" || ! -f "$model" ]]; then
-  echo "no model found; pass one explicitly: ./artifacts/play.sh <candidate.onnx>" >&2
+  echo "no model found; pass one explicitly: ./scripts/play.sh <candidate.onnx>" >&2
   exit 1
 fi
 
-# Ask the pipeline for the environment rather than rebuilding it here. This
-# script used to hardcode both the site-packages path (with the Python version
-# baked in) and an unversioned libonnxruntime.so, and broke on a venv that had
-# neither: the prebuilt wheel ships libonnxruntime.so.1.28.0 with no
-# unversioned symlink, and the interpreter is not always python3.14.
-# runtime_environment already handles the versioned name, lib64, and the whole
-# LD_LIBRARY_PATH -- and it is what rl_loop gives its own stages, so serving a
-# model now uses the same environment that generation and arenas do.
-eval "$(
-  "$root/training/.venv/bin/python3" -c "
-import shlex, sys
-sys.path.insert(0, '$root/training')
-from vgo_training.pipeline import runtime_environment
-environment = runtime_environment()
-for key in ('ORT_DYLIB_PATH', 'LD_LIBRARY_PATH'):
-    value = environment.get(key)
-    if value:
-        print(f'export {key}={shlex.quote(value)}')
-" 2>/dev/null
-)"
+source "$root/scripts/env/ort.sh"
 if [[ -z "${ORT_DYLIB_PATH:-}" || ! -f "${ORT_DYLIB_PATH}" ]]; then
   # Refuse rather than proceed: a failed dlopen deadlocks in ort::api() instead
   # of returning an error, so the server would hang silently before listening.
