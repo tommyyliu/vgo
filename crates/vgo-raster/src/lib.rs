@@ -16,39 +16,18 @@ pub use edt::{
 /// fixed cost. Measured crossover sits between 14 and 28 stones.
 const DISTANCE_SETTLED_MINIMUM_STONES: usize = 20;
 
-/// Grid cells per stone radius below which the distance-transform mask is not
-/// trustworthy.
+/// Whether `settled` takes the distance-transform path, and at what oversample,
+/// or `None` for the per-stone solve.
 ///
-/// Its bound assumes the sampled legal set resolves the real one, and the legal
-/// set between densely packed stones is a sliver a couple of cells wide. Coarsen
-/// the grid and those slivers fall between samples entirely: measured on the
-/// same fixture at r = 1/18, a 128² raster (7.11 cells per radius) disagreed
-/// with the definition on 0 pixels, while a 48² raster (2.67) disagreed on
-/// **9.16%**. Six is chosen between those two points with margin toward the
-/// safe side; it is calibrated, not derived.
-const DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS: f64 = 6.0;
-
-/// Largest oversample the distance-transform mask will use to reach
-/// [`DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS`]. Odd, because the fine grid's
-/// centre sample must coincide with the output pixel's centre.
-const DISTANCE_SETTLED_MAXIMUM_OVERSAMPLE: usize = 5;
-
-/// How finely the distance-transform `settled` mask must sample the legal set
-/// for this raster, or `None` when the per-stone solve should run instead.
-///
-/// A coarse raster on a big board -- 128 at r = 1/38 is 3.4 cells per radius --
-/// used to fall back to the O(stones^2) solve, which at ~300 stones cost 2.3x a
-/// 256 raster of the same position. Oversampling the legality grid alone keeps
-/// the O(pixels) path: 3x at 128 samples as finely as 384 would, while every
-/// other plane stays at 128.
-pub(crate) fn settled_oversample(position: &Position, config: RasterConfig) -> Option<usize> {
-    if position.stones().len() < DISTANCE_SETTLED_MINIMUM_STONES {
-        return None;
-    }
-    let cells_per_radius = config.width.min(config.height) as f64 * position.radius();
-    (1..=DISTANCE_SETTLED_MAXIMUM_OVERSAMPLE)
-        .step_by(2)
-        .find(|&scale| scale as f64 * cells_per_radius >= DISTANCE_SETTLED_MINIMUM_CELLS_PER_RADIUS)
+/// The transform samples the legal set at the output resolution. It used to need
+/// six cells per stone radius -- below that, legal slivers fell between samples
+/// and the region beside them read as settled -- and coarse rasters oversampled
+/// the legality grid to get there. Marking the legal-set vertices on the grid
+/// (see `sampled_legal_set_into`) catches every sliver at any resolution: on 103
+/// real 1/38 positions at 128, 1x and 3x both disagreed with the definition on 4
+/// of 1.56M pixels, and 1x rasterizes 17% faster.
+pub(crate) fn settled_oversample(position: &Position, _config: RasterConfig) -> Option<usize> {
+    (position.stones().len() >= DISTANCE_SETTLED_MINIMUM_STONES).then_some(1)
 }
 
 pub const CHANNEL_COUNT: usize = 12;

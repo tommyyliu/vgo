@@ -887,19 +887,18 @@ mod tests {
     }
 
     /// A coarse raster on a big board -- 128 at r = 1/38, 3.4 cells per radius --
-    /// reaches the distance-transform path only by oversampling the legality
-    /// grid. It must still agree with the definition, including on the lattice
-    /// whose legal gaps are about one cell wide.
+    /// samples the legal set at the output resolution. It must still agree with
+    /// the definition, including on the lattice whose legal gaps are about one
+    /// cell wide.
     #[test]
-    fn oversampled_coarse_raster_agrees_with_the_definition() {
+    fn coarse_raster_agrees_with_the_definition() {
         let radius = 1.0 / 38.0;
         let config = RasterConfig::square_of(128, RasterKind::CompactRadius);
         for count in [28usize, 120, 240] {
             let position = fixture(count, radius);
             assert!(position.validate().is_playable());
             let scale = crate::settled_oversample(&position, config)
-                .expect("a coarse raster must oversample rather than fall back");
-            assert_eq!(scale, 3);
+                .expect("a coarse raster must take the distance path");
             let vertices = legal_set_vertices(&position);
             let (mask, _) = settled_mask_by_bounded_distance(&position, config, scale);
             let mut wrong = 0usize;
