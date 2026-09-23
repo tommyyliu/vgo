@@ -434,6 +434,78 @@ fn sampled_legal_set_into(
     }
 }
 
+/// The legal set's vertices, bucketed so an undecided pixel can look for one
+/// nearer than its own stone before paying for the exact test.
+///
+/// A vertex is an exact legal point. If one is strictly closer to a pixel than
+/// the pixel's nearest stone, a new stone could be placed nearer than the owner
+/// and the pixel is not settled -- no further geometry needed. The undecided
+/// band is mostly pixels beside a thin legal gap, which are exactly the pixels
+/// the vertex marks rescued from being wrongly called settled, and a gap's own
+/// vertices are right there. Marks are few -- a handful per legal speck -- so
+/// the buckets are coarse and mostly empty.
+struct VertexGrid {
+    cell: f64,
+    side: usize,
+    starts: Vec<u32>,
+    points: Vec<Point>,
+}
+
+impl VertexGrid {
+    fn build(marks: &[Point], cell: f64) -> Self {
+        let side = ((1.0 / cell).ceil() as usize).max(1);
+        let bucket = |p: &Point| {
+            let column = ((p.x / cell) as usize).min(side - 1);
+            let row = ((p.y / cell) as usize).min(side - 1);
+            row * side + column
+        };
+        let mut counts = vec![0u32; side * side + 1];
+        for mark in marks {
+            counts[bucket(mark) + 1] += 1;
+        }
+        for index in 1..counts.len() {
+            counts[index] += counts[index - 1];
+        }
+        let mut fill = counts.clone();
+        let mut points = vec![Point::new(0.0, 0.0); marks.len()];
+        for mark in marks {
+            let slot = &mut fill[bucket(mark)];
+            points[*slot as usize] = *mark;
+            *slot += 1;
+        }
+        Self { cell, side, starts: counts, points }
+    }
+
+    /// Whether a vertex lies strictly closer than `distance` to `point`. Errs
+    /// toward no at the boundary, which only sends a pixel to the exact test.
+    fn any_closer(&self, point: Point, distance: f64) -> bool {
+        if self.points.is_empty() {
+            return false;
+        }
+        let reach = distance * (1.0 - 1e-9) - 1e-12;
+        if reach <= 0.0 {
+            return false;
+        }
+        let reach_squared = reach * reach;
+        let low = |v: f64| (((v - reach) / self.cell).floor().max(0.0) as usize).min(self.side - 1);
+        let high = |v: f64| (((v + reach) / self.cell).floor().max(0.0) as usize).min(self.side - 1);
+        for row in low(point.y)..=high(point.y) {
+            let base = row * self.side;
+            let (first, last) = (
+                self.starts[base + low(point.x)] as usize,
+                self.starts[base + high(point.x) + 1] as usize,
+            );
+            for mark in &self.points[first..last] {
+                let (dx, dy) = (mark.x - point.x, mark.y - point.y);
+                if dx.mul_add(dx, dy * dy) < reach_squared {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 /// The settled mask, via distance transforms.
 ///
 /// `oversample` multiplies the grid the legal-set distance is measured on; 1
@@ -567,6 +639,7 @@ pub(crate) struct SettledRows {
     spacing_squared: f64,
     slack: f64,
     index: Option<LegalSetIndex>,
+    vertices: VertexGrid,
     pub(crate) exact_tests: usize,
 }
 
@@ -584,7 +657,9 @@ pub(crate) fn prepare_settled_rows(
     squared_distance_transform_into(&legal, fine_width, fine_height, scratch);
     scratch.legal = legal;
     let spacing = 1.0 / fine_width as f64;
+    let vertices = VertexGrid::build(index.vertices(), (2.0 * position.radius()).max(spacing));
     SettledRows {
+        vertices,
         scale,
         fine_width,
         fine_height,
@@ -631,6 +706,11 @@ impl SettledRows {
                 > (sampled + self.half_diagonal) * (sampled + self.half_diagonal)
             {
                 false
+            } else if self
+                .vertices
+                .any_closer(Point::new(xs[column], y), nearest_squares[column].sqrt())
+            {
+                false
             } else {
                 self.exact_tests += 1;
                 let known = self
@@ -675,6 +755,7 @@ fn settled_by_bounded_distance_into(
     let spacing_squared = spacing * spacing;
     let slack = spacing * std::f64::consts::SQRT_2;
     let half_diagonal = 0.5 * slack;
+    let vertex_grid = VertexGrid::build(known_index.vertices(), (2.0 * radius).max(spacing));
     // How far the sampled distance can overstate the true one.
     //
     // Half a cell diagonal is the tempting answer and it is wrong: it assumes
@@ -786,6 +867,8 @@ fn settled_by_bounded_distance_into(
             } else if scratch.nearest_squares[column]
                 > (sampled + half_diagonal) * (sampled + half_diagonal)
             {
+                false
+            } else if vertex_grid.any_closer(Point::new(x, y), scratch.nearest_squares[column].sqrt()) {
                 false
             } else {
                 exact_tests += 1;
