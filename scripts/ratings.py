@@ -12,8 +12,9 @@ players, re-fitting from scratch lets old matches inform new ratings, and the
 whole history sharpens as it grows. `prior_games` in the fitter is what keeps an
 undefeated model finite rather than diverging to +inf.
 
-Ratings are anchored at sl-w64b16 = 0, so they are comparable with every number
-measured against it directly.
+Ratings are anchored at sl-w64b16 = 0 when it appears in the history, so they
+are comparable with every number measured against it directly. A run that never
+played it (one started from scratch) is anchored at its earliest model instead.
 
     scripts/ratings.py [artifacts/vgo-continuous/anchor.jsonl]
 """
@@ -93,7 +94,9 @@ def main() -> None:
     for m in matches:
         adjacency[m["a"]].add(m["b"])
         adjacency[m["b"]].add(m["a"])
-    anchored, stack = set(), [ANCHOR_ID]
+    players = {m["a"] for m in matches} | {m["b"] for m in matches}
+    anchor = ANCHOR_ID if ANCHOR_ID in players else min(players)
+    anchored, stack = set(), [anchor]
     while stack:
         node = stack.pop()
         if node in anchored:
@@ -101,7 +104,7 @@ def main() -> None:
         anchored.add(node)
         stack.extend(adjacency[node] - anchored)
 
-    ratings = fit_ratings(matches, anchor=ANCHOR_ID)
+    ratings = fit_ratings(matches, anchor=anchor)
     floating = sorted(set(ratings) - anchored)
     games = {}
     for m in matches:
@@ -109,7 +112,7 @@ def main() -> None:
         games[m["a"]] = games.get(m["a"], 0) + n
         games[m["b"]] = games.get(m["b"], 0) + n
     print(f"  {len(matches)} matches, {sum(games.values()) // 2} games, "
-          f"{len(ratings)} models   (anchor sl-w64b16 = 0)")
+          f"{len(ratings)} models   (anchor {label(anchor)} = 0)")
     if skipped:
         print(f"  {skipped} record(s) skipped for missing model names")
     print(f"\n  {'model':<20} {'rating':>8} {'games':>7}")
@@ -118,7 +121,7 @@ def main() -> None:
             continue
         print(f"  {label(identifier):<20} {rating:>+8.0f} {games.get(identifier, 0):>7}")
     if floating:
-        print(f"\n  NOT COMPARABLE -- no match path to {label(ANCHOR_ID)}, so these are")
+        print(f"\n  NOT COMPARABLE -- no match path to {label(anchor)}, so these are")
         print("  fitted against the prior rather than the anchor and sit on their own")
         print("  scale. They need a match against an anchored model to join.")
         for identifier in sorted(floating, key=lambda i: -ratings[i]):

@@ -67,6 +67,13 @@ models="$output/models"
 # 150k rather than the 200k that produced the +307: that run peaked at 46 GB of
 # 60 with nothing else on the box, and here a generator is resident throughout.
 window="${VGO_WINDOW_SAMPLES:-150000}"
+# Input raster, square. The policy grid stays at 128 either way, so this changes
+# what the network sees, not which moves it can propose: boundary cells whose
+# centre is illegal still snap to the nearest legal point inside them.
+resolution="${VGO_RESOLUTION:-256}"
+# Board sizes, as space-separated `WEIGHT:UNITS` or `WEIGHT:LOW-HIGH` bands in
+# stone diameters across. Komi and the ply cap follow from each game's size.
+read -r -a board_mix <<< "${VGO_BOARD_MIX:-50:38 25:18 25:18-38}"
 # Half the window new before retraining. Duty is `epochs * 0.0125 / turnover`
 # and the window cancels, so these two knobs alone decide how much of the GPU
 # goes to training: 8 epochs at 0.50 is ~20%, at 0.30 it would be 33%. A fresher
@@ -232,8 +239,8 @@ start_generator () {
     --output-root "$games" --label "$label" \
     --stop-file "$stop_file" --first-game "$first_game" \
     --actors "$actors" --simulations "$simulations" \
-    --resolution 256 --policy-resolution 128 --raster-kind compact-radius \
-    --board-mix 50:38 --board-mix 25:18 --board-mix 25:18-38 \
+    --resolution "$resolution" --policy-resolution 128 --raster-kind compact-radius \
+    "${board_mix_flags[@]}" \
     --max-plies 70 --radius 0.05555555555555555 \
     --coarse-pool 16 --widening-coefficient 6.0 --maximum-candidates 321 \
     --komi-area-coefficient "$komi_area_coefficient" \
@@ -255,7 +262,12 @@ start_generator () {
 }
 
 
+board_mix_flags=()
+for band in "${board_mix[@]}"; do board_mix_flags+=(--board-mix "$band"); done
+
 model="$seed_model"
+# With no seed and no named anchor, the run's first trained model becomes the
+# reference once it exists, so a from-scratch run still builds a rating graph.
 anchor="${anchor_model:-$seed_model}"
 
 # Continue the update numbering from whatever is on disk. Restarting from zero
@@ -347,6 +359,7 @@ print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$onnx")
   generator=$(start_generator "$label" "$onnx" "$next_game")
   touch "$games/$previous_label.stop"
   model="$onnx"
+  [ -z "$anchor" ] && anchor="$onnx"
   baseline=$(count_samples)
   echo "[loop] update $update done: generation $generation started (pid $generator), $previous_label draining"
 
@@ -440,7 +453,7 @@ print('\n'.join(random.Random(int(sys.argv[2])).sample(pool, count)))
         --candidate "$onnx" "${opponent_flags[@]}" \
         --candidate-raster-kind compact-radius \
         --radius "$anchor_radius" --komi "$anchor_komi" \
-        --policy-resolution 128 --resolution 256 \
+        --policy-resolution 128 --resolution "$resolution" \
         --simulations "$anchor_simulations" --pairs "$anchor_pairs" \
         --max-plies "$anchor_max_plies" --threads 8 --maximum-batch 32 \
         --coarse-pool 16 --widening-coefficient 4.0 --maximum-candidates 321 \

@@ -1,5 +1,5 @@
 /target/
-/artifacts/
+/artifacts
 # The official-rules runs live in their own root, not a subdirectory of
 # artifacts/. scripts/build-dense-curve.py globs `artifacts/*/records.jsonl` and
 # fits one Bradley-Terry scale over everything it finds, so a run under a
