@@ -74,13 +74,15 @@ pub struct Settlement {
 ///
 /// The shared core of `Analysis::new` and `Settlement::new`: everything either
 /// one needs before it can say which groups are settled.
-fn alive_groups_of(
+fn alive_groups_of<const WITNESSES_FIRST: bool, const QUERY_FIRST: bool>(
     position: &Position,
     geometry: &voronoi::Geometry,
     legal_vertices: &[Point],
     playable: bool,
+    mut alive_groups: HashSet<usize>,
+    #[cfg(feature = "iteration-lab")] index: Option<&legal_set::LegalSetIndex>,
+    #[cfg(feature = "iteration-lab")] known_settled_cells: &[bool],
 ) -> HashSet<usize> {
-    let mut alive_groups = HashSet::new();
     if !playable {
         return alive_groups;
     }
@@ -89,13 +91,34 @@ fn alive_groups_of(
         if alive_groups.contains(&group) {
             continue;
         }
+        #[cfg(feature = "iteration-lab")]
+        if known_settled_cells.get(stone_index).copied().unwrap_or(false) {
+            continue;
+        }
         let stone = position.stones()[stone_index];
         let stone_point = Point::new(stone.x, stone.y);
         let alive = match position.ruleset() {
-            Ruleset::Vgo => cell.polygon.iter().any(|&vertex| {
-                legal_set::escape_witness(position, vertex, stone_point, Some(legal_vertices))
-                    .is_some()
-            }),
+            Ruleset::Vgo => {
+                (WITNESSES_FIRST && cell.polygon.iter().any(|&vertex| {
+                    legal_vertices.iter().any(|&candidate| {
+                        numeric::strictly_closer(vertex, candidate, stone_point).is_strictly_less
+                    })
+                })) || cell.polygon.iter().any(|&vertex| {
+                    #[cfg(feature = "iteration-lab")]
+                    if let Some(index) = index {
+                        if QUERY_FIRST {
+                            return legal_set::escape_witness_query_first(
+                                position, vertex, stone_point, index,
+                            ).is_some();
+                        }
+                        return legal_set::escape_witness_indexed(
+                            position, vertex, stone_point, index,
+                        ).is_some();
+                    }
+                    legal_set::escape_witness(position, vertex, stone_point, Some(legal_vertices))
+                        .is_some()
+                })
+            }
             Ruleset::Official => {
                 official_cell_is_alive(position, stone_index, cell, legal_vertices)
             }
@@ -181,14 +204,69 @@ impl Settlement {
     /// Settlement alone, skipping the score and outcome a full analysis builds.
     #[must_use]
     pub fn new(position: &Position) -> Self {
+        Self::build::<false, false, false>(position)
+    }
+
+    pub(crate) fn build<const WITNESSES_FIRST: bool, const INDEXED: bool, const QUERY_FIRST: bool>(
+        position: &Position,
+    ) -> Self {
+        Self::build_seeded::<WITNESSES_FIRST, INDEXED, QUERY_FIRST>(position, |_| HashSet::new())
+    }
+
+    pub(crate) fn build_seeded<const WITNESSES_FIRST: bool, const INDEXED: bool, const QUERY_FIRST: bool>(
+        position: &Position,
+        seed: impl FnOnce(&voronoi::Geometry) -> HashSet<usize>,
+    ) -> Self {
         let validation = position.validate();
         let geometry = voronoi::compute(position);
+        #[cfg(feature = "iteration-lab")]
+        let index = INDEXED.then(|| legal_set::LegalSetIndex::build(position));
+        #[cfg(feature = "iteration-lab")]
+        let legal_vertices = index.as_ref().map_or_else(
+            || legal_set::vertices(position),
+            |index| index.vertices().to_vec(),
+        );
+        #[cfg(not(feature = "iteration-lab"))]
         let legal_vertices = legal_set::vertices(position);
-        let alive_groups = alive_groups_of(
+        let alive_groups = alive_groups_of::<WITNESSES_FIRST, QUERY_FIRST>(
             position,
             &geometry,
             &legal_vertices,
             validation.is_playable(),
+            seed(&geometry),
+            #[cfg(feature = "iteration-lab")]
+            index.as_ref(),
+            #[cfg(feature = "iteration-lab")]
+            &[],
+        );
+        let settled_groups = settled_from(&geometry, &alive_groups);
+        Self {
+            geometry,
+            settled_groups,
+            validation,
+            legal_vertices,
+            alive_groups,
+        }
+    }
+
+    /// Laboratory-only positive group and negative cell certificates.
+    #[cfg(feature = "iteration-lab")]
+    pub(crate) fn build_with_facts(
+        position: &Position,
+        seed: impl FnOnce(&voronoi::Geometry) -> (HashSet<usize>, Vec<bool>),
+    ) -> Self {
+        let validation = position.validate();
+        let geometry = voronoi::compute(position);
+        let legal_vertices = legal_set::vertices(position);
+        let (alive, negative) = seed(&geometry);
+        let alive_groups = alive_groups_of::<false, false>(
+            position,
+            &geometry,
+            &legal_vertices,
+            validation.is_playable(),
+            alive,
+            None,
+            &negative,
         );
         let settled_groups = settled_from(&geometry, &alive_groups);
         Self {

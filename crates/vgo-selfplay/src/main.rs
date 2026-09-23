@@ -18,6 +18,8 @@ use vgo_selfplay::{accumulate_search_stats, play_game as run_playout};
 
 #[derive(Clone, Copy, Debug)]
 struct MatchConfig {
+    #[cfg(feature = "iteration-lab")]
+    support: Option<vgo_search::transition_lab::SupportConfig>,
     pairs: usize,
     first_simulations: u32,
     second_simulations: u32,
@@ -29,6 +31,17 @@ struct MatchConfig {
 
 #[derive(Debug, Parser)]
 struct Arguments {
+    /// Use the bounded support-certificate transition cache (experimental).
+    #[cfg(feature = "iteration-lab")]
+    #[arg(long)]
+    supports: bool,
+    #[cfg(feature = "iteration-lab")]
+    #[arg(long, default_value_t = 1)]
+    support_cache_mib: usize,
+    /// Differential-check every accelerated transition. Exclude from timings.
+    #[cfg(feature = "iteration-lab")]
+    #[arg(long, requires = "supports")]
+    verify_supports: bool,
     #[arg(long, default_value_t = 5)]
     pairs: usize,
     #[arg(long, default_value_t = 1_000)]
@@ -47,6 +60,8 @@ struct Arguments {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct GameReport {
+    #[cfg(feature = "iteration-lab")]
+    support: vgo_search::transition_lab::SupportMetrics,
     first_score: f64,
     completed: bool,
     plies: u32,
@@ -59,6 +74,8 @@ struct GameReport {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MatchReport {
+    #[cfg(feature = "iteration-lab")]
+    support: vgo_search::transition_lab::SupportMetrics,
     games: u64,
     completed: u64,
     first_wins: u64,
@@ -75,6 +92,18 @@ struct MatchReport {
 
 impl MatchReport {
     fn add(&mut self, game: GameReport) {
+        #[cfg(feature = "iteration-lab")]
+        {
+            self.support.calls += game.support.calls;
+            self.support.hits += game.support.hits;
+            self.support.builds += game.support.builds;
+            self.support.evictions += game.support.evictions;
+            self.support.oversized += game.support.oversized;
+            self.support.peak_retained_bytes = self
+                .support
+                .peak_retained_bytes
+                .max(game.support.peak_retained_bytes);
+        }
         self.games += 1;
         self.plies += u64::from(game.plies);
         self.captures += game.captures;
@@ -96,6 +125,13 @@ impl MatchReport {
     }
 
     fn print(self, config: MatchConfig, wall_time: Duration) {
+        #[cfg(feature = "iteration-lab")]
+        if config.support.is_some() {
+            eprintln!(
+                "support backend (counts summed across games; peak per game/worker): {:?}",
+                self.support
+            );
+        }
         let score = if self.completed == 0 {
             0.0
         } else {
@@ -165,30 +201,41 @@ impl MatchReport {
 
 fn play_game(config: MatchConfig, first_color: Color, pair_seed: u64) -> GameReport {
     let started = Instant::now();
-    let playout = run_playout(
-        Position::new(config.radius, Vec::new(), Color::Black),
-        config.maximum_plies,
-        |position, _| {
-            let simulations = if position.to_move() == first_color {
-                config.first_simulations
-            } else {
-                config.second_simulations
-            };
-            Ok::<_, Infallible>(search(
-                position,
-                SearchConfig::canary(simulations),
-                pair_seed,
-            ))
-        },
-        |_| {},
-    )
-    .expect("naive search is infallible");
+    let run = || {
+        run_playout(
+            Position::new(config.radius, Vec::new(), Color::Black),
+            config.maximum_plies,
+            |position, _| {
+                let simulations = if position.to_move() == first_color {
+                    config.first_simulations
+                } else {
+                    config.second_simulations
+                };
+                Ok::<_, Infallible>(search(
+                    position,
+                    SearchConfig::canary(simulations),
+                    pair_seed,
+                ))
+            },
+            |_| {},
+        )
+        .expect("naive search is infallible")
+    };
+    #[cfg(feature = "iteration-lab")]
+    let (playout, support) = match config.support {
+        Some(options) => vgo_search::transition_lab::with_support_backend(options, run),
+        None => (run(), vgo_search::transition_lab::SupportMetrics::default()),
+    };
+    #[cfg(not(feature = "iteration-lab"))]
+    let playout = run();
     let first_score = playout.outcome.map_or(0.0, |outcome| match outcome.winner {
         Some(winner) if winner == first_color => 1.0,
         Some(_) => 0.0,
         None => 0.5,
     });
     GameReport {
+        #[cfg(feature = "iteration-lab")]
+        support,
         first_score,
         completed: playout.completed(),
         plies: playout.stats.plies,
@@ -253,6 +300,16 @@ fn wilson_interval(points: f64, games: u64) -> (f64, f64) {
 fn main() {
     let arguments = Arguments::parse();
     let config = MatchConfig {
+        #[cfg(feature = "iteration-lab")]
+        support: arguments
+            .supports
+            .then_some(vgo_search::transition_lab::SupportConfig {
+                byte_budget: arguments
+                    .support_cache_mib
+                    .checked_mul(1024 * 1024)
+                    .expect("cache budget overflow"),
+                verify: arguments.verify_supports,
+            }),
         pairs: arguments.pairs,
         first_simulations: arguments.first,
         second_simulations: arguments.second,
@@ -281,6 +338,8 @@ mod tests {
     #[test]
     fn short_game_run_is_bounded() {
         let config = MatchConfig {
+            #[cfg(feature = "iteration-lab")]
+            support: None,
             pairs: 1,
             first_simulations: 2,
             second_simulations: 2,

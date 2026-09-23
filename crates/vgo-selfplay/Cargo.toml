@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
+iteration-lab = ["vgo-search/iteration-lab"]
 profiling = ["dep:pprof"]
 default = []
 

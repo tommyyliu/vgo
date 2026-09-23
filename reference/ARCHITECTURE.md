@@ -30,7 +30,7 @@ the DOM, renderer settings, history, hover state, or contour depth.
 position contains only rule-relevant state:
 
 ```text
-{ radius, stones, toMove, passes, phase }
+{ radius, stones, toMove, passes, phase, komi }
 ```
 
 The position, stone array, and stones are frozen. A change creates a new

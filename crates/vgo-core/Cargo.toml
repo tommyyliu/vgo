@@ -8,5 +8,20 @@ rust-version.workspace = true
 [dependencies]
 num-bigint = "0.4"
 
+[features]
+iteration-lab = []
+
+[[example]]
+name = "iteration_lab"
+required-features = ["iteration-lab"]
+
+[[example]]
+name = "support_lab"
+required-features = ["iteration-lab"]
+
+[[example]]
+name = "undo_lab"
+required-features = ["iteration-lab"]
+
 [lib]
 path = "src/lib.rs"

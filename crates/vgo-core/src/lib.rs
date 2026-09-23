@@ -9,6 +9,9 @@ mod model;
 mod numeric;
 mod voronoi;
 
+#[cfg(feature = "iteration-lab")]
+pub mod iteration_lab;
+
 pub use analysis::{Analysis, Outcome, Score, Settlement};
 pub use connectivity::{
     CutKind, MAX_PAIR_CUT_DISTANCE, SAFE_PAIR_DISTANCE, connected_pairs, pair_color, pair_cut,

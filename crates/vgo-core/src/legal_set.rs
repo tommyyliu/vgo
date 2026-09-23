@@ -647,15 +647,89 @@ pub(crate) fn escape_witness(
     known_vertices: Option<&[Point]>,
 ) -> Option<Point> {
     let mut witness = None;
-    visit_candidates(position, vertex, known_vertices, |candidate| {
-        if numeric::strictly_closer(vertex, candidate, stone).is_strictly_less {
-            witness = Some(candidate);
-            true
-        } else {
-            false
-        }
-    });
+    // A candidate can only win by sitting strictly nearer `vertex` than `stone`
+    // does, so nothing beyond that distance ever qualifies -- and
+    // `visit_candidates_within` already knows how to skip the stones that
+    // cannot reach inside it. This was the call that never passed the bound, so
+    // every cell of every position paid the O(stones) clearance test once per
+    // stone on the board, to screen candidates that lost on distance anyway.
+    //
+    // The bound is the exact predicate, not the locality theorem: a stone
+    // contributes the point one diameter along the ray to the query, so a stone
+    // farther than `reach + diameter` cannot land within `reach`. `SNAP_MARGIN`
+    // keeps the geometric cut strictly looser than the interval-arithmetic
+    // comparison below, so the two cannot disagree about a boundary case.
+    let reach = numeric::length(vertex.x - stone.x, vertex.y - stone.y) + numeric::SNAP_MARGIN;
+    visit_candidates_within(
+        position,
+        vertex,
+        Some(reach),
+        known_vertices,
+        None,
+        &mut |candidate| {
+            if numeric::strictly_closer(vertex, candidate, stone).is_strictly_less {
+                witness = Some(candidate);
+                true
+            } else {
+                false
+            }
+        },
+    );
     witness
+}
+
+/// Same analytic candidates and robust comparison as `escape_witness`, with
+/// one shared clearance index for all the cells of a position.
+#[cfg(feature = "iteration-lab")]
+pub(crate) fn escape_witness_indexed(
+    position: &Position,
+    vertex: Point,
+    stone: Point,
+    index: &LegalSetIndex,
+) -> Option<Point> {
+    let mut witness = None;
+    visit_candidates_within(position, vertex, None, Some(&index.vertices),
+        index.buckets.as_ref(), &mut |candidate| {
+            if numeric::strictly_closer(vertex, candidate, stone).is_strictly_less {
+                witness = Some(candidate);
+                true
+            } else { false }
+        });
+    witness
+}
+
+/// Query-driven survival: reject irrelevant feature candidates before paying
+/// for clearance. Every positive certificate uses the normal robust predicate;
+/// every analytic feature from the baseline remains in the enumeration.
+#[cfg(feature = "iteration-lab")]
+pub(crate) fn escape_witness_query_first(
+    position: &Position,
+    vertex: Point,
+    stone: Point,
+    index: &LegalSetIndex,
+) -> Option<Point> {
+    let qualifies = |p| numeric::strictly_closer(vertex, p, stone).is_strictly_less;
+    let accept = |p: Point| qualifies(p) && contains_with(position, index.buckets.as_ref(), p.x, p.y);
+    if accept(vertex) { return Some(vertex); }
+    let diameter = 2.0 * position.radius();
+    for blocker in position.stones() {
+        let dx = vertex.x - blocker.x;
+        let dy = vertex.y - blocker.y;
+        let radial = numeric::length(dx, dy);
+        let directions: &[(f64, f64)] = if radial < numeric::EDGE_EPSILON {
+            &[(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
+        } else { &[(dx / radial, dy / radial)] };
+        for &(ux, uy) in directions {
+            let p = Point::new(blocker.x + diameter * ux, blocker.y + diameter * uy);
+            if accept(p) { return Some(p); }
+        }
+    }
+    let r = position.radius();
+    for p in [Point::new(r, vertex.y), Point::new(1.0-r, vertex.y),
+              Point::new(vertex.x, r), Point::new(vertex.x, 1.0-r)] {
+        if accept(p) { return Some(p); }
+    }
+    index.vertices.iter().copied().find(|&p| qualifies(p))
 }
 
 #[cfg(test)]

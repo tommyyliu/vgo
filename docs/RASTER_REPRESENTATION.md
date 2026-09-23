@@ -39,7 +39,7 @@ ONNX profile shapes.
 | 9 | `previous_pass` | `[0, 1]` | Constant plane, `1` when the last move was a pass. Two passes end the game, so a live position is only ever at zero or one -- this is the pass state, not a summary of it. |
 | 10 | `settled` | `[0, 1]` | This repository's capture predicate: no legal centre can get strictly closer to the point than the stone that owns it. Reads as *can anyone still take this area*. |
 | 11 | `komi` | `[-1, 1]` | Constant plane, signed for the side to move. |
-| 12 | `dead_zone` | `[0, 1]` | voronoigo.com's capture predicate: `dist(x, L) > r`, where no stone can be placed covering the point. Reads as *can anyone still reach this area*. Strictly contains `settled`; see [`OFFICIAL_RULES.md`](OFFICIAL_RULES.md). |
+| 12 | `dead_zone` | `[0, 1]` | voronoigo.com's capture predicate: `dist(x, L) > r`, where no stone can be placed covering the point. Reads as *can anyone still reach this area*. Contains `settled` away from exact equality boundaries; see [`OFFICIAL_RULES.md`](OFFICIAL_RULES.md). |
 | 13 | `current_connections` | `[0, 1]` | A one-cell line between each pair of current-player stones that no enemy pair can wedge apart. |
 | 14 | `opponent_connections` | `[0, 1]` | The same for the opponent. |
 

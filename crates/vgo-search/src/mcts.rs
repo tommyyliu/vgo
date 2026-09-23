@@ -249,6 +249,29 @@ enum FineGridCache {
 }
 
 impl Node {
+    pub(crate) fn memory_usage(&self) -> crate::TreeMemory {
+        fn visit(node: &Node, counter: &mut crate::memory::MemoryCounter) {
+            counter.report.nodes += 1;
+            counter.report.node_bytes += size_of::<Node>();
+            counter.report.edge_capacity_bytes += node.children.capacity() * size_of::<Child>();
+            counter.report.position_bytes += std::mem::size_of_val(node.position.stones());
+            counter.report.unreported_candidate_caches += usize::from(node.candidates.is_some());
+            if let Some(evaluation) = &node.evaluation {
+                evaluation.account_memory(counter);
+            }
+            if let FineGridCache::Ready(grid) = &node.fine_grid {
+                grid.account_memory(counter);
+            }
+            for child in &node.children {
+                if let Some(node) = &child.node {
+                    visit(node, counter);
+                }
+            }
+        }
+        let mut counter = crate::memory::MemoryCounter::default();
+        visit(self, &mut counter);
+        counter.report
+    }
     /// Build a node whose evaluation was already computed elsewhere.
     ///
     /// The batched path evaluates a round of leaves together, so by the time a
@@ -570,20 +593,19 @@ impl Node {
 ///
 /// Terminates because the pass candidate is always present and `pass` cannot
 /// self-capture, so at worst every placement is marked and the pass is chosen.
-fn select_playable_child(node: &mut Node, config: SearchConfig) -> Option<usize> {
+fn select_playable_child(node: &mut Node, config: SearchConfig) -> Option<(usize, Option<vgo_core::MoveResult>)> {
     while node.children.iter().any(|child| !child.refused) {
         let index = node.select_child(config);
         // Already expanded, so the rules accepted it when it was expanded.
         if node.children[index].node.is_some() {
-            return Some(index);
+            return Some((index, None));
         }
-        if node.children[index]
+        if let Some(transition) = node.children[index]
             .candidate
             .action
             .try_apply(&node.position)
-            .is_some()
         {
-            return Some(index);
+            return Some((index, Some(transition)));
         }
         node.children[index].refused = true;
     }
@@ -818,11 +840,7 @@ pub(crate) enum Descent {
 /// back to back and their leaves evaluated as one batch. Each visited edge takes
 /// a virtual visit, which `back_up` releases. Every `descend` must be paired with
 /// exactly one `back_up` or the tree keeps a phantom in-flight visit forever.
-pub(crate) fn descend(
-    node: &mut Node,
-    config: SearchConfig,
-    stats: &mut SearchStats,
-) -> Descent {
+pub(crate) fn descend(node: &mut Node, config: SearchConfig, stats: &mut SearchStats) -> Descent {
     let mut path = Vec::new();
     let mut current = &mut *node;
     let mut depth = 0_u32;
@@ -850,7 +868,7 @@ pub(crate) fn descend(
         }
 
         current.widen(config, stats);
-        let Some(index) = select_playable_child(current, config) else {
+        let Some((index, transition)) = select_playable_child(current, config) else {
             // Every placement here self-captures and the rules refuse them all,
             // so only the pass remains -- and `select_playable_child` never
             // discards that. Reaching this means the node has no children at
@@ -864,10 +882,7 @@ pub(crate) fn descend(
         if current.children[index].node.is_none() {
             // Resolve terminal children from the transition analysis. They have
             // exact outcomes and must never consume a model slot.
-            let transition = current.children[index]
-                .candidate
-                .action
-                .apply(&current.position);
+            let transition = transition.expect("unexpanded selection returns its resolved move");
             if transition.position.phase() == Phase::Finished {
                 let value = transition.analysis.outcome.black_utility();
                 let expansion = Node::terminal(transition.position, value, current.match_seed);
@@ -957,14 +972,14 @@ fn simulate(
     }
 
     node.widen(config, stats);
-    let Some(child_index) = select_playable_child(node, config) else {
+    let Some((child_index, transition)) = select_playable_child(node, config) else {
         unreachable!("a playable node always keeps its pass candidate");
     };
     let child = &mut node.children[child_index];
     let black_value = if let Some(child_node) = child.node.as_mut() {
         simulate(child_node, config, match_seed, evaluator, depth + 1, stats)?
     } else {
-        let transition = child.candidate.action.apply(&node.position);
+        let transition = transition.expect("unexpanded selection returns its resolved move");
         let child_node = Node::new(
             transition.position,
             Some(&transition.analysis),
@@ -1728,7 +1743,11 @@ mod tests {
                 if x > 0.94 || y > 0.94 {
                     break;
                 }
-                let colour = if index % 2 == 0 { Color::Black } else { Color::White };
+                let colour = if index % 2 == 0 {
+                    Color::Black
+                } else {
+                    Color::White
+                };
                 stones.push(Stone::new(x, y, colour));
             }
             let position = Position::new(radius, stones, Color::Black)
@@ -1745,32 +1764,36 @@ mod tests {
             // instead of marking them, walk off the end of a shortened vector
             // in production while every test here passed at leaf batch 1.
             for leaf_batch in [1usize, 4, 8] {
-            let mut config = SearchConfig::canary(64);
-            config.temperature = 0.0;
-            config.leaf_batch = leaf_batch;
-            let result = crate::search_at_ply(&position, config, seed, &crate::NaiveEvaluator, 0)
-                .expect("search");
+                let mut config = SearchConfig::canary(64);
+                config.temperature = 0.0;
+                config.leaf_batch = leaf_batch;
+                let result =
+                    crate::search_at_ply(&position, config, seed, &crate::NaiveEvaluator, 0)
+                        .expect("search");
 
-            // Whatever it chose, the rules must accept it.
-            if let Action::Place(point) = result.action {
-                assert!(
-                    vgo_core::place(&position, point.x, point.y).is_ok(),
-                    "seed {seed}: search returned a move the official rules refuse"
-                );
-            }
-            // And every surviving child must be a move too.
-            for child in &result.children {
-                if let Action::Place(point) = child.action {
+                // Whatever it chose, the rules must accept it.
+                if let Action::Place(point) = result.action {
                     assert!(
                         vgo_core::place(&position, point.x, point.y).is_ok(),
-                        "seed {seed}: a refused move survived as a candidate"
+                        "seed {seed}: search returned a move the official rules refuse"
                     );
                 }
-            }
-            assert!(
-                result.children.iter().any(|c| matches!(c.action, Action::Place(_))),
-                "seed {seed}: the search kept no placements at all"
-            );
+                // And every surviving child must be a move too.
+                for child in &result.children {
+                    if let Action::Place(point) = child.action {
+                        assert!(
+                            vgo_core::place(&position, point.x, point.y).is_ok(),
+                            "seed {seed}: a refused move survived as a candidate"
+                        );
+                    }
+                }
+                assert!(
+                    result
+                        .children
+                        .iter()
+                        .any(|c| matches!(c.action, Action::Place(_))),
+                    "seed {seed}: the search kept no placements at all"
+                );
             }
         }
     }

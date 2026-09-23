@@ -5,6 +5,7 @@
 //! that mapping is how two implementations drift apart. `vgo-inference` and the
 //! browser client both use this one.
 
+use std::sync::Arc;
 use vgo_core::Position;
 use vgo_search::{Action, FineGrid, Policy};
 
@@ -14,7 +15,7 @@ use crate::{RasterConfig, action_pixel};
 pub struct DensePolicy {
     /// The *policy* grid, which may be coarser than the rendered raster.
     config: RasterConfig,
-    logits: Vec<f32>,
+    logits: Arc<Vec<f32>>,
 }
 
 impl DensePolicy {
@@ -27,11 +28,17 @@ impl DensePolicy {
             config.pixels() + 1,
             "a dense policy is one logit per cell plus the pass"
         );
-        Self { config, logits }
+        Self {
+            config,
+            logits: Arc::new(logits),
+        }
     }
 }
 
 impl Policy for DensePolicy {
+    fn heap_allocations(&self) -> Option<Vec<vgo_search::HeapAllocation>> {
+        Some(vec![vgo_search::HeapAllocation::vector(&self.logits)])
+    }
     fn logit(&self, action: Action) -> f64 {
         let index = match action {
             Action::Pass => self.config.pixels(),
@@ -43,8 +50,12 @@ impl Policy for DensePolicy {
     fn fine_grid(&self, position: &Position, coarse: usize) -> Option<FineGrid> {
         let width = self.config.width;
         let height = self.config.height;
-        Some(FineGrid::build(position, width, height, coarse, |row, col| {
-            self.logits[row * width + col]
-        }))
+        Some(FineGrid::from_shared_logits(
+            position,
+            width,
+            height,
+            coarse,
+            Arc::clone(&self.logits),
+        ))
     }
 }

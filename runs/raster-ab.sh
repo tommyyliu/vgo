@@ -35,9 +35,10 @@
 # Slot 3 is the capture predicate and is the only difference: `settled` is this
 # repository's rule -- a group lives while some future stone can still take area
 # from it -- and `dead_zone` is voronoigo.com's, where a group lives while a
-# stone could still be placed touching its territory. The second is strictly
-# more aggressive; measured on real shards it covers 47.9% of the board against
-# settled's 44.1%.
+# stone could still be placed touching its territory. The second is more
+# aggressive at the group level, including tangencies (docs/OFFICIAL_RULES.md).
+# Historical sampled coverage was 47.9% against settled's 44.1%; the exact
+# corpus and measurement command were not recorded here.
 #
 # Every other plane is bit-identical between the two, which is what makes this a
 # one-plane A/B rather than a comparison of representations, and what lets a

@@ -1,0 +1,21 @@
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 128, hits: 109, builds: 19, evictions: 1, oversized: 0, peak_retained_bytes: 1000392 }
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 128, hits: 109, builds: 19, evictions: 1, oversized: 0, peak_retained_bytes: 1000392 }
+fixture=80 actors=1 sims=64: 0.057172s -> 0.088890s, 0.6432x; ranges=0.057172..0.057172/0.088890..0.088890; fingerprints match
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 128, hits: 96, builds: 32, evictions: 25, oversized: 0, peak_retained_bytes: 987648 }
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 128, hits: 96, builds: 32, evictions: 25, oversized: 0, peak_retained_bytes: 987648 }
+fixture=160 actors=1 sims=64: 0.134416s -> 0.248966s, 0.5399x; ranges=0.134416..0.134416/0.248966..0.248966; fingerprints match
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+actor=0 SupportMetrics { calls: 128, hits: 94, builds: 34, evictions: 30, oversized: 0, peak_retained_bytes: 955080 }
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+actor=0 SupportMetrics { calls: 128, hits: 94, builds: 34, evictions: 30, oversized: 0, peak_retained_bytes: 955080 }
+fixture=240 actors=1 sims=64: 0.398882s -> 0.677522s, 0.5887x; ranges=0.398882..0.398882/0.677522..0.677522; fingerprints match

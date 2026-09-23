@@ -1,0 +1,44 @@
+[
+  {
+    "round": 0,
+    "mib": 1,
+    "seconds": 1.954566,
+    "plies_per_second": 130.9753674217192,
+    "metrics": "support backend (counts summed across games; peak per game/worker): SupportMetrics { calls: 43234, hits: 39024, builds: 4210, evictions: 4122, oversized: 0, peak_retained_bytes: 1048520 }"
+  },
+  {
+    "round": 0,
+    "mib": 4,
+    "seconds": 2.002617,
+    "plies_per_second": 127.83273087165445,
+    "metrics": "support backend (counts summed across games; peak per game/worker): SupportMetrics { calls: 43234, hits: 39024, builds: 4210, evictions: 3954, oversized: 0, peak_retained_bytes: 3037888 }"
+  },
+  {
+    "round": 1,
+    "mib": 4,
+    "seconds": 1.962321,
+    "plies_per_second": 130.45775894973352,
+    "metrics": "support backend (counts summed across games; peak per game/worker): SupportMetrics { calls: 43234, hits: 39024, builds: 4210, evictions: 3954, oversized: 0, peak_retained_bytes: 3037888 }"
+  },
+  {
+    "round": 1,
+    "mib": 1,
+    "seconds": 1.948566,
+    "plies_per_second": 131.3786651311785,
+    "metrics": "support backend (counts summed across games; peak per game/worker): SupportMetrics { calls: 43234, hits: 39024, builds: 4210, evictions: 4122, oversized: 0, peak_retained_bytes: 1048520 }"
+  },
+  {
+    "round": 2,
+    "mib": 1,
+    "seconds": 1.95867,
+    "plies_per_second": 130.70093481801428,
+    "metrics": "support backend (counts summed across games; peak per game/worker): SupportMetrics { calls: 43234, hits: 39024, builds: 4210, evictions: 4122, oversized: 0, peak_retained_bytes: 1048520 }"
+  },
+  {
+    "round": 2,
+    "mib": 4,
+    "seconds": 1.9523,
+    "plies_per_second": 131.1273882087794,
+    "metrics": "support backend (counts summed across games; peak per game/worker): SupportMetrics { calls: 43234, hits: 39024, builds: 4210, evictions: 3954, oversized: 0, peak_retained_bytes: 3037888 }"
+  }
+]

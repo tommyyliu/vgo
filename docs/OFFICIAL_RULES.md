@@ -1,8 +1,13 @@
-# Playing the official rules
+# Compatibility with the current website rules
 
-`voronoigo.com`'s rules, as `Ruleset::Official` in `crates/vgo-core`. This is
-what differs, what our implementation does about it, and what is still weaker
-here than in the reference.
+This note documents `voronoigo.com`'s current behavior, exposed as
+`Ruleset::Official` in `crates/vgo-core`. Here, *Official* is a compatibility
+label: it means website-compatible, not canonical or preferred. This
+repository's rules remain the game defined in [`reference/RULES.md`](../reference/RULES.md).
+
+The purpose of this note is to record what differs, what our compatibility
+implementation does about it, and what is still weaker here than in the
+website reference.
 
 The reference is [`csun/voronoi-go-rs`](https://github.com/csun/voronoi-go-rs) —
 a Rust port of the original TypeScript client, verified against fixtures the
@@ -28,26 +33,42 @@ things by it.
 where `L` is the legal set of stone centres, `d_S(x)` the distance from `x` to
 the nearest stone, and `r` the stone radius.
 
-**The official rule is strictly more aggressive**, and the containment is worth
-deriving because it is not obvious in either direction. If a legal centre `p`
-lies within `r` of a point `x` of the region, then
+**The website rule is more aggressive**, and the containment is worth deriving
+because it is not obvious in either direction.
+If a legal centre `p` lies strictly within `r` of a point `x` of the region,
+then
 
-    d_S(x) >= d_S(p) - |x - p| >= 2r - r = r >= |x - p|
+    d_S(x) >= d_S(p) - |x - p| >= 2r - |x - p| > r > |x - p|
 
 using `d_S(p) >= 2r`, which holds because `p` is a legal centre and so at least
 one diameter from every stone. So `p` challenges `x`, and our rule calls the
-group alive too. The converse fails: `p` can sit `3r` from a large cell and still
-be strictly closer to a far corner of it than the owning stone is. That is the
-"a group lives while it can still connect out" case, and it exists only here.
+group alive too. At exact tangency, `|x - p| = r`, the argument gives only
+`d_S(x) >= r`. If equality holds, choose an owning stone `s`. Legality and
+the triangle inequality force `|p - s| = 2r` and `x = (p + s) / 2`.
+Any other stone tied at `x` would also have to be opposite `p` on the same
+radius-`r` circle, hence coincide with `s`. Thus `s` uniquely owns `x`.
+The midpoint is inside the board, so a small step from `x` toward `p` remains
+inside `s`'s cell and is strictly closer to `p`. This witnesses the group's
+survival even though `x` itself is tied.
 
-So: **every group the official rules keep alive, ours keeps alive. Ours keeps
-some alive that theirs captures.** Measured as a field on real positions, the
-official dead zone covers 47.9% of the board where our settled region covers
-44.1%.
+The converse fails: `p` can sit `3r` from a large cell and still be strictly
+closer to a far corner of it than the owning stone is.
+That is the "a group lives while it can still connect out" case, and it exists
+only here.
 
-Practically the gap is small, because deliberate sacrifice is rarer here than in
-Go — a group that cannot be reached usually also cannot be extended. But it is a
-real difference in the rules and not a tolerance.
+So: **every group the website rules keep alive, ours keeps alive, while ours
+keeps some groups that theirs captures.** This is a group-level statement:
+the pointwise settled and dead-zone sets still differ at equality boundaries.
+
+The comments in [`runs/raster-ab.sh`](../runs/raster-ab.sh) record sampled
+coverage of 47.9% for the website dead zone and 44.1% for our settled region.
+The exact corpus and measurement command were not recorded there, so these
+are historical observations, not a reproducible benchmark or a measure of
+how often the two rules disagree about captures.
+
+The predicates differ in the rules themselves, independently of numerical
+tolerances. Their practical effect needs capture and gameplay comparisons;
+pointwise area coverage alone does not establish how small that effect is.
 
 ### 2. Self-capture
 
@@ -62,10 +83,10 @@ friendlies; the enemy is resolved first and dies first, exactly as here. With
 self-capture-only moves illegal there is no no-op placement, so the pass rule
 never fires and the whole even-trade question does not arise.
 
-**This costs the search nothing.** `Action::apply` resolves a candidate into a
-position before `Node::new` evaluates it, so a self-capture is already known by
-the time it would reach the network — the candidate is dropped at expansion, no
-inference wasted. Treating one as a pass instead would be wrong: it would invent
+**Refused moves spend no network inference.** `Action::try_apply` resolves a
+candidate before `Node::new` evaluates it, so a forbidden self-capture is
+dropped at expansion. The geometry work needed to discover the refusal is
+still paid. Treating one as a pass instead would be wrong: it would invent
 a move the real client rejects, and a bot trained on it would propose moves the
 site refuses.
 
@@ -88,15 +109,15 @@ From there, two routes, and the shorter one needs less.
 clipped to a rectangular board is convex too, so it is the hull of its corners;
 and a convex set containing every corner contains their hull.
 
-**Via linearity, which assumes nothing about the cell.** A half-plane is
+**Via linearity, which does not require convexity.** A half-plane is
 `{ f > c }` for a linear `f`, and a linear functional on a polygon attains its
 maximum at a vertex. So a half-plane that meets a bounded polygon at all contains
 one of its vertices. If any point of the cell is taken by `p`, then `p`'s
 half-plane meets the cell, so it contains a corner, so that corner is taken.
 
-The second is the one to remember: it needs neither the cell's convexity nor the
-settled region's, so it would survive a board whose edges were not straight lines
-or a cell that had been clipped into something awkward.
+The second argument also works for nonconvex polygons. It still requires
+polygonal boundaries: on a curved boundary, a linear functional can attain
+its maximum away from every corner.
 
 Either way, a cell whose corners are all settled is settled entirely, and
 checking corners misses nothing.
@@ -106,7 +127,7 @@ non-convex, which is why `alive_groups_of` walks cells rather than group regions
 It does not need to do better: any point of the union lies in one of the cells,
 and that cell is where the argument above finds its corner.
 
-That also corrects `AXIOMS.md`'s A16, which records each `R_s` as star-shaped
+That also strengthens `AXIOMS.md`'s A16, which records each `R_s` as star-shaped
 about `s`. True, but weaker than the fact: it is convex. The radial solve in
 `settled.rs` only needs star-shapedness, so nothing there is wrong -- but a
 future reader deriving bounds from A16 is leaving something on the table.
@@ -117,7 +138,7 @@ implementation, not an argument for the theorem.
 
 **None of it transfers to `Ruleset::Official`.** Its question is whether the
 region comes within `r` of a legal point -- a distance band with curved edges,
-not a half-plane. Nothing is convex, nothing is an intersection of slices, and a
+not a half-plane. The same convexity argument does not apply, and a
 cell edge really can dip into the band with both its corners outside. That is
 why its extra edge tests are necessary, and why the case ours still misses --
 the closest approach between the interior of an edge and a smooth arc of `L`'s
@@ -141,12 +162,12 @@ Recorded for a future revisit rather than as a to-do. None of it is urgent.
   without rebuilding, and `undo_move` restores the previous state bit for bit,
   down to the segment list. We recompute the legal set per position. For a search
   that plays and unplays millions of moves that is a genuine architectural
-  advantage, and it is the strongest argument for his design.
-- **A tighter tolerance, relative to a stone.** His `EPSILON` is `1e-7` at stone
-  radius `1.0`; ours is `1e-7` at radius `0.0557`, so ours is about 18x looser
-  measured in stone radii. Our coordinates live in `[0,1]` and barely use the
-  exponent range, so scaling the base board up would buy that back. Nothing has
-  been traced to this, and f64 has room either way.
+  advantage, and it is the strongest argument for that design.
+- **A tighter tolerance, relative to a stone.** The reference's `EPSILON` is
+  `1e-7` at stone radius `1.0`; ours is `1e-7` at radius `0.0557`, so ours is
+  about 18x looser measured in stone radii. Our coordinates live in `[0,1]` and
+  barely use the exponent range, so scaling the base board up would buy that
+  back. Nothing has been traced to this, and f64 has room either way.
 - **Degeneracy handling.** Three dead-zone circles through one point, and
   sub-ulp arcs between crossings that resolve a couple of parts in 10^15 apart,
   are handled deliberately and pinned by fixtures.

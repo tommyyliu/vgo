@@ -1,0 +1,57 @@
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 2800, hits: 1989, builds: 811, evictions: 793, oversized: 0, peak_retained_bytes: 1011128 }
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 2800, hits: 1989, builds: 811, evictions: 793, oversized: 0, peak_retained_bytes: 1011128 }
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 2800, hits: 1989, builds: 811, evictions: 793, oversized: 0, peak_retained_bytes: 1011128 }
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 2800, hits: 1989, builds: 811, evictions: 793, oversized: 0, peak_retained_bytes: 1011128 }
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 2800, hits: 1989, builds: 811, evictions: 793, oversized: 0, peak_retained_bytes: 1011128 }
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=80 stones=80 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 2800, hits: 1989, builds: 811, evictions: 793, oversized: 0, peak_retained_bytes: 1011128 }
+fixture=80 actors=1 sims=1400: 0.976800s -> 1.173389s, 0.8325x; ranges=0.969080..0.982619/1.171285..1.176742; fingerprints match
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 2800, hits: 1795, builds: 1005, evictions: 998, oversized: 0, peak_retained_bytes: 991376 }
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 2800, hits: 1795, builds: 1005, evictions: 998, oversized: 0, peak_retained_bytes: 991376 }
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 2800, hits: 1795, builds: 1005, evictions: 998, oversized: 0, peak_retained_bytes: 991376 }
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 2800, hits: 1795, builds: 1005, evictions: 998, oversized: 0, peak_retained_bytes: 991376 }
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 2800, hits: 1795, builds: 1005, evictions: 998, oversized: 0, peak_retained_bytes: 991376 }
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+replay sample=160 stones=153 radius=0.02631578947368421 komi=0.00817232640022589 passes=0
+actor=0 SupportMetrics { calls: 2800, hits: 1795, builds: 1005, evictions: 998, oversized: 0, peak_retained_bytes: 991376 }
+fixture=160 actors=1 sims=1400: 2.568384s -> 3.479572s, 0.7381x; ranges=2.543317..2.573619/3.440363..3.501377; fingerprints match
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+actor=0 SupportMetrics { calls: 2778, hits: 1545, builds: 1233, evictions: 1229, oversized: 0, peak_retained_bytes: 959456 }
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+actor=0 SupportMetrics { calls: 2778, hits: 1545, builds: 1233, evictions: 1229, oversized: 0, peak_retained_bytes: 959456 }
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+actor=0 SupportMetrics { calls: 2778, hits: 1545, builds: 1233, evictions: 1229, oversized: 0, peak_retained_bytes: 959456 }
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+actor=0 SupportMetrics { calls: 2778, hits: 1545, builds: 1233, evictions: 1229, oversized: 0, peak_retained_bytes: 959456 }
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+actor=0 SupportMetrics { calls: 2778, hits: 1545, builds: 1233, evictions: 1229, oversized: 0, peak_retained_bytes: 959456 }
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+replay sample=240 stones=217 radius=0.02631578947368421 komi=0.00817232640022589 passes=1
+actor=0 SupportMetrics { calls: 2778, hits: 1545, builds: 1233, evictions: 1229, oversized: 0, peak_retained_bytes: 959456 }
+fixture=240 actors=1 sims=1400: 8.633602s -> 7.667817s, 1.1260x; ranges=8.599187..8.720538/7.628121..7.692204; fingerprints match

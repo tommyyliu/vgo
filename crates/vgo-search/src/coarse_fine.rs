@@ -13,8 +13,10 @@
 //! The exact sampling probability is `beta = P_coarse(C) * P_fine(a | C)`, which
 //! we return so the training side can importance-correct the target.
 
+use std::sync::Arc;
 use vgo_core::{
-    COORDINATE_EPSILON, Point, Position, is_inside_legal_inset, legal_set_vertices, nearest_legal_placement_with,
+    COORDINATE_EPSILON, Point, Position, is_inside_legal_inset, legal_set_vertices,
+    nearest_legal_placement_with,
 };
 
 /// A sampled placement candidate and the probability it was drawn with.
@@ -33,8 +35,9 @@ pub struct FineGrid {
     width: usize,
     height: usize,
     coarse: usize, // coarse-cell size in fine cells (pool factor), both axes
-    logits: Vec<f32>,
-    legal: Vec<bool>,
+    logits: Arc<Vec<f32>>,
+    // Rust Vec<bool> uses a byte per cell. Pack exact legality into bits.
+    legal: Vec<u64>,
     /// Cells whose illegal centre was projected onto legal area inside the
     /// cell, keyed by row-major cell index. Ordinary legal cells place at their
     /// centre and need no stored point. Build order keeps this sorted for lookup.
@@ -42,6 +45,25 @@ pub struct FineGrid {
 }
 
 impl FineGrid {
+    fn legal_at(&self, index: usize) -> bool {
+        self.legal[index / 64] & (1u64 << (index % 64)) != 0
+    }
+
+    #[cfg(test)]
+    fn unpacked_legal(&self) -> Vec<bool> {
+        (0..self.width * self.height)
+            .map(|i| self.legal_at(i))
+            .collect()
+    }
+    pub(crate) fn account_memory(&self, counter: &mut crate::memory::MemoryCounter) {
+        for allocation in [
+            crate::HeapAllocation::vector(&self.logits),
+            crate::HeapAllocation::vector(&self.legal),
+            crate::HeapAllocation::vector(&self.placement_overrides),
+        ] {
+            counter.allocation(allocation, false);
+        }
+    }
     // The production-like 128x128/35-stone fixture has 219 snapped cells. A
     // 256-entry slab avoids growth while occupying 6 KiB, versus the former
     // dense placement table's 256 KiB.
@@ -58,9 +80,45 @@ impl FineGrid {
         coarse: usize,
         mut logit_at: impl FnMut(usize, usize) -> f32,
     ) -> Self {
+        Self::build_storage(position, width, height, coarse, None, &mut logit_at)
+    }
+
+    /// Reuse immutable policy logits. Illegal entries are ignored by the legal
+    /// mask, not overwritten. A trailing pass logit is permitted.
+    pub fn from_shared_logits(
+        position: &Position,
+        width: usize,
+        height: usize,
+        coarse: usize,
+        logits: Arc<Vec<f32>>,
+    ) -> Self {
+        assert!(width > 0 && height > 0);
+        assert!(logits.len() == width * height || logits.len() == width * height + 1);
+        Self::build_storage(
+            position,
+            width,
+            height,
+            coarse,
+            Some(logits),
+            &mut |_, _| unreachable!(),
+        )
+    }
+
+    fn build_storage(
+        position: &Position,
+        width: usize,
+        height: usize,
+        coarse: usize,
+        shared: Option<Arc<Vec<f32>>>,
+        logit_at: &mut impl FnMut(usize, usize) -> f32,
+    ) -> Self {
         let coarse = coarse.clamp(1, width.min(height));
-        let mut logits = vec![f32::NEG_INFINITY; width * height];
-        let mut legal = vec![false; width * height];
+        let mut logits = if shared.is_none() {
+            vec![f32::NEG_INFINITY; width * height]
+        } else {
+            Vec::new()
+        };
+        let mut legal = vec![0u64; (width * height).div_ceil(64)];
         // A cell is playable when its centre is legal, or when the centre is
         // only just illegal and projects onto legal area still inside the cell.
         // The second case is what keeps thin legal regions reachable: legality
@@ -130,18 +188,23 @@ impl FineGrid {
                 } else {
                     continue;
                 };
-                legal[idx] = true;
-                logits[idx] = logit_at(row, col);
+                legal[idx / 64] |= 1u64 << (idx % 64);
+                if shared.is_none() {
+                    logits[idx] = logit_at(row, col);
+                }
                 if let Some(point) = placement_override {
                     placement_overrides.push((idx, point));
                 }
             }
         }
+        // Scratch headroom is useful while snapping; it need not live in every
+        // retained tree node. Empty grids also release the initial 6 KiB slab.
+        placement_overrides.shrink_to_fit();
         Self {
             width,
             height,
             coarse,
-            logits,
+            logits: shared.unwrap_or_else(|| Arc::new(logits)),
             legal,
             placement_overrides,
         }
@@ -181,7 +244,7 @@ impl FineGrid {
         for row in r0..(r0 + self.coarse).min(self.height) {
             for col in c0..(c0 + self.coarse).min(self.width) {
                 let idx = row * self.width + col;
-                if self.legal[idx] {
+                if self.legal_at(idx) {
                     let v = self.logits[idx];
                     best = Some(best.map_or(v, |b| b.max(v)));
                 }
@@ -202,6 +265,51 @@ impl FineGrid {
     }
 }
 
+#[cfg(test)]
+mod shared_storage_tests {
+    use super::*;
+    use vgo_core::{Color, Stone};
+
+    #[test]
+    fn shared_logits_preserve_mask_snapping_and_noisy_sampling() {
+        let parent = Position::new(0.1, vec![Stone::new(0.3, 0.3, Color::Black)], Color::White);
+        for (width, height, coarse) in [(17, 23, 4), (32, 32, 8)] {
+            let values = Arc::new(
+                (0..width * height + 1)
+                    .map(|i| ((i * 19) % 97) as f32 / 13.0)
+                    .collect::<Vec<_>>(),
+            );
+            let copy =
+                FineGrid::build(&parent, width, height, coarse, |r, c| values[r * width + c]);
+            let shared =
+                FineGrid::from_shared_logits(&parent, width, height, coarse, Arc::clone(&values));
+            assert!(Arc::ptr_eq(&values, &shared.logits));
+            assert_eq!(copy.legal, shared.legal);
+            assert_eq!(copy.placement_overrides, shared.placement_overrides);
+            assert!(copy.unpacked_legal().iter().any(|&v| !v));
+            assert!(!copy.placement_overrides.is_empty());
+            for noise in [0.0, 0.25, 1.0] {
+                let rng = || {
+                    let mut state = 19u64;
+                    move || {
+                        state = crate::candidates::splitmix64(state);
+                        crate::candidates::unit_f64(state)
+                    }
+                };
+                let expected = sample_candidates_noisy(&copy, 128, noise, rng());
+                let actual = sample_candidates_noisy(&shared, 128, noise, rng());
+                assert_eq!(expected.len(), actual.len());
+                for (a, b) in expected.iter().zip(&actual) {
+                    assert_eq!(
+                        (a.point.x.to_bits(), a.point.y.to_bits(), a.beta.to_bits()),
+                        (b.point.x.to_bits(), b.point.y.to_bits(), b.beta.to_bits())
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Draw `count` candidates with replacement via coarse->fine factored sampling.
 /// `rng` yields uniform f64 in [0, 1). Returns fewer than `count` only if the
 /// board has no legal placement at all.
@@ -210,7 +318,9 @@ pub fn sample_candidates(
     count: usize,
     rng: impl FnMut() -> f64,
 ) -> Vec<CandidateSample> {
-    sample_candidates_with(grid, count, 0.0, rng, |row, col| grid.placement_at(row, col))
+    sample_candidates_with(grid, count, 0.0, rng, |row, col| {
+        grid.placement_at(row, col)
+    })
 }
 
 /// Sample candidates with `noise` uniform mass mixed into the proposal.
@@ -285,7 +395,7 @@ fn sample_candidates_with(
         for row in r0..(r0 + grid.coarse).min(grid.height) {
             for col in c0..(c0 + grid.coarse).min(grid.width) {
                 let idx = row * grid.width + col;
-                if grid.legal[idx] {
+                if grid.legal_at(idx) {
                     fine.push((row, col, grid.logits[idx]));
                 }
             }
@@ -317,12 +427,7 @@ fn sample_candidates_with(
 /// which is what makes the bounded scatter sound: a cell no stone comes within
 /// `reach` of keeps infinity, and infinity satisfies any such threshold just as
 /// its true distance would.
-fn nearest_stone_squares(
-    position: &Position,
-    width: usize,
-    height: usize,
-    reach: f64,
-) -> Vec<f64> {
+fn nearest_stone_squares(position: &Position, width: usize, height: usize, reach: f64) -> Vec<f64> {
     let mut nearest = vec![f64::INFINITY; width * height];
     if reach <= 0.0 {
         return nearest;
@@ -331,10 +436,8 @@ fn nearest_stone_squares(
         // Cells whose centre can lie within `reach` of this stone.
         let low_col = (((stone.x - reach) * width as f64 - 0.5).ceil()).max(0.0) as usize;
         let low_row = (((stone.y - reach) * height as f64 - 0.5).ceil()).max(0.0) as usize;
-        let high_col =
-            (((stone.x + reach) * width as f64 - 0.5).floor()).max(0.0) as usize;
-        let high_row =
-            (((stone.y + reach) * height as f64 - 0.5).floor()).max(0.0) as usize;
+        let high_col = (((stone.x + reach) * width as f64 - 0.5).floor()).max(0.0) as usize;
+        let high_row = (((stone.y + reach) * height as f64 - 0.5).floor()).max(0.0) as usize;
         for row in low_row..=high_row.min(height - 1) {
             let y = (row as f64 + 0.5) / height as f64;
             let dy = y - stone.y;
@@ -444,8 +547,10 @@ fn sample_index(probs: &[f64], u: f64) -> usize {
 
 #[cfg(test)]
 mod scatter_tests {
-    use vgo_core::{Color, Point, Position, Stone, is_legal_placement, legal_set_vertices,
-                   nearest_legal_placement_with};
+    use vgo_core::{
+        Color, Point, Position, Stone, is_legal_placement, legal_set_vertices,
+        nearest_legal_placement_with,
+    };
 
     use super::{FineGrid, straddles_boundary};
 
@@ -471,7 +576,11 @@ mod scatter_tests {
             stones.push(Stone {
                 x,
                 y,
-                color: if index % 2 == 0 { Color::Black } else { Color::White },
+                color: if index % 2 == 0 {
+                    Color::Black
+                } else {
+                    Color::White
+                },
             });
         }
         Position::new(radius, stones, Color::Black)
@@ -524,7 +633,7 @@ mod scatter_tests {
             let position = lattice(count, radius, 19);
             let grid = FineGrid::build(&position, 64, 64, 16, |_, _| 0.0);
             let expected = reference_legal(&position, 64, 64);
-            let actual = grid.legal.clone();
+            let actual = grid.unpacked_legal();
             assert_eq!(
                 actual,
                 expected,
@@ -620,7 +729,7 @@ mod tests {
             (row * width + col) as f32 * 0.03125 - 7.0
         });
 
-        assert_eq!(grid.legal, expected_legal);
+        assert_eq!(grid.unpacked_legal(), expected_legal);
         let mut expected_overrides = Vec::new();
         for row in 0..height {
             for col in 0..width {
@@ -677,12 +786,12 @@ mod tests {
         // Force sampling through one snapped sliver cell, then compare the
         // complete sampled output with the former dense placement lookup.
         let snapped_index = expected_overrides[0].0;
-        for (index, logit) in grid.logits.iter_mut().enumerate() {
-            if grid.legal[index] {
+        for (index, logit) in Arc::make_mut(&mut grid.logits).iter_mut().enumerate() {
+            if grid.legal[index / 64] & (1u64 << (index % 64)) != 0 {
                 *logit = -20.0;
             }
         }
-        grid.logits[snapped_index] = 20.0;
+        Arc::make_mut(&mut grid.logits)[snapped_index] = 20.0;
         let random_values = vec![0.13, 0.73, 0.41, 0.89, 0.27, 0.61];
         let expected =
             sample_candidates_with(&grid, 64, 0.0, stream(random_values.clone()), |row, col| {
@@ -742,7 +851,7 @@ mod tests {
             let mut legal_fine = 0;
             for r in r0..(r0 + coarse).min(height) {
                 for c in c0..(c0 + coarse).min(width) {
-                    if grid.legal[r * width + c] {
+                    if grid.legal_at(r * width + c) {
                         legal_fine += 1;
                     }
                 }
@@ -861,7 +970,7 @@ mod tests {
         let mut reached = false;
         for col in 0..width {
             let idx = row * width + col;
-            if !grid.legal[idx] {
+            if !grid.legal_at(idx) {
                 continue;
             }
             let placement = grid.placement_at(row, col);
@@ -898,7 +1007,7 @@ mod tests {
         for row in 0..height {
             for col in 0..width {
                 let idx = row * width + col;
-                if !grid.legal[idx] {
+                if !grid.legal_at(idx) {
                     continue;
                 }
                 let centre = cell_center(row, col, width, height);

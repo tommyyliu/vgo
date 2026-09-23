@@ -1,6 +1,14 @@
 use std::collections::HashSet;
 
-use vgo_core::{Point, Position, is_legal_placement, legal_set_vertices, pass, place};
+use vgo_core::{Point, Position, is_legal_placement, legal_set_vertices, pass};
+
+fn place(position: &Position, x: f64, y: f64) -> Result<vgo_core::MoveResult, vgo_core::MoveError> {
+    #[cfg(feature = "iteration-lab")]
+    if let Some(result) = crate::transition_lab::place(position, x, y) {
+        return result;
+    }
+    vgo_core::place(position, x, y)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
@@ -18,15 +26,16 @@ impl Action {
     /// the candidate and picks another. Every other rejection is still a panic,
     /// because it means an illegal point reached the search.
     pub fn try_apply(self, position: &Position) -> Option<vgo_core::MoveResult> {
-        if let Self::Place(point) = self {
-            if matches!(
-                place(position, point.x, point.y),
-                Err(vgo_core::MoveError::SelfCapture)
-            ) {
-                return None;
-            }
+        match self {
+            Self::Pass => Some(self.apply(position)),
+            Self::Place(point) => match place(position, point.x, point.y) {
+                Ok(result) => Some(result),
+                Err(vgo_core::MoveError::SelfCapture) => None,
+                Err(error) => panic!(
+                    "placement candidate must be legal: {error:?}\n  point {point:?}\n  position {position:?}"
+                ),
+            },
         }
-        Some(self.apply(position))
     }
 
     pub fn apply(self, position: &Position) -> vgo_core::MoveResult {
@@ -40,9 +49,7 @@ impl Action {
                 let stones = position.stones();
                 let nearest = stones
                     .iter()
-                    .map(|stone| {
-                        vgo_core::planar_length(point.x - stone.x, point.y - stone.y)
-                    })
+                    .map(|stone| vgo_core::planar_length(point.x - stone.x, point.y - stone.y))
                     .fold(f64::INFINITY, f64::min);
                 panic!(
                     "placement candidate must be legal: {error:?}\n  \
@@ -219,6 +226,22 @@ mod tests {
     use vgo_core::{Color, Position, Stone, is_legal_placement};
 
     use super::{Action, CandidateSource, generate_candidates};
+
+    #[test]
+    fn try_apply_preserves_no_op_pass_and_official_refusal() {
+        let position = Position::new(0.4, vec![], Color::Black);
+        let action = Action::Place(vgo_core::Point::new(0.5, 0.5));
+        let result = action.try_apply(&position).unwrap();
+        assert!(result.position.stones().is_empty());
+        assert_eq!(result.position.to_move(), Color::White);
+        let finished = action.try_apply(&result.position).unwrap();
+        assert_eq!(finished.position.phase(), vgo_core::Phase::Finished);
+        assert!(
+            action
+                .try_apply(&position.with_ruleset(vgo_core::Ruleset::Official))
+                .is_none()
+        );
+    }
 
     #[test]
     fn larger_budgets_extend_the_same_candidate_prefix() {

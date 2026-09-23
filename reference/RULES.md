@@ -5,6 +5,9 @@ lemmas belong in `AXIOMS.md`, not here.
 
 ## 1. Board and stones
 
+- The two colors are Black and White. A standard game starts with an empty
+  board, Black to move, and zero consecutive passes. A setup diagram may instead
+  specify the initial stones and player to move.
 - The board is the closed unit square `D = [0,1] x [0,1]`.
 - A game has a fixed stone radius `r`, with `0 < r < 1/2`.
 - Each stone has a color and a center in the inset square
@@ -30,9 +33,10 @@ V_s(S) = { x in D : ||x-s|| <= ||x-t|| for every t in S }.
 - A group is a connected component of same-color stones under that adjacency.
 - A group's region is the union of its stones' cells.
 - A color's score is the total area of its stones' cells.
-- A game has a fixed komi, an area subtracted from Black's lead when the game
-  is scored. It is a fraction of the board, like the scores it adjusts, not a
-  stone count: komi `0.18` spots White eighteen percent of the board. Komi is
+- A game has a fixed, finite real-valued komi, an area subtracted from Black's
+  lead when the game is scored. It is a fraction of the board, like the scores
+  it adjusts, not a stone count: komi `0.18` spots White eighteen percent of the
+  board. Positive komi favors White and negative komi favors Black. Komi is
   fixed for a game and is not changed by any move.
 
 ## 3. Legal placement centers
@@ -80,8 +84,7 @@ A placement is resolved as one transaction:
 
 Self-capture is global: it can remove the new stone's group, a disconnected
 friendly group, or both. The new stone can remove the last useful placement
-center for a disconnected group without taking area from that group. The
-reference implementation warns when a move removes one or more friendly stones.
+center for a disconnected group without taking area from that group.
 
 ## 6. Passing and repetition
 
@@ -96,6 +99,5 @@ reference implementation warns when a move removes one or more friendly stones.
 - Two consecutive passes end the game. The current Voronoi area totals are the
   final scores. Black wins when `black - white - komi` is positive, White when
   it is negative, and an exact zero is a tie.
-- After the game ends, no further move or pass is allowed. Undo or Clear may be
-  used to return the reference implementation to an active position.
-- The reference rules currently impose no ko or repetition restriction.
+- After the game ends, no further move or pass is allowed.
+- There is no ko or repetition restriction.

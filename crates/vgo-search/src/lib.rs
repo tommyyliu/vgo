@@ -4,13 +4,17 @@ mod candidates;
 mod coarse_fine;
 mod evaluator;
 mod mcts;
+mod memory;
+#[cfg(feature = "iteration-lab")]
+pub mod transition_lab;
+pub use memory::{HeapAllocation, TreeMemory};
 
 pub use candidates::{Action, Candidate, CandidateSequence, CandidateSource, generate_candidates};
 pub use coarse_fine::{CandidateSample, FineGrid, sample_candidates};
 pub use evaluator::{Evaluation, EvaluationError, Evaluator, NaiveEvaluator, Policy};
 mod stepped;
-pub use stepped::{SteppedSearch, drive as drive_stepped};
 pub use mcts::{
     ChildSummary, SearchConfig, SearchResult, SearchStats, search, search_at_ply,
     search_with_evaluator,
 };
+pub use stepped::{SteppedSearch, drive as drive_stepped};

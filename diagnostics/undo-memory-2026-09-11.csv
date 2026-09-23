@@ -1,0 +1,7 @@
+fixture,start_stones,depth,variant,history_bytes,median_roundtrip_us
+play-r0-ply100,10,32,snapshots,9960,482.291
+play-r0-ply100,10,32,undo,3712,481.821
+play-r1-ply100,37,32,snapshots,37080,3722.806
+play-r1-ply100,37,32,undo,3456,3725.365
+play-r2-ply100,100,32,snapshots,90048,15144.853
+play-r2-ply100,100,32,undo,2688,15229.483

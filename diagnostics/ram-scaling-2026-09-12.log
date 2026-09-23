@@ -1,0 +1,15 @@
+verified actors=1 simulations=350
+verified actors=2 simulations=350
+verified actors=4 simulations=350
+verified actors=8 simulations=350
+verified actors=1 simulations=700
+verified actors=2 simulations=700
+verified actors=4 simulations=700
+verified actors=8 simulations=700
+verified actors=1 simulations=1400
+verified actors=2 simulations=1400
+verified actors=4 simulations=1400
+verified actors=8 simulations=1400
+verified actors=1 simulations=2800
+verified actors=2 simulations=2800
+verified actors=4 simulations=2800

@@ -13,6 +13,11 @@ const REFUSED_MOVE_LOGIT: f64 = 64.0;
 const SELF_CAPTURE_LOGIT_PENALTY: f64 = 24.0;
 
 pub trait Policy: Send + Sync {
+    /// Optional diagnostic payload inventory. None explicitly means unknown,
+    /// not zero. Shared buffers should use their allocation's common identity.
+    fn heap_allocations(&self) -> Option<Vec<crate::HeapAllocation>> {
+        None
+    }
     fn logit(&self, action: Action) -> f64;
 
     /// A dense fine grid of placement logits for coarse->fine candidate sampling,
@@ -30,6 +35,16 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
+    pub(crate) fn account_memory(&self, counter: &mut crate::memory::MemoryCounter) {
+        counter.report.policy_bytes += std::mem::size_of_val(&*self.policy);
+        if let Some(allocations) = self.policy.heap_allocations() {
+            for allocation in allocations {
+                counter.allocation(allocation, true);
+            }
+        } else {
+            counter.report.unreported_policies += 1;
+        }
+    }
     #[must_use]
     pub fn new(current_value: f64, policy: Box<dyn Policy>) -> Self {
         assert!(current_value.is_finite() && (-1.0..=1.0).contains(&current_value));

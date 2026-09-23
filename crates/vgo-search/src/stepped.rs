@@ -70,11 +70,26 @@ enum Stage {
         pending_index: Vec<Option<usize>>,
     },
     /// Between rounds, with simulations still to run.
-    Ready { root: Box<Node>, remaining: u32 },
-    Finished { root: Box<Node> },
+    Ready {
+        root: Box<Node>,
+        remaining: u32,
+    },
+    Finished {
+        root: Box<Node>,
+    },
 }
 
 impl SteppedSearch {
+    /// Retained tree payload only; excludes pending batches, driver state,
+    /// allocator headers, and caches explicitly reported as unknown.
+    pub fn tree_memory(&self) -> crate::TreeMemory {
+        match &self.stage {
+            Stage::Root => crate::TreeMemory::default(),
+            Stage::Ready { root, .. } | Stage::Round { root, .. } | Stage::Finished { root } => {
+                root.memory_usage()
+            }
+        }
+    }
     /// Begin a search. Nothing is evaluated until [`Self::next_batch`].
     ///
     /// # Panics
@@ -204,9 +219,9 @@ impl SteppedSearch {
         match std::mem::replace(&mut self.stage, Stage::Root) {
             Stage::Root => {
                 let mut evaluations = evaluations;
-                let evaluation = evaluations.pop().ok_or_else(|| {
-                    EvaluationError::new("the root needs exactly one evaluation")
-                })?;
+                let evaluation = evaluations
+                    .pop()
+                    .ok_or_else(|| EvaluationError::new("the root needs exactly one evaluation"))?;
                 let mut root = Box::new(Node::from_evaluation(
                     self.position.clone(),
                     evaluation,
@@ -377,7 +392,7 @@ pub fn drive(
 
 #[cfg(test)]
 mod tests {
-    use vgo_core::{Color, Point, Position, Stone};
+    use vgo_core::{Color, Position, Stone};
 
     use super::*;
     use crate::{Action, Evaluator, NaiveEvaluator, search_at_ply};
@@ -393,7 +408,11 @@ mod tests {
             if x > 0.94 || y > 0.94 {
                 break;
             }
-            let colour = if index % 2 == 0 { Color::Black } else { Color::White };
+            let colour = if index % 2 == 0 {
+                Color::Black
+            } else {
+                Color::White
+            };
             placed.push(Stone::new(x, y, colour));
         }
         Position::new(radius, placed, Color::Black).with_komi(0.104)
@@ -451,8 +470,11 @@ mod tests {
                             right.black_value.to_bits(),
                             "child value differs at {context}"
                         );
-                        assert_eq!(left.prior.to_bits(), right.prior.to_bits(),
-                            "prior differs at {context}");
+                        assert_eq!(
+                            left.prior.to_bits(),
+                            right.prior.to_bits(),
+                            "prior differs at {context}"
+                        );
                     }
                     assert_eq!(
                         batched.stats.simulations, stepped.stats.simulations,
@@ -474,7 +496,10 @@ mod tests {
         assert!(!first.is_empty());
         assert_eq!(first.len(), second.len());
         assert!(!search.finished());
-        assert!(search.submit(Vec::new()).is_err(), "count mismatch must be rejected");
+        assert!(
+            search.submit(Vec::new()).is_err(),
+            "count mismatch must be rejected"
+        );
     }
 
     /// The caller may stop early; what it has is still a usable answer.
@@ -495,7 +520,10 @@ mod tests {
                 .expect("naive evaluation");
             search.submit(evaluations).expect("submit");
         }
-        assert!(!search.finished(), "256 simulations cannot finish in five rounds");
+        assert!(
+            !search.finished(),
+            "256 simulations cannot finish in five rounds"
+        );
         assert!(search.simulations() > 0, "some simulations must have run");
     }
 }

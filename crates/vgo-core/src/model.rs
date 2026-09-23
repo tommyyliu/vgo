@@ -56,8 +56,10 @@ pub enum Ruleset {
     /// Strictly the more aggressive capture rule of the two, which is not
     /// obvious and is worth the derivation. If a legal centre `p` lies within
     /// `r` of a point `x`, then `d_S(x) >= d_S(p) - ||x - p|| >= 2r - r = r >=
-    /// ||x - p||`, so `p` challenges `x` and [`Vgo`](Self::Vgo) calls the group
-    /// alive too. The converse fails: `p` can be `3r` from a large cell and
+    /// ||x - p||`. If strict, `p` challenges `x`. At equality, `x` is the
+    /// midpoint of `p` and its unique owning stone; a small step toward `p`
+    /// stays inside that cell and is strictly challenged. Thus [`Vgo`](Self::Vgo)
+    /// calls the group alive too. The converse fails: `p` can be `3r` from a large cell and
     /// still take area from it, which is the "keep a group alive while it can
     /// connect out" case that only this repository's rules allow.
     ///
@@ -119,6 +121,10 @@ pub struct Position {
 }
 
 impl Position {
+    #[cfg(feature = "iteration-lab")]
+    pub(crate) fn take_stones_for_lab(&mut self) -> Vec<Stone> {
+        std::mem::take(&mut self.stones)
+    }
     #[must_use]
     pub fn new(radius: f64, stones: Vec<Stone>, to_move: Color) -> Self {
         Self {
