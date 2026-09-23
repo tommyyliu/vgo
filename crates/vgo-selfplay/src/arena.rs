@@ -26,13 +26,18 @@ struct Arguments {
     #[arg(long)]
     candidate: PathBuf,
     /// Channel layout the candidate was exported with. Each model reads only
-    /// its own layout, so a semantic and an RGB model can still play: both see
-    /// the same positions, each rendered the way it was trained to read.
+    /// its own layout, so two models with different layouts can still play:
+    /// both see the same positions, each rendered the way it was trained to read.
     #[arg(long, default_value = "semantic")]
     candidate_raster_kind: RasterKind,
     /// Layout for every --opponent. Defaults to the candidate's.
     #[arg(long)]
     opponent_raster_kind: Option<RasterKind>,
+    /// Input size for every --opponent. Defaults to --resolution. Like the
+    /// layout, it is a property of each export, so a 128 and a 256 model can
+    /// meet: each reads the same position rendered at its own size.
+    #[arg(long)]
+    opponent_resolution: Option<usize>,
     /// Repeatable. Each opponent plays `--pairs` color-swapped pairs against the
     /// same loaded candidate and emits its own JSON record. Batching them here
     /// amortizes the provider's per-process model load and warmup, which is
@@ -192,11 +197,12 @@ struct GameResult {
 fn load_model(
     model: PathBuf,
     kind: RasterKind,
+    resolution: usize,
     arguments: &Arguments,
 ) -> Result<BatchedEvaluator, EvaluationError> {
     let service = OnnxBatchService::load(&OnnxServiceConfig {
         model,
-        raster: RasterConfig::square_of(arguments.resolution, kind),
+        raster: RasterConfig::square_of(resolution, kind),
         policy: Some(RasterConfig::square(arguments.policy_resolution)),
         maximum_batch: arguments.maximum_batch,
         provider: arguments.provider,
@@ -241,6 +247,12 @@ fn validate_arguments(arguments: &Arguments) -> Result<(), &'static str> {
         || arguments.device_id < 0
     {
         return Err("arena counts, simulations, and dimensions must be positive");
+    }
+    if arguments.opponent_resolution == Some(0) {
+        return Err("--opponent-resolution must be positive");
+    }
+    if arguments.opponent_resolution.is_some_and(|size| size < arguments.policy_resolution) {
+        return Err("--opponent-resolution must not be below --policy-resolution");
     }
     if arguments.opponent_simulations == Some(0) {
         return Err("--opponent-simulations must be positive");
@@ -423,6 +435,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let candidate = load_model(
         arguments.candidate.clone(),
         arguments.candidate_raster_kind,
+        arguments.resolution,
         &arguments,
     )?;
     // One record per opponent, or a single naive-evaluator record when none are
@@ -441,6 +454,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     arguments
                         .opponent_raster_kind
                         .unwrap_or(arguments.candidate_raster_kind),
+                    arguments.opponent_resolution.unwrap_or(arguments.resolution),
                     &arguments,
                 )
             })
