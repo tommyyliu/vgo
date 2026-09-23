@@ -914,7 +914,7 @@ mod tests {
     /// dispatch at `SEARCH_MINIMUM_STONES` as well.
     #[test]
     fn fused_settled_matches_the_reference_builder() {
-        // 256 samples the legal set directly; 128 at this radius oversamples it.
+        // Both sizes sample the legal set at the output resolution.
         for width in [256usize, 128] {
             fused_settled_matches_at(width);
         }
