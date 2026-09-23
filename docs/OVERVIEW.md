@@ -1,11 +1,8 @@
 # System overview
 
 Start here. This is the map: what the system does, how the pieces fit, and why
-the load-bearing decisions are what they are. Every section ends with where to
-read more, so nothing here is duplicated in depth.
-
-Everything below describes the system **as it runs today**. Where a document is
-known to be out of date, that is called out inline.
+the load-bearing decisions are what they are. Each section ends with where to
+read more.
 
 ---
 
@@ -25,41 +22,56 @@ is no finite action set, so:
   a coarse-to-fine sampler** (§5);
 - move proposals come from **progressive widening**, not enumeration (§5).
 
-## 2. The loop, at a glance
+## 2. The loop
 
 ```
-   self-play (Rust)  ->  replay shards  ->  training (Python)  ->  ONNX export
-        ^                                                              |
-        +--------------------------- new model <-----------------------+
-                                         |
-                                     arena / Elo
+  vgo-generate-continuous  --one game per directory-->  games/gen-N-<sha>/
+          ^  (holds the incumbent model throughout)           |
+          |                                                   v
+   new generator on the  <--  export_onnx  <--  train-once.py (from scratch,
+   exported model                                on the newest window)
+                                                              |
+                                          every few updates:  v
+                                     vgo-arena vs sampled earlier models
+                                     -> anchor.jsonl -> scripts/ratings.py
 ```
 
-Four processes, run by a queue-driven pipeline rather than a serial barrier:
+[`scripts/bulk-loop.sh`](../scripts/bulk-loop.sh) runs it, and its header is the
+design document. In short:
 
-| stage | owner | what it produces |
-|---|---|---|
-| generation | Rust `vgo-generate-demo` | replay shards of (position, policy target, value, ownership) |
-| training | Python `PersistentLearner` | a `.pt` checkpoint |
-| export | Python `export_onnx` | a `.onnx` graph the Rust side serves |
-| rating | Rust `vgo-arena` | pairwise results fit to Bradley-Terry Elo |
+- **Generation never stops.** One generator writes each finished game as its
+  own directory. When a new model is exported, a new generator starts on it and
+  the old one drains the games it holds, so the GPU never idles on a
+  shard-completion tail.
+- **Training is from scratch, not incremental.** When `turnover` of the
+  `window` (default 15% of 150k samples) is new, a fresh model trains for
+  `epochs` (8) on the newest window and is adopted without a gate. A
+  warm-started incremental chain lost 41-7 (+307 Elo) to a from-scratch model
+  on the same corpus; retraining breaks the chain, so a bad round only affects
+  the games it produces.
+- **Rating is a graph, not a gate.** Every `anchor_every` updates the new model
+  plays short matches against a few sampled earlier models. `scripts/ratings.py`
+  fits everything at once (Bradley-Terry), anchored at `sl-w64b16 = 0`.
+- **Resignation is soft and self-calibrating.** A conceded game plays on at a
+  cheaper search budget, so every game still reaches a real result. The
+  threshold is re-picked before each generator from the measured false
+  positives (`scripts/resign-calibration.py`).
+- **Boards are mixed.** Generation draws 50% at radius 1/38, 25% at 1/18, and
+  25% uniformly between them, with komi set per board (a fixed number of points,
+  as in Go). The loop's own rating runs at 1/18, and
+  [`scripts/bigboard-curve.sh`](../scripts/bigboard-curve.sh) re-rates
+  checkpoints at 1/38.
 
-Generation and training **overlap** — the learner trains on shard N while actors
-generate shard N+1. Details, including the utilization feedback loop and how
-shards are retired, are in [`RL_LOOP.md`](RL_LOOP.md).
-
-To actually run any of it, see [`RUNNING.md`](RUNNING.md). That document also
-collects the failure modes that are confusing the first time (TensorRT library
-paths, engine cache invalidation, stale resolution defaults).
+To run any of it, see [`RUNNING.md`](RUNNING.md).
 
 ## 3. Language split
 
 **Rust owns everything in the hot loop**: rules, search, rasterization, native
-inference, arenas, shard serialization. **Python owns training and export
-only.** Rust does not import Python; they meet at two file formats — the replay
-shard and the ONNX graph.
+inference, arenas, game serialization. **Python owns training and export
+only.** They meet at two file formats: the game dataset (`dataset.vgo` plus a
+`manifest.json`) and the ONNX graph.
 
-This split exists because self-play throughput is the binding constraint on
+The split exists because self-play throughput is the binding constraint on
 learning speed, and the per-move work (legality, Voronoi geometry, scoring) is
 branch-heavy exact computation that does not vectorize.
 
@@ -69,181 +81,125 @@ is native.
 
 ## 4. Board representation
 
-A `Position` is rendered to a `[C, H, W]` f32 tensor by `vgo-raster`, sampling
-the centre of every pixel. Two layouts exist:
+A `Position` is rendered to a `[C, H, W]` tensor by `vgo-raster`, sampling the
+centre of every pixel. The layouts that remain:
 
-- **semantic**, 12 channels — stones, Voronoi cells, distance fields, ridges,
-  legality clearance, radius, pass state, settled mask, komi;
-- **compact**, 5 channels — `current_stones`, `opponent_stones`,
-  `voronoi_ridge`, `settled`, `komi`.
+| kind | planes | used by |
+|---|---|---|
+| `compact-radius` | 7: current/opponent stones, voronoi ridge, settled, komi, previous pass, radius | **the loop**, 256x256 |
+| `compact-pass` | 6: the same without radius | the browser client's model |
+| `compact-dead-zone` | 6: dead zone in place of settled, for the official rules | [`OFFICIAL_RULES.md`](OFFICIAL_RULES.md) |
+| `semantic` | 12 engineered channels | shard tooling, legality masks, tests |
 
-**Production runs compact at 128x128.** An ablation found the dropped channels
-were recoverable from the kept ones, and 5 channels cut both shard size and the
-per-batch staging copy.
+The radius plane exists because board size *is* the radius (the board is always
+the unit square). An empty board renders identically at every radius without
+it.
 
-> [`RASTER_REPRESENTATION.md`](RASTER_REPRESENTATION.md) still describes a
-> 10-channel tensor. The channel *semantics* it documents are correct; the count
-> is stale (now 12 semantic / 5 compact).
+Game datasets store positions, not pixels, and are rasterized at load time by
+`vgo-render-shard`. See [`POSITION_SHARDS.md`](POSITION_SHARDS.md) for why, and
+[`RASTER_REPRESENTATION.md`](RASTER_REPRESENTATION.md) for the channel semantics.
 
-Shards store game records and re-render rasters on load rather than storing
-pixels — see [`POSITION_SHARDS.md`](POSITION_SHARDS.md) for why (rendered pixels
-were 6 GB per shard, 4 GB of it raster).
+The `settled` plane is 92-96% of raster cost. It is computed by a distance
+transform ([`research/SETTLED_REGION_PROBLEM.md`](research/SETTLED_REGION_PROBLEM.md)).
 
 ## 5. Search and the policy target
 
-MCTS with progressive widening. Because the action space is continuous, the
-policy head emits a **spatial map over a P x P grid** (`policy_resolution`),
-plus one pass logit. Candidate moves are drawn coarse-to-fine: the coarse grid
-picks a cell, then a fine draw picks a point within it.
+MCTS with progressive widening. The policy head emits a **spatial map over a
+128x128 grid** plus one pass logit. Candidate moves are drawn coarse-to-fine:
+a coarse cell (16x16 pooling) is picked from the map, then a fine draw picks a
+point within it. Uniform mass (10%) is mixed into the root's proposal so the
+loop can try moves its policy does not already favour.
 
 This replaced a random-candidate sampler that could not train: with candidates
 drawn independently of the board, the policy target carried no board-dependent
-signal. That redesign is documented in [`POLICY_REDESIGN.md`](POLICY_REDESIGN.md).
+signal. See [`POLICY_REDESIGN.md`](POLICY_REDESIGN.md).
 
-`policy_resolution` is decoupled from the raster resolution on purpose — a
-~9-across board does not need 128x128 of placement precision, and a coarser grid
-concentrates a fixed number of proposal draws over fewer cells. Production
-currently runs both at 128.
+The widening coefficient matters more than any model-side lever: raising it
+from 2 was worth about +240 Elo. The loop generates at 6.0 and rates at 4.0.
 
 ## 6. The model
 
 DDRNet-inspired dual-resolution convolutional net in
-[`training/vgo_training/model.py`](../training/vgo_training/model.py).
-Production is `width=96, blocks=16` (~18.3M parameters, ~18.29M exported).
+[`training/vgo_training/model.py`](../training/vgo_training/model.py), and the only
+architecture left. The loop trains `width=64, blocks=16`, one attention block in
+each context stage, GroupNorm with 8 groups: about 8.2M parameters.
 
-**Shape.** A stem downsamples 128 -> 32. A *detail* branch stays at 32x32 and
-carries placement geometry; a *context* branch steps down 16 -> 8 and carries
-global information. Two bilateral fusions exchange between them. The detail
-branch dominates cost — three stages at ~1.9 ms each against ~1.3-1.5 ms for
-context.
+**Shape.** A stem downsamples by 4. A *detail* branch stays at that resolution
+and carries placement geometry; a *context* branch steps down twice more and
+carries global information. Two bilateral fusions exchange between them.
 
 **Heads.** Policy (spatial map + pass), value, and ownership. Each exists twice:
 a plain set reading raw trunk features, and a `_normed` set reading
 batch-normalized features. The normalized set carries most of the training loss;
 the plain set is what inference and the exported graph use. Without a norm in
 front of *some* head, nothing penalizes weight magnitude, and trunk weights
-inflate until activations overflow fp16. Keeping an unnormalized twin for
-inference keeps BatchNorm running statistics out of the exported graph.
+inflate until activations overflow fp16.
 
-**Value is categorical.** Two logits — P(mover wins), P(mover loses) — collapsed
-by `value_utility` to the [-1, 1] scalar the search consumes. A tanh scalar with
-MSE was tried and abandoned: its `(1 - v^2)` gradient factor vanished exactly on
-confidently-wrong positions, so the cases most needing correction learned
-slowest. Ownership uses the same idea with the redundant logit dropped (BCE on
-one logit is identical to two-class softmax CE).
+**Value is categorical.** Two logits, P(mover wins) and P(mover loses), are
+collapsed by `value_utility` to the [-1, 1] scalar the search consumes. A tanh
+scalar with MSE was abandoned: its `(1 - v^2)` gradient factor vanished exactly
+on confidently wrong positions.
 
-**Ownership is auxiliary.** It predicts who holds each cell at game end. It is
-spatial rather than scalar because a game's ~58 positions share one value label,
-which a net this size memorizes by trajectory; ownership varies within a game so
-it cannot collapse that way. It is training-only and never enters the exported
-graph.
+**Ownership is auxiliary** and currently weighted 0. It is training-only and
+never enters the exported graph.
 
-**Normalization: GroupNorm, 8 groups, two per residual block.** See §8 for the
-measurements behind this and what is known about changing it.
+**Optimizer: Adam.** Muon led early in A/Bs and was overtaken by update 24 in the
+loop. Bigger nets are a dead end at this compute: one doubling of simulations is
+worth about 61 Elo, which is the exchange rate to judge capacity results by.
 
-Exact shapes, the parameter and time budget per stage, and the experimental
-options are in [`MODEL_ARCHITECTURE.md`](MODEL_ARCHITECTURE.md).
+Exact shapes and the per-stage budget are in
+[`MODEL_ARCHITECTURE.md`](MODEL_ARCHITECTURE.md).
 
 ## 7. Serving
 
-The exported graph takes `states` and emits `policy_logits` and `values`. Rust
-loads it through ONNX Runtime with the TensorRT execution provider (fp16) and
-serves it behind a batching broker: actors submit evaluation requests, a broker
-thread assembles them into batches up to `maximum_batch`, waits at most
-`delay_ms`, and dispatches.
+Models are exported with a **packed input**: binary planes as bits, constant
+planes as one scalar each, the rest fp16, expanded inside the graph. At 256x256
+that stages 152 KB per position instead of 1792 KB, which doubled measured
+throughput (1.72k -> 3.7k positions/s) with bit-identical outputs.
 
-**Two execution slots can overlap host staging and GPU execution.** Each slot
-owns its own session, thread, and staging buffer. A shared broker now builds
-batches before selecting a slot, so the concurrency no longer divides arrivals
-between independent queues. Three slots collapsed in the original measurement
-because there is only one GPU and the third session added contention.
+Rust loads the graph through ONNX Runtime's TensorRT provider (fp16) and serves
+it behind a batching broker. Two inference slots overlap host staging with GPU
+execution. `--inference-slots 2 --maximum-batch 32 --leaf-batch 4` is the
+known-good combination: at 4 slots the inference threads livelock.
 
-`inference_slots` defaults to 2 in `PipelineConfig`. With the shared broker, the
-exact w64/b16 attention model measured 16,433 pos/s at batch 32, 13,343 at batch
-64, and 14,255 with three slots at batch 16. A paired production-shaped short
-self-play run improved from 20.67s to 18.92s at batch 32 while averaging
-31.8/32 positions. Batch size is a resumable serving control rather than search
-identity; the effective ceiling remains recorded per shard. A resumed ceiling
-must fit the current ONNX artifact, so lowering 64 to 32 works directly while
-raising beyond an old export requires re-exporting it.
+The generator asks CUDA to block rather than spin while waiting on the GPU,
+which frees two cores that were otherwise pinned at 100%.
 
-The protocol and the evaluator interface are in
-[`INFERENCE_PROTOCOL.md`](INFERENCE_PROTOCOL.md). The Blackwell/sm_120 toolchain
-situation — why onnxruntime is built from source and loaded via `ORT_DYLIB_PATH`
-— is in [`NVRTX_HANDOFF.md`](NVRTX_HANDOFF.md).
+The protocol and evaluator interface are in
+[`INFERENCE_PROTOCOL.md`](INFERENCE_PROTOCOL.md).
 
 ## 8. Decisions worth knowing, with evidence
 
-These are the choices a newcomer is most likely to want to re-litigate. Each was
-measured.
+**Two GroupNorms per residual block, 8 groups.** The groups are statistically
+interchangeable (spread across group means 1.24x against 3.35x within), and
+LayerNorm trains equivalently. Grouping is kept for throughput: 1 group is ~43%
+slower on TensorRT, and 4-96 groups are within 0.4% of each other.
 
-**Two GroupNorms per residual block, 8 groups.**
-Grouping buys nothing representationally here: across all 42 norm sites of a
-trained model, the spread *across* group means is 1.24x while the spread *within*
-groups is 3.35x, so the groups are statistically interchangeable and LayerNorm
-loses no information. LayerNorm also trains equivalently (policy_kl 1.004x,
-value_mae 0.98x). The reason to keep grouping is throughput: 1 group is ~43%
-slower on TensorRT, while 4/8/12 groups are within 0.4% of each other and the
-curve is flat to 96. So 8 is correct, for a reason unrelated to why it was
-originally chosen.
-
-**One norm per block is a known, unadopted win.** Halving the norms (one after
-the second conv instead of one after each) is **+11% end-to-end inference and
--10% training wall time**, and it does *not* destabilize: peak validation
-activation 1.04x, fp16 headroom 747x, deepest-block peak actually 21% *lower*.
-Removing normalization entirely is faster per batch but **slower end to end** —
-it finishes batches faster than the broker can feed them and drops the GPU to
-78-85%. Not yet adopted because strength was never measured in an arena; the
-change is one line (`ResidualBlock`) plus a fresh run to validate.
-
-**Value head: categorical, not tanh+MSE.** Measured median gradient damping of
-0.0004 on real positions under tanh+MSE — a 2500x weaker signal precisely where
-the model was confidently wrong.
+**One norm per block is a known, unadopted win**: +11% inference and -10%
+training wall time, with no activation growth (peak validation activation
+1.04x). Its strength was never measured in an arena.
 
 **Ownership: BCE, not MSE.** MSE has no finite per-cell optimum against +/-1
-targets, so it keeps pulling long after the sign settles; it drove 16.6% of cells
-past +/-1, a magnitude that means nothing for a bounded quantity.
-
-**Komi is sampled per game, from a normal.** Checkpoints are rated at the komi
-they trained on, since strength is komi-dependent.
-
-**Resignation is soft, with an adaptive threshold** chosen from measured error
-rather than a constant, and disabled when no threshold meets the false-positive
-target.
+targets and drove 16.6% of cells past +/-1.
 
 **Few large arena matches, not many small ones.** Cost per game falls ~3.3x as a
-match grows (3.08 s/game at 4 pairs, 0.92 at 60) because concurrency is capped by
-game count and a small match never fills an inference batch.
+match grows, because concurrency is capped by game count and a small match never
+fills an inference batch.
 
-## 9. Where the numbers live
+**Training telemetry is not evidence of strength.** `best_epoch` and validation
+levels are not comparable across rounds. Judge by play.
 
-Measured results that are not in the code:
-
-- [`benchmarks/`](../benchmarks/README.md) — workload definitions and retained
-  JSON results.
-- [`RL_LOOP.md`](RL_LOOP.md) — loop-level throughput and the utilization
-  feedback loop.
-- Git history is unusually informative here; commit messages carry the reasoning
-  for individual changes (`git log --oneline` and read the ones that sound like
-  decisions).
-
-## 10. Reading order
+## 9. Where to read next
 
 - **Running it:** [`RUNNING.md`](RUNNING.md).
-- **Changing the loop:** [`RL_LOOP.md`](RL_LOOP.md), then
-  [`SELFPLAY_ARCHITECTURE.md`](SELFPLAY_ARCHITECTURE.md).
-- **Changing the model:** §6 above, then
-  [`MODEL_ARCHITECTURE.md`](MODEL_ARCHITECTURE.md), then `model.py`, then
-  [`POLICY_REDESIGN.md`](POLICY_REDESIGN.md) for why the policy is shaped as it
-  is.
-- **Changing inference:** §7 above, then
-  [`INFERENCE_PROTOCOL.md`](INFERENCE_PROTOCOL.md), then
-  [`NVRTX_HANDOFF.md`](NVRTX_HANDOFF.md) if the toolchain misbehaves.
-- **Changing the representation:** §4 above, then
-  [`RASTER_REPRESENTATION.md`](RASTER_REPRESENTATION.md) (note the stale channel
-  count) and [`POSITION_SHARDS.md`](POSITION_SHARDS.md).
-
-Historical or superseded: [`RGB_REPRESENTATION_EXPERIMENT.md`](RGB_REPRESENTATION_EXPERIMENT.md)
-records a representation that was tried and dropped.
-[`NEXT_MILESTONE.md`](NEXT_MILESTONE.md) describes a milestone that has since
-been met.
+- **Changing the loop:** the header of [`scripts/bulk-loop.sh`](../scripts/bulk-loop.sh),
+  then [`SELFPLAY_ARCHITECTURE.md`](SELFPLAY_ARCHITECTURE.md).
+- **Changing the model:** §6, then [`MODEL_ARCHITECTURE.md`](MODEL_ARCHITECTURE.md)
+  and `model.py`.
+- **Changing the representation:** §4, then
+  [`RASTER_REPRESENTATION.md`](RASTER_REPRESENTATION.md) and
+  [`POSITION_SHARDS.md`](POSITION_SHARDS.md).
+- **Geometry performance research** (locality bounds, support certificates,
+  iteration lab): [`research/`](research).
+- **History:** commit messages carry the reasoning for individual changes, and
+  everything removed in the 2026-09-23 prune is on `archive/pre-prune`.

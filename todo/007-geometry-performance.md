@@ -9,15 +9,15 @@
 The engine has optimized clipping and legal-set construction, but still
 rebuilds geometry and repeatedly searches for survival witnesses. The detailed
 review, reproducible benchmark commands, initial results, and proposed
-incremental design are in [`BOARD_ITERATION_LAB.md`](../docs/BOARD_ITERATION_LAB.md).
-The follow-up [`SUPPORT_CERTIFICATES.md`](../docs/SUPPORT_CERTIFICATES.md) records
+incremental design are in [`BOARD_ITERATION_LAB.md`](../docs/research/BOARD_ITERATION_LAB.md).
+The follow-up [`SUPPORT_CERTIFICATES.md`](../docs/research/SUPPORT_CERTIFICATES.md) records
 the stable-support theorem, dormant-point prototype, negative-cell cache, and
 the next engineering steps. These experiments remain opt-in.
-The [`MCTS_MEMORY_LAB.md`](../docs/MCTS_MEMORY_LAB.md) follow-up adds tree-memory
+The [`MCTS_MEMORY_LAB.md`](../docs/research/MCTS_MEMORY_LAB.md) follow-up adds tree-memory
 accounting and a lab-only compact undo prototype. Shared immutable policy logits
 are enabled in production; incremental geometry and compact MCTS nodes are not.
 Support certificates are now wired into an opt-in bounded MCTS/self-play backend;
-see [`SUPPORT_SEARCH_INTEGRATION.md`](../docs/SUPPORT_SEARCH_INTEGRATION.md).
+see [`SUPPORT_SEARCH_INTEGRATION.md`](../docs/research/SUPPORT_SEARCH_INTEGRATION.md).
 
 Capture resolution already uses exactly two simultaneous removal stages.
 Reanalysis after opponent removal is needed to discover revived friendly

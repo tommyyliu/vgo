@@ -1,53 +1,33 @@
 # Voronoi Go
 
-This repository is being prepared for search and machine-learning experiments
-over the continuous-action game defined in [`reference/RULES.md`](reference/RULES.md).
+AlphaZero-style self-play for the continuous-action game defined in
+[`reference/RULES.md`](reference/RULES.md): stones go anywhere in the unit
+square, and territory is decided by Voronoi cells.
 
-**New here? Read [`docs/OVERVIEW.md`](docs/OVERVIEW.md).** It maps the whole
-system top-down — the RL loop, the language split, the board representation, the
-model, and the serving path — and records the load-bearing decisions with the
-measurements behind them, so you do not have to reconstruct them from a dozen
-files.
+**New here? Read [`docs/OVERVIEW.md`](docs/OVERVIEW.md)**, then
+[`docs/RUNNING.md`](docs/RUNNING.md) for commands.
 
-**Want to put the bot on a website?** [`client/`](client/README.md) is a
-self-contained browser opponent: one 360 KB ES module with the engine compiled
-to WebAssembly, no server and no GPU to operate. `createBot`, then `chooseMove`.
+**Want the bot on a website?** [`client/`](client/README.md) is a self-contained
+browser opponent: the engine compiled to WebAssembly plus a small ES module, with
+no server and no GPU to operate.
 
-## Repository areas
+## Layout
 
-- [`reference/`](reference/README.md) contains the clean, working JavaScript
-  implementation, mathematical rules, proofs, architecture notes, and browser
-  regression suite. It is the behavioral oracle for future implementations.
-- [`docs/`](docs/SELFPLAY_ARCHITECTURE.md) contains the native simulator decision
-  and the Rust self-play/inference architecture. The immediate execution
-  plan is [`docs/NEXT_MILESTONE.md`](docs/NEXT_MILESTONE.md).
-- [`benchmarks/`](benchmarks/README.md) defines implementation-neutral workloads
-  used to compare candidate simulator backends.
-- [`crates/vgo-core/`](crates/vgo-core) is the exact Rust rules engine,
-  [`crates/vgo-inference/`](crates/vgo-inference) batches model evaluations
-  through native ONNX Runtime/TensorRT or a diagnostic Python subprocess,
-  [`crates/vgo-raster/`](crates/vgo-raster) produces the canonical semantic
-  tensor and RGB diagnostics,
-  [`crates/vgo-search/`](crates/vgo-search) provides deterministic candidates and
-  progressive-widening MCTS, and [`crates/vgo-selfplay/`](crates/vgo-selfplay)
-  owns complete playouts, the paired canary arena, model smoke tests, and demo
-  trajectory generation.
-- [`client/`](client/README.md) is the embeddable browser bot: `crates/vgo-wasm`
-  compiled to WebAssembly plus the JavaScript that drives its search loop, built
-  into a single module a site can serve. Because inference is asynchronous in a
-  browser, the search hands its loop out
-  ([`SteppedSearch`](crates/vgo-search/src/stepped.rs)), which is also what lets
-  it think for a time budget rather than a fixed simulation count. Design notes
-  and measurements: [`docs/CLIENT_BOT.md`](docs/CLIENT_BOT.md).
-- [`training/`](training) owns Python model training, checkpoint export, replay
-  loading, and the retained protocol-debug service. Rust self-play does not
-  import it.
-- [`todo/`](todo/README.md) tracks known rule, geometry, and visualization work.
+| path | what it is |
+|---|---|
+| [`crates/vgo-core`](crates/vgo-core) | exact rules engine: legality, Voronoi geometry, captures, scoring |
+| [`crates/vgo-search`](crates/vgo-search) | progressive-widening MCTS with coarse-to-fine candidate sampling |
+| [`crates/vgo-raster`](crates/vgo-raster) | position -> model input tensor; `vgo-render-shard`/`vgo-pack-shard` for the Python loader |
+| [`crates/vgo-inference`](crates/vgo-inference) | ONNX Runtime / TensorRT sessions behind a batching broker |
+| [`crates/vgo-selfplay`](crates/vgo-selfplay) | `vgo-generate-continuous`, `vgo-arena`, `vgo-serve-move` |
+| [`crates/vgo-wasm`](crates/vgo-wasm) | the engine for the browser client |
+| [`training/`](training) | PyTorch model, learner, ONNX export |
+| [`scripts/`](scripts) | the loop (`bulk-loop.sh`) and its tools |
+| [`client/`](client/README.md) | the embeddable browser bot |
+| [`reference/`](reference/README.md) | JavaScript reference implementation, rules and proofs: the behavioural oracle |
+| [`docs/`](docs) | system docs; [`docs/research/`](docs/research) holds geometry and search research write-ups |
+| [`todo/`](todo/README.md) | backlog |
 
-[`docs/RUNNING.md`](docs/RUNNING.md) collects every command for tests, the
-reinforcement-learning loop, strength measurement and the benchmarks, along with
-the failure modes that are confusing the first time.
-The model-facing channel contract is documented in
-[`docs/RASTER_REPRESENTATION.md`](docs/RASTER_REPRESENTATION.md).
-The model execution boundaries are documented in
-[`docs/INFERENCE_PROTOCOL.md`](docs/INFERENCE_PROTOCOL.md).
+Code for experiments that were concluded (the shard pipeline, Muon, the flat and
+U-Net nets, RGB rasters, tournament tooling and the rest) was removed on
+2026-09-23. It is all on the `archive/pre-prune` branch.

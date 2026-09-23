@@ -6,8 +6,10 @@ rest of the system see [`OVERVIEW.md`](OVERVIEW.md) §6; for the decisions and
 their evidence see §8 there.
 
 Source: [`training/vgo_training/model.py`](../training/vgo_training/model.py).
-Production is `architecture=ddrnet, width=96, blocks=16, norm_groups=8` at a
-128x128 compact raster.
+The loop trains `width=64, blocks=16, norm_groups=8`, one attention block per
+context stage, on a 256x256 `compact-radius` raster (about 8.2M parameters).
+The shapes and timings below were measured on an earlier w96 model at 128x128;
+the structure is the same.
 
 ## Why this shape
 

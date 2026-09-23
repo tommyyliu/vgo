@@ -60,7 +60,7 @@ So: **every group the website rules keep alive, ours keeps alive, while ours
 keeps some groups that theirs captures.** This is a group-level statement:
 the pointwise settled and dead-zone sets still differ at equality boundaries.
 
-The comments in [`runs/raster-ab.sh`](../runs/raster-ab.sh) record sampled
+The comments in `runs/raster-ab.sh` (on the `archive/pre-prune` branch) record sampled
 coverage of 47.9% for the website dead zone and 44.1% for our settled region.
 The exact corpus and measurement command were not recorded there, so these
 are historical observations, not a reproducible benchmark or a measure of

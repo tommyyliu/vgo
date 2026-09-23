@@ -71,7 +71,7 @@ fn a_cell_can_lose_its_liberty_without_any_capture() {
 #[test]
 fn a_stone_at_7_4918_r_can_change_individual_cell_status() {
     // Exact decimal construction and independent rational certificate:
-    // docs/LOCAL_CONTESTABILITY_FLOOR.md, diagnostics/check_locality_floor.py.
+    // docs/research/LOCAL_CONTESTABILITY_FLOOR.md, diagnostics/check_locality_floor.py.
     let r = 1.0 / 12.0;
     let coordinates = [
         (1.0, 1.0),

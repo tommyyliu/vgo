@@ -142,8 +142,6 @@ impl EdtScratch {
 
 }
 
-/// Exposed for `vgo-raster-bench`. See `sampled_legal_set`.
-#[doc(hidden)]
 pub(crate) fn squared_distance_transform(mask: &[bool], width: usize, height: usize) -> Vec<f64> {
     let mut scratch = EdtScratch::default();
     squared_distance_transform_into(mask, width, height, &mut scratch);
@@ -339,10 +337,6 @@ fn nearest_row_chunked(
 }
 
 /// The legal set sampled onto a grid, built by stamping exclusion discs.
-/// Exposed for `vgo-raster-bench`, which times the raster's parts separately so
-/// they can be optimised one at a time. Not part of the API: the signature
-/// tracks whatever the transform needs and will change without notice.
-#[doc(hidden)]
 pub(crate) fn sampled_legal_set(position: &Position, fine_width: usize, fine_height: usize) -> Vec<bool> {
     let mut scratch = EdtScratch::default();
     sampled_legal_set_into(position, fine_width, fine_height, &mut scratch);

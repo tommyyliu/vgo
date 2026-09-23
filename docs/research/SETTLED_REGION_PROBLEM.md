@@ -139,7 +139,7 @@ Ideas not yet tried, in no particular order:
   any pixel of interest could be skipped entirely.
 - **Coarse-to-fine.** Decide whole 8x8 pixel blocks by a conservative bound and
   only refine blocks the boundary crosses.
-- **Per-pixel, on a GPU.** Done, in `crates/vgo-raster-cuda`: 13.9x per position
+- **Per-pixel, on a GPU.** Done, in `crates/vgo-raster-cuda` (removed 2026-09-23; see `archive/pre-prune`): 13.9x per position
   at batch 32 in f32. But it does not pay off in self-play on this machine —
   rasterization is parallel across 64 actor threads and the GPU only wins where
   the CPU is weak (crossover around 9 cores). The distance-transform work above

@@ -176,8 +176,7 @@ select less informatively. Self-play uses 4. This is measurable natively with
 `vgo-arena` and has not been.
 
 **Phase 2 — the WGSL rasterizer. Abandoned**, for the reasons under *The mistake
-to avoid*. `crates/vgo-raster-cuda` is the surviving fragment of this line of
-work and is not used either.
+to avoid*.
 
 **Phase 3 — WASM build. Done.** `crates/vgo-wasm` exposes `Game` and `Search`;
 `client/src/bot.js` drives the loop.

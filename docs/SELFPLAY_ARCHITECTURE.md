@@ -6,16 +6,16 @@ Rust owns gameplay, search, native model inference, arenas, and replay
 serialization:
 
 - `vgo-core`: exact rules, geometry, transitions, termination, and scoring;
-- `vgo-raster`: canonical semantic tensors and visual diagnostics;
+- `vgo-raster`: the model's input tensors, and the shard renderer the Python
+  loader calls;
 - `vgo-search`: evaluators, progressive-widening MCTS, spatial proposals, and
   visit-based move selection;
-- `vgo-inference`: bounded request grouping plus ONNX Runtime/TensorRT and
-  diagnostic Python backends; and
+- `vgo-inference`: bounded request grouping over ONNX Runtime/TensorRT; and
 - `vgo-selfplay`: complete-game playouts, actor pools, arenas, and immutable
-  replay-shard publication.
+  per-game dataset publication.
 
-Python owns replay preparation, optimization, checkpoints, ONNX export,
-publication orchestration, and telemetry scheduling. Python never imports the
+Python owns replay preparation, optimization, checkpoints and ONNX export.
+`scripts/bulk-loop.sh` orchestrates. Python never imports the
 simulator, and Rust never implements neural-network layers. Replay shards and
 self-describing model artifacts are the durable boundary.
 
@@ -122,49 +122,28 @@ Actors finish at most their current search, then every handle is joined before
 the inference brokers and native sessions are destroyed. This bounds the tail
 without allowing TensorRT process-exit cleanup to race an in-flight inference.
 
-## Pipeline boundary
+## Loop boundary
 
-The Python coordinator consumes immutable shards, not actor-owned buffers. It
-may train and run the next actor shard concurrently. Every actor captures an
-incumbent before starting, and the shard records that model digest, so a
-publication during generation creates explicit bounded policy lag rather than
-ambiguous mixed-policy data. `--maximum-prefetch-shards` bounds the active and
-completed shards ahead of the learner; zero restores barriered scheduling.
+`vgo-generate-continuous` writes each finished game as its own one-game
+dataset under `games/gen-N-<sha>/`, where the directory names the model that
+played it. A generator holds one model for its whole life. When the loop
+exports a new model it starts a second generator on it and touches the first
+one's stop file, so the old generator finishes the games it holds while the new
+one is already producing. Policy lag is therefore explicit and bounded by one
+game per actor, and nothing swaps an evaluator on the per-leaf hot path.
 
-One supervised learner process owns the model, optimizer, optional compiled
-graph, prepared replay-window cache, and pinned staging buffers across every
-update in one coordinator invocation. Training defaults to BF16 autocast on
-supported CUDA devices. A coordinator restart creates a new learner process and
-reloads the authoritative accepted checkpoint; persistent state never
-substitutes for the immutable checkpoint/replay boundary.
-
-The run configuration separates learning identity from operational placement
-and concurrency. Search/replay/model/optimizer semantics remain fixed, while
-the update target, prefetch depth, actor counts, device placement, compilation,
-TensorRT warmup, and telemetry capacity may change at a restart and are
-recorded in config history.
-
-See [`RL_LOOP.md`](RL_LOOP.md) for replay-window scheduling, persistent learner
-ownership, promotion, recovery, and off-path telemetry.
+`scripts/train-once.py` selects the newest games totalling the window by game
+number, not directory order, and trains a fresh learner process. Nothing
+persists between rounds except files.
 
 ## Failure semantics
 
 - Model schema or backend startup errors fail before games begin.
 - A disconnect, malformed output, wrong ID, output-count mismatch, or non-finite
   prediction aborts search; no neutral fallback is synthesized.
-- Evaluator identity is fixed for an entire shard or arena.
-- Replay appears only after exact-size serialization and durable publication.
-- On POSIX, coordinator cancellation targets the full subprocess group so the
-  binary launched through Cargo cannot remain as an orphan GPU consumer. On
-  Windows, the current supervisor guarantees only direct Cargo-process
-  termination, not descendant-tree cleanup.
-- A single run-directory lease prevents two coordinators from publishing the
-  same sequence.
-- State is reloaded only after that lease is acquired; recovered replay,
-  checkpoint, ONNX, and publication identities are checked before reuse.
-- Telemetry is queued outside candidate cadence. A drain groups all selected
-  opponents for one candidate into one arena process, amortizing model/provider
-  startup while publishing an atomic result for each match.
+- Evaluator identity is fixed for an entire generator or arena.
+- A game appears only after complete serialization and an atomic rename, so a
+  killed generator loses only the games in flight.
 
 ## Measurement layers
 
@@ -172,16 +151,9 @@ ownership, promotion, recovery, and off-path telemetry.
 2. Tree search with an in-process deterministic evaluator.
 3. Rasterization, request grouping, backend inference, and output extraction.
 4. End-to-end actor games through the shared broker.
-5. Completed-game queue occupancy, writer backpressure, tail waste, and durable
-   replay publication.
-6. Steady-state actor/learner overlap and candidate-publication cadence.
+5. Completed-game queue occupancy, writer backpressure, and durable
+   publication.
 
-The coordinator aggregates these boundaries in `run.json.utilization`:
-generation/update sample counts, stage and optimizer wall time, overlap factor,
-active-game occupancy, inference batch fill, writer backpressure, optimization
-fraction, and prepared-replay cache reuse. See
-[`RL_LOOP.md`](RL_LOOP.md#utilization-feedback-loop) before changing operational
-concurrency controls.
-
-These boundaries keep CPU search, GPU execution, storage, and orchestration
+Each generator reports broker batch fill and stage timings in `generate.log`.
+Keeping these boundaries separate keeps CPU search, GPU execution and storage
 costs separately attributable.

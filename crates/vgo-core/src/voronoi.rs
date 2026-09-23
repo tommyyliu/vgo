@@ -347,7 +347,7 @@ pub fn compute(position: &Position) -> Geometry {
     // two cross they stay crossed. Sorting is O(n log n) per cell against the
     // O(n) clips it saves, which is why this is a stepping stone -- a grid
     // walked outward enumerates in approximately this order for far less. See
-    // docs/VORONOI_CUTOFF.md.
+    // docs/research/VORONOI_CUTOFF.md.
     let mut order: Vec<(f64, usize)> = Vec::with_capacity(count.saturating_sub(1));
     // One set of buffers for the whole call; see `Scratch`.
     let mut scratch = Scratch::default();
@@ -495,7 +495,7 @@ mod tests {
     /// Clipping against every stone, the way `compute` did before the cutoff.
     ///
     /// The specification the cutoff is measured against: it must produce the
-    /// same diagram, not a close one. See docs/VORONOI_CUTOFF.md.
+    /// same diagram, not a close one. See docs/research/VORONOI_CUTOFF.md.
     fn compute_exhaustively(position: &Position) -> Vec<(Vec<Point>, f64)> {
         let count = position.stones().len();
         let mut out = Vec::with_capacity(count);

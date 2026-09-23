@@ -384,7 +384,7 @@ fn cuda_provider(device_id: i32) -> ort::ep::ExecutionProviderDispatch {
     // across Run() calls — the first inference is correct, then outputs compound
     // every subsequent call (maxabs 5 -> 103 -> 455 -> ...) until they overflow
     // to NaN, which surfaced as `invalid inference value` in the arena. The
-    // other options are safe. See docs/NVRTX_HANDOFF.md.
+    // other options are safe.
     ep::CUDA::default()
         .with_device_id(device_id)
         .with_tf32(true)

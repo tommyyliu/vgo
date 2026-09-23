@@ -1,8 +1,9 @@
 //! Self-play that never stops to fill a shard.
 //!
-//! `vgo-generate-demo` plays toward a sample target and then drains: actors that
-//! finish a game stop taking new ones while the slowest game plays out. That
-//! tail is a fixed cost per shard, and it grew teeth when games did. Measured on
+//! The shard generator this replaced (`vgo-generate-demo`) played toward a
+//! sample target and then drained: actors that finished a game stopped taking
+//! new ones while the slowest game played out. That tail was a fixed cost per
+//! shard, and it grew teeth when games did. Measured on
 //! a multi-radius run at 38 units: 57 minutes reaching the target with 32 actors
 //! busy, then 65 minutes with *two* actors busy and thirty cores idle. Half the
 //! wall clock at 6% utilisation, for a shard that had already collected 1.66x

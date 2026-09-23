@@ -518,9 +518,7 @@ pub(crate) fn rasterize_compact_into(position: &Position, config: RasterConfig, 
 /// Split out because that plane is where the cost is: 92% of this function at
 /// the median stone count under the per-stone geometric solve, and still 60-80%
 /// under the distance transform, while the other four are per-pixel work over
-/// the stone list. That asymmetry means the two want different hardware, and
-/// `vgo-raster-cuda` exists to compute the mask for a whole batch in one launch
-/// and hand it here.
+/// the stone list.
 ///
 /// The predicate is `settled` for this repository's rules and the dead zone for
 /// the official ones. Nothing below cares which: both are a boolean per pixel

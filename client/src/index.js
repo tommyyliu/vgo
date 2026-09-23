@@ -112,7 +112,7 @@ const DEFAULT_LEAF_BATCH = 8;
 ///     network -- but it makes browser play diverge from measured play for no
 ///     reason.
 ///
-/// The defaults in `vgo-serve-move` and `pipeline.py` were 4, which no run has
+/// The defaults in `vgo-serve-move` and the old shard pipeline were 4, which no run has
 /// used; that is where this constant was first copied from.
 const DEFAULT_COARSE_POOL = 16;
 

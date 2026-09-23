@@ -112,9 +112,8 @@ komi_area_coefficient="${VGO_KOMI_AREA_COEFFICIENT:-28.0}"
 # Re-picked before each generator rather than once per run, because calibration
 # describes the model that produced it and a model still learning invalidates its
 # own history -- one recorded run fired on 15 of 1625 games over fifteen shards
-# and 440 of 1686 over the next sixteen. This is what `pipeline.py` did per
-# shard; the bulk loop dropped it when it stopped using the pipeline, not
-# deliberately.
+# and 440 of 1686 over the next sixteen. The old shard pipeline did this per
+# shard; the bulk loop first dropped it by accident.
 #
 # Set the target to 0 to pin the threshold and switch adaptation off.
 resign_threshold="${VGO_RESIGN_THRESHOLD:-0.99}"

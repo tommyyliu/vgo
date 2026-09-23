@@ -9,9 +9,8 @@
 #   ./scripts/setup.sh --check  # verify only, install nothing
 #
 # On onnxruntime: the stock `onnxruntime-gpu` wheel is sufficient, including on
-# Blackwell/sm_120. docs/NVRTX_HANDOFF.md describes building it from source with
-# a userspace CUDA toolchain -- that was necessary for onnxruntime 1.24 and is
-# not necessary now. Do not follow it on a new box.
+# Blackwell/sm_120. Building it from source was necessary for onnxruntime 1.24
+# and is not necessary now.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
