@@ -159,6 +159,36 @@ class LearnerUpdate:
     config: LearnerConfig
 
 
+def _return_freed_memory() -> None:
+    """Hand heap the allocator is holding back to the operating system.
+
+    Preparing a shard allocates dense temporaries -- the full policy target,
+    the unpacked raster -- that are freed as soon as the packed form exists.
+    glibc keeps that freed memory in its arenas rather than returning it, so a
+    window of one-game shards grew to 66 KB per sample of resident memory for
+    43.6 KB of tensors. Trimming after each shard keeps resident memory at what
+    the window actually holds, which is what decides how large a window fits.
+    A no-op anywhere `malloc_trim` does not exist.
+    """
+    trim = _MALLOC_TRIM
+    if trim is not None:
+        trim(0)
+
+
+def _load_malloc_trim():
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+
+        return ctypes.CDLL("libc.so.6").malloc_trim
+    except (OSError, AttributeError):
+        return None
+
+
+_MALLOC_TRIM = _load_malloc_trim()
+
+
 @dataclass(frozen=True)
 class _FileSignature:
     device: int
@@ -371,10 +401,11 @@ class ReplayCache:
         self._entries = {
             path: shard for path, shard in self._entries.items() if path in active
         }
-        shards = tuple(
-            self.get(path, preparation_batch_size) for path in resolved
-        )
-        return ReplayWindow(shards)
+        shards = []
+        for path in resolved:
+            shards.append(self.get(path, preparation_batch_size))
+            _return_freed_memory()
+        return ReplayWindow(tuple(shards))
 
     def status(self) -> dict[str, object]:
         return {
