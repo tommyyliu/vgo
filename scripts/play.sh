@@ -7,14 +7,29 @@
 # loading with no output and no error -- the process simply appears to hang
 # before it ever reaches the listen call. scripts/env/ort.sh sets it up.
 #
-#   ./scripts/play.sh                          # newest model of any run
-#   ./scripts/play.sh path/to/candidate.onnx   # a specific model
-#   SIMULATIONS=256 ./scripts/play.sh          # stronger, slower
+#   ./scripts/play.sh                                   # newest model of any run
+#   ./scripts/play.sh path/to/model.onnx                # a specific model
+#   ./scripts/play.sh --simulations 4096 path/to.onnx   # stronger, slower
+#
+# --simulations, --address and --coarse-pool may also be set as SIMULATIONS,
+# ADDRESS and COARSE_POOL in the environment.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-model="${1:-}"
+model=""
+while (( $# > 0 )); do
+  case "$1" in
+    --simulations) SIMULATIONS="${2:?--simulations needs a number}"; shift 2 ;;
+    --address) ADDRESS="${2:?--address needs host:port}"; shift 2 ;;
+    --coarse-pool) COARSE_POOL="${2:?--coarse-pool needs a number}"; shift 2 ;;
+    -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
+    -*) echo "unknown option $1 (see --help)" >&2; exit 2 ;;
+    *)
+      [[ -n "$model" ]] && { echo "more than one model given: $model and $1" >&2; exit 2; }
+      model="$1"; shift ;;
+  esac
+done
 if [[ -z "$model" ]]; then
   # Newest checkpoint of the newest run that has one, rather than a run named
   # here: a hardcoded path goes stale every time a run is superseded, and this
@@ -44,8 +59,12 @@ if [[ -z "$model" ]]; then
     model="${newest[0]:-}"
   fi
 fi
-if [[ -z "$model" || ! -f "$model" ]]; then
-  echo "no model found; pass one explicitly: ./scripts/play.sh <candidate.onnx>" >&2
+if [[ -n "$model" && ! -f "$model" ]]; then
+  echo "no such model: $model" >&2
+  exit 1
+fi
+if [[ -z "$model" ]]; then
+  echo "no model found; pass one explicitly: ./scripts/play.sh <model.onnx>" >&2
   exit 1
 fi
 
