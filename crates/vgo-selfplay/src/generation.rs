@@ -392,6 +392,13 @@ pub struct GameRecord {
     pub black_utility: f32,
     /// Area margin, always non-negative.
     pub margin: f64,
+    /// Each side's Voronoi area on the final board, before komi.
+    ///
+    /// The score target: the win/loss label says who won, these say by how
+    /// much, and keeping them before komi lets a reader score the same board at
+    /// any komi. `black_area - white_area - komi` is Black's signed margin.
+    pub black_area: f64,
+    pub white_area: f64,
     pub reached_ply_cap: bool,
     pub resigned: bool,
     /// Ply a soft concession fired at, if one did. The game played on from
@@ -551,11 +558,13 @@ pub fn generate_game(
             if let Some(ply) = step.soft_resign_ply {
                 soft_from.set(ply);
             }
-            // The last position the game reached, recorded or not. Adjudication
-            // scores this rather than the last *sample*: under subsampling they
-            // are different positions, and scoring a board several plies short
-            // of the end awards the game on a state neither player played to.
-            final_position.replace(Some(step.position.clone()));
+            // The last position the game reached, recorded or not: the board
+            // *after* this step's move. `step.position` is the board the move
+            // was searched from, one ply short, and scoring a capped game on it
+            // awarded the result on a board neither player finished on -- in a
+            // close game, to the wrong side, and inconsistently with the final
+            // areas recorded beside it.
+            final_position.replace(Some(step.transition.position.clone()));
             let target = policy_target(step.search, policy_config);
             pending.push(PendingSample {
                 // Store the position; rendering is a training-time choice now,
@@ -652,6 +661,7 @@ pub fn generate_game(
         })
         .collect();
     let samples: Vec<LabeledSample> = samples;
+    let final_score = Analysis::new(&playout.final_position).score;
     Ok(GameSamples {
         record: Some(GameRecord {
             game: game_index,
@@ -666,10 +676,9 @@ pub fn generate_game(
             // scored. Recomputing it from the final position is what makes a
             // resigned game reviewable -- it says how far behind the conceding
             // side actually was, which is the only way to judge the rule.
-            margin: {
-                let analysis = Analysis::new(&playout.final_position);
-                (analysis.score.black - analysis.score.white - playout.final_position.komi()).abs()
-            },
+            margin: (final_score.black - final_score.white - playout.final_position.komi()).abs(),
+            black_area: final_score.black,
+            white_area: final_score.white,
             reached_ply_cap: playout.outcome.is_none(),
             resigned: playout.resigned,
             soft_resign_ply: playout.stats.soft_resign_ply,

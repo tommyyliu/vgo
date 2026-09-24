@@ -308,17 +308,41 @@ fn write_game(
 
     if let Some(record) = game.record.as_ref() {
         let mut writer = BufWriter::new(fs::File::create(staging.join("games.jsonl"))?);
+        // The final board and both areas are what the score and ownership
+        // targets are built from. They cannot be recovered afterwards -- the
+        // last recorded position is one move short of the end -- so every
+        // game written without them is score data lost for good.
         writeln!(
             writer,
-            r#"{{"game":{},"komi":{:.6},"radius":{:.8},"plies":{},"black_utility":{},"reached_ply_cap":{},"resigned":{},"first_sample":0,"sample_count":{}}}"#,
+            concat!(
+                r#"{{"game":{},"komi":{:.6},"radius":{:.8},"plies":{},"passes":{},"#,
+                r#""self_captures":{},"black_utility":{},"margin":{:.6},"#,
+                r#""black_area":{:.8},"white_area":{:.8},"#,
+                r#""reached_ply_cap":{},"resigned":{},"soft_resign_ply":{},"#,
+                r#""first_sample":0,"sample_count":{},"final_stones":[{}]}}"#
+            ),
             record.game,
             record.komi,
             record.radius,
             record.plies,
+            record.passes,
+            record.self_captures,
             record.black_utility,
+            record.margin,
+            record.black_area,
+            record.white_area,
             record.reached_ply_cap,
             record.resigned,
+            record
+                .soft_resign_ply
+                .map_or_else(|| "null".to_owned(), |ply| ply.to_string()),
             published.samples,
+            record
+                .final_stones
+                .iter()
+                .map(|(x, y, colour)| format!("[{x:.9},{y:.9},{colour}]"))
+                .collect::<Vec<_>>()
+                .join(","),
         )?;
         writer.flush()?;
     }
