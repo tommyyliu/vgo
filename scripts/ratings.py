@@ -13,8 +13,9 @@ whole history sharpens as it grows. `prior_games` in the fitter is what keeps an
 undefeated model finite rather than diverging to +inf.
 
 Ratings are anchored at sl-w64b16 = 0 when it appears in the history, so they
-are comparable with every number measured against it directly. A run that never
-played it (one started from scratch) is anchored at its earliest model instead.
+are comparable with every number measured against it directly. Otherwise the
+first non-update model seen -- usually the run's seed -- is the anchor, and
+failing that the earliest update.
 
     scripts/ratings.py [artifacts/vgo-continuous/anchor.jsonl]
 """
@@ -36,13 +37,18 @@ ANCHOR_ID = 0
 NAMED = {"sl-w64b16": ANCHOR_ID, "control": -1}
 
 
-def model_id(path: str) -> int | None:
+def model_id(path: str) -> int:
     stem = Path(path).name.replace(".onnx", "")
-    if stem in NAMED:
-        return NAMED[stem]
     match = re.fullmatch(r"update-(\d+)", stem)
-    # Update 0 would collide with the anchor's id, so updates are offset by one.
-    return int(match.group(1)) + 1 if match else None
+    if match:
+        # Update 0 would collide with the anchor's id, so updates are offset by one.
+        return int(match.group(1)) + 1
+    # Any other model -- a seed, a control, a model from another run -- gets its
+    # own id below every update. These used to be dropped as "missing names",
+    # which silently removed a from-scratch run's matches against its seed.
+    if stem not in NAMED:
+        NAMED[stem] = min(NAMED.values()) - 1
+    return NAMED[stem]
 
 
 def label(identifier: int) -> str:
@@ -70,9 +76,6 @@ def main() -> None:
             skipped += 1
             continue
         a, b = model_id(candidate), model_id(opponent)
-        if a is None or b is None:
-            skipped += 1
-            continue
         matches.append({"a": a, "b": b,
                         "a_wins": record["candidate_wins"],
                         "b_wins": record["candidate_losses"],
