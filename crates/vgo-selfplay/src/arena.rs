@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::{
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -472,6 +472,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The running score of a match, printed to stderr as each game finishes.
+///
+/// The JSON record lands only when the whole match is done, and a 1/38 match
+/// runs for an hour, so without this a match in progress says nothing -- not
+/// how far along it is, not which way it is going, not whether it is hung.
+#[derive(Default)]
+struct Tally {
+    finished: usize,
+    wins: usize,
+    losses: usize,
+    draws: usize,
+    undecided: usize,
+}
+
+impl Tally {
+    fn record(&mut self, result: &GameResult, games: usize, started: Instant, label: &str) {
+        self.finished += 1;
+        let verdict = match result.outcome.filter(|_| result.completed).map(|o| o.winner) {
+            Some(Some(winner)) if winner == result.candidate_color => {
+                self.wins += 1;
+                "won"
+            }
+            Some(Some(_)) => {
+                self.losses += 1;
+                "lost"
+            }
+            Some(None) => {
+                self.draws += 1;
+                "drew"
+            }
+            None => {
+                self.undecided += 1;
+                "undecided"
+            }
+        };
+        let decided = self.wins + self.losses + self.draws;
+        let score = if decided == 0 {
+            f64::NAN
+        } else {
+            (self.wins as f64 + 0.5 * self.draws as f64) / decided as f64
+        };
+        let elapsed = started.elapsed().as_secs_f64();
+        let remaining = elapsed / self.finished as f64 * (games - self.finished) as f64;
+        let seat = if result.candidate_color == Color::Black { "B" } else { "W" };
+        eprintln!(
+            "[arena] {label} game {}/{games}: candidate ({seat}) {verdict} in {} plies | \
+             {}-{}-{} score {score:.3} | {:.1}m elapsed, ~{:.1}m left",
+            self.finished,
+            result.plies,
+            self.wins,
+            self.losses,
+            self.draws,
+            elapsed / 60.0,
+            remaining / 60.0,
+        );
+    }
+}
+
 fn run_match(
     arguments: &Arc<Arguments>,
     candidate: &BatchedEvaluator,
@@ -485,12 +543,19 @@ fn run_match(
     // shared across every opponent, so report this match's delta.
     let baseline = candidate.metrics();
     let started = Instant::now();
+    let tally = Arc::new(Mutex::new(Tally::default()));
+    let label = opponent_path
+        .and_then(|path| path.file_stem())
+        .and_then(|name| name.to_str())
+        .map_or_else(|| "vs naive".to_owned(), |name| format!("vs {name}"));
     let mut handles = Vec::with_capacity(arguments.threads);
     for _ in 0..arguments.threads {
         let arguments = Arc::clone(arguments);
         let candidate = candidate.clone();
         let opponent = opponent.cloned();
         let next_game = Arc::clone(&next_game);
+        let tally = Arc::clone(&tally);
+        let label = label.clone();
         handles.push(thread::spawn(move || {
             let mut results = Vec::new();
             loop {
@@ -503,13 +568,18 @@ fn run_match(
                 } else {
                     Color::White
                 };
-                results.push(play_game(
+                let result = play_game(
                     &candidate,
                     opponent.as_ref(),
                     candidate_color,
                     seed_base + (game / 2) as u64,
                     &arguments,
-                )?);
+                )?;
+                tally
+                    .lock()
+                    .expect("arena tally")
+                    .record(&result, games, started, &label);
+                results.push(result);
             }
             Ok::<_, EvaluationError>(results)
         }));
