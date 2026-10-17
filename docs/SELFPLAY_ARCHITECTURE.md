@@ -30,8 +30,8 @@ actor game
   -> validated ordered evaluations
   -> MCTS backup
   -> completed labelled trajectory
-  -> bounded writer queue
-  -> streaming replay-v3 writer
+  -> actor-owned streaming position-replay writer
+  -> atomic game-directory publication
 ```
 
 MCTS submits a leaf round through `Evaluator::evaluate_batch`. Simple
@@ -75,52 +75,42 @@ and telemetry. This is intentionally separate from the Python learner's
 `--training-device`, so a multi-GPU run can keep Rust inference on (for example)
 device 0 and PyTorch on `cuda:1`.
 
-For TensorRT, the coordinator runs a full configured inference batch after each
-export by default. That primes the shared, model-digest-scoped engine cache
-during the current actor tail instead of delaying the next shard's first model
-load. `--no-warm-inference` disables the operational warmup; CUDA and CPU
-providers skip it.
+The continuous generator loads its TensorRT slots sequentially so builders do
+not race over the cache. Model-digest-scoped engine caches and a shared timing
+cache reduce subsequent startup cost. A change to precision, shape, or batch
+limits can require an engine rebuild.
 
 ## Playout contract
 
 `vgo-selfplay::play_game` is the sole owner of whole-game progression:
 
-- exact position fingerprints and repetition avoidance;
-- preferred-action fallback;
+- selection of the search's preferred playable action, or pass if none exists;
 - transition application and event accounting;
 - pass/pass termination and maximum-ply bounds; and
 - accumulated search and gameplay statistics.
 
-The canary, model smoke tests, arenas, and replay generator therefore share game
-semantics. MCTS owns only tree-local simulation.
+The arena and replay generator share this progression. The current Vgo rules
+permit repetition; this driver adds no repetition prohibition. MCTS owns only
+tree-local simulation.
 
 ## Streaming replay
 
-Actor threads send only complete, terminally labelled games through a bounded
-`sync_channel`. The consumer serializes replay-v3 records immediately. It never
-holds a full shard of semantic rasters in memory.
+Each continuous actor generates and writes its own complete game; there is no
+collector or completed-game queue. Replay stores positions and sparse search
+records, not a shard of rendered model inputs. The stream hashes and publishes
+the dataset inside a private staging directory; the game directory is renamed
+into place after its manifest and sidecars have been written.
 
-The header advertises the exact requested record count. Whole completed games
-are admitted until that count is reached; only excess records in the final
-complete game are omitted. The writer hashes bytes while writing, flushes,
-fsyncs, atomically renames `dataset.vgo.tmp`, and syncs the containing
-directory. A failed or incomplete stream removes its private temporary file and
-never publishes a shard.
+The manifest identifies the dataset digest, model digest when present, sample
+count, nominal raster dimensions, policy size, and simulation budget.
+`games.jsonl` records the actual per-game radius/komi, final scores and stones,
+cap status, and soft resignation. Full resolved run configuration and stage
+timings live in `performance.jsonl`, rather than being repeated in every game
+manifest. `resign-calibration.jsonl` stores counterfactual threshold outcomes.
 
-The manifest identifies:
-
-- replay schema and dataset digest/size;
-- behavior-model digest and immutable shard ID;
-- first/last serialized game IDs and per-record game/seed identity;
-- search, actor, queue, raster, and policy configuration;
-- attempted, completed, discarded, failed, tail, writer, and wall timings; and
-- broker batch/utilization timings.
-
-Only requested example rasters survive for image output. At the exact boundary,
-the collector signals cancellation and closes the completed-game receiver.
-Actors finish at most their current search, then every handle is joined before
-the inference brokers and native sessions are destroyed. This bounds the tail
-without allowing TensorRT process-exit cleanup to race an in-flight inference.
+A stop file drains games already in flight. Cancellation aborts searches on
+failure or at a profiling deadline. Actor handles are joined before inference
+sessions are released; this avoids teardown racing active calls.
 
 ## Loop boundary
 
@@ -151,9 +141,16 @@ persists between rounds except files.
 2. Tree search with an in-process deterministic evaluator.
 3. Rasterization, request grouping, backend inference, and output extraction.
 4. End-to-end actor games through the shared broker.
-5. Completed-game queue occupancy, writer backpressure, and durable
-   publication.
+5. Per-actor writing time and successfully published games/samples.
 
-Each generator reports broker batch fill and stage timings in `generate.log`.
-Keeping these boundaries separate keeps CPU search, GPU execution and storage
-costs separately attributable.
+The continuous generator appends startup, periodic, and final records to each
+generation's `performance.jsonl`, with brief summaries in `generate.log`.
+Records distinguish work in flight from published data, include process memory,
+and group search work by rounded board size, thirds of the game cap, and soft
+resignation status. Neural runs include interval and cumulative broker counters.
+The bulk loop's `events.jsonl` marks training and generator handoffs. See
+[`RUNNING.md`](RUNNING.md#continuous-run-performance) for fields and interpretation.
+
+Search wall time includes inference waits, parallel duration sums overlap, and
+queue durations are position-weighted. These metrics expose stage costs; their
+sum is not a decomposition of CPU time. Use a flamegraph to locate CPU work.

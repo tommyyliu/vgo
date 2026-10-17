@@ -92,11 +92,15 @@ to come out of the detail branch or the block count; the policy resize is
 ## Components
 
 **`ResidualBlock`** — two 3x3 convolutions and a skip. Deep trunks need the
-residual branch held near unit variance or activations compound, and there are
-two mutually exclusive ways to do it: `groups` puts a GroupNorm after each
-convolution, and `residual_scale` applies KataGo's fixed `1/sqrt(n)` constant
-where a norm would sit. Prefer `groups`; the constant cannot respond to weight
-drift and is kept for older checkpoints.
+residual branch controlled or activations compound. `groups` enables GroupNorm
+after the convolutions; without it the block is unnormalized. Historical
+fixed residual scaling is no longer an option in the current model constructor.
+
+`norms_per_block` defaults to two. The one-norm experiment removes only the
+normalization after the second convolution, retaining the first normalization,
+skip and activation. This setting applies to convolutional residual blocks;
+attention and head normalization remain as before. Checkpoint metadata records
+the count, and loading rejects weights incompatible with that architecture.
 
 **`_Down`** — stride-2 conv, then residual blocks at the smaller scale. Both
 context stages are one of these.

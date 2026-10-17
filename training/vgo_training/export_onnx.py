@@ -29,6 +29,23 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def graph_inputs(model: onnx.ModelProto, maximum_batch: int) -> list[dict[str, object]]:
+    """Describe the actual exported inputs, including packed triples and dtypes."""
+    return [
+        {
+            "name": value.name,
+            "dtype": onnx.helper.tensor_dtype_to_np_dtype(value.type.tensor_type.elem_type).name,
+            "shape": [
+                dimension.dim_param if dimension.HasField("dim_param") else dimension.dim_value
+                for dimension in value.type.tensor_type.shape.dim
+            ],
+            "minimum_batch": 1,
+            "maximum_batch": maximum_batch,
+        }
+        for value in model.graph.input
+    ]
+
+
 def export(arguments: argparse.Namespace) -> dict[str, object]:
     if arguments.maximum_batch < 2:
         raise ValueError("maximum batch must be at least two for dynamic export")
@@ -116,6 +133,7 @@ def export(arguments: argparse.Namespace) -> dict[str, object]:
         finally:
             os.close(descriptor)
 
+    inputs = graph_inputs(model_proto, arguments.maximum_batch)
     manifest = {
         "schema": "vgo.onnx-manifest.v1",
         "checkpoint": str(checkpoint_path),
@@ -125,13 +143,8 @@ def export(arguments: argparse.Namespace) -> dict[str, object]:
         "torch_version": torch.__version__,
         "onnx_version": onnx.__version__,
         "opset": model_proto.opset_import[0].version,
-        "input": {
-            "name": "states",
-            "dtype": "float32",
-            "shape": ["batch", channels, height, width],
-            "minimum_batch": 1,
-            "maximum_batch": arguments.maximum_batch,
-        },
+        "input_layout": properties["vgo.input_layout"],
+        "inputs": inputs,
         "outputs": [
             {
                 "name": "policy_logits",
@@ -152,9 +165,14 @@ def export(arguments: argparse.Namespace) -> dict[str, object]:
             "raster_kind": checkpoint.get("raster_kind"),
             "width": model_width,
             "blocks": blocks,
+            "norms_per_block": int(checkpoint.get("norms_per_block", 2)),
             "parameters": sum(parameter.numel() for parameter in model.parameters()),
         },
     }
+    # Preserve the singular field for dense exports; a packed graph has no
+    # single states input, so advertising one silently misdescribes its contract.
+    if not arguments.packed_input:
+        manifest["input"] = inputs[0]
     manifest_path = output_path.with_suffix(output_path.suffix + ".json")
     atomic_write_text(
         manifest_path, json.dumps(manifest, indent=2) + "\n"

@@ -7,6 +7,10 @@ square, and territory is decided by Voronoi cells.
 **New here? Read [`docs/OVERVIEW.md`](docs/OVERVIEW.md)**, then
 [`docs/RUNNING.md`](docs/RUNNING.md) for commands.
 
+For the ideas behind the whole system, read the hierarchical
+[`project outline`](docs/PROJECT_OUTLINE.md). The current work order is in the
+[`restart roadmap`](todo/ROADMAP.md).
+
 **Want the bot on a website?** [`client/`](client/README.md) is a self-contained
 browser opponent: the engine compiled to WebAssembly plus a small ES module, with
 no server and no GPU to operate.

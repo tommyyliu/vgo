@@ -17,6 +17,9 @@ measurements are still valid for the code they were taken on.
 
 | doc | question |
 |---|---|
+| [TREE_REUSE_2026-10-14.md](TREE_REUSE_2026-10-14.md) | do existing tails need filtering, can MCTS retain useful work, and do native failures return within a deadline? |
+| [RESTART_2026-10-13.md](RESTART_2026-10-13.md) | what does the current GPU/CPU profile show, and does indexed radial enumeration help? |
+| [RESTART_2026-10-14.md](RESTART_2026-10-14.md) | production-scale pruning, matched model variants, and a randomized search-budget pilot |
 | [LOCAL_CONTESTABILITY.md](LOCAL_CONTESTABILITY.md) | how far away can a stone change another stone's status? |
 | [LOCAL_CONTESTABILITY_SHARP_BOUND.md](LOCAL_CONTESTABILITY_SHARP_BOUND.md) | the (2 + 4 sqrt 2) r upper bound |
 | [LOCAL_CONTESTABILITY_FLOOR.md](LOCAL_CONTESTABILITY_FLOOR.md) | the 7.4918 r lower bound |

@@ -4,6 +4,10 @@ Start here. This is the map: what the system does, how the pieces fit, and why
 the load-bearing decisions are what they are. Each section ends with where to
 read more.
 
+For a deeper hierarchical explanation of the ideas and their dependencies, see
+[`PROJECT_OUTLINE.md`](PROJECT_OUTLINE.md). Current implementation work and its
+acceptance criteria are in the [`restart roadmap`](../todo/ROADMAP.md).
+
 ---
 
 ## 1. What this is

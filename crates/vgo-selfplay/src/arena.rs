@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::VecDeque;
+use std::{cell::RefCell, collections::VecDeque};
 use std::{
     path::PathBuf,
     sync::{
@@ -17,7 +17,10 @@ use vgo_inference::{
     BatchedEvaluator, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
 };
 use vgo_raster::{RasterConfig, RasterKind};
-use vgo_search::{Action, EvaluationError, Evaluator, NaiveEvaluator, SearchConfig, search_with_evaluator};
+use vgo_search::{
+    Action, EvaluationError, Evaluator, NaiveEvaluator, ReusableSearch, ReuseMetrics, SearchConfig,
+    search_for_duration, search_with_evaluator,
+};
 use vgo_selfplay::{ADJUDICATION_PLIES, award_by_area, play_game as run_playout};
 
 #[derive(Debug, Parser)]
@@ -49,6 +52,21 @@ struct Arguments {
     pairs: usize,
     #[arg(long, default_value_t = 16)]
     simulations: u32,
+    /// Equal advisory wall-time budget for both seats; simulations remains a ceiling.
+    /// Root plus one round is guaranteed and a pending inference round may overrun.
+    #[arg(long)]
+    move_time_ms: Option<u64>,
+    /// Retain the candidate seat's subtree across actual moves (arena only).
+    #[arg(long)]
+    tree_reuse: bool,
+    /// Independently enable reuse for the opponent seat.
+    #[arg(long)]
+    opponent_tree_reuse: bool,
+    #[arg(long, default_value_t = 4096)]
+    reuse_maximum_nodes: usize,
+    /// Tracked retained payload per seat; excludes allocator overhead.
+    #[arg(long, default_value_t = 256)]
+    reuse_maximum_mib: usize,
     /// Simulations for the opponent seat, when it should differ from the
     /// candidate's. Ratings need both seats equal, so this is not for measuring
     /// strength -- it is for asking what search itself is worth: play a model
@@ -192,6 +210,35 @@ struct GameResult {
     /// they are what a rating is computed from. An undecided rate has no
     /// explanation without them.
     moves: Vec<(Color, Option<Point>)>,
+    // Candidate, opponent. Timed search can exceed its advisory deadline while
+    // a broker round is pending, so report actual work and elapsed search time.
+    searches: [SeatSearches; 2],
+}
+
+#[derive(Clone, Copy, Default)]
+struct SeatSearches {
+    moves: u64,
+    simulations: u64,
+    milliseconds: f64,
+    maximum_milliseconds: f64,
+    reuse: ReuseMetrics,
+}
+
+impl SeatSearches {
+    fn json(self) -> serde_json::Value {
+        let count = self.moves.max(1) as f64;
+        serde_json::json!({"moves": self.moves,
+            "average_simulations": self.simulations as f64 / count,
+            "average_search_ms": self.milliseconds / count,
+            "maximum_search_ms": self.maximum_milliseconds,
+            "reuse": {"searches": self.reuse.searches, "hits": self.reuse.hits,
+                "inherited_visits": self.reuse.inherited_visits,
+                "advances": self.reuse.advances, "advance_hits": self.reuse.advance_hits,
+                "limit_drops": self.reuse.limit_drops,
+                "advance_ms": self.reuse.advance_nanoseconds as f64 / 1e6,
+                "maximum_retained_nodes": self.reuse.maximum_retained_nodes,
+                "maximum_retained_payload_bytes": self.reuse.maximum_retained_bytes}})
+    }
 }
 
 fn load_model(
@@ -237,6 +284,24 @@ fn search_config(
 }
 
 fn validate_arguments(arguments: &Arguments) -> Result<(), &'static str> {
+    if arguments.reuse_maximum_nodes == 0
+        || arguments.reuse_maximum_mib == 0
+        || arguments
+            .reuse_maximum_mib
+            .checked_mul(1024 * 1024)
+            .is_none()
+    {
+        return Err("tree reuse limits must be positive and fit in memory size");
+    }
+    if (arguments.tree_reuse && arguments.root_exploration_noise != 0.0)
+        || (arguments.opponent_tree_reuse
+            && arguments
+                .opponent_root_exploration_noise
+                .unwrap_or(arguments.root_exploration_noise)
+                != 0.0)
+    {
+        return Err("tree reuse requires zero root exploration noise for that seat");
+    }
     if arguments.pairs == 0
         || arguments.simulations == 0
         || arguments.maximum_plies == 0
@@ -251,11 +316,17 @@ fn validate_arguments(arguments: &Arguments) -> Result<(), &'static str> {
     if arguments.opponent_resolution == Some(0) {
         return Err("--opponent-resolution must be positive");
     }
-    if arguments.opponent_resolution.is_some_and(|size| size < arguments.policy_resolution) {
+    if arguments
+        .opponent_resolution
+        .is_some_and(|size| size < arguments.policy_resolution)
+    {
         return Err("--opponent-resolution must not be below --policy-resolution");
     }
     if arguments.opponent_simulations == Some(0) {
         return Err("--opponent-simulations must be positive");
+    }
+    if arguments.move_time_ms == Some(0) {
+        return Err("--move-time-ms must be positive");
     }
     if arguments.coarse_pool > arguments.policy_resolution {
         return Err("--coarse-pool must not exceed --policy-resolution");
@@ -273,9 +344,7 @@ fn validate_arguments(arguments: &Arguments) -> Result<(), &'static str> {
 /// constraint, so a rounded file would not reload as the position that was
 /// played. Rust's float Display is already the shortest round-tripping form.
 fn game_sgf(result: &GameResult, radius: f64, komi: f64) -> String {
-    let mut text = format!(
-        "(;FF[4]GM[VGO]SZ[1]RA[{radius}]KM[{komi}]PL[B]"
-    );
+    let mut text = format!("(;FF[4]GM[VGO]SZ[1]RA[{radius}]KM[{komi}]PL[B]");
     for (colour, action) in &result.moves {
         let tag = match colour {
             Color::Black => "B",
@@ -316,12 +385,23 @@ fn play_game(
     let mut closing: VecDeque<Position> = VecDeque::with_capacity(ADJUDICATION_PLIES);
     let record_moves = arguments.sgf_directory.is_some();
     let mut moves: Vec<(Color, Option<Point>)> = Vec::new();
+    let mut searches = [SeatSearches::default(); 2];
+    let reuse = RefCell::new([
+        ReusableSearch::new(
+            arguments.reuse_maximum_nodes,
+            arguments.reuse_maximum_mib * 1024 * 1024,
+        ),
+        ReusableSearch::new(
+            arguments.reuse_maximum_nodes,
+            arguments.reuse_maximum_mib * 1024 * 1024,
+        ),
+    ]);
     let playout = run_playout(
         Position::new(arguments.radius, Vec::new(), Color::Black)
             .with_ruleset(arguments.ruleset)
             .with_komi(arguments.komi),
         arguments.maximum_plies,
-        |position, _| {
+        |position, ply| {
             let is_candidate = position.to_move() == candidate_color;
             let evaluator: &dyn Evaluator = if is_candidate {
                 candidate
@@ -361,23 +441,61 @@ fn play_game(
             let leaf_batch = if is_candidate {
                 arguments.leaf_batch
             } else {
-                arguments.opponent_leaf_batch.unwrap_or(arguments.leaf_batch)
+                arguments
+                    .opponent_leaf_batch
+                    .unwrap_or(arguments.leaf_batch)
             };
-            search_with_evaluator(
-                position,
-                search_config(
-                    simulations,
-                    arguments.coarse_pool,
-                    leaf_batch,
-                    candidates,
-                    widening,
-                    noise,
-                ),
-                seed,
-                evaluator,
-            )
+            let config = search_config(
+                simulations,
+                arguments.coarse_pool,
+                leaf_batch,
+                candidates,
+                widening,
+                noise,
+            );
+            let started = Instant::now();
+            let enabled = if is_candidate {
+                arguments.tree_reuse
+            } else {
+                arguments.opponent_tree_reuse
+            };
+            let result = if enabled {
+                reuse.borrow_mut()[usize::from(!is_candidate)].search(
+                    position,
+                    config,
+                    seed,
+                    u64::from(!is_candidate),
+                    ply,
+                    evaluator,
+                    arguments.move_time_ms.map(Duration::from_millis),
+                )
+            } else if let Some(milliseconds) = arguments.move_time_ms {
+                search_for_duration(
+                    position,
+                    config,
+                    seed,
+                    evaluator,
+                    Duration::from_millis(milliseconds),
+                )
+            } else {
+                search_with_evaluator(position, config, seed, evaluator)
+            }?;
+            let milliseconds = started.elapsed().as_secs_f64() * 1000.0;
+            let seat = &mut searches[usize::from(!is_candidate)];
+            seat.moves += 1;
+            seat.simulations += u64::from(result.stats.simulations);
+            seat.milliseconds += milliseconds;
+            seat.maximum_milliseconds = seat.maximum_milliseconds.max(milliseconds);
+            Ok(result)
         },
         |step| {
+            let mut trees = reuse.borrow_mut();
+            if arguments.tree_reuse {
+                trees[0].advance(step.action, &step.transition.position);
+            }
+            if arguments.opponent_tree_reuse {
+                trees[1].advance(step.action, &step.transition.position);
+            }
             if closing.len() == ADJUDICATION_PLIES {
                 closing.pop_front();
             }
@@ -403,12 +521,16 @@ fn play_game(
     let outcome = playout
         .outcome
         .or_else(|| closing.back().map(award_by_area));
+    for (seat, tree) in searches.iter_mut().zip(reuse.borrow().iter()) {
+        seat.reuse = tree.metrics();
+    }
     Ok(GameResult {
         completed: outcome.is_some(),
         outcome,
         candidate_color,
         plies: playout.stats.plies,
         moves,
+        searches,
     })
 }
 
@@ -454,7 +576,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     arguments
                         .opponent_raster_kind
                         .unwrap_or(arguments.candidate_raster_kind),
-                    arguments.opponent_resolution.unwrap_or(arguments.resolution),
+                    arguments
+                        .opponent_resolution
+                        .unwrap_or(arguments.resolution),
                     &arguments,
                 )
             })
@@ -489,7 +613,11 @@ struct Tally {
 impl Tally {
     fn record(&mut self, result: &GameResult, games: usize, started: Instant, label: &str) {
         self.finished += 1;
-        let verdict = match result.outcome.filter(|_| result.completed).map(|o| o.winner) {
+        let verdict = match result
+            .outcome
+            .filter(|_| result.completed)
+            .map(|o| o.winner)
+        {
             Some(Some(winner)) if winner == result.candidate_color => {
                 self.wins += 1;
                 "won"
@@ -515,7 +643,11 @@ impl Tally {
         };
         let elapsed = started.elapsed().as_secs_f64();
         let remaining = elapsed / self.finished as f64 * (games - self.finished) as f64;
-        let seat = if result.candidate_color == Color::Black { "B" } else { "W" };
+        let seat = if result.candidate_color == Color::Black {
+            "B"
+        } else {
+            "W"
+        };
         eprintln!(
             "[arena] {label} game {}/{games}: candidate ({seat}) {verdict} in {} plies | \
              {}-{}-{} score {score:.3} | {:.1}m elapsed, ~{:.1}m left",
@@ -614,9 +746,7 @@ fn run_match(
             } else {
                 "natural"
             };
-            let path = directory.join(format!(
-                "{label}-game{index:03}-cand{seat}-{status}.sgf"
-            ));
+            let path = directory.join(format!("{label}-game{index:03}-cand{seat}-{status}.sgf"));
             std::fs::write(path, game_sgf(result, arguments.radius, arguments.komi))?;
         }
     }
@@ -630,7 +760,29 @@ fn run_match(
     // plies is far past where the board settles, so a high share means the
     // sides are stalling rather than that the game is long.
     let mut capped = 0_usize;
+    let mut searches = [SeatSearches::default(); 2];
     for result in &results {
+        for (total, game) in searches.iter_mut().zip(result.searches) {
+            total.moves += game.moves;
+            total.simulations += game.simulations;
+            total.milliseconds += game.milliseconds;
+            total.maximum_milliseconds = total.maximum_milliseconds.max(game.maximum_milliseconds);
+            total.reuse.searches += game.reuse.searches;
+            total.reuse.hits += game.reuse.hits;
+            total.reuse.inherited_visits += game.reuse.inherited_visits;
+            total.reuse.advances += game.reuse.advances;
+            total.reuse.advance_hits += game.reuse.advance_hits;
+            total.reuse.limit_drops += game.reuse.limit_drops;
+            total.reuse.advance_nanoseconds += game.reuse.advance_nanoseconds;
+            total.reuse.maximum_retained_nodes = total
+                .reuse
+                .maximum_retained_nodes
+                .max(game.reuse.maximum_retained_nodes);
+            total.reuse.maximum_retained_bytes = total
+                .reuse
+                .maximum_retained_bytes
+                .max(game.reuse.maximum_retained_bytes);
+        }
         plies += u64::from(result.plies);
         if result.plies >= arguments.maximum_plies {
             capped += 1;
@@ -695,6 +847,9 @@ fn run_match(
             "  \"candidate_score\": {:.6},\n",
             "  \"score_ci95\": [{:.6}, {:.6}],\n",
             "  \"simulations_per_move\": {},\n",
+            "  \"move_time_ms\": {},\n",
+            "  \"candidate_search\": {},\n",
+            "  \"opponent_search\": {},\n",
             "  \"opponent_simulations_per_move\": {},\n",
             "  \"coarse_pool\": {},\n",
             "  \"average_plies\": {:.3},\n",
@@ -722,6 +877,11 @@ fn run_match(
         interval.0,
         interval.1,
         arguments.simulations,
+        arguments
+            .move_time_ms
+            .map_or_else(|| "null".to_owned(), |value| value.to_string()),
+        searches[0].json(),
+        searches[1].json(),
         arguments
             .opponent_simulations
             .unwrap_or(arguments.simulations),

@@ -5,7 +5,7 @@ use crate::{
     FineGrid, NaiveEvaluator,
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SearchConfig {
     pub simulations: u32,
     pub initial_candidates: usize,
@@ -249,6 +249,32 @@ enum FineGridCache {
 }
 
 impl Node {
+    pub(crate) fn memory_usage(&self) -> crate::TreeMemory {
+        fn visit(node: &Node, counter: &mut crate::memory::MemoryCounter) {
+            counter.report.nodes += 1;
+            counter.report.node_bytes += size_of::<Node>();
+            counter.report.edge_capacity_bytes += node.children.capacity() * size_of::<Child>();
+            counter.report.position_bytes += std::mem::size_of_val(node.position.stones());
+            if let Some(candidates) = &node.candidates {
+                counter.report.sampling_bytes +=
+                    size_of::<CandidateSequence>() + candidates.payload_bytes();
+            }
+            if let Some(evaluation) = &node.evaluation {
+                evaluation.account_memory(counter);
+            }
+            if let FineGridCache::Ready(grid) = &node.fine_grid {
+                grid.account_memory(counter);
+            }
+            for child in &node.children {
+                if let Some(node) = &child.node {
+                    visit(node, counter);
+                }
+            }
+        }
+        let mut counter = crate::memory::MemoryCounter::default();
+        visit(self, &mut counter);
+        counter.report
+    }
     /// Build a node whose evaluation was already computed elsewhere.
     ///
     /// The batched path evaluates a round of leaves together, so by the time a
@@ -332,6 +358,24 @@ impl Node {
     /// no view of the tree it will be placed in.
     pub(crate) fn mark_root(&mut self) {
         self.is_root = true;
+    }
+
+    pub(crate) fn visits(&self) -> u32 {
+        self.visits
+    }
+
+    pub(crate) fn matches_position(&self, position: &Position) -> bool {
+        self.position == *position
+    }
+
+    /// Drop siblings and keep only the child for the committed move. Exact
+    /// Position equality includes captures, pass count, rules, komi and mover.
+    pub(crate) fn take_child(&mut self, action: Action, position: &Position) -> Option<Box<Node>> {
+        self.children
+            .iter_mut()
+            .find(|child| child.candidate.action == action)
+            .and_then(|child| child.node.take())
+            .filter(|node| node.matches_position(position))
     }
 
     pub(crate) fn black_evaluation(&self) -> f64 {
@@ -570,7 +614,10 @@ impl Node {
 ///
 /// Terminates because the pass candidate is always present and `pass` cannot
 /// self-capture, so at worst every placement is marked and the pass is chosen.
-fn select_playable_child(node: &mut Node, config: SearchConfig) -> Option<(usize, Option<vgo_core::MoveResult>)> {
+fn select_playable_child(
+    node: &mut Node,
+    config: SearchConfig,
+) -> Option<(usize, Option<vgo_core::MoveResult>)> {
     while node.children.iter().any(|child| !child.refused) {
         let index = node.select_child(config);
         // Already expanded, so the rules accepted it when it was expanded.
@@ -1103,6 +1150,42 @@ mod tests {
         run_batched_simulations, sampled_child_indices, search, search_at_ply,
         search_with_evaluator, simulate,
     };
+
+    #[test]
+    fn reroot_uses_the_committed_capture_position_and_rejects_a_mismatch() {
+        use vgo_core::{Point, Stone};
+        let before = Position::new(
+            0.2,
+            vec![
+                Stone::new(0.799_999, 0.394_301_338_356_336_74, Color::Black),
+                Stone::new(0.450_359_755_708_616_2, 0.200_001, Color::White),
+                Stone::new(0.200_001, 0.590_089_667_194_192_1, Color::Black),
+            ],
+            Color::White,
+        )
+        .with_komi(0.12);
+        let action = Action::Place(Point::new(0.604_780_272_776_142_7, 0.799_999));
+        let transition = action.apply(&before);
+        assert_eq!(transition.captured, 2);
+        let after = transition.position;
+        let mut root =
+            Node::from_evaluation(before.clone(), NaiveEvaluator.evaluate(&before).unwrap(), 7);
+        root.widen(SearchConfig::canary(1), &mut SearchStats::default());
+        // Attach the evaluated capturing child, then perform the production
+        // extraction. It must match captures, not an appended-stone shortcut.
+        root.children[0].candidate.action = action;
+        root.children[0].node = Some(Box::new(Node::from_evaluation(
+            after.clone(),
+            NaiveEvaluator.evaluate(&after).unwrap(),
+            7,
+        )));
+        let mut retained = root.take_child(action, &after).unwrap();
+        assert!(retained.matches_position(&after));
+        assert!(!retained.matches_position(&after.clone().with_komi(0.13)));
+        retained.mark_root();
+        assert!(retained.is_root);
+        assert!(root.take_child(action, &after).is_none());
+    }
 
     fn child(action: Action, visits: u32) -> ChildSummary {
         ChildSummary {

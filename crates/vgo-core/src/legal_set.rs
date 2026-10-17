@@ -78,14 +78,14 @@ fn visit_candidates_within(
     let diameter = 2.0 * radius;
 
     let stone_reach = threshold.map(|t| t + diameter);
-    for stone in position.stones() {
+    let mut visit_stone = |stone: &crate::Stone| {
         let dx = point.x - stone.x;
         let dy = point.y - stone.y;
         let radial_distance = numeric::length(dx, dy);
-        if let Some(reach) = stone_reach {
-            if radial_distance >= reach {
-                continue;
-            }
+        if let Some(reach) = stone_reach
+            && radial_distance >= reach
+        {
+            return false;
         }
         let directions: &[(f64, f64)] = if radial_distance < numeric::EDGE_EPSILON {
             &[(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
@@ -98,6 +98,22 @@ fn visit_candidates_within(
                 return true;
             }
         }
+        false
+    };
+    // Threshold queries need only stones whose radial projection can reach
+    // the query disk. The retained index already has the spatial buckets;
+    // use them for this enumeration as well as for candidate clearance.
+    // Keep the same distance/projection arithmetic and final reach test.
+    let found = match (buckets, stone_reach) {
+        (Some(buckets), Some(reach))
+            if reach.is_finite() && reach > 0.0 && point.x.is_finite() && point.y.is_finite() =>
+        {
+            buckets.visit_near(position, point, reach, &mut visit_stone)
+        }
+        _ => position.stones().iter().any(&mut visit_stone),
+    };
+    if found {
+        return true;
     }
 
     for candidate in [
@@ -191,6 +207,32 @@ impl StoneBuckets {
     fn bucket(&self, row: usize, column: usize) -> &[u32] {
         let index = row * self.columns + column;
         &self.indices[self.starts[index] as usize..self.starts[index + 1] as usize]
+    }
+
+    /// Visit a conservative bounding square of the radial candidate reach.
+    /// The caller still checks Euclidean distance, so extra buckets affect
+    /// only cost. Coordinate slack keeps a rounded boundary from excluding a
+    /// stone accepted by the existing floating-point radial test.
+    fn visit_near(
+        &self,
+        position: &Position,
+        point: Point,
+        reach: f64,
+        visit: &mut impl FnMut(&crate::Stone) -> bool,
+    ) -> bool {
+        let margin = reach + numeric::COORDINATE_EPSILON;
+        let (first_column, first_row) = self.cell_of(point.x - margin, point.y - margin);
+        let (last_column, last_row) = self.cell_of(point.x + margin, point.y + margin);
+        for row in first_row..=last_row {
+            for column in first_column..=last_column {
+                for &index in self.bucket(row, column) {
+                    if visit(&position.stones()[index as usize]) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Every stone after `first` that could pair with the point, in index order.
@@ -425,7 +467,14 @@ pub fn none_closer_than(
     known_vertices: Option<&[Point]>,
 ) -> bool {
     let mut visit = |candidate: Point| point.distance(candidate) < threshold;
-    !visit_candidates_within(position, point, Some(threshold), known_vertices, None, &mut visit)
+    !visit_candidates_within(
+        position,
+        point,
+        Some(threshold),
+        known_vertices,
+        None,
+        &mut visit,
+    )
 }
 
 pub fn distance(position: &Position, point: Point, known_vertices: Option<&[Point]>) -> f64 {
@@ -688,13 +737,21 @@ pub(crate) fn escape_witness_indexed(
     index: &LegalSetIndex,
 ) -> Option<Point> {
     let mut witness = None;
-    visit_candidates_within(position, vertex, None, Some(&index.vertices),
-        index.buckets.as_ref(), &mut |candidate| {
+    visit_candidates_within(
+        position,
+        vertex,
+        None,
+        Some(&index.vertices),
+        index.buckets.as_ref(),
+        &mut |candidate| {
             if numeric::strictly_closer(vertex, candidate, stone).is_strictly_less {
                 witness = Some(candidate);
                 true
-            } else { false }
-        });
+            } else {
+                false
+            }
+        },
+    );
     witness
 }
 
@@ -709,8 +766,11 @@ pub(crate) fn escape_witness_query_first(
     index: &LegalSetIndex,
 ) -> Option<Point> {
     let qualifies = |p| numeric::strictly_closer(vertex, p, stone).is_strictly_less;
-    let accept = |p: Point| qualifies(p) && contains_with(position, index.buckets.as_ref(), p.x, p.y);
-    if accept(vertex) { return Some(vertex); }
+    let accept =
+        |p: Point| qualifies(p) && contains_with(position, index.buckets.as_ref(), p.x, p.y);
+    if accept(vertex) {
+        return Some(vertex);
+    }
     let diameter = 2.0 * position.radius();
     for blocker in position.stones() {
         let dx = vertex.x - blocker.x;
@@ -718,16 +778,26 @@ pub(crate) fn escape_witness_query_first(
         let radial = numeric::length(dx, dy);
         let directions: &[(f64, f64)] = if radial < numeric::EDGE_EPSILON {
             &[(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
-        } else { &[(dx / radial, dy / radial)] };
+        } else {
+            &[(dx / radial, dy / radial)]
+        };
         for &(ux, uy) in directions {
             let p = Point::new(blocker.x + diameter * ux, blocker.y + diameter * uy);
-            if accept(p) { return Some(p); }
+            if accept(p) {
+                return Some(p);
+            }
         }
     }
     let r = position.radius();
-    for p in [Point::new(r, vertex.y), Point::new(1.0-r, vertex.y),
-              Point::new(vertex.x, r), Point::new(vertex.x, 1.0-r)] {
-        if accept(p) { return Some(p); }
+    for p in [
+        Point::new(r, vertex.y),
+        Point::new(1.0 - r, vertex.y),
+        Point::new(vertex.x, r),
+        Point::new(vertex.x, 1.0 - r),
+    ] {
+        if accept(p) {
+            return Some(p);
+        }
     }
     index.vertices.iter().copied().find(|&p| qualifies(p))
 }
@@ -858,7 +928,11 @@ mod tests {
             stones.push(Stone {
                 x,
                 y,
-                color: if index % 2 == 0 { Color::Black } else { Color::White },
+                color: if index % 2 == 0 {
+                    Color::Black
+                } else {
+                    Color::White
+                },
             });
         }
         Position::new(radius, stones, Color::Black)
@@ -872,12 +946,10 @@ mod tests {
         for (radius, count) in [(1.0 / 18.0, 28usize), (1.0 / 18.0, 52), (1.0 / 36.0, 240)] {
             let position = threshold_lattice(count, radius);
             let known = vertices(&position);
+            let index = super::LegalSetIndex::build(&position);
             for row in 0..24 {
                 for column in 0..24 {
-                    let point = Point::new(
-                        (column as f64 + 0.5) / 24.0,
-                        (row as f64 + 0.5) / 24.0,
-                    );
+                    let point = Point::new((column as f64 + 0.5) / 24.0, (row as f64 + 0.5) / 24.0);
                     let exact = distance(&position, point, Some(&known));
                     for scale in [0.25, 0.5, 0.9, 1.0, 1.1, 2.0] {
                         let threshold = exact * scale;
@@ -886,7 +958,51 @@ mod tests {
                             threshold <= exact,
                             "{count} stones, point {point:?}, threshold {threshold} vs exact {exact}",
                         );
+                        assert_eq!(
+                            super::none_closer_than_indexed(&position, point, threshold, &index),
+                            threshold <= exact,
+                            "indexed: {count} stones, point {point:?}, threshold {threshold} vs exact {exact}",
+                        );
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_threshold_queries_match_exhaustive_near_boundaries() {
+        for count in [31, 32, 64, 160, 240] {
+            let radius = 1.0 / 38.0;
+            let position = scattered(count, radius, 83);
+            let index = super::LegalSetIndex::build(&position);
+            let mut points = vec![
+                Point::new(0.0, 0.0),
+                Point::new(radius, radius),
+                Point::new(1.0 - radius, 1.0 - radius),
+                Point::new(0.5, 0.5),
+            ];
+            points.extend(index.vertices.iter().copied().take(12));
+            for stone in position.stones().iter().take(8) {
+                points.push(Point::new(stone.x, stone.y));
+                points.push(Point::new(stone.x + 2.0 * radius, stone.y));
+            }
+            for point in points {
+                let nearest = distance(&position, point, Some(&index.vertices));
+                for threshold in [
+                    0.0,
+                    radius,
+                    nearest.next_down(),
+                    nearest,
+                    nearest.next_up(),
+                    2.0 * radius,
+                    f64::INFINITY,
+                    f64::NAN,
+                ] {
+                    assert_eq!(
+                        super::none_closer_than_indexed(&position, point, threshold, &index),
+                        none_closer_than(&position, point, threshold, Some(&index.vertices)),
+                        "{count} stones: point {point:?}, threshold {threshold}"
+                    );
                 }
             }
         }

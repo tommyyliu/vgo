@@ -451,7 +451,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "500 Internal Server Error",
                     &format!("{{\"error\":\"{}\"}}", escape(&error.to_string())),
                 );
-                continue;
+                return Err(error.into());
             }
         };
         let payload = move_json(&result, position.to_move());
@@ -490,19 +490,16 @@ mod tests {
     /// which is what makes the omission worth a test.
     #[test]
     fn komi_is_read_when_present_and_zero_when_absent() {
-        let with = parse_request(
-            r#"{"radius":0.05,"komi":0.18,"toMove":"B","stones":[]}"#,
-        )
-        .expect("should parse");
+        let with = parse_request(r#"{"radius":0.05,"komi":0.18,"toMove":"B","stones":[]}"#)
+            .expect("should parse");
         assert!((with.komi - 0.18).abs() < 1e-9);
 
         // A client written before komi existed means komi zero.
         assert_eq!(parse_request(BODY).expect("should parse").komi, 0.0);
 
         // Negative komi spots Black and is a legitimate setting, not a typo.
-        let negative =
-            parse_request(r#"{"radius":0.05,"komi":-0.125,"toMove":"B","stones":[]}"#)
-                .expect("should parse");
+        let negative = parse_request(r#"{"radius":0.05,"komi":-0.125,"toMove":"B","stones":[]}"#)
+            .expect("should parse");
         assert!((negative.komi + 0.125).abs() < 1e-9);
     }
 

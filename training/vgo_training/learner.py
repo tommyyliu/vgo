@@ -87,6 +87,7 @@ class LearnerConfig:
     resolution: int | None = None
     # GroupNorm groups per residual block; None leaves the block unnormalized.
     norm_groups: int | None = None
+    norms_per_block: int = 2
     # Weight on the auxiliary ownership loss, relative to policy at 1.0. Zero
     # disables the head's supervision *and* stops the window holding its
     # targets, which is 0.063 MB per sample -- a fifth of a packed sample. The
@@ -131,6 +132,8 @@ class LearnerConfig:
             raise ValueError("value weight must be finite and nonnegative")
         if self.model_width <= 0 or self.blocks <= 0:
             raise ValueError("model width and blocks must be positive")
+        if self.norms_per_block not in (1, 2):
+            raise ValueError("norms_per_block must be 1 or 2")
         if self.threads <= 0:
             raise ValueError("thread count must be positive")
         if self.precision not in ("float32", "bfloat16"):
@@ -1223,6 +1226,7 @@ class PersistentLearner:
                 )
                 and int(metadata.get("model_width", -1)) == config.model_width
                 and int(metadata.get("blocks", -1)) == config.blocks
+                and int(metadata.get("norms_per_block", 2)) == config.norms_per_block
             )
             if reused:
                 parent_checkpoint = str(self.current_checkpoint)
@@ -1276,6 +1280,7 @@ class PersistentLearner:
                     # These follow the parent, not the config: they are part of
                     # the function the loaded weights were trained for.
                     "norm_groups": checkpoint.get("norm_groups"),
+                    "norms_per_block": int(checkpoint.get("norms_per_block", 2)),
                     "context_attention_blocks": int(
                         checkpoint.get("context_attention_blocks", 0)
                     ),
@@ -1288,6 +1293,7 @@ class PersistentLearner:
                     blocks=config.blocks,
                     policy_resolution=decoupled,
                     norm_groups=config.norm_groups,
+                    norms_per_block=config.norms_per_block,
                     context_attention_blocks=config.context_attention_blocks,
                     attention_heads=config.attention_heads,
                     raster_resolution=window.height,
@@ -1303,6 +1309,7 @@ class PersistentLearner:
                     "architecture": "ddrnet",
                     "raster_kind": config.raster_kind,
                     "norm_groups": config.norm_groups,
+                    "norms_per_block": config.norms_per_block,
                     "context_attention_blocks": config.context_attention_blocks,
                     "attention_heads": config.attention_heads,
                 }
@@ -1713,6 +1720,7 @@ class PersistentLearner:
                 parameter.numel() for parameter in self.model.parameters()
             ),
             "epochs": config.epochs,
+            "training_config": asdict(config),
             "batch_size": config.batch_size,
             "learning_rate": config.learning_rate,
             "schedule": config.schedule,

@@ -23,8 +23,13 @@ def _group_count(width: int, preferred: int) -> int:
     return 1
 
 
-def residual_stack(width: int, blocks: int, groups: int | None) -> list["ResidualBlock"]:
-    return [ResidualBlock(width, groups=groups) for _ in range(blocks)]
+def residual_stack(
+    width: int, blocks: int, groups: int | None, norms_per_block: int = 2
+) -> list["ResidualBlock"]:
+    return [
+        ResidualBlock(width, groups=groups, norms_per_block=norms_per_block)
+        for _ in range(blocks)
+    ]
 
 
 def value_head(channels: int) -> nn.Sequential:
@@ -85,8 +90,12 @@ class ResidualBlock(nn.Module):
     forward in eager PyTorch, and it lowers to ONNX ``InstanceNormalization``.
     """
 
-    def __init__(self, width: int, groups: int | None = None) -> None:
+    def __init__(
+        self, width: int, groups: int | None = None, norms_per_block: int = 2
+    ) -> None:
         super().__init__()
+        if norms_per_block not in (1, 2):
+            raise ValueError("norms_per_block must be 1 or 2")
         if groups is None:
             self.layers = nn.Sequential(
                 nn.Conv2d(width, width, kernel_size=3, padding=1),
@@ -102,6 +111,8 @@ class ResidualBlock(nn.Module):
                 nn.Conv2d(width, width, kernel_size=3, padding=1, bias=False),
                 nn.GroupNorm(divisor, width),
             )
+            if norms_per_block == 1:
+                self.layers = self.layers[:-1]
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return torch.relu(inputs + self.layers(inputs))
@@ -126,6 +137,7 @@ class _Down(nn.Module):
         attention_blocks: int = 0,
         attention_heads: int = 8,
         board: tuple[int, int] | None = None,
+        norms_per_block: int = 2,
     ) -> None:
         super().__init__()
         if attention_blocks and board is None:
@@ -140,7 +152,7 @@ class _Down(nn.Module):
         )
         kept = blocks - attention_blocks
         self.body = nn.Sequential(
-            *residual_stack(channels_out, kept, groups)
+            *residual_stack(channels_out, kept, groups, norms_per_block)
         )
         # Held apart from `body` because a transformer block takes an optional
         # mask that nn.Sequential cannot thread through.
@@ -245,6 +257,7 @@ class DDRNetPolicyValueNet(nn.Module):
         context_attention_blocks: int = 0,
         attention_heads: int = 8,
         raster_resolution: int | None = None,
+        norms_per_block: int = 2,
     ) -> None:
         super().__init__()
         if stem_stride not in (1, 2, 4):
@@ -266,6 +279,9 @@ class DDRNetPolicyValueNet(nn.Module):
         context1_board = None if trunk is None else (trunk // 2, trunk // 2)
         context2_board = None if trunk is None else (trunk // 4, trunk // 4)
         self.norm_groups = norm_groups
+        if norms_per_block not in (1, 2):
+            raise ValueError("norms_per_block must be 1 or 2")
+        self.norms_per_block = norms_per_block
         stem_channels = max(8, width // 2)
         detail_channels = width
         context_channels = width * 2
@@ -298,11 +314,11 @@ class DDRNetPolicyValueNet(nn.Module):
             nn.ReLU(),
         )
         self.detail_entry = nn.Sequential(
-            *residual_stack(detail_channels, stage_blocks, norm_groups)
+            *residual_stack(detail_channels, stage_blocks, norm_groups, norms_per_block)
         )
 
         self.detail_stage1 = nn.Sequential(
-            *residual_stack(detail_channels, stage_blocks, norm_groups)
+            *residual_stack(detail_channels, stage_blocks, norm_groups, norms_per_block)
         )
         self.context_stage1 = _Down(
             detail_channels,
@@ -312,6 +328,7 @@ class DDRNetPolicyValueNet(nn.Module):
             attention_blocks=context_attention_blocks,
             attention_heads=attention_heads,
             board=context1_board,
+            norms_per_block=norms_per_block,
         )
         self.context_to_detail1 = nn.Conv2d(
             context_channels, detail_channels, kernel_size=1
@@ -325,7 +342,7 @@ class DDRNetPolicyValueNet(nn.Module):
         )
 
         self.detail_stage2 = nn.Sequential(
-            *residual_stack(detail_channels, stage_blocks, norm_groups)
+            *residual_stack(detail_channels, stage_blocks, norm_groups, norms_per_block)
         )
         self.context_stage2 = _Down(
             context_channels,
@@ -335,6 +352,7 @@ class DDRNetPolicyValueNet(nn.Module):
             attention_blocks=context_attention_blocks,
             attention_heads=attention_heads,
             board=context2_board,
+            norms_per_block=norms_per_block,
         )
         self.context_to_detail2 = nn.Conv2d(
             deep_channels, detail_channels, kernel_size=1
@@ -385,7 +403,7 @@ class DDRNetPolicyValueNet(nn.Module):
         self.detail_tail = nn.Sequential(
             nn.Conv2d(detail_channels, context_channels, kernel_size=1),
             nn.ReLU(),
-            *residual_stack(context_channels, 1, norm_groups),
+            *residual_stack(context_channels, 1, norm_groups, norms_per_block),
         )
         self.policy_features = nn.Sequential(
             nn.Conv2d(
@@ -582,6 +600,7 @@ def build_model(
     context_attention_blocks: int = 0,
     attention_heads: int = 8,
     raster_resolution: int | None = None,
+    norms_per_block: int = 2,
 ) -> DDRNetPolicyValueNet:
     """`policy_resolution` coarsens the placement grid the policy head emits
     while leaving the input raster untouched; None keeps them equal.
@@ -598,6 +617,7 @@ def build_model(
         context_attention_blocks=context_attention_blocks,
         attention_heads=attention_heads,
         raster_resolution=raster_resolution,
+        norms_per_block=norms_per_block,
     )
 
 
@@ -626,11 +646,12 @@ def load_model(checkpoint_path: Path) -> tuple[DDRNetPolicyValueNet, dict[str, o
         context_attention_blocks=int(checkpoint.get("context_attention_blocks", 0)),
         attention_heads=int(checkpoint.get("attention_heads", 8)),
         raster_resolution=height,
+        norms_per_block=int(checkpoint.get("norms_per_block", 2)),
     )
     # The batch-normalized twin heads and the ownership head exist only while
     # training, so an exported model lacks them. Everything inference reads
     # still has to be present.
-    missing, _ = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    missing, unexpected = model.load_state_dict(checkpoint["state_dict"], strict=False)
     required = [
         name
         for name in missing
@@ -640,6 +661,15 @@ def load_model(checkpoint_path: Path) -> tuple[DDRNetPolicyValueNet, dict[str, o
         raise RuntimeError(
             f"checkpoint is missing {len(required)} inference weight(s), "
             f"starting with {required[0]}"
+        )
+    unexpected_trunk = [
+        name for name in unexpected
+        if not ("_normed" in name or "_norm." in name or name.startswith("ownership_"))
+    ]
+    if unexpected_trunk:
+        raise RuntimeError(
+            "checkpoint architecture disagrees with inference weights, "
+            f"starting with {unexpected_trunk[0]}"
         )
     model.eval()
     return model, checkpoint

@@ -121,6 +121,7 @@ def main() -> None:
         "which is what generation ran at",
     )
     parser.add_argument("--norm-groups", type=int, default=8)
+    parser.add_argument("--norms-per-block", type=int, choices=(1, 2), default=2)
     parser.add_argument(
         "--context-attention-blocks",
         type=int,
@@ -180,6 +181,7 @@ def main() -> None:
         context_attention_blocks=arguments.context_attention_blocks,
         attention_heads=arguments.attention_heads,
         norm_groups=arguments.norm_groups,
+        norms_per_block=arguments.norms_per_block,
         threads=arguments.threads,
         device=arguments.device,
         precision=arguments.precision,

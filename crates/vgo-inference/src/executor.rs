@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     marker::PhantomData,
     sync::mpsc::{self, Receiver, SyncSender},
     thread::{self, JoinHandle},
@@ -100,10 +101,27 @@ pub struct ThreadedBatchExecutor<S: BatchService + 'static> {
     in_flight: usize,
     join: Option<JoinHandle<()>>,
     service: PhantomData<S>,
+    timeout: Duration,
+    pending: Option<(u64, Instant, u64, u64)>,
+    description: String,
+    fatal_native_failure: bool,
 }
 
 impl<S: BatchService + 'static> ThreadedBatchExecutor<S> {
-    pub fn spawn(mut service: S) -> Result<Self, EvaluationError> {
+    pub fn spawn(service: S) -> Result<Self, EvaluationError> {
+        Self::spawn_with_timeout(
+            service,
+            crate::deadline_from_env("VGO_INFERENCE_TIMEOUT_SECONDS", 120)?,
+        )
+    }
+
+    pub fn spawn_with_timeout(mut service: S, timeout: Duration) -> Result<Self, EvaluationError> {
+        if timeout.is_zero() {
+            return Err(EvaluationError::new("inference timeout must be positive"));
+        }
+        let description = service.description();
+        let fatal_native_failure = service.fatal_native_failure();
+        let worker_description = description.clone();
         let (batch_sender, batch_receiver) = mpsc::sync_channel::<InferenceBatch>(1);
         let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
         let join = thread::Builder::new()
@@ -112,7 +130,11 @@ impl<S: BatchService + 'static> ThreadedBatchExecutor<S> {
                 while let Ok(batch) = batch_receiver.recv() {
                     let sequence = batch.sequence;
                     let started = Instant::now();
-                    let result = service.infer(&batch.inputs);
+                    let result = service.infer(&batch.inputs).map_err(|error| {
+                        EvaluationError::new(format!(
+                            "{worker_description} slot 0 batch {sequence}: {error}"
+                        ))
+                    });
                     let stages = service.last_inference_stages();
                     let completion = result.map(|outputs| CompletedBatch {
                         sequence,
@@ -134,6 +156,10 @@ impl<S: BatchService + 'static> ThreadedBatchExecutor<S> {
             in_flight: 0,
             join: Some(join),
             service: PhantomData,
+            timeout,
+            pending: None,
+            description,
+            fatal_native_failure,
         })
     }
 }
@@ -151,12 +177,19 @@ impl<S: BatchService + 'static> BatchExecutor for ThreadedBatchExecutor<S> {
         if self.in_flight >= self.capacity() {
             return Err(EvaluationError::new("batch executor has no available slot"));
         }
+        let pending = (
+            batch.sequence(),
+            Instant::now(),
+            batch.inputs()[0].id(),
+            batch.inputs().last().unwrap().id(),
+        );
         self.sender
             .as_ref()
-            .expect("sender exists while executor is alive")
+            .ok_or_else(|| EvaluationError::new("inference executor stopped after a fatal error"))?
             .send(batch)
             .map_err(|_| EvaluationError::new("batch executor has stopped"))?;
         self.in_flight += 1;
+        self.pending = Some(pending);
         Ok(0)
     }
 
@@ -164,11 +197,36 @@ impl<S: BatchService + 'static> BatchExecutor for ThreadedBatchExecutor<S> {
         if self.in_flight == 0 {
             return Err(EvaluationError::new("batch executor has no in-flight work"));
         }
-        let completion = self
+        let (sequence, started, first, last) = self.pending.expect("in-flight batch metadata");
+        let completion = match self
             .receiver
-            .recv()
-            .map_err(|_| EvaluationError::new("batch executor dropped its completion"))?;
+            .recv_timeout(self.timeout.saturating_sub(started.elapsed()))
+        {
+            Ok(completion) => completion,
+            Err(error) => {
+                if self.fatal_native_failure {
+                    crate::deadline::arm_fatal_watchdog();
+                }
+                // A native call cannot be interrupted safely. Disconnect and
+                // detach it so callers and process shutdown can finish. Fatal:
+                // the owner must exit rather than reopen GPU sessions here.
+                self.sender.take();
+                self.join.take();
+                self.pending = None;
+                self.in_flight = 0;
+                return Err(EvaluationError::new(format!(
+                    "{} slot 0 batch {sequence}, request IDs {first}..{last}, elapsed {:.3}s (limit {:.3}s): {error}",
+                    self.description,
+                    started.elapsed().as_secs_f64(),
+                    self.timeout.as_secs_f64()
+                )));
+            }
+        };
         self.in_flight -= 1;
+        self.pending = None;
+        if completion.is_err() && self.fatal_native_failure {
+            crate::deadline::arm_fatal_watchdog();
+        }
         completion
     }
 }
@@ -176,6 +234,8 @@ impl<S: BatchService + 'static> BatchExecutor for ThreadedBatchExecutor<S> {
 struct ServiceWorker {
     sender: Option<SyncSender<InferenceBatch>>,
     join: Option<JoinHandle<()>>,
+    description: String,
+    fatal_native_failure: bool,
 }
 
 impl Drop for ServiceWorker {
@@ -196,10 +256,25 @@ pub struct ThreadedBatchExecutorPool<S: BatchService + 'static> {
     available: Vec<usize>,
     in_flight: usize,
     service: PhantomData<S>,
+    timeout: Duration,
+    pending: HashMap<u64, (usize, Instant, u64, u64)>,
 }
 
 impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
     pub fn spawn(services: Vec<S>) -> Result<Self, EvaluationError> {
+        Self::spawn_with_timeout(
+            services,
+            crate::deadline_from_env("VGO_INFERENCE_TIMEOUT_SECONDS", 120)?,
+        )
+    }
+
+    pub fn spawn_with_timeout(
+        services: Vec<S>,
+        timeout: Duration,
+    ) -> Result<Self, EvaluationError> {
+        if timeout.is_zero() {
+            return Err(EvaluationError::new("inference timeout must be positive"));
+        }
         if services.is_empty() {
             return Err(EvaluationError::new(
                 "inference executor pool must contain at least one service",
@@ -208,6 +283,9 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
         let (completion_sender, completion_receiver) = mpsc::channel();
         let mut workers = Vec::with_capacity(services.len());
         for (slot, mut service) in services.into_iter().enumerate() {
+            let description = service.description();
+            let fatal_native_failure = service.fatal_native_failure();
+            let worker_description = description.clone();
             let (sender, receiver) = mpsc::sync_channel::<InferenceBatch>(1);
             let completions = completion_sender.clone();
             let join = thread::Builder::new()
@@ -216,7 +294,11 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
                     while let Ok(batch) = receiver.recv() {
                         let sequence = batch.sequence;
                         let started = Instant::now();
-                        let result = service.infer(&batch.inputs);
+                        let result = service.infer(&batch.inputs).map_err(|error| {
+                            EvaluationError::new(format!(
+                                "{worker_description} slot {slot} batch {sequence}: {error}"
+                            ))
+                        });
                         let stages = service.last_inference_stages();
                         let completion = result.map(|outputs| CompletedBatch {
                             sequence,
@@ -237,6 +319,8 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
             workers.push(ServiceWorker {
                 sender: Some(sender),
                 join: Some(join),
+                description,
+                fatal_native_failure,
             });
         }
         drop(completion_sender);
@@ -247,6 +331,8 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
             available,
             in_flight: 0,
             service: PhantomData,
+            timeout,
+            pending: HashMap::new(),
         })
     }
 }
@@ -264,6 +350,13 @@ impl<S: BatchService + 'static> BatchExecutor for ThreadedBatchExecutorPool<S> {
         let Some(slot) = self.available.pop() else {
             return Err(EvaluationError::new("batch executor has no available slot"));
         };
+        let pending = (
+            slot,
+            Instant::now(),
+            batch.inputs()[0].id(),
+            batch.inputs().last().unwrap().id(),
+        );
+        let sequence = batch.sequence();
         let result = self.workers[slot]
             .sender
             .as_ref()
@@ -275,6 +368,7 @@ impl<S: BatchService + 'static> BatchExecutor for ThreadedBatchExecutorPool<S> {
             return Err(error);
         }
         self.in_flight += 1;
+        self.pending.insert(sequence, pending);
         Ok(slot)
     }
 
@@ -282,11 +376,48 @@ impl<S: BatchService + 'static> BatchExecutor for ThreadedBatchExecutorPool<S> {
         if self.in_flight == 0 {
             return Err(EvaluationError::new("batch executor has no in-flight work"));
         }
-        let completion = self
-            .completion_receiver
-            .recv()
-            .map_err(|_| EvaluationError::new("inference executor pool stopped"))??;
+        let (&sequence, &(slot, started, first, last)) = self
+            .pending
+            .iter()
+            .min_by_key(|(_, (_, started, _, _))| *started)
+            .expect("in-flight metadata");
+        let result = if started.elapsed() >= self.timeout {
+            Err(mpsc::RecvTimeoutError::Timeout)
+        } else {
+            self.completion_receiver
+                .recv_timeout(self.timeout.saturating_sub(started.elapsed()))
+        };
+        let completion = match result {
+            Ok(Ok(completion)) => completion,
+            error => {
+                if self
+                    .workers
+                    .iter()
+                    .any(|worker| worker.fatal_native_failure)
+                {
+                    crate::deadline::arm_fatal_watchdog();
+                }
+                for worker in &mut self.workers {
+                    worker.sender.take();
+                    worker.join.take();
+                }
+                self.pending.clear();
+                self.available.clear();
+                self.in_flight = 0;
+                return Err(match error {
+                    Ok(Err(error)) => error,
+                    Err(error) => EvaluationError::new(format!(
+                        "{} slot {slot} batch {sequence}, request IDs {first}..{last}, elapsed {:.3}s (limit {:.3}s): {error}",
+                        self.workers[slot].description,
+                        started.elapsed().as_secs_f64(),
+                        self.timeout.as_secs_f64()
+                    )),
+                    Ok(Ok(_)) => unreachable!(),
+                });
+            }
+        };
         self.in_flight -= 1;
+        self.pending.remove(&completion.sequence);
         self.available.push(completion.slot);
         Ok(completion)
     }
@@ -316,6 +447,10 @@ impl<S: BatchService + 'static> Drop for ThreadedBatchExecutor<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
     use vgo_core::{Color, Position};
     use vgo_raster::{RasterConfig, rasterize};
 
@@ -328,13 +463,72 @@ mod tests {
 
     struct EchoService;
 
+    struct GatedService(Option<mpsc::Receiver<()>>);
+    impl BatchService for GatedService {
+        fn contract(&self) -> BatchContract {
+            EchoService.contract()
+        }
+        fn description(&self) -> String {
+            "model=gated-test provider=test".into()
+        }
+        fn infer(
+            &mut self,
+            inputs: &[InferenceInput],
+        ) -> Result<Vec<InferenceOutput>, EvaluationError> {
+            if let Some(gate) = self.0.take() {
+                let _ = gate.recv();
+            }
+            EchoService.infer(inputs)
+        }
+    }
+
+    #[test]
+    fn single_slot_timeout_and_drop_do_not_wait_for_a_stalled_native_call() {
+        let (release, gate) = mpsc::channel();
+        let mut executor = ThreadedBatchExecutor::spawn_with_timeout(
+            GatedService(Some(gate)),
+            Duration::from_millis(30),
+        )
+        .unwrap();
+        executor.submit(batch(7, 11)).unwrap();
+        let started = Instant::now();
+        let error = executor.receive().unwrap_err().to_string();
+        assert!(
+            error.contains("model=gated-test provider=test slot 0 batch 7, request IDs 11..11")
+        );
+        assert!(executor.submit(batch(8, 12)).is_err());
+        drop(executor);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn fast_pool_slot_cannot_hide_an_old_stalled_batch() {
+        let (release, gate) = mpsc::channel();
+        let mut executor = ThreadedBatchExecutorPool::spawn_with_timeout(
+            vec![GatedService(Some(gate)), GatedService(None)],
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        executor.submit(batch(7, 11)).unwrap();
+        executor.submit(batch(8, 12)).unwrap();
+        assert_eq!(executor.receive().unwrap().sequence(), 8);
+        let started = Instant::now();
+        let error = executor.receive().unwrap_err().to_string();
+        assert!(error.contains("slot 0 batch 7, request IDs 11..11"));
+        assert!(executor.submit(batch(9, 13)).is_err());
+        drop(executor);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release.send(()).unwrap();
+    }
+
     impl BatchService for EchoService {
         fn contract(&self) -> BatchContract {
             BatchContract {
                 raster: RasterConfig::square(2),
                 policy: RasterConfig::square(2),
                 maximum_batch: 1,
-            input_layout: InputLayout::Dense,
+                input_layout: InputLayout::Dense,
             }
         }
 

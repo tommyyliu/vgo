@@ -96,6 +96,11 @@ pub struct CandidateSequence {
 }
 
 impl CandidateSequence {
+    pub(crate) fn payload_bytes(&self) -> usize {
+        std::mem::size_of_val(self.position.stones())
+            + self.anchors.capacity() * size_of::<Point>()
+            + self.seen.capacity() * size_of::<(i64, i64)>()
+    }
     #[must_use]
     pub fn new(position: &Position, match_seed: u64) -> Self {
         let mut anchors = legal_set_vertices(position);

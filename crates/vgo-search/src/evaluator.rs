@@ -13,6 +13,10 @@ const REFUSED_MOVE_LOGIT: f64 = 64.0;
 const SELF_CAPTURE_LOGIT_PENALTY: f64 = 24.0;
 
 pub trait Policy: Send + Sync {
+    /// Heap payload for diagnostic accounting; None marks an unknown policy.
+    fn heap_allocations(&self) -> Option<Vec<crate::HeapAllocation>> {
+        None
+    }
     fn logit(&self, action: Action) -> f64;
 
     /// A dense fine grid of placement logits for coarse->fine candidate sampling,
@@ -30,6 +34,16 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
+    pub(crate) fn account_memory(&self, counter: &mut crate::memory::MemoryCounter) {
+        counter.report.policy_bytes += std::mem::size_of_val(&*self.policy);
+        if let Some(allocations) = self.policy.heap_allocations() {
+            for allocation in allocations {
+                counter.allocation(allocation, true);
+            }
+        } else {
+            counter.report.unreported_policies += 1;
+        }
+    }
     #[must_use]
     pub fn new(current_value: f64, policy: Box<dyn Policy>) -> Self {
         assert!(current_value.is_finite() && (-1.0..=1.0).contains(&current_value));
@@ -111,6 +125,12 @@ struct NaivePolicy {
 }
 
 impl Policy for NaivePolicy {
+    fn heap_allocations(&self) -> Option<Vec<crate::HeapAllocation>> {
+        Some(vec![crate::HeapAllocation {
+            identity: self.position.stones().as_ptr() as usize,
+            bytes: std::mem::size_of_val(self.position.stones()),
+        }])
+    }
     fn logit(&self, action: Action) -> f64 {
         let Action::Place(point) = action else {
             return 0.0;

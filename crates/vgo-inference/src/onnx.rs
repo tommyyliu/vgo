@@ -2,16 +2,16 @@ use std::{
     fs,
     io::{BufReader, Read, Seek},
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
+use half::f16;
 use ort::{
     ep,
     session::{Session, builder::GraphOptimizationLevel},
     value::TensorRef,
 };
 use sha2::{Digest, Sha256};
-use half::f16;
 use vgo_raster::RasterConfig;
 use vgo_raster::packed::{bit_plane_bytes, packed_layout_for};
 use vgo_search::EvaluationError;
@@ -72,6 +72,7 @@ pub struct OnnxServiceConfig {
 }
 
 pub struct OnnxBatchService {
+    description: String,
     session: Session,
     raster: RasterConfig,
     policy: RasterConfig,
@@ -94,6 +95,49 @@ pub struct OnnxBatchService {
 
 impl OnnxBatchService {
     pub fn load(config: &OnnxServiceConfig) -> Result<Self, EvaluationError> {
+        Self::load_with_timeout(
+            config,
+            crate::deadline_from_env("VGO_INFERENCE_STARTUP_SECONDS", 1800)?,
+        )
+    }
+
+    /// A stalled native load is detached on timeout. Treat this as fatal to the
+    /// owning process; retry in a fresh process so GPU/native state is released.
+    pub fn load_with_timeout(
+        config: &OnnxServiceConfig,
+        timeout: Duration,
+    ) -> Result<Self, EvaluationError> {
+        if timeout.is_zero() {
+            return Err(EvaluationError::new(
+                "inference startup timeout must be positive",
+            ));
+        }
+        let description = format!(
+            "model={} provider={} device={} maximum_batch={} cache={} runtime={}",
+            config.model.display(),
+            config.provider.as_str(),
+            config.device_id,
+            config.maximum_batch,
+            config.cache_directory.display(),
+            std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| "system lookup".into())
+        );
+        eprintln!(
+            "[inference] loading {description}; startup limit {}s (TensorRT engine construction may take several minutes)",
+            timeout.as_secs_f64()
+        );
+        let config = config.clone();
+        let started = Instant::now();
+        let service = crate::deadline::startup(&description, timeout, true, move || {
+            Self::load_native(&config)
+        })?;
+        eprintln!(
+            "[inference] ready {description}; elapsed {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+        Ok(service)
+    }
+
+    fn load_native(config: &OnnxServiceConfig) -> Result<Self, EvaluationError> {
         if config.maximum_batch == 0 {
             return Err(EvaluationError::new("maximum batch must be positive"));
         }
@@ -207,6 +251,12 @@ impl OnnxBatchService {
             InputLayout::Packed => Vec::new(),
         };
         Ok(Self {
+            description: format!(
+                "model={} provider={} device={}",
+                model.display(),
+                config.provider.as_str(),
+                config.device_id
+            ),
             session,
             raster: config.raster,
             policy: config.policy.unwrap_or(config.raster),
@@ -238,6 +288,12 @@ impl OnnxBatchService {
 }
 
 impl BatchService for OnnxBatchService {
+    fn fatal_native_failure(&self) -> bool {
+        true
+    }
+    fn description(&self) -> String {
+        self.description.clone()
+    }
     fn contract(&self) -> BatchContract {
         BatchContract {
             raster: self.raster,
@@ -432,9 +488,7 @@ fn file_declares_packed_input(path: &Path) -> bool {
     };
     // The value follows the key within a few bytes of protobuf framing.
     let window = &tail[at + key.len()..(at + key.len() + 24).min(tail.len())];
-    window
-        .windows(6)
-        .any(|candidate| candidate == b"packed")
+    window.windows(6).any(|candidate| candidate == b"packed")
 }
 
 fn profile_shapes(config: &OnnxServiceConfig) -> ProfileShapes {
@@ -729,7 +783,11 @@ mod packed_parity_tests {
                 stones.push(Stone::new(
                     x,
                     y,
-                    if index % 2 == 0 { Color::Black } else { Color::White },
+                    if index % 2 == 0 {
+                        Color::Black
+                    } else {
+                        Color::White
+                    },
                 ));
                 index += 1;
                 if index == 24 {

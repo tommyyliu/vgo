@@ -32,9 +32,8 @@
 # catastrophe and nothing finer, for ~23 minutes of a GPU that would otherwise
 # be generating.
 #
-# Progress is measured instead against a *fixed* anchor every `anchor_every`
-# rounds. Games against one unchanging opponent accumulate power; pairwise
-# gates restart the question every time and never converge.
+# Progress is measured through a connected graph of matches against sampled
+# earlier models and fixed references every `anchor_every` rounds.
 #
 # The window cancels out of the cost: training duty is `epochs * 0.0125 /
 # turnover` regardless of how wide it is, so those two knobs alone set how much
@@ -47,9 +46,9 @@
 # proportionally cheaper. Widen it for diversity, not to train less often.
 #
 # Epoch count is from prior testing: high single digits is safe here. It matters
-# because the learner publishes the *final* epoch and only reports that a better
-# one existed (`selection_regret`), so overfitting ships silently. The arena
-# gate is what makes an aggressive count safe to run at all.
+# because the learner publishes the *final* epoch; `selection_regret` reports
+# the difference from the best validation epoch. Adoption is ungated, so epoch
+# changes need a separate strength experiment.
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -74,16 +73,18 @@ resolution="${VGO_RESOLUTION:-256}"
 # Board sizes, as space-separated `WEIGHT:UNITS` or `WEIGHT:LOW-HIGH` bands in
 # stone diameters across. Komi and the ply cap follow from each game's size.
 read -r -a board_mix <<< "${VGO_BOARD_MIX:-50:38 25:18 25:18-38}"
-# Half the window new before retraining. Duty is `epochs * 0.0125 / turnover`
-# and the window cancels, so these two knobs alone decide how much of the GPU
-# goes to training: 8 epochs at 0.50 is ~20%, at 0.30 it would be 33%. A fresher
-# model is worth less than it looks when each round already replaces half the
-# window, and training competes with the generation that feeds it.
+# Fraction of the window replaced before retraining. Training competes with
+# generation; the historical duty estimate above was measured on a different
+# recipe and should be rechecked from the current lifecycle/performance logs.
 turnover="${VGO_TURNOVER:-0.15}"
 epochs="${VGO_EPOCHS:-8}"
 updates="${VGO_UPDATES:-200}"
 actors="${VGO_ACTORS:-32}"
+telemetry_seconds="${VGO_TELEMETRY_SECONDS:-30}"
 simulations="${VGO_SIMULATIONS:-1000}"
+full_search_fraction="${VGO_FULL_SEARCH_FRACTION:-1.0}"
+fast_simulations="${VGO_FAST_SIMULATIONS:-200}"
+norms_per_block="${VGO_NORMS_PER_BLOCK:-2}"
 # The naive evaluator's value is a heuristic, so deep search on it buys little,
 # and with no model the whole generator runs on CPU while the GPU idles. A
 # from-scratch run spends its first generation here, so keep it cheap.
@@ -176,6 +177,18 @@ python="$root/training/.venv/bin/python"
 source "$root/scripts/env/ort.sh"
 mkdir -p "$games" "$models"
 
+# Lifecycle timestamps join training contention and generator handoffs to the
+# per-process performance.jsonl records. Arguments are data, never Python code.
+record_event () {
+  "$python" - "$output/events.jsonl" "$@" "loop_pid=$$" <<'PY'
+import json, sys, time
+event = {"schema": "vgo.loop-event.v1", "unix_seconds": time.time(), "event": sys.argv[2]}
+event.update(argument.split("=", 1) for argument in sys.argv[3:])
+with open(sys.argv[1], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(event) + "\n")
+PY
+}
+
 # Samples currently on disk, from manifests rather than by loading anything.
 count_samples () {
   "$python" - "$games" <<'PY'
@@ -221,6 +234,7 @@ pick_resign_threshold () {
   fi
   chosen=$("$python" "$root/scripts/resign-calibration.py" "$games" --pick \
     --games "$resign_calibration_games" --window "$resign_window" \
+    --minimum-ply "$resign_minimum_ply" \
     --target "$resign_target_false_positive" --fallback "$resign_threshold" 2>/dev/null)
   [ -z "$chosen" ] && chosen="$resign_threshold"
   echo "$chosen"
@@ -243,11 +257,15 @@ start_generator () {
     echo "[resign] $label: threshold $threshold chosen from calibration (target $(echo "100*$resign_target_false_positive" | bc -l | cut -c1-4)%)" >&2
   fi
   local model_flag=()
+  local search_fraction=1.0
   [ -n "$model" ] && model_flag=(--model "$model")
+  [ -n "$model" ] && search_fraction="$full_search_fraction"
   setsid nohup "$root/target/release/vgo-generate-continuous" \
     --output-root "$games" --label "$label" \
     --stop-file "$stop_file" --first-game "$first_game" \
     --actors "$actors" --simulations "$budget" \
+    --full-search-fraction "$search_fraction" --fast-simulations "$fast_simulations" \
+    --telemetry-seconds "$telemetry_seconds" \
     --resolution "$resolution" --policy-resolution 128 --raster-kind compact-radius \
     "${board_mix_flags[@]}" \
     --max-plies 70 --radius 0.05555555555555555 \
@@ -267,7 +285,9 @@ start_generator () {
     --seed $((70000 + first_game)) \
     "${model_flag[@]}" \
     >> "$output/generate.log" 2>&1 &
-  echo $!
+  local pid=$!
+  record_event generator_started "label=$label" "pid=$pid" "model=$model"
+  echo "$pid"
 }
 
 
@@ -326,6 +346,7 @@ for ((update = first_update; update < first_update + updates; update++)); do
 
   checkpoint="$models/update-$(printf '%06d' "$update").pt"
   echo "[loop] update $update: training from scratch on the most recent $window samples"
+  record_event training_started "update=$update" "checkpoint=$checkpoint" "generator_pid=$generator"
   # No `--initial-checkpoint`, and that is the entire point of this script. The
   # incremental chain is what accumulated the damage a from-scratch run on the
   # same corpus beat 41-7.
@@ -341,12 +362,13 @@ for ((update = first_update; update < first_update + updates; update++)); do
       --output "$checkpoint" \
       --raster-kind compact-radius --resolution "$resolution" \
       --model-width 64 --blocks 16 --context-attention-blocks 1 \
-      --attention-heads 8 --norm-groups 8 --precision bfloat16 \
+      --attention-heads 8 --norm-groups 8 --norms-per-block "$norms_per_block" --precision bfloat16 \
       --epochs "$epochs" --batch-size 64 --learning-rate 0.0005 \
       --value-weight 2.0 --ownership-weight 0.0 --validation-fraction 0.1 \
       --schedule wsd --warmup-epochs 0 --compile \
       --seed $((90000 + update)) --report-every 1 \
-  ) >> "$output/train.log" 2>&1 || { echo "[loop] training failed" >&2; exit 1; }
+  ) >> "$output/train.log" 2>&1 || { record_event training_failed "update=$update"; echo "[loop] training failed" >&2; exit 1; }
+  record_event training_finished "update=$update" "checkpoint=$checkpoint"
 
   onnx="${checkpoint%.pt}.onnx"
   packed_flag=()
@@ -354,7 +376,8 @@ for ((update = first_update; update < first_update + updates; update++)); do
   ( cd "$root/training" && "$python" -m vgo_training.export_onnx \
       --checkpoint "$checkpoint" --output "$onnx" --maximum-batch 64 \
       "${packed_flag[@]}" \
-  ) >> "$output/train.log" 2>&1 || { echo "[loop] export failed" >&2; exit 1; }
+  ) >> "$output/train.log" 2>&1 || { record_event export_failed "update=$update"; echo "[loop] export failed" >&2; exit 1; }
+  record_event export_finished "update=$update" "model=$onnx"
 
   # Start the successor before stopping the incumbent, so generation never
   # pauses. `next_game` advances past anything the old process could claim.
@@ -364,9 +387,11 @@ for ((update = first_update; update < first_update + updates; update++)); do
 import hashlib,sys
 print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$onnx")
   previous_label="$label"
+  previous_generator="$generator"
   label="gen-$(printf '%06d' "$generation")-$run_tag-$sha"
   generator=$(start_generator "$label" "$onnx" "$next_game")
   touch "$games/$previous_label.stop"
+  record_event generator_draining "label=$previous_label" "pid=$previous_generator"
   model="$onnx"
   [ -z "$anchor" ] && anchor="$onnx"
   baseline=$(count_samples)

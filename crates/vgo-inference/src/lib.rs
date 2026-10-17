@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod deadline;
 mod executor;
 mod onnx;
 mod protocol;
@@ -27,6 +28,21 @@ use std::{
 use vgo_core::Position;
 use vgo_raster::{DensePolicy, RasterConfig, packed::rasterize_packed, rasterize};
 use vgo_search::{Evaluation, EvaluationError, Evaluator};
+
+fn deadline_from_env(name: &str, default_seconds: u64) -> Result<Duration, EvaluationError> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+            .ok_or_else(|| {
+                EvaluationError::new(format!("{name} must be a positive integer in seconds"))
+            }),
+        Err(std::env::VarError::NotPresent) => Ok(Duration::from_secs(default_seconds)),
+        Err(error) => Err(EvaluationError::new(format!("{name}: {error}"))),
+    }
+}
 
 /// Renders one position into whatever form the backend asked for.
 ///
@@ -85,6 +101,14 @@ pub struct InferenceStageMetrics {
 }
 
 pub trait BatchService: Send {
+    /// Arm a final process watchdog after a native failure that may also block
+    /// exit handlers. Synthetic services can simply return their errors.
+    fn fatal_native_failure(&self) -> bool {
+        false
+    }
+    fn description(&self) -> String {
+        std::any::type_name::<Self>().to_owned()
+    }
     fn contract(&self) -> BatchContract;
     fn infer(&mut self, batch: &[InferenceInput]) -> Result<Vec<InferenceOutput>, EvaluationError>;
 
@@ -134,7 +158,6 @@ pub struct BrokerMetrics {
 }
 
 impl BrokerMetrics {
-
     #[must_use]
     pub fn delta_since(self, earlier: Self) -> Self {
         Self {
@@ -384,11 +407,12 @@ impl BatchedEvaluator {
             ));
         }
         let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
+        let executor = ThreadedBatchExecutor::spawn(service)?;
         let metrics = Arc::new(AtomicMetrics::default());
         let broker_metrics = Arc::clone(&metrics);
         let join = thread::Builder::new()
             .name(String::from("vgo-inference-broker"))
-            .spawn(move || run_broker(config, contract, service, receiver, broker_metrics))
+            .spawn(move || run_broker(config, contract, executor, receiver, broker_metrics))
             .map_err(|error| EvaluationError::new(format!("start inference broker: {error}")))?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -689,7 +713,7 @@ impl Evaluator for BatchedEvaluatorPool {
 fn run_broker(
     config: BrokerConfig,
     contract: BatchContract,
-    mut service: impl BatchService,
+    mut executor: impl BatchExecutor,
     receiver: Receiver<Request>,
     metrics: Arc<AtomicMetrics>,
 ) {
@@ -799,8 +823,13 @@ fn run_broker(
         }
         let expected_ids = inputs.iter().map(InferenceInput::id).collect::<Vec<_>>();
         let started = Instant::now();
-        let result = service.infer(&inputs);
-        let stages = service.last_inference_stages();
+        let result = InferenceBatch::new(expected_ids[0], inputs)
+            .and_then(|batch| executor.submit(batch))
+            .and_then(|_| executor.receive());
+        let stages = result
+            .as_ref()
+            .map_or(InferenceStageMetrics::default(), CompletedBatch::stages);
+        let result = result.map(CompletedBatch::into_outputs);
         metrics
             .inference_nanoseconds
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -850,6 +879,9 @@ fn run_broker(
                     .fetch_add(position_count as u64, Ordering::Relaxed);
                 for part in parts {
                     let _ = part.request.response.send(Err(error.clone()));
+                }
+                for request in receiver.try_iter() {
+                    let _ = request.response.send(Err(error.clone()));
                 }
                 break;
             }
@@ -1260,6 +1292,71 @@ mod tests {
         wrong_id: bool,
     }
 
+    #[test]
+    fn stalled_pool_fails_every_waiting_caller_and_shuts_down() {
+        struct Blocked(mpsc::Receiver<()>);
+        impl BatchService for Blocked {
+            fn contract(&self) -> BatchContract {
+                test_contract(1)
+            }
+            fn infer(
+                &mut self,
+                _: &[InferenceInput],
+            ) -> Result<Vec<InferenceOutput>, EvaluationError> {
+                let _ = self.0.recv();
+                Err(EvaluationError::new("released test backend"))
+            }
+        }
+        let (release, gate) = mpsc::channel();
+        let service = Blocked(gate);
+        let contract = service.contract();
+        let executor =
+            ThreadedBatchExecutorPool::spawn_with_timeout(vec![service], Duration::from_millis(30))
+                .unwrap();
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let position = Position::new(0.1, Vec::new(), Color::Black);
+        let mut waiting = Vec::new();
+        for id in 1..=5 {
+            let (response, completion) = mpsc::sync_channel(1);
+            sender
+                .send(Request {
+                    inputs: vec![encode_request(id, &position, contract)],
+                    encoding_nanoseconds: 0,
+                    queued_at: Instant::now(),
+                    response,
+                })
+                .unwrap();
+            waiting.push(completion);
+        }
+        drop(sender);
+        let metrics = Arc::new(AtomicMetrics::default());
+        let lanes = vec![Arc::new(AtomicMetrics::default())];
+        let started = Instant::now();
+        run_pool_broker(
+            BrokerConfig {
+                maximum_delay: Duration::from_millis(1),
+                queue_capacity: 8,
+            },
+            contract,
+            executor,
+            receiver,
+            metrics,
+            lanes,
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        for completion in waiting {
+            assert!(
+                completion
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("batch 0, request IDs 1..1")
+            );
+        }
+        release.send(()).unwrap();
+    }
+
     struct FailingService;
 
     struct StagedService;
@@ -1307,7 +1404,7 @@ mod tests {
                 raster: RasterConfig::square(2),
                 policy: RasterConfig::square(2),
                 maximum_batch: 2,
-            input_layout: InputLayout::Dense,
+                input_layout: InputLayout::Dense,
             }
         }
 
@@ -1335,7 +1432,7 @@ mod tests {
                 raster: RasterConfig::square(2),
                 policy: RasterConfig::square(2),
                 maximum_batch: self.maximum_batch,
-            input_layout: InputLayout::Dense,
+                input_layout: InputLayout::Dense,
             }
         }
 
@@ -1415,7 +1512,7 @@ mod tests {
             raster: RasterConfig::square(2),
             policy: RasterConfig::square(2),
             maximum_batch,
-        input_layout: InputLayout::Dense,
+            input_layout: InputLayout::Dense,
         }
     }
 
@@ -1514,7 +1611,7 @@ mod tests {
                 queue_capacity: GROUPS,
             },
             contract,
-            service,
+            ThreadedBatchExecutor::spawn(service).unwrap(),
             receiver,
             Arc::clone(&metrics),
         );

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Self-play that never stops to fill a shard.
 //!
 //! The shard generator this replaced (`vgo-generate-demo`) played toward a
@@ -45,7 +47,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod telemetry_writer;
 
 use clap::{ArgAction, Parser};
 use sha2::{Digest, Sha256};
@@ -56,10 +60,11 @@ use vgo_inference::{
 use vgo_raster::{RasterConfig, RasterKind};
 use vgo_search::{Evaluator, NaiveEvaluator};
 use vgo_selfplay::generation::{
-    GameSamples, GameSettings, KOMI_AREA_COEFFICIENT, generate_game, parse_board_mix,
+    GameSamples, GameSettings, KOMI_AREA_COEFFICIENT, generate_game_observed, parse_board_mix,
     replay_capacity_for,
 };
 use vgo_selfplay::replay_stream::{ReplayStream, stone_capacity_for_radius};
+use vgo_selfplay::telemetry::GenerationTelemetry;
 
 #[derive(Parser, Debug, Clone)]
 #[command(about = "Continuous self-play: one directory per game, no shard tail")]
@@ -117,9 +122,17 @@ struct Config {
     /// slice and stops. Zero waits for a normal exit.
     #[arg(long, default_value_t = 0)]
     profile_seconds: u64,
+    /// Stop after this many seconds of generation, abandoning incomplete games.
+    /// Independent of profiling and measured after model sessions are ready.
+    #[arg(long, default_value_t = 0)]
+    run_seconds: u64,
     /// First game index, so a restarted generation does not reuse seeds.
     #[arg(long, default_value_t = 0)]
     first_game: u64,
+    /// Seconds between progress reports; zero writes only startup and final records.
+    /// Appends interval metrics to <output-root>/<label>/performance.jsonl.
+    #[arg(long, default_value_t = 30)]
+    telemetry_seconds: u64,
 
     #[arg(long, default_value_t = 128)]
     resolution: usize,
@@ -129,6 +142,11 @@ struct Config {
     raster_kind: RasterKind,
     #[arg(long, default_value_t = 1600)]
     simulations: u32,
+    /// Full-search probability; fast turns are omitted from training replay.
+    #[arg(long, default_value_t = 1.0)]
+    full_search_fraction: f64,
+    #[arg(long, default_value_t = 200)]
+    fast_simulations: u32,
     #[arg(long, default_value_t = 16)]
     coarse_pool: usize,
     #[arg(long, default_value_t = 4)]
@@ -195,6 +213,8 @@ impl Config {
         GameSettings {
             policy_resolution: self.policy_resolution,
             simulations: self.simulations,
+            full_search_fraction: self.full_search_fraction,
+            fast_simulations: self.fast_simulations,
             coarse_pool: self.coarse_pool,
             temperature: self.temperature,
             temperature_plies: self.temperature_plies,
@@ -319,7 +339,7 @@ fn write_game(
                 r#""self_captures":{},"black_utility":{},"margin":{:.6},"#,
                 r#""black_area":{:.8},"white_area":{:.8},"#,
                 r#""reached_ply_cap":{},"resigned":{},"soft_resign_ply":{},"#,
-                r#""first_sample":0,"sample_count":{},"final_stones":[{}]}}"#
+                r#""first_sample":0,"sample_count":{},"final_stones":[{}],"search_budgets":{},"policy_eligible":{}}}"#
             ),
             record.game,
             record.komi,
@@ -343,6 +363,8 @@ fn write_game(
                 .map(|(x, y, colour)| format!("[{x:.9},{y:.9},{colour}]"))
                 .collect::<Vec<_>>()
                 .join(","),
+            serde_json::to_string(&record.search_budgets)?,
+            serde_json::to_string(&record.policy_eligible)?,
         )?;
         writer.flush()?;
     }
@@ -353,9 +375,10 @@ fn write_game(
         for trial in &calibration {
             writeln!(
                 writer,
-                r#"{{"threshold":{:.4},"window":{},"fired":{},"wrong":{},"plies_saved":{},"confidence":{:.4}}}"#,
+                r#"{{"threshold":{:.4},"window":{},"minimum_ply":{},"fired":{},"wrong":{},"plies_saved":{},"confidence":{:.4}}}"#,
                 trial.threshold,
                 trial.window,
+                trial.minimum_ply,
                 u32::from(trial.fired),
                 u32::from(trial.wrong),
                 trial.plies_saved,
@@ -397,28 +420,44 @@ fn write_game(
 /// from a side thread would skip it. `cancelled` is the right one here -- a
 /// profiling run wants a bounded slice of search, not the games, and waiting
 /// for 32 actors to finish a 38-unit board would take over an hour.
-#[cfg(feature = "profiling")]
-fn arm_profile_deadline(
+fn deadline_seconds(config: &Config) -> Option<u64> {
+    [
+        config.run_seconds,
+        if config.profile_output.is_some() {
+            config.profile_seconds
+        } else {
+            0
+        },
+    ]
+    .into_iter()
+    .filter(|seconds| *seconds > 0)
+    .min()
+}
+
+fn expected_deadline_cancellation(error: &vgo_search::EvaluationError, deadline: bool) -> bool {
+    deadline && error.to_string() == "replay generation cancelled"
+}
+
+fn arm_deadline(
     config: &Config,
     stopping: &Arc<AtomicBool>,
     cancelled: &Arc<AtomicBool>,
+    deadline: &Arc<AtomicBool>,
 ) {
-    let seconds = config.profile_seconds;
-    if config.profile_output.is_none() || seconds == 0 {
+    let Some(seconds) = deadline_seconds(config) else {
         return;
-    }
+    };
     let stopping = Arc::clone(stopping);
     let cancelled = Arc::clone(cancelled);
+    let deadline = Arc::clone(deadline);
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(seconds));
-        eprintln!("[profile] {seconds}s elapsed, abandoning games in flight");
+        eprintln!("[deadline] {seconds}s elapsed, abandoning games in flight");
+        deadline.store(true, Ordering::Release);
         stopping.store(true, Ordering::Release);
         cancelled.store(true, Ordering::Release);
     });
 }
-
-#[cfg(not(feature = "profiling"))]
-fn arm_profile_deadline(_: &Config, _: &Arc<AtomicBool>, _: &Arc<AtomicBool>) {}
 
 #[cfg(feature = "profiling")]
 type Profiler = Option<pprof::ProfilerGuard<'static>>;
@@ -502,11 +541,9 @@ fn use_blocking_sync(device: usize) -> Result<(), String> {
     // SAFETY: `cuInit` is idempotent and `device` is validated by `device::get`
     // before use; both are the documented preconditions.
     unsafe {
-        sys::cuInit(0)
-            .result()
-            .map_err(|e| e.to_string())?;
-        let handle = cudarc::driver::result::device::get(device as i32)
-            .map_err(|e| e.to_string())?;
+        sys::cuInit(0).result().map_err(|e| e.to_string())?;
+        let handle =
+            cudarc::driver::result::device::get(device as i32).map_err(|e| e.to_string())?;
         sys::cuDevicePrimaryCtxSetFlags_v2(
             handle,
             sys::CUctx_flags_enum::CU_CTX_SCHED_BLOCKING_SYNC as u32,
@@ -519,6 +556,12 @@ fn use_blocking_sync(device: usize) -> Result<(), String> {
 
 fn main() -> io::Result<()> {
     let config = Config::parse();
+    if config.profile_seconds > 0 && config.profile_output.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--profile-seconds needs --profile-output; use --run-seconds for an unprofiled timed run",
+        ));
+    }
     // Before anything touches CUDA: the driver refuses to change this flag once
     // the primary context is active, and ONNX Runtime retains that same
     // context when the first session is built.
@@ -545,7 +588,7 @@ fn main() -> io::Result<()> {
         None => None,
     };
 
-    let (evaluator, _broker): (Arc<dyn Evaluator>, Option<BatchedEvaluatorPool>) =
+    let (evaluator, broker): (Arc<dyn Evaluator>, Option<BatchedEvaluatorPool>) =
         match &config.model {
             None => (Arc::new(NaiveEvaluator), None),
             Some(model) => {
@@ -586,20 +629,31 @@ fn main() -> io::Result<()> {
     // turns an orderly stop into a spurious failure in every other actor.
     let stopping = Arc::new(AtomicBool::new(false));
     let cancelled = Arc::new(AtomicBool::new(false));
-    arm_profile_deadline(&config, &stopping, &cancelled);
+    let deadline = Arc::new(AtomicBool::new(false));
+    arm_deadline(&config, &stopping, &cancelled, &deadline);
     let next_game = Arc::new(AtomicU64::new(config.first_game));
     let games_written = Arc::new(AtomicU64::new(0));
     let samples_written = Arc::new(AtomicU64::new(0));
     let settings = config.game_settings();
+    let telemetry = Arc::new(GenerationTelemetry::new(config.actors));
+    let reporter = telemetry_writer::Reporter::start(
+        &config,
+        &root,
+        model_sha256.as_deref(),
+        Arc::clone(&telemetry),
+        broker.clone(),
+        Arc::clone(&cancelled),
+    )?;
 
     // Each actor owns the whole cycle: play a game, write it, take the next.
     // There is no collector and no channel, because there is nothing to batch --
     // which is also why no actor can ever be left waiting on another's game.
     let mut handles = Vec::with_capacity(config.actors);
-    for _ in 0..config.actors {
+    for actor in 0..config.actors {
         let evaluator = Arc::clone(&evaluator);
         let stopping = Arc::clone(&stopping);
         let cancelled = Arc::clone(&cancelled);
+        let deadline = Arc::clone(&deadline);
         let next_game = Arc::clone(&next_game);
         let games_written = Arc::clone(&games_written);
         let samples_written = Arc::clone(&samples_written);
@@ -607,53 +661,91 @@ fn main() -> io::Result<()> {
         let config = config.clone();
         let root = root.clone();
         let model_sha256 = model_sha256.clone();
+        let telemetry = Arc::clone(&telemetry);
         handles.push(thread::spawn(move || -> io::Result<()> {
-            loop {
-                if stopping.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                if let Some(path) = &config.stop_file {
-                    if path.exists() {
+            let result = (|| -> io::Result<()> {
+                loop {
+                    if stopping.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    if let Some(path) = &config.stop_file
+                        && path.exists()
+                    {
                         stopping.store(true, Ordering::Release);
                         return Ok(());
                     }
-                }
-                if config.maximum_games > 0
-                    && games_written.load(Ordering::Relaxed) >= config.maximum_games
-                {
-                    stopping.store(true, Ordering::Release);
-                    return Ok(());
-                }
-                let index = next_game.fetch_add(1, Ordering::Relaxed);
-                let game = match generate_game(&settings, evaluator.as_ref(), index, &cancelled) {
-                    Ok(game) => game,
-                    Err(error) => {
-                        cancelled.store(true, Ordering::Release);
-                        return Err(io::Error::other(error));
+                    if config.maximum_games > 0
+                        && games_written.load(Ordering::Relaxed) >= config.maximum_games
+                    {
+                        stopping.store(true, Ordering::Release);
+                        return Ok(());
                     }
-                };
-                // A game with no terminal label teaches nothing; it is dropped
-                // rather than written, and the actor moves on.
-                if !game.completed || game.samples.is_empty() {
-                    continue;
+                    let index = next_game.fetch_add(1, Ordering::Relaxed);
+                    telemetry.phase(actor, "playing");
+                    let game = match generate_game_observed(
+                        &settings,
+                        evaluator.as_ref(),
+                        index,
+                        &cancelled,
+                        |progress| telemetry.searched(actor, progress),
+                    ) {
+                        Ok(game) => game,
+                        Err(error) => {
+                            if expected_deadline_cancellation(
+                                &error,
+                                deadline.load(Ordering::Acquire),
+                            ) {
+                                telemetry.discarded(actor);
+                                return Ok(());
+                            }
+                            cancelled.store(true, Ordering::Release);
+                            return Err(io::Error::other(error));
+                        }
+                    };
+                    // A game with no terminal label teaches nothing; it is dropped
+                    // rather than written, and the actor moves on.
+                    if !game.completed || game.samples.is_empty() {
+                        telemetry.discarded(actor);
+                        continue;
+                    }
+                    let capped = game.reached_ply_cap;
+                    let radius = game.samples[0].position.radius();
+                    let soft_resigned = game
+                        .record
+                        .as_ref()
+                        .is_some_and(|record| record.soft_resign_ply.is_some());
+                    telemetry.phase(actor, "writing");
+                    let writing_started = Instant::now();
+                    let written = write_game(
+                        &root,
+                        index,
+                        game,
+                        &config,
+                        raster,
+                        policy_size,
+                        model_sha256.as_deref(),
+                    )?;
+                    telemetry.published(
+                        actor,
+                        radius,
+                        written,
+                        capped,
+                        soft_resigned,
+                        writing_started.elapsed(),
+                    );
+                    if written > 0 {
+                        games_written.fetch_add(1, Ordering::Relaxed);
+                        samples_written.fetch_add(written as u64, Ordering::Relaxed);
+                    }
                 }
-                let written = write_game(
-                    &root,
-                    index,
-                    game,
-                    &config,
-                    raster,
-                    policy_size,
-                    model_sha256.as_deref(),
-                )?;
-                if written > 0 {
-                    games_written.fetch_add(1, Ordering::Relaxed);
-                    samples_written.fetch_add(written as u64, Ordering::Relaxed);
-                }
+            })();
+            telemetry.phase(actor, "done");
+            if result.is_err() {
+                cancelled.store(true, Ordering::Release);
             }
+            result
         }));
     }
-
     let mut failure = None;
     for handle in handles {
         match handle.join() {
@@ -666,25 +758,23 @@ fn main() -> io::Result<()> {
             }
         }
     }
-    // Before the failure check, not after: a profiling run ends by cancelling
-    // the actors, so the error path is the *expected* one there and returning
-    // early would discard the profile the run existed to produce.
+    reporter.finish()?;
+    // Preserve the profile even when a genuine actor/backend failure occurred.
     finish_profiler(profiler, config.profile_output.as_deref())?;
 
     if let Some(error) = failure {
-        // A deliberate profiling stop is not a failure. Anything else is.
-        if config.profile_seconds > 0 && config.profile_output.is_some() {
-            eprintln!("[profile] games in flight were abandoned, as intended");
-        } else {
-            return Err(error);
-        }
+        return Err(error);
     }
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
     writeln!(out, "{{")?;
     writeln!(out, "  \"label\": \"{}\",", config.label)?;
-    writeln!(out, "  \"games\": {},", games_written.load(Ordering::Relaxed))?;
+    writeln!(
+        out,
+        "  \"games\": {},",
+        games_written.load(Ordering::Relaxed)
+    )?;
     writeln!(
         out,
         "  \"samples\": {}",
@@ -692,4 +782,145 @@ fn main() -> io::Result<()> {
     )?;
     writeln!(out, "}}")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vgo_selfplay::generation::generate_game;
+
+    #[test]
+    fn timed_run_does_not_require_a_profile_and_uses_the_earlier_deadline() {
+        let mut config = Config::parse_from([
+            "generator",
+            "--output-root",
+            "unused",
+            "--label",
+            "test",
+            "--run-seconds",
+            "7",
+        ]);
+        assert_eq!(super::deadline_seconds(&config), Some(7));
+        config.profile_output = Some("unused.svg".into());
+        config.profile_seconds = 3;
+        assert_eq!(super::deadline_seconds(&config), Some(3));
+        config.run_seconds = 0;
+        config.profile_seconds = 0;
+        assert_eq!(super::deadline_seconds(&config), None);
+    }
+
+    #[test]
+    fn a_deadline_does_not_hide_genuine_backend_failures() {
+        let cancellation = vgo_search::EvaluationError::new("replay generation cancelled");
+        assert!(super::expected_deadline_cancellation(&cancellation, true));
+        assert!(!super::expected_deadline_cancellation(&cancellation, false));
+        assert!(!super::expected_deadline_cancellation(
+            &vgo_search::EvaluationError::new("inference failed"),
+            true
+        ));
+    }
+
+    #[test]
+    fn randomized_budgets_keep_only_full_targets_but_record_every_search() {
+        let config = Config::parse_from([
+            "generator",
+            "--output-root",
+            "unused",
+            "--label",
+            "test",
+            "--simulations",
+            "16",
+            "--fast-simulations",
+            "4",
+            "--full-search-fraction",
+            "0.25",
+            "--max-plies",
+            "24",
+            "--policy-resolution",
+            "16",
+        ]);
+        let cancelled = AtomicBool::new(false);
+        let mut updates = Vec::new();
+        let game = generate_game_observed(
+            &config.game_settings(),
+            &NaiveEvaluator,
+            99,
+            &cancelled,
+            |update| updates.push(update),
+        )
+        .unwrap();
+        let record = game.record.unwrap();
+        assert_eq!(record.search_budgets.len(), updates.len());
+        assert_eq!(
+            record.policy_eligible.iter().filter(|&&keep| keep).count(),
+            game.samples.len()
+        );
+        assert!(record.policy_eligible[0]);
+        assert!(record.policy_eligible.iter().any(|&keep| !keep));
+        for sample in &game.samples {
+            assert!(record.policy_eligible[sample.ply as usize]);
+            let expected = if sample.position.to_move() == vgo_core::Color::Black {
+                record.black_utility
+            } else {
+                -record.black_utility
+            };
+            assert_eq!(sample.value, expected);
+        }
+        for (index, update) in updates.iter().enumerate() {
+            assert_eq!(
+                update.simulations,
+                if record.policy_eligible[index] { 16 } else { 4 }
+            );
+        }
+        assert_eq!(game.calibration.len(), 36);
+        let again =
+            generate_game(&config.game_settings(), &NaiveEvaluator, 99, &cancelled).unwrap();
+        assert_eq!(
+            again.record.unwrap().policy_eligible,
+            record.policy_eligible
+        );
+    }
+
+    #[test]
+    fn observing_progress_preserves_the_game_and_replay_targets() {
+        let config = Config::parse_from([
+            "generator",
+            "--output-root",
+            "unused",
+            "--label",
+            "test",
+            "--simulations",
+            "8",
+            "--max-plies",
+            "9",
+            "--policy-resolution",
+            "16",
+        ]);
+        let settings = config.game_settings();
+        let cancelled = AtomicBool::new(false);
+        let plain = generate_game(&settings, &NaiveEvaluator, 123, &cancelled).unwrap();
+        let mut updates = Vec::new();
+        let observed =
+            generate_game_observed(&settings, &NaiveEvaluator, 123, &cancelled, |progress| {
+                updates.push(progress)
+            })
+            .unwrap();
+        assert_eq!(updates.len(), observed.samples.len());
+        assert_eq!(plain.samples.len(), observed.samples.len());
+        assert_eq!(
+            plain.record.as_ref().unwrap().final_stones,
+            observed.record.as_ref().unwrap().final_stones
+        );
+        for (index, (left, right)) in plain.samples.iter().zip(&observed.samples).enumerate() {
+            assert_eq!(left.position, right.position);
+            assert_eq!(left.policy, right.policy);
+            assert_eq!(left.visits, right.visits);
+            assert_eq!(left.beta, right.beta);
+            assert_eq!(left.proposal_counts, right.proposal_counts);
+            assert_eq!(left.value, right.value);
+            assert_eq!(left.selected_action, right.selected_action);
+            assert_eq!(updates[index].ply, index as u32);
+            assert_eq!(updates[index].simulations, 8);
+        }
+    }
 }

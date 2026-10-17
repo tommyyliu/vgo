@@ -8,6 +8,7 @@
 /// agree with this file exactly.
 pub mod replay_stream;
 pub mod generation;
+pub mod telemetry;
 
 use vgo_core::{Analysis, Color, GameEvent, Outcome, Phase, Position};
 

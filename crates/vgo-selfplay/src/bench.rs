@@ -4,8 +4,9 @@
 //! so numbers from different commits are comparable: applying a move, the
 //! board analysis, the legal-set vertex index, the settled plane, the packed
 //! raster at both sizes the loop has used, the search's fine grid, and a whole
-//! search with a fixed policy standing in for the network. Inference is left
-//! out on purpose: it measures the GPU and the driver, not this code.
+//! search with a fixed policy standing in for the network. These default paths
+//! leave inference out. With `--model`, run concurrent neural searches instead,
+//! including encoding, broker scheduling and actual model inference.
 //!
 //! Positions come from `benchmarks/positions.txt`, 16 at radius 1/38 and 16 at
 //! 1/18, and each path is reported per board size because cost scales with
@@ -16,13 +17,19 @@
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use vgo_core::{
     Analysis, Color, LegalSetIndex, Point, Position, Stone, nearest_legal_placement, place,
 };
-use vgo_raster::{DensePolicy, RasterConfig, RasterKind, packed::rasterize_packed, settled_for_raster};
+use vgo_inference::{
+    BatchedEvaluatorPool, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
+};
+use vgo_raster::{
+    DensePolicy, RasterConfig, RasterKind, packed::rasterize_packed, settled_for_raster,
+};
 use vgo_search::{
     Evaluation, EvaluationError, Evaluator, Policy, SearchConfig, search_with_evaluator,
 };
@@ -38,6 +45,25 @@ struct Arguments {
     /// Run only the paths whose name contains this.
     #[arg(long)]
     only: Option<String>,
+    /// Run complete neural searches on the saved positions instead of CPU-only paths.
+    #[arg(long)]
+    model: Option<PathBuf>,
+    #[arg(long, default_value_t = 256)]
+    resolution: usize,
+    #[arg(long, default_value_t = 32)]
+    actors: usize,
+    #[arg(long, default_value_t = 1000)]
+    simulations: u32,
+    #[arg(long, default_value_t = 32)]
+    maximum_batch: usize,
+    #[arg(long, default_value_t = 2)]
+    inference_slots: usize,
+    #[arg(long, default_value_t = 0.1)]
+    root_exploration_noise: f64,
+    #[arg(long, default_value = "tensorrt")]
+    provider: OnnxProvider,
+    #[arg(long, default_value = "artifacts/onnx-cache")]
+    cache_directory: PathBuf,
 }
 
 /// Policy grid and search settings the loop generates with.
@@ -53,7 +79,13 @@ fn load(path: &PathBuf) -> Vec<Position> {
         .map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
             let number = |index: usize| -> f64 { fields[index].parse().expect("number") };
-            let colour = |value: f64| if value == 0.0 { Color::Black } else { Color::White };
+            let colour = |value: f64| {
+                if value == 0.0 {
+                    Color::Black
+                } else {
+                    Color::White
+                }
+            };
             let count = number(4) as usize;
             let stones = (0..count)
                 .map(|stone| {
@@ -85,7 +117,9 @@ impl FixedEvaluator {
             }
         }
         logits.push(-2.0);
-        Self { logits: Arc::new(logits) }
+        Self {
+            logits: Arc::new(logits),
+        }
     }
 }
 
@@ -93,7 +127,10 @@ impl Evaluator for FixedEvaluator {
     fn evaluate(&self, position: &Position) -> Result<Evaluation, EvaluationError> {
         // Varies with the position so backed-up values are not all equal.
         let value = ((position.stones().len() % 7) as f64 - 3.0) / 10.0;
-        let policy = DensePolicy::new(RasterConfig::square(POLICY_RESOLUTION), self.logits.to_vec());
+        let policy = DensePolicy::new(
+            RasterConfig::square(POLICY_RESOLUTION),
+            self.logits.to_vec(),
+        );
         Ok(Evaluation::new(value, Box::new(policy)))
     }
 }
@@ -130,6 +167,10 @@ fn time(ops: usize, budget: Duration, mut work: impl FnMut()) -> Timing {
 fn main() {
     let arguments = Arguments::parse();
     let positions = load(&arguments.positions);
+    if arguments.model.is_some() {
+        neural_benchmark(&arguments, positions);
+        return;
+    }
     let budget = Duration::from_secs_f64(arguments.seconds);
     let evaluator = FixedEvaluator::new();
     let policy_grid = RasterConfig::square(POLICY_RESOLUTION);
@@ -155,14 +196,21 @@ fn main() {
             .iter()
             .enumerate()
             .map(|(index, position)| {
-                let target = Point::new(0.13 + 0.57 * ((index * 7) % 11) as f64 / 11.0, 0.21 + 0.6 * ((index * 5) % 13) as f64 / 13.0);
+                let target = Point::new(
+                    0.13 + 0.57 * ((index * 7) % 11) as f64 / 11.0,
+                    0.21 + 0.6 * ((index * 5) % 13) as f64 / 13.0,
+                );
                 nearest_legal_placement(position, target).point
             })
             .collect();
         let raster = |size| RasterConfig::square_of(size, RasterKind::CompactRadius);
         let count = positions.len();
         let mut run = |name: &str, ops: usize, work: &mut dyn FnMut()| {
-            if arguments.only.as_deref().is_some_and(|only| !name.contains(only)) {
+            if arguments
+                .only
+                .as_deref()
+                .is_some_and(|only| !name.contains(only))
+            {
                 return;
             }
             let timing = time(ops, budget, work);
@@ -212,9 +260,118 @@ fn main() {
         });
         run("search_200", count, &mut || {
             for (index, position) in positions.iter().enumerate() {
-                let _ = black_box(search_with_evaluator(position, search, index as u64, &evaluator));
+                let _ = black_box(search_with_evaluator(
+                    position,
+                    search,
+                    index as u64,
+                    &evaluator,
+                ));
             }
         });
     }
     println!("{{{}}}", results.join(","));
+}
+
+fn neural_benchmark(arguments: &Arguments, positions: Vec<Position>) {
+    assert!(arguments.actors > 0 && arguments.simulations > 0 && arguments.inference_slots > 0);
+    // The same primary-context flag as continuous generation, before ORT loads.
+    // SAFETY: initialization is idempotent, the device handle is checked, and
+    // the primary-context flags are set before any native session is loaded.
+    if !matches!(arguments.provider, OnnxProvider::Cpu) {
+        unsafe {
+            use cudarc::driver::sys;
+            sys::cuInit(0).result().expect("CUDA initialization");
+            let device = cudarc::driver::result::device::get(0).expect("CUDA device");
+            sys::cuDevicePrimaryCtxSetFlags_v2(
+                device,
+                sys::CUctx_flags_enum::CU_CTX_SCHED_BLOCKING_SYNC as u32,
+            )
+            .result()
+            .expect("CUDA blocking sync before session load");
+        }
+    }
+    let mut services = Vec::new();
+    for _ in 0..arguments.inference_slots {
+        services.push(
+            OnnxBatchService::load(&OnnxServiceConfig {
+                model: arguments.model.clone().unwrap(),
+                raster: RasterConfig::square_of(arguments.resolution, RasterKind::CompactRadius),
+                policy: Some(RasterConfig::square(POLICY_RESOLUTION)),
+                maximum_batch: arguments.maximum_batch,
+                provider: arguments.provider,
+                device_id: 0,
+                fp16: true,
+                cache_directory: arguments.cache_directory.clone(),
+            })
+            .expect("neural benchmark session"),
+        );
+    }
+    let pool = Arc::new(
+        BatchedEvaluatorPool::spawn(
+            BrokerConfig {
+                maximum_delay: Duration::from_millis(1),
+                queue_capacity: arguments.actors * 8,
+            },
+            services,
+        )
+        .expect("neural benchmark broker"),
+    );
+    let mut config = SearchConfig::canary(arguments.simulations);
+    config.coarse_pool = COARSE_POOL;
+    config.widening_coefficient = 6.0;
+    config.maximum_candidates = 321;
+    config.leaf_batch = 4;
+    config.root_exploration_noise = arguments.root_exploration_noise;
+    let mut results = serde_json::Map::new();
+    for units in [18, 38] {
+        let boards: Vec<_> = positions
+            .iter()
+            .filter(|position| (1.0 / position.radius()).round() as u32 == units)
+            .cloned()
+            .collect();
+        assert!(!boards.is_empty());
+        let baseline = pool.metrics();
+        let timing = time(
+            arguments.actors,
+            Duration::from_secs_f64(arguments.seconds),
+            || {
+                thread::scope(|scope| {
+                    for actor in 0..arguments.actors {
+                        let evaluator = Arc::clone(&pool);
+                        let position = &boards[actor % boards.len()];
+                        scope.spawn(move || {
+                            black_box(
+                                search_with_evaluator(
+                                    position,
+                                    config,
+                                    actor as u64,
+                                    evaluator.as_ref(),
+                                )
+                                .expect("neural search"),
+                            );
+                        });
+                    }
+                });
+            },
+        );
+        let metrics = pool.metrics().delta_since(baseline);
+        let name = format!(
+            "r{units}.neural_search_{}x{}",
+            arguments.actors, arguments.simulations
+        );
+        eprintln!(
+            "{name}: {:.2} searches/s, {} timed passes",
+            1e6 / timing.per_op_us,
+            timing.passes
+        );
+        results.insert(
+            name,
+            serde_json::json!({
+                "us": timing.per_op_us, "spread": timing.spread, "passes": timing.passes,
+                "positions": metrics.positions, "failures": metrics.failures,
+                "broker": vgo_selfplay::telemetry::broker_json(metrics, arguments.maximum_batch),
+            }),
+        );
+    }
+    println!("{}", serde_json::Value::Object(results));
 }

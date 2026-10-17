@@ -30,6 +30,17 @@ work.
 
 ## Broker
 
+ONNX initialization has a readiness deadline (`VGO_INFERENCE_STARTUP_SECONDS`,
+default 1800 s). Both broker variants execute through worker slots with a batch
+deadline (`VGO_INFERENCE_TIMEOUT_SECONDS`, default 120 s). Pool deadlines track
+the oldest dispatched batch so successful peers cannot hide a stalled slot.
+Diagnostics identify model/provider, slot, batch, request IDs and elapsed time.
+On timeout callers disconnect and the native worker detaches; the process must
+exit before retrying. Healthy shutdown still joins workers. See
+[deadline operations](RUNNING.md#native-inference-deadlines).
+A final three-second native-failure watchdog bounds exit cleanup too; Linux
+uses `exit_group(70)` to bypass stuck native handlers.
+
 Each actor rasterizes its leaf round before submitting one ordered group through
 a bounded synchronous channel. The broker takes the first group, waits up to a
 short deadline for peers, and flattens groups across backend batch boundaries up

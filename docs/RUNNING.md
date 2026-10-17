@@ -57,6 +57,51 @@ Every knob is an environment variable documented in the script header:
 script resumes from whatever `models/` holds, so rerunning it after a stop
 continues the run.
 
+### Continuous-run performance
+
+The generator appends `performance.jsonl` inside each generation directory.
+Every launch writes a `run` record with its PID, model digest, source revision,
+hardware, and resolved configuration. `interval` records arrive every 30 seconds
+by default, and a `final` record is written after actors finish. A restart
+appends a new run ID. Set `VGO_TELEMETRY_SECONDS` in the bulk loop, or pass
+`--telemetry-seconds` directly; zero disables periodic reporting while retaining
+startup and final records.
+
+Neural startup records also identify the actual input layout and effective batch
+ceiling reported by the backend, plus the GPU description when available. Older
+ONNX sidecars incorrectly advertised packed graphs as a single dense input;
+the graph metadata and backend contract are authoritative. New exports describe
+their actual graph inputs in the `inputs` array and declare `input_layout`.
+
+The records distinguish searched plies (including games in flight) from games
+and samples successfully published. They report capped and soft-resigned games,
+search and write durations, actor activity, and Linux RSS/peak RSS. Per-board
+counters group radii by rounded `1/r`; search buckets further divide each game's
+ply cap into opening/middle/late thirds and separate soft-resigned searches.
+These stage names describe progress through the configured cap, not settlement.
+
+Neural runs also include interval and cumulative broker metrics: average batch
+size/fill, encoding, queue, input packing, native session execution, output
+extraction, and dispatch/wait counters. Search duration includes waits for
+inference. Parallel wall-time sums overlap, and queue durations are weighted
+by positions, so these fields must not be added into CPU-time percentages.
+Memory fields are null on systems without Linux `/proc`.
+
+The loop appends timestamped training, export, generator-start, and drain events
+to `events.jsonl`. Join their `unix_seconds` and generator PIDs with performance
+records to identify training contention and overlapping model generations.
+Short `[progress]` summaries also appear in `generate.log`.
+
+For CPU-only checks, use the naive evaluator and avoid CUDA initialization:
+
+```bash
+target/release/vgo-generate-continuous --output-root /tmp/vgo-check --label cpu \
+  --blocking-sync false --actors 2 --simulations 32 --maximum-games 4 \
+  --telemetry-seconds 1
+```
+
+This checks generation/accounting; it does not measure neural self-play speed.
+
 A run directory holds:
 
 | path | contents |
@@ -94,6 +139,39 @@ cd training
 `maximum_batch` is frozen into each ONNX at export time. Two models can only meet
 in an arena at the smaller of their two ceilings.
 
+`--norms-per-block 1` trains a residual trunk with one GroupNorm per convolutional
+block; the default remains two. The count is stored in checkpoints and exports.
+Checkpoints without this field retain the original two-norm architecture.
+Warm starts inherit the checkpoint's architecture. For the bulk loop, set
+`VGO_NORMS_PER_BLOCK`; compare fresh training runs before changing a campaign.
+
+### Randomized search-budget experiment
+
+The continuous generator accepts `--full-search-fraction 0.25
+--fast-simulations 200` with, for example, `--simulations 1000`. Every game's
+first turn is full; later turns choose a seeded full/fast budget. Fast turns
+disable root noise and move temperature. Soft resignation can reduce either
+budget further. Defaults keep every turn full, preserving the existing recipe.
+
+Only full-selected turns enter replay: **both policy and value training use
+these rows with their normal weights**. Fast turns still determine the final
+outcome and contribute to resignation calibration. `games.jsonl` contains
+per-ply `search_budgets` and `policy_eligible` arrays; join replay rows by ply.
+Telemetry distinguishes searched plies from policy-eligible plies and actually
+published samples. Budget and eligibility are different after soft resignation.
+
+The bulk-loop equivalents are `VGO_FULL_SEARCH_FRACTION` and
+`VGO_FAST_SIMULATIONS`. The initial naive generation stays full-budget. These
+are experiment controls, not a recommendation to adopt the mixed recipe.
+
+For a bounded generation slice use `--run-seconds 600`. Its clock starts after
+model sessions are ready, requires no profiling feature, and discards incomplete
+games at the deadline. Actors finish the search in flight before checking
+cancellation; final exit can overrun by one search per actor.
+`--profile-seconds` requires `--profile-output`; without it the generator now
+rejects the command instead of silently ignoring the deadline. When both limits
+are specified, the earlier positive deadline wins.
+
 ## Measuring strength
 
 ```bash
@@ -110,6 +188,18 @@ For a single match, call `target/release/vgo-arena` directly (after sourcing
 `scripts/env/ort.sh`). Pass `--simulations`, `--resolution`,
 `--policy-resolution`, `--max-plies`, `--komi` and `--candidate-raster-kind`
 explicitly; the binary's defaults are not the loop's.
+
+For equal thinking time add `--move-time-ms 200 --simulations 10000`, applying
+the same advisory time budget to both seats with a simulation ceiling. Search
+completes root evaluation and at least one round; a pending broker round can
+overrun the deadline. Reports include each seat's actual average simulations,
+average search milliseconds, and longest search. Keep threads and batching
+fixed between experiments; queue contention is part of this measurement.
+
+The bounded restart recipes are in
+[`scripts/experiments/restart-2026-10-14.py`](../scripts/experiments/restart-2026-10-14.py).
+Run its stages sequentially with an otherwise idle CPU/GPU; it records commands,
+binary digests, process exit codes and elapsed times alongside raw reports.
 
 ## Looking at games
 
@@ -150,6 +240,58 @@ search, and commit the new record with the change. A path is flagged only when
 it is more than 10% slower *and* slower by more than the two runs' combined
 spread. It refuses to run above load 2, because a running generator inflates
 every number. Records from different machines are never compared.
+
+## Arena tree reuse
+
+`vgo-arena --tree-reuse` retains the candidate's tree; use
+`--opponent-tree-reuse` independently for the opponent. With the same model on
+both seats and `--move-time-ms 200`, this measures the effect of keeping work
+at an advisory elapsed-time budget. Root exploration noise must be zero on a
+seat using reuse. Existing visits influence selection, and `--simulations`
+limits new work per move. Intervening reroot/drop time is charged to the next
+move's budget; one completed round remains guaranteed.
+
+`--reuse-maximum-nodes 4096` and `--reuse-maximum-mib 256` bound accepted cache
+structure and tracked payload per seat. Payload excludes allocator metadata
+and hidden capacity, so consult process RSS too. Over-limit trees are dropped.
+Arena JSON includes per-seat hit counts, inherited visits, limit drops, maximum
+retained payload and reroot time. Self-play and the browser do not enable reuse.
+
+## Native inference deadlines
+
+All native entry points honor these positive integer environment settings:
+
+| Setting | Default | Scope |
+| --- | ---: | --- |
+| `VGO_INFERENCE_STARTUP_SECONDS` | 1800 | Each ONNX session's initialization and contract validation |
+| `VGO_INFERENCE_TIMEOUT_SECONDS` | 120 | Each dispatched backend batch, independently of other slots |
+
+For a cached model during diagnostics, for example:
+
+```bash
+export VGO_INFERENCE_STARTUP_SECONDS=120
+export VGO_INFERENCE_TIMEOUT_SECONDS=30
+```
+
+Cold TensorRT construction can take minutes; choose its startup allowance
+accordingly. Loading logs name the model/backend and report waiting every
+30 seconds until readiness. A batch timeout names its slot, sequence, request
+IDs and elapsed time; queued callers fail when the broker stops.
+
+Timeouts are fatal to the owning process. A native call cannot be interrupted
+safely, so its worker is detached and process exit releases native resources.
+Restart in a fresh process. The move server sends an error response and exits;
+generation and arena failures return nonzero. Healthy shutdown joins workers.
+These deadlines are separate from the generator's post-readiness `--run-seconds`.
+Native failures also arm a final three-second watchdog because native exit
+handlers can hang after the error is reported. Linux then exits with status 70
+without running those handlers; other targets abort. In-flight games can be
+abandoned, while published replay remains atomic.
+
+Calibration rows now carry `minimum_ply`; `resign-calibration.py --minimum-ply 20`
+filters for the live default floor. The bulk loop passes its configured floor.
+Legacy rows describe a counterfactual floor of zero and are excluded from
+floor-20 threshold selection until matching new data is available.
 
 ## Traps
 

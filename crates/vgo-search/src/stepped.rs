@@ -58,6 +58,162 @@ pub struct SteppedSearch {
     outstanding: Vec<Position>,
 }
 
+/// Arena/browser prototype: owns one model's tree across committed moves.
+/// Inherited visits participate in move selection, while SearchStats count only
+/// new work. This is deliberately not wired into self-play training targets.
+pub struct ReusableSearch {
+    root: Option<Box<Node>>,
+    identity: Option<(SearchConfig, u64, u64)>,
+    maximum_nodes: usize,
+    maximum_payload_bytes: usize,
+    metrics: ReuseMetrics,
+    advance_time: std::time::Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReuseMetrics {
+    pub searches: u64,
+    pub hits: u64,
+    pub inherited_visits: u64,
+    pub advances: u64,
+    pub advance_hits: u64,
+    pub limit_drops: u64,
+    pub maximum_retained_nodes: usize,
+    /// Tracked payload, excluding allocator headers and reference-count headers.
+    pub maximum_retained_bytes: usize,
+    pub advance_nanoseconds: u64,
+}
+
+impl ReusableSearch {
+    #[must_use]
+    pub fn new(maximum_nodes: usize, maximum_payload_bytes: usize) -> Self {
+        Self {
+            root: None,
+            identity: None,
+            maximum_nodes,
+            maximum_payload_bytes,
+            metrics: ReuseMetrics::default(),
+            advance_time: std::time::Duration::ZERO,
+        }
+    }
+
+    #[must_use]
+    pub fn metrics(&self) -> ReuseMetrics {
+        self.metrics
+    }
+
+    /// Advance through *every* actual move, including the other seat's moves.
+    /// Missing candidates, unevaluated children and mismatches discard the tree.
+    pub fn advance(&mut self, action: crate::Action, position: &Position) {
+        let started = std::time::Instant::now();
+        self.metrics.advances += 1;
+        let next = self
+            .root
+            .take()
+            .and_then(|mut root| root.take_child(action, position));
+        if next.is_some() {
+            self.metrics.advance_hits += 1;
+        }
+        self.retain(next);
+        let elapsed = started.elapsed();
+        self.advance_time += elapsed;
+        self.metrics.advance_nanoseconds += elapsed.as_nanos() as u64;
+    }
+
+    pub fn clear(&mut self) {
+        self.root = None;
+        self.identity = None;
+        self.advance_time = std::time::Duration::ZERO;
+    }
+
+    fn retain(&mut self, root: Option<Box<Node>>) {
+        self.root = root.filter(|node| {
+            let memory = node.memory_usage();
+            if memory.nodes > self.maximum_nodes
+                || memory.tracked_bytes() > self.maximum_payload_bytes
+                || memory.unreported_policies > 0
+            {
+                self.metrics.limit_drops += 1;
+                false
+            } else {
+                self.metrics.maximum_retained_nodes =
+                    self.metrics.maximum_retained_nodes.max(memory.nodes);
+                self.metrics.maximum_retained_bytes = self
+                    .metrics
+                    .maximum_retained_bytes
+                    .max(memory.tracked_bytes());
+                true
+            }
+        });
+    }
+
+    /// `model_revision` must change when evaluator weights/backend identity
+    /// changes. Configuration and seed changes also invalidate cached work.
+    /// Root exploration noise is unsupported: old proposals have different beta
+    /// probabilities from a freshly noised root. Use deterministic play here.
+    pub fn search(
+        &mut self,
+        position: &Position,
+        config: SearchConfig,
+        seed: u64,
+        model_revision: u64,
+        ply: u32,
+        evaluator: &dyn crate::Evaluator,
+        budget: Option<std::time::Duration>,
+    ) -> Result<SearchResult, EvaluationError> {
+        if config.root_exploration_noise != 0.0 {
+            self.clear();
+            return Err(EvaluationError::new(
+                "tree reuse requires zero root exploration noise",
+            ));
+        }
+        let started = std::time::Instant::now();
+        // Charge intervening reroot/drop/accounting work to this seat's next
+        // advisory budget, so it is not free work in an equal-time arena.
+        let budget = budget.map(|limit| limit.saturating_sub(self.advance_time));
+        self.advance_time = std::time::Duration::ZERO;
+        let identity = (config, seed, model_revision);
+        let root = self
+            .root
+            .take()
+            .filter(|node| self.identity == Some(identity) && node.matches_position(position));
+        self.identity = Some(identity);
+        self.metrics.searches += 1;
+        let mut search = SteppedSearch::new(position.clone(), config, seed, ply);
+        if let Some(mut root) = root {
+            self.metrics.hits += 1;
+            self.metrics.inherited_visits += u64::from(root.visits());
+            root.mark_root();
+            search.stage = Stage::Ready {
+                root,
+                remaining: config.simulations,
+            };
+        }
+        loop {
+            if search.finished() {
+                break;
+            }
+            let batch = search.next_batch().to_vec();
+            if batch.is_empty() {
+                break;
+            }
+            search.submit(evaluator.evaluate_batch(&batch)?)?;
+            if search.stats.simulations > 0
+                && budget.is_some_and(|limit| started.elapsed() >= limit)
+            {
+                break;
+            }
+        }
+        let result = search.partial_result()?;
+        let root = match search.stage {
+            Stage::Ready { root, .. } | Stage::Finished { root } => root,
+            _ => unreachable!("search completes at a round boundary"),
+        };
+        self.retain(Some(root));
+        Ok(result)
+    }
+}
+
 enum Stage {
     /// The root itself has not been evaluated.
     Root,
@@ -295,6 +451,26 @@ impl SteppedSearch {
         ))
     }
 
+    /// Return the completed work at a round boundary, including a partial search.
+    pub fn partial_result(&self) -> Result<SearchResult, EvaluationError> {
+        let root = match &self.stage {
+            Stage::Ready { root, .. } | Stage::Finished { root } => root,
+            Stage::Root | Stage::Round { .. } => {
+                return Err(EvaluationError::new(
+                    "partial result needs an evaluated root and no pending round",
+                ));
+            }
+        };
+        Ok(assemble_result(
+            root,
+            &self.position,
+            self.config,
+            self.match_seed,
+            self.ply,
+            self.stats,
+        ))
+    }
+
     /// The move the search currently prefers, without consuming it.
     ///
     /// Callable before the budget is spent: stopping on a deadline is the
@@ -380,12 +556,181 @@ pub fn drive(
     Ok(())
 }
 
+/// Stop starting new simulation rounds after the time budget. Root evaluation
+/// and one simulation round are guaranteed; in-flight calls finish, so this is
+/// an advisory deadline with at most one round's overrun thereafter.
+pub fn search_for_duration(
+    position: &Position,
+    config: SearchConfig,
+    seed: u64,
+    evaluator: &dyn crate::Evaluator,
+    budget: std::time::Duration,
+) -> Result<SearchResult, EvaluationError> {
+    let started = std::time::Instant::now();
+    let mut search = SteppedSearch::new(position.clone(), config, seed, 0);
+    loop {
+        if search.finished() {
+            return search.finish();
+        }
+        let batch = search.next_batch().to_vec();
+        if batch.is_empty() {
+            return search.partial_result();
+        }
+        search.submit(evaluator.evaluate_batch(&batch)?)?;
+        if search.stats.simulations > 0 && started.elapsed() >= budget {
+            return search.partial_result();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use vgo_core::{Color, Position, Stone};
 
     use super::*;
     use crate::{Action, Evaluator, NaiveEvaluator, search_at_ply};
+
+    #[test]
+    fn reuse_preserves_cold_search_and_adds_new_work_to_committed_subtree() {
+        let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+        let config = SearchConfig {
+            leaf_batch: 4,
+            ..SearchConfig::canary(32)
+        };
+        let mut cache = ReusableSearch::new(4096, 256 << 20);
+        let first = cache
+            .search(&position, config, 71, 1, 0, &NaiveEvaluator, None)
+            .unwrap();
+        let expected = search_at_ply(&position, config, 71, &NaiveEvaluator, 0).unwrap();
+        assert_eq!(first.children, expected.children);
+        assert_eq!(first.stats, expected.stats);
+        let next = first.action.apply(&position).position;
+        cache.advance(first.action, &next);
+        let retained = cache
+            .root
+            .as_ref()
+            .expect("selected child was evaluated")
+            .visits();
+        let result = cache
+            .search(&next, config, 71, 1, 1, &NaiveEvaluator, None)
+            .unwrap();
+        assert_eq!(cache.metrics().hits, 1);
+        assert_eq!(cache.metrics().inherited_visits, u64::from(retained));
+        assert_eq!(result.stats.simulations, 32);
+        assert_eq!(cache.root.as_ref().unwrap().visits(), retained + 32);
+    }
+
+    #[test]
+    fn reuse_invalidates_model_config_seed_undo_and_missing_moves() {
+        let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+        let config = SearchConfig::canary(16);
+        let mut cache = ReusableSearch::new(4096, 256 << 20);
+        let mut cold = |position: &Position, config, seed, revision| {
+            let hits = cache.metrics().hits;
+            cache
+                .search(position, config, seed, revision, 0, &NaiveEvaluator, None)
+                .unwrap();
+            assert_eq!(cache.metrics().hits, hits);
+        };
+        cold(&position, config, 7, 1);
+        cold(&position, config, 7, 2);
+        cold(
+            &position,
+            SearchConfig {
+                exploration: 2.0,
+                ..config
+            },
+            7,
+            2,
+        );
+        cold(&position, config, 8, 2);
+        let next = Action::Pass.apply(&position).position;
+        cold(&next, config, 8, 2);
+        cold(&position, config, 8, 2); // undo
+        let missing = Action::Place(vgo_core::Point::new(0.49, 0.51));
+        cache.advance(missing, &missing.apply(&position).position);
+        assert!(cache.root.is_none());
+    }
+
+    #[test]
+    fn reuse_handles_passes_and_enforces_retention_limits_and_noise_contract() {
+        let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+        let config = SearchConfig::canary(64);
+        let mut cache = ReusableSearch::new(4096, 256 << 20);
+        cache
+            .search(&position, config, 3, 1, 0, &NaiveEvaluator, None)
+            .unwrap();
+        let passed = Action::Pass.apply(&position).position;
+        cache.advance(Action::Pass, &passed);
+        assert!(cache.root.as_ref().unwrap().matches_position(&passed));
+        let finished = Action::Pass.apply(&passed).position;
+        cache.advance(Action::Pass, &finished);
+        // A terminal retained child can be dropped; a terminal position is never searched.
+        assert!(
+            cache
+                .root
+                .as_ref()
+                .is_none_or(|node| node.matches_position(&finished))
+        );
+        let mut limited = ReusableSearch::new(1, 1);
+        limited
+            .search(&position, config, 3, 1, 0, &NaiveEvaluator, None)
+            .unwrap();
+        assert!(limited.root.is_none());
+        assert_eq!(limited.metrics().limit_drops, 1);
+        assert!(
+            limited
+                .search(
+                    &position,
+                    SearchConfig {
+                        root_exploration_noise: 0.1,
+                        ..config
+                    },
+                    3,
+                    1,
+                    0,
+                    &NaiveEvaluator,
+                    None
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("noise")
+        );
+    }
+
+    #[test]
+    fn a_zero_deadline_still_evaluates_a_root_and_completes_a_round() {
+        let position = Position::new(1.0 / 18.0, Vec::new(), Color::Black);
+        let result = search_for_duration(
+            &position,
+            crate::SearchConfig::canary(100),
+            71,
+            &NaiveEvaluator,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(result.stats.simulations, 1);
+        assert!(!result.children.is_empty());
+        let complete = search_for_duration(
+            &position,
+            crate::SearchConfig::canary(8),
+            71,
+            &NaiveEvaluator,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let expected = search_at_ply(
+            &position,
+            crate::SearchConfig::canary(8),
+            71,
+            &NaiveEvaluator,
+            0,
+        )
+        .unwrap();
+        assert_eq!(complete.action, expected.action);
+        assert_eq!(complete.children, expected.children);
+        assert_eq!(complete.stats, expected.stats);
+    }
 
     fn fixture(stones: usize, radius: f64) -> Position {
         let spacing = 2.0 * radius * 1.1;

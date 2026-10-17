@@ -36,6 +36,9 @@ impl DensePolicy {
 }
 
 impl Policy for DensePolicy {
+    fn heap_allocations(&self) -> Option<Vec<vgo_search::HeapAllocation>> {
+        Some(vec![vgo_search::HeapAllocation::vector(&self.logits)])
+    }
     fn logit(&self, action: Action) -> f64 {
         let index = match action {
             Action::Pass => self.config.pixels(),
