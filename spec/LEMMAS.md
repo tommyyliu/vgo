@@ -719,6 +719,37 @@ at most the sum of its components' magnitudes, so `s <= L` up to relative roundi
 
 ## Floating-point lemmas
 
+### E15. A nearest field extends over new stones
+
+*Status: Proved.* Used by `nearest_field`.
+
+**Claim.** Let `S` be a list of stones and `A` a prefix of it. For a pixel `p`, let
+`(n, m)` be the two smallest computed squared distances from `p` to `A`, both
+`+inf` when `A` is empty. Folding each stone of `S - A` into `(n, m)` by
+
+```text
+v = the computed squared distance from p to the stone
+(n, m) := (min(n, v), min(m, max(n, v)))
+```
+
+gives the two smallest computed squared distances from `p` to `S`, bit for bit.
+
+**Proof.** The update keeps `n <= m` and, by induction on the values folded, `(n, m)`
+are the two smallest of the multiset seen so far: a value below `n` becomes the new
+smallest and pushes `n` to second, a value between them replaces `m`, and a larger
+one changes nothing. So the result depends only on the multiset, not on the order.
+A computed distance is a pure function of the pixel and the stone's coordinates, no
+value is NaN, and the sweep and the fold evaluate it through one function, so a
+stone contributes the same bits whichever path computes it. `A` being a prefix,
+compared by the exact bits of each coordinate, makes `A` plus `S - A` exactly the
+multiset of `S`. QED
+
+**Capture.** Removing a stone from the middle of the list ends the shared prefix
+there, so `A` is not a prefix of the new list and the fold does not apply. Nothing
+can be subtracted from a field, which is why the test is a prefix and not a subset
+of stones. Such a position is swept instead, and by E1 a sweep gives these same two
+smallest values, so the paths agree.
+
 ### N1. Length comparison
 
 *Status: Proved for `t < 2^511`.* Used by `length_below`. Outside that range the shortcut

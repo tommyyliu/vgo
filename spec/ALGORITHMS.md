@@ -56,6 +56,16 @@ a tile. Discarding only selects candidates, so stored distances stay exact.
 - **Cost:** a few candidates per pixel instead of `n`.
 - **Code:** `vgo-raster/src/packed.rs`, `sweep_tile`
 
+### Reusing the nearest field across a search
+
+Every leaf of a search holds the root's stones plus the few on its path. Each thread keeps
+one swept field and folds in only the stones past it, comparing exact coordinates to prove
+the saved stones are a prefix. A capture breaks the prefix, so that leaf is swept.
+
+- **Relies on:** E15.
+- **Cost:** a copy plus one pass per stone past the anchor, instead of a sweep.
+- **Code:** `vgo-raster/src/packed.rs`, `nearest_field`
+
 ### Stone planes by stamping
 
 A stone plane only asks whether a pixel is inside some disc, so each stone stamps its own
