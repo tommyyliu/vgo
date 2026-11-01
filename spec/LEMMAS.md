@@ -750,6 +750,50 @@ can be subtracted from a field, which is why the test is a prefix and not a subs
 of stones. Such a position is swept instead, and by E1 a sweep gives these same two
 smallest values, so the paths agree.
 
+### E16. Far stones leave an exact answer alone
+
+*Status: Proved.* Used by `classify_row` and `KnownAnswers`.
+
+**Claim.** Let `S` be a list of stones and `S'` the same list with stones `T` after it.
+Fix a point `p` and a threshold `d`, and let the margin be `m = 1e-5`. If every `t` in `T`
+has `|t - p| >= d + 2r + m`, then the exact test gives the same answer for `S'` as for `S`.
+The exact test here is the vertex check of [E10] together with
+`none_closer_than_except_vertices`, which asks whether any candidate `c` has
+`length_below(p - c, d)` and is legal.
+
+**Proof.** The test reads only the stones and the radius. Call a candidate *near* if it
+passes `length_below(p - c, d)`, so by [N1] it is within `d` of `p`. It is enough to show
+the two lists have the same near candidates, with the same legality.
+
+*New candidates are not near.* A candidate that `S'` has and `S` lacks comes from some `t`:
+its projection onto `t`'s exclusion circle, or a vertex on that circle ([E13]). Either way
+it is within `2r` of `t` up to rounding and `COORDINATE_EPSILON`, far below `m`, so it is
+at least `|t - p| - 2r - m/2 >= d + m/2` from `p`. It is not near.
+
+*Old candidates keep their legality.* If `c` is near, then
+`|c - t| >= |t - p| - d >= 2r + m`, so `t` does not exclude it. Clearance from the rest of
+`S` is the same test in both lists, so `c` is legal for `S'` exactly when it is legal for `S`.
+
+*Old near vertices are still there, unchanged.* The point `p`, its wall and stone
+projections and the vertices are computed from the coordinates alone, so a candidate both
+lists produce has the same bits. A vertex of `S` near `p` is legal for `S'` by the last step,
+so `S'` enumerates it too. De-duplication cannot replace it, since it merges only points
+within about `COORDINATE_EPSILON`, and every new vertex is at least `m` from any near point.
+
+The buckets return what a full scan returns ([E7], [E10]), and the tests are pure, so the
+order of visiting has no effect. So the same near candidates pass, and the answers agree. QED
+
+**Use.** A position extends the anchor's stones `S` when they are a prefix of its list, as
+in [E15]. Take `d` to be the pixel's nearest-stone distance. A stone that far away is not
+the nearest, so `d` has the same bits in the leaf and in the anchor's own field. Two leaves
+that each satisfy the claim at `p` therefore both give the answer for `S`, so one can save it
+and the other read it. The anchor is keyed by its stones, grid and radius, so an answer never
+leaves the board it was computed for.
+
+This covers only the exact test. The two cheap cases run for every pixel of every leaf,
+so a pixel the unproved floor of [O1] decides is decided as it was, and the plane does not
+depend on what the thread rendered earlier.
+
 ### N1. Length comparison
 
 *Status: Proved for `t < 2^511`.* Used by `length_below`. Outside that range the shortcut

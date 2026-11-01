@@ -84,6 +84,16 @@ and an exact legal-space test decides the narrow band between them.
 - **Cost:** linear in pixels, plus about 1,300 exact tests per 128-pixel big-board raster.
 - **Code:** `vgo-raster/src/settled_bounds.rs`, `edt.rs`
 
+### Reusing exact answers across a search
+
+The exact test asks whether a legal point lies within `d` of a pixel, so a stone farther
+than `d + 2r` cannot change the answer. A leaf's new stones are usually that far from most
+of the band, so each thread saves the answers for the stones its leaves share.
+
+- **Relies on:** E15, E16.
+- **Cost:** a distance check per new stone for each undecided pixel, in place of the test.
+- **Code:** `vgo-raster/src/settled_bounds.rs`, `KnownAnswers`
+
 ## Search
 
 ### Progressive widening

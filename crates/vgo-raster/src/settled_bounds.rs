@@ -316,6 +316,7 @@ pub fn settled_mask_by_bounded_distance(
 ///
 /// Not proved exact on every position: see [O1].
 pub(crate) struct SettledRows {
+    diameter: f64,
     scale: usize,
     fine_width: usize,
     fine_height: usize,
@@ -340,6 +341,42 @@ const fn fine_index(index: usize, scale: usize, fine_size: usize) -> usize {
     }
 }
 
+/// How much farther than `d + 2r` a stone must be to leave an exact answer alone.
+///
+/// Far above any rounding here, and far below a pixel. See [E16].
+const ANSWER_REACH_MARGIN: f64 = 1.0e-5;
+
+/// An exact answer a run of stones has not given yet.
+pub(crate) const ANSWER_UNKNOWN: u8 = 0;
+const ANSWER_NOT_SETTLED: u8 = 1;
+const ANSWER_SETTLED: u8 = 2;
+
+/// Exact answers saved for a run of stones this position extends, one row's worth,
+/// and the position's stones past that run.
+pub(crate) struct KnownAnswers<'a> {
+    pub(crate) stone_xs: &'a [f64],
+    pub(crate) stone_ys: &'a [f64],
+    pub(crate) row: &'a mut [u8],
+}
+
+impl KnownAnswers<'_> {
+    /// The column's saved answer, if every stone past the run is outside
+    /// `reach_square` of `point` and so has no say in it.
+    #[inline]
+    fn slot_beyond_stones_past(
+        &mut self,
+        column: usize,
+        point: Point,
+        reach_square: f64,
+    ) -> Option<&mut u8> {
+        let beyond = self.stone_xs.iter().zip(self.stone_ys).all(|(&x, &y)| {
+            let (dx, dy) = (x - point.x, y - point.y);
+            dx * dx + dy * dy >= reach_square
+        });
+        beyond.then(|| &mut self.row[column])
+    }
+}
+
 pub(crate) fn prepare_settled_rows(
     position: &Position,
     config: RasterConfig,
@@ -359,6 +396,7 @@ pub(crate) fn prepare_settled_rows(
     // narrower than a cell, which is why this is not proved exact: see [O1].
     let slack = spacing * std::f64::consts::SQRT_2;
     SettledRows {
+        diameter: 2.0 * position.radius(),
         scale,
         fine_width,
         fine_height,
@@ -392,6 +430,7 @@ impl SettledRows {
         nearest_squares: &[f64],
         field: &[f64],
         out: &mut [bool],
+        mut known: Option<KnownAnswers<'_>>,
     ) {
         let scale = self.scale;
         let base = fine_index(row, scale, self.fine_height) * self.fine_width;
@@ -434,14 +473,34 @@ impl SettledRows {
             }
             let point = Point::new(xs[column], y);
             let distance = nearest_squares[column].sqrt();
+            // Stones this far away cannot change the answer, so the one saved for
+            // the shared stones is this position's answer too: [E16].
+            let reach = distance + self.diameter + ANSWER_REACH_MARGIN;
+            let saved = known
+                .as_mut()
+                .and_then(|known| known.slot_beyond_stones_past(column, point, reach * reach));
+            if let Some(answer) = saved.as_deref()
+                && *answer != ANSWER_UNKNOWN
+            {
+                out[column] = *answer == ANSWER_SETTLED;
+                continue;
+            }
             // A vertex is an exact legal point. If one is strictly closer than the
             // pixel's nearest stone the pixel is not settled, with no further
             // geometry. The undecided band is mostly pixels beside a thin legal
             // gap, and a gap's own vertices are right there.
-            out[column] = !self.index.any_vertex_closer(point, distance) && {
+            let settled = !self.index.any_vertex_closer(point, distance) && {
                 self.exact_tests += 1;
                 none_closer_than_except_vertices(position, point, distance, &self.index)
             };
+            out[column] = settled;
+            if let Some(answer) = saved {
+                *answer = if settled {
+                    ANSWER_SETTLED
+                } else {
+                    ANSWER_NOT_SETTLED
+                };
+            }
         }
     }
 }
@@ -505,6 +564,7 @@ fn settled_by_bounded_distance_into(
             &scratch.nearest_squares,
             scratch.edt.field(),
             out,
+            None,
         );
     }
     rows.exact_tests
