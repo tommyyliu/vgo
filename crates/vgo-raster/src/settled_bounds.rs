@@ -174,9 +174,9 @@ fn nearest_row_chunked(
 /// `vertices`.
 ///
 /// Sampling alone misses any legal component that contains no cell centre, and
-/// that is not rare: two stones a hair over `2r` apart leave a sliver of legal
-/// board between them, which is exactly the contestable gap a boundary move
-/// lives in. Missing one makes the distance to the legal set an overestimate,
+/// that is not rare: three stones whose exclusion circles nearly close up leave
+/// a pocket of legal board between them, which is exactly the contestable gap a
+/// boundary move lives in. Missing one makes the distance to the legal set an overestimate,
 /// so the settled test calls the region beside it settled. Measured on real
 /// 1/38 positions, that was 1.2% of every 256 raster's pixels, all of them
 /// false "settled". Every bounded component has a vertex, so marking the vertex
