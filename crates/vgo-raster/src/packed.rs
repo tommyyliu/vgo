@@ -17,7 +17,7 @@
 //! this has to agree with, and `bit_expansion_table` for the bit order.
 
 
-use half::f16;
+use half::{f16, slice::HalfFloatSliceExt};
 use vgo_core::{Color, Position};
 
 use crate::edt::{EdtScratch, prepare_settled_rows};
@@ -87,7 +87,9 @@ struct PackedScratch {
     settled: Vec<bool>,
     stone_xs: Vec<f64>,
     stone_ys: Vec<f64>,
-    stone_is_current: Vec<bool>,
+    nearest_squares: Vec<f64>,
+    second_squares: Vec<f64>,
+    candidates: Vec<u32>,
 }
 
 impl Clone for PackedRaster {
@@ -183,280 +185,143 @@ impl PackedRaster {
 
 }
 
-/// Stones bucketed by cell, so a chunk of pixels can find the few that matter.
-///
-/// The sweep it replaces is O(pixels x stones): every stone is tested against
-/// every pixel, and on a 38-unit board running to 312 plies that is 150+ stones
-/// against 65,536 pixels, roughly ten million distance computations per raster.
-/// A profile put the sweeps at 29% of the generator's CPU.
-///
-/// Cell size is one exclusion diameter, so a cell holds *at most two* stones --
-/// not one, as the tempting argument goes: two stones at opposite corners of a
-/// `2r` cell are `2r*sqrt(2)` apart, comfortably above the `2r` minimum
-/// separation. Hence buckets rather than a single slot per cell.
-///
-/// CSR rather than `Vec<Vec<_>>`: the grid is rebuilt for every rasterization,
-/// and a hundred small allocations per raster would cost more than the scan it
-/// is replacing.
-struct StoneGrid {
-    cell: f64,
-    width: usize,
-    height: usize,
-    starts: Vec<u32>,
-    indices: Vec<u32>,
+/// Side of the smallest tile, in pixels. Measured best of 4, 8, 16 and 32.
+const LEAF_TILE: usize = 16;
+
+/// The stones and pixel coordinates a sweep reads.
+struct SweepInput<'a> {
+    stone_xs: &'a [f64],
+    stone_ys: &'a [f64],
+    xs: &'a [f64],
+    ys: &'a [f64],
 }
 
-impl StoneGrid {
-    fn build(xs: &[f64], ys: &[f64], cell: f64) -> Self {
-        debug_assert_eq!(xs.len(), ys.len());
-        let width = (1.0 / cell).ceil() as usize + 1;
-        let height = width;
-        let cells = width * height;
-        let mut counts = vec![0u32; cells + 1];
-        let index_of = |x: f64, y: f64| {
-            let cx = ((x / cell) as usize).min(width - 1);
-            let cy = ((y / cell) as usize).min(height - 1);
-            cy * width + cx
-        };
-        for (x, y) in xs.iter().zip(ys) {
-            counts[index_of(*x, *y) + 1] += 1;
-        }
-        for i in 0..cells {
-            counts[i + 1] += counts[i];
-        }
-        let mut cursor = counts.clone();
-        let mut indices = vec![0u32; xs.len()];
-        for (stone, (x, y)) in xs.iter().zip(ys).enumerate() {
-            let cell_index = index_of(*x, *y);
-            indices[cursor[cell_index] as usize] = stone as u32;
-            cursor[cell_index] += 1;
-        }
-        Self {
-            cell,
-            width,
-            height,
-            starts: counts,
-            indices,
-        }
-    }
-
-    fn empty(cell: f64) -> Self {
-        Self {
-            cell,
-            width: 1,
-            height: 1,
-            starts: vec![0, 0],
-            indices: Vec::new(),
-        }
-    }
-
-    #[inline]
-    fn bucket(&self, cx: usize, cy: usize) -> &[u32] {
-        let cell = cy * self.width + cx;
-        let (start, end) = (self.starts[cell] as usize, self.starts[cell + 1] as usize);
-        &self.indices[start..end]
-    }
-}
-
-/// Pixels per chunk, once chunking is worth doing.
+/// Nearest and second-nearest squared distances for a tile of pixels.
 ///
-/// The box a chunk needs grows with its width, so a wider chunk gathers more
-/// stones; a narrower one amortizes the ring walk over fewer pixels. Measured
-/// at radius 1/38, 256x256, sweep time against the flat scan:
+/// `candidates[inherited..]` holds the stones the enclosing tile kept. Let `c`
+/// be this tile's centre, `h` the distance from `c` to its corners and `d` the
+/// distance from `c` to its second-nearest candidate. Those two candidates are
+/// within `d + h` of every pixel, so each pixel's second-nearest distance is at
+/// most `d + h`. A stone at least `d + 2h` from `c` is at least `d + h` from
+/// every pixel, so it cannot be one of a pixel's two nearest. Any two stones give
+/// a valid `d`, which is why each level only needs to look at its parent's list.
 ///
-/// ```text
-/// CHUNK    28 stones   60    120    240
-///    16        0.28x  0.53  1.30   3.62
-///    32        0.39   0.78  1.78   4.48
-///    64        0.51   0.95  2.05   5.16
-///   128        0.54   1.05  1.99   4.49
-///   256        0.53   1.18  1.79   3.87
-/// ```
-///
-/// 64 wins where it matters. Half of generated games are 38-unit boards running
-/// to 312 plies, so by sample count roughly three quarters of positions come
-/// from boards carrying over a hundred stones.
-const CHUNK: usize = 64;
-
-/// Below this many stones, scan every stone instead.
-///
-/// The search only pays when the bound actually prunes, and with few stones
-/// every stone is inside it anyway -- so the ring walk, the grid indirection
-/// and the per-ring bound scan are pure overhead. Setting the chunk to the full
-/// row is not enough to recover it, because that machinery still runs; the flat
-/// scan has to be a separate path.
-///
-/// The measured break-even is around 60 stones; keeping the threshold there
-/// avoids paying the grid setup on early positions while helping late ones.
-const SEARCH_MINIMUM_STONES: usize = 60;
-
-/// Every stone against every pixel, one stone at a time.
-///
-/// What the dense writer does, and what wins below `SEARCH_MINIMUM_STONES`.
-/// Stones outside and pixels inside, so the inner loop is a flat sequence of
-/// independent minima over contiguous f64 -- the shape the autovectorizer
-/// handles.
-#[allow(clippy::too_many_arguments)]
-fn sweep_row_flat(
-    stone_xs: &[f64],
-    stone_ys: &[f64],
-    stone_is_current: &[bool],
-    y: f64,
-    xs: &[f64],
-    current_squares: &mut [f64],
-    opponent_squares: &mut [f64],
+/// The bound only chooses candidates. Every stored distance is still the exact
+/// `mul_add` the dense writer computes, and the two-smallest update does not
+/// depend on visit order. The slack on the limit covers rounding in the bound.
+fn sweep_tile(
+    input: &SweepInput<'_>,
+    columns: std::ops::Range<usize>,
+    rows: std::ops::Range<usize>,
+    inherited: usize,
+    candidates: &mut Vec<u32>,
     nearest_squares: &mut [f64],
     second_squares: &mut [f64],
 ) {
-    for stone in 0..stone_xs.len() {
-        let (sx, sy) = (stone_xs[stone], stone_ys[stone]);
-        let dy = y - sy;
+    let SweepInput { stone_xs, stone_ys, xs, ys } = *input;
+    let centre_x = 0.5 * (xs[columns.start] + xs[columns.end - 1]);
+    let centre_y = 0.5 * (ys[rows.start] + ys[rows.end - 1]);
+    let half_diagonal = (centre_x - xs[columns.start]).hypot(centre_y - ys[rows.start]);
+
+    let end = candidates.len();
+    let (mut first, mut second) = (f64::INFINITY, f64::INFINITY);
+    for &stone in &candidates[inherited..end] {
+        let stone = stone as usize;
+        let (dx, dy) = (stone_xs[stone] - centre_x, stone_ys[stone] - centre_y);
+        let square = dx * dx + dy * dy;
+        second = second.min(square.max(first));
+        first = first.min(square);
+    }
+    let reach = second.sqrt() + 2.0 * half_diagonal;
+    let limit = reach * reach * (1.0 + 1.0e-9);
+    for index in inherited..end {
+        let stone = candidates[index];
+        let at = stone as usize;
+        let (dx, dy) = (stone_xs[at] - centre_x, stone_ys[at] - centre_y);
+        if dx * dx + dy * dy <= limit {
+            candidates.push(stone);
+        }
+    }
+
+    let (tile_width, tile_height) = (columns.len(), rows.len());
+    if tile_width > LEAF_TILE || tile_height > LEAF_TILE {
+        let middle_column = columns.start + tile_width.div_ceil(2);
+        let middle_row = rows.start + tile_height.div_ceil(2);
+        let row_halves = [rows.start..middle_row, middle_row..rows.end];
+        let column_halves = [columns.start..middle_column, middle_column..columns.end];
+        for row_half in &row_halves {
+            for column_half in &column_halves {
+                if !row_half.is_empty() && !column_half.is_empty() {
+                    sweep_tile(
+                        input,
+                        column_half.clone(),
+                        row_half.clone(),
+                        end,
+                        candidates,
+                        nearest_squares,
+                        second_squares,
+                    );
+                }
+            }
+        }
+    } else {
+        let width = xs.len();
+        let tile_xs = &xs[columns.clone()];
+        for row in rows {
+            let y = ys[row];
+            let from = row * width + columns.start;
+            let to = row * width + columns.end;
+            let nearest_row = &mut nearest_squares[from..to];
+            let second_row = &mut second_squares[from..to];
+            for &stone in &candidates[end..] {
+                let stone = stone as usize;
+                let (sx, dy) = (stone_xs[stone], y - stone_ys[stone]);
+                let dy_square = dy * dy;
+                for ((nearest, second), &x) in
+                    nearest_row.iter_mut().zip(second_row.iter_mut()).zip(tile_xs)
+                {
+                    let dx = x - sx;
+                    // `mul_add`, matching the dense writer and the nearest field
+                    // `settled` classifies against. `settled` is a bit decided
+                    // by comparing this distance against a sampled one, so one
+                    // ulp is a different pixel.
+                    let square = dx.mul_add(dx, dy_square);
+                    *second = second.min(square.max(*nearest));
+                    *nearest = nearest.min(square);
+                }
+            }
+        }
+    }
+    candidates.truncate(end);
+}
+
+/// Marks the pixels inside `(x, y)`'s disc.
+///
+/// A disc has few pixels, so this is far cheaper than keeping a per-colour
+/// minimum for every pixel in the sweep. The row and column ranges are padded by
+/// a pixel; the test itself is the dense writer's `square <= radius^2`.
+fn stamp_disc(
+    plane: &mut [u8],
+    (x, y): (f64, f64),
+    radius: f64,
+    xs: &[f64],
+    ys: &[f64],
+) {
+    let (width, height) = (xs.len(), ys.len());
+    let radius_square = radius * radius;
+    let span = |centre: f64, size: usize| {
+        let low = ((centre - radius) * size as f64 - 1.5).floor().max(0.0) as usize;
+        let high = (((centre + radius) * size as f64 + 1.5).ceil() as usize).min(size);
+        low..high
+    };
+    let columns = span(x, width);
+    for row in span(y, height) {
+        let dy = ys[row] - y;
         let dy_square = dy * dy;
-        let target = if stone_is_current[stone] {
-            &mut *current_squares
-        } else {
-            &mut *opponent_squares
-        };
-        for column in 0..xs.len() {
-            let dx = xs[column] - sx;
-            // `mul_add`, matching `sweep_row_chunked` and the nearest field
-            // `settled` classifies against. These used to differ: the flat path
-            // rounded twice and the chunked one once, so the stone-count
-            // dispatch quietly changed the arithmetic underneath a position.
-            // The ridge absorbed that in f16, but `settled` is a bit decided by
-            // comparing this distance against a sampled one, and there a single
-            // ulp is a different pixel.
-            let square = dx.mul_add(dx, dy_square);
-            if square < target[column] {
-                target[column] = square;
-            }
-            if square < nearest_squares[column] {
-                second_squares[column] = nearest_squares[column];
-                nearest_squares[column] = square;
-            } else if square < second_squares[column] {
-                second_squares[column] = square;
-            }
-        }
-    }
-}
-
-/// Nearest and second-nearest squared distances over all stones, plus the
-/// nearest over each colour, for one row -- searching outward from each chunk
-/// instead of scanning every stone.
-///
-/// The bound: a stone whose closest possible approach to the chunk already
-/// exceeds every pixel's current second-nearest distance cannot change any of
-/// them, and if it also exceeds `radius^2` it cannot set a stone-disc bit
-/// either. Rings are walked outward so the near stones land first and pull that
-/// bound down quickly; ring `k` is at least `(k-1) * cell` away, so once that
-/// passes the bound every later ring does too.
-///
-/// Writes exactly what the all-stones scan writes. `min` and the two-smallest
-/// update are order-independent for the values they produce, so visiting stones
-/// in a different order changes nothing -- which is what lets this be checked
-/// bit-for-bit against the dense writer.
-#[allow(clippy::too_many_arguments)]
-fn sweep_row_chunked(
-    grid: &StoneGrid,
-    stone_xs: &[f64],
-    stone_ys: &[f64],
-    stone_is_current: &[bool],
-    y: f64,
-    xs: &[f64],
-    radius_square: f64,
-    current_squares: &mut [f64],
-    opponent_squares: &mut [f64],
-    nearest_squares: &mut [f64],
-    second_squares: &mut [f64],
-) {
-    let width = xs.len();
-    let cell = grid.cell;
-    let row_cell = ((y / cell) as usize).min(grid.height - 1);
-    for start in (0..width).step_by(CHUNK) {
-        let end = (start + CHUNK).min(width);
-        let (low_x, high_x) = (xs[start], xs[end - 1]);
-        let cx0 = ((low_x / cell) as usize).min(grid.width - 1);
-        let cx1 = ((high_x / cell) as usize).min(grid.width - 1);
-
-        let mut bound = f64::INFINITY;
-        let longest = grid.width.max(grid.height);
-        for ring in 0..=longest {
-            if ring > 0 {
-                let reach = (ring - 1) as f64 * cell;
-                let reach_square = reach * reach;
-                if reach_square >= bound && reach_square > radius_square {
-                    break;
-                }
-            }
-            let mut touched = false;
-            for cy in row_cell.saturating_sub(ring)..=(row_cell + ring).min(grid.height - 1) {
-                let edge_y = cy.abs_diff(row_cell) == ring;
-                let from = cx0.saturating_sub(ring);
-                let to = (cx1 + ring).min(grid.width - 1);
-                for cx in from..=to {
-                    // Only the ring itself, not the filled block: inner cells
-                    // were visited by an earlier, closer ring.
-                    let edge_x = cx + ring == cx0 || cx == cx1 + ring;
-                    if !(edge_y || edge_x) {
-                        continue;
-                    }
-                    touched = true;
-                    for &stone in grid.bucket(cx, cy) {
-                        let stone = stone as usize;
-                        let (sx, sy) = (stone_xs[stone], stone_ys[stone]);
-                        let dy = y - sy;
-                        let dy_square = dy * dy;
-                        // Closest the chunk can come to this stone.
-                        let gap = if sx < low_x {
-                            low_x - sx
-                        } else if sx > high_x {
-                            sx - high_x
-                        } else {
-                            0.0
-                        };
-                        let floor_square = gap.mul_add(gap, dy_square);
-                        if floor_square >= bound && floor_square > radius_square {
-                            continue;
-                        }
-                        let target = if stone_is_current[stone] {
-                            &mut *current_squares
-                        } else {
-                            &mut *opponent_squares
-                        };
-                        for column in start..end {
-                            let dx = xs[column] - sx;
-                            let square = dx.mul_add(dx, dy_square);
-                            if square < target[column] {
-                                target[column] = square;
-                            }
-                            if square < nearest_squares[column] {
-                                second_squares[column] = nearest_squares[column];
-                                nearest_squares[column] = square;
-                            } else if square < second_squares[column] {
-                                second_squares[column] = square;
-                            }
-                        }
-                    }
-                }
-            }
-            // Recompute the bound once per ring, not once per stone: it only
-            // ever decreases, so a stale value prunes less but never wrongly,
-            // and a per-stone reduction over the chunk would cost as much as
-            // the scan being avoided.
-            let mut worst: f64 = 0.0;
-            for column in start..end {
-                if second_squares[column] > worst {
-                    worst = second_squares[column];
-                }
-            }
-            bound = worst;
-            if !touched && ring > 0 && bound.is_finite() {
-                // Nothing left in this ring and the bound is real; the next
-                // rings are further still.
-                let reach = ring as f64 * cell;
-                if reach * reach >= bound && reach * reach > radius_square {
-                    break;
-                }
+        for column in columns.clone() {
+            let dx = xs[column] - x;
+            if dx.mul_add(dx, dy_square) <= radius_square {
+                set_bit(plane, row * width + column, true);
             }
         }
     }
@@ -481,6 +346,13 @@ fn ridge_at(nearest_square: f64, second_square: f64, radius: f64) -> f32 {
     // reached the model on the first position of the first game and the run
     // died with "invalid inference value".
     (1.0 - (second - nearest) / radius).max(0.0).min(1.0) as f32
+}
+
+/// `ridge_at` over a row, as a flat loop over contiguous slices.
+fn ridge_row(nearest_squares: &[f64], second_squares: &[f64], radius: f64, out: &mut [f32]) {
+    for ((out, &nearest), &second) in out.iter_mut().zip(nearest_squares).zip(second_squares) {
+        *out = ridge_at(nearest, second, radius);
+    }
 }
 
 #[inline]
@@ -524,7 +396,6 @@ pub(crate) fn rasterize_compact_radius_packed_into(
     let pixels = config.pixels();
     let width = config.width;
     let radius = position.radius();
-    let radius_square = radius * radius;
     let to_move = position.to_move();
 
     // The three constant planes, as three stores rather than three fills over
@@ -553,7 +424,9 @@ pub(crate) fn rasterize_compact_radius_packed_into(
         settled,
         stone_xs,
         stone_ys,
-        stone_is_current,
+        nearest_squares,
+        second_squares,
+        candidates,
     } = scratch;
     for byte in bits.iter_mut() {
         *byte = 0;
@@ -588,149 +461,94 @@ pub(crate) fn rasterize_compact_radius_packed_into(
     let (opponent_plane, settled_plane) = rest.split_at_mut(stride);
     let dense_plane = dense_plane.as_mut_slice();
 
-    // Stones flattened with a colour flag, so one grid serves all three minima.
-    // The dense writer keeps two lists and scans each in full; the grid decides
-    // which stones a chunk of pixels can possibly need.
     let stones = position.stones();
     stone_xs.clear();
     stone_ys.clear();
-    stone_is_current.clear();
-    stone_xs.reserve(stones.len());
-    stone_ys.reserve(stones.len());
-    stone_is_current.reserve(stones.len());
-    for stone in stones {
-        stone_xs.push(stone.x);
-        stone_ys.push(stone.y);
-        stone_is_current.push(stone.color == to_move);
-    }
+    stone_xs.extend(stones.iter().map(|stone| stone.x));
+    stone_ys.extend(stones.iter().map(|stone| stone.y));
     let stone_xs = stone_xs.as_slice();
     let stone_ys = stone_ys.as_slice();
-    let stone_is_current = stone_is_current.as_slice();
-    // Cell size from the stone count, not from the radius. `2r` is the natural
-    // geometric choice -- it caps a cell at two stones -- but on a sparse board
-    // it leaves the grid 93% empty, and the ring walk then spends its time
-    // stepping over cells that hold nothing. One stone per cell on average
-    // keeps the walk proportional to the stones it finds. Never finer than 2r,
-    // which is where the bucket bound comes from.
-    let searching = stone_xs.len() >= SEARCH_MINIMUM_STONES;
-    let spacing = if stone_xs.is_empty() {
-        2.0 * radius
-    } else {
-        (2.0 * radius).max(1.0 / (stone_xs.len() as f64).sqrt())
-    };
-    let grid = if searching {
-        StoneGrid::build(&stone_xs, &stone_ys, spacing)
-    } else {
-        StoneGrid::empty(spacing)
-    };
 
-    let mut row_storage = vec![f64::INFINITY; 5 * width];
-    let (xs, row_storage) = row_storage.split_at_mut(width);
+    let height = config.height;
+    let mut ridges = vec![0.0f32; width];
+    let ridges = ridges.as_mut_slice();
+    let mut coordinates = vec![0.0f64; width + height];
+    let (xs, ys) = coordinates.split_at_mut(width);
     for (column, x) in xs.iter_mut().enumerate() {
         *x = (column as f64 + 0.5) / width as f64;
     }
-    let (current_squares, row_storage) = row_storage.split_at_mut(width);
-    let (opponent_squares, row_storage) = row_storage.split_at_mut(width);
-    let (nearest_squares, second_squares) = row_storage.split_at_mut(width);
+    for (row, y) in ys.iter_mut().enumerate() {
+        *y = (row as f64 + 0.5) / height as f64;
+    }
+    let (xs, ys) = (&*xs, &*ys);
 
-    for row in 0..config.height {
-        let y = (row as f64 + 0.5) / config.height as f64;
-        current_squares.fill(f64::INFINITY);
-        opponent_squares.fill(f64::INFINITY);
-        nearest_squares.fill(f64::INFINITY);
-        second_squares.fill(f64::INFINITY);
-
-        if searching {
-            sweep_row_chunked(
-                &grid,
-                &stone_xs,
-                &stone_ys,
-                &stone_is_current,
-                y,
-                xs,
-                radius_square,
-                current_squares,
-                opponent_squares,
-                nearest_squares,
-                second_squares,
-            );
+    for stone in stones {
+        let plane = if stone.color == to_move {
+            &mut *current_plane
         } else {
-            sweep_row_flat(
-                &stone_xs,
-                &stone_ys,
-                &stone_is_current,
-                y,
-                xs,
-                current_squares,
-                opponent_squares,
-                nearest_squares,
-                second_squares,
-            );
-        }
+            &mut *opponent_plane
+        };
+        stamp_disc(plane, (stone.x, stone.y), radius, xs, ys);
+    }
+
+    nearest_squares.clear();
+    nearest_squares.resize(pixels, f64::INFINITY);
+    second_squares.clear();
+    second_squares.resize(pixels, f64::INFINITY);
+    candidates.clear();
+    candidates.extend(0..stones.len() as u32);
+    sweep_tile(
+        &SweepInput { stone_xs, stone_ys, xs, ys },
+        0..width,
+        0..height,
+        0,
+        candidates,
+        nearest_squares,
+        second_squares,
+    );
+
+    for row in 0..height {
+        let y = ys[row];
+        let base = row * width;
+        let nearest_row = &nearest_squares[base..base + width];
+        let second_row = &second_squares[base..base + width];
 
         if let Some(rows) = settled_rows.as_mut() {
-            let base = row * width;
             rows.classify_row(
                 position,
                 row,
                 width,
                 y,
                 xs,
-                nearest_squares,
+                nearest_row,
                 edt.field(),
                 &mut settled[base..base + width],
             );
         }
 
-        // Build each output byte in a register and store it once. Setting bits
-        // in place instead costs a read-modify-write on the same byte for eight
-        // consecutive pixels, and that dependency chain stops the loop
-        // vectorizing -- measured 2.9x the dense writer's time, against 1.2x
-        // this way.
-        //
+        // On its own, not inside the bit packing below: there the loop's carried
+        // byte stops it vectorizing, and this is two square roots per pixel.
+        ridge_row(nearest_row, second_row, radius, ridges);
+        dense_plane[base..base + width].convert_from_f32_slice(ridges);
+
         // Groups of eight align with byte boundaries only because `width` is a
         // multiple of eight, which makes `row * width` one too. The general
-        // path below carries a running bit position across rows instead.
+        // path below sets each bit on its own.
         if width % 8 == 0 {
-            for group in 0..width / 8 {
-                let base = row * width + group * 8;
-                let (mut current, mut opponent, mut settled_bits) = (0u8, 0u8, 0u8);
-                for bit in 0..8 {
-                    let column = group * 8 + bit;
-                    let pixel = base + bit;
-                    current |= u8::from(current_squares[column] <= radius_square) << bit;
-                    opponent |= u8::from(opponent_squares[column] <= radius_square) << bit;
-                    settled_bits |= u8::from(settled[pixel]) << bit;
-                    dense_plane[pixel] = f16::from_f32(ridge_at(
-                        nearest_squares[column],
-                        second_squares[column],
-                        radius,
-                    ));
+            for (bytes, flags) in settled_plane[base / 8..(base + width) / 8]
+                .iter_mut()
+                .zip(settled[base..base + width].chunks_exact(8))
+            {
+                let mut byte = 0u8;
+                for (bit, &flag) in flags.iter().enumerate() {
+                    byte |= u8::from(flag) << bit;
                 }
-                let byte = base / 8;
-                current_plane[byte] = current;
-                opponent_plane[byte] = opponent;
-                settled_plane[byte] = settled_bits;
+                *bytes = byte;
             }
         } else {
             for column in 0..width {
-                let pixel = row * width + column;
-                set_bit(
-                    current_plane,
-                    pixel,
-                    current_squares[column] <= radius_square,
-                );
-                set_bit(
-                    opponent_plane,
-                    pixel,
-                    opponent_squares[column] <= radius_square,
-                );
+                let pixel = base + column;
                 set_bit(settled_plane, pixel, settled[pixel]);
-                dense_plane[pixel] = f16::from_f32(ridge_at(
-                    nearest_squares[column],
-                    second_squares[column],
-                    radius,
-                ));
             }
         }
     }
@@ -765,11 +583,8 @@ mod tests {
     /// even if the bound were wrong. This is the case that can fail.
     #[test]
     fn the_chunked_sweep_matches_at_real_stone_counts() {
-        // Both sides of `CHUNKED_SWEEP_MINIMUM_STONES`, and a radius small
-        // enough to fit counts above it: at 1/18 the board holds ~128 stones,
-        // so a threshold of 100 would barely be crossed. Without the high
-        // counts the chunked path is not exercised at all and the dispatch
-        // hides it.
+        // A radius small enough to reach high stone counts, where the tile
+        // search discards the most stones.
         let radius = 1.0 / 38.0;
         let step = 2.2 * radius;
         for count in [0usize, 1, 2, 9, 28, 60, 99, 100, 140, 240] {
@@ -910,8 +725,7 @@ mod tests {
     /// sides compute squared distances by `mul_add`.
     ///
     /// Stone counts straddle `DISTANCE_SETTLED_MINIMUM_STONES`, so this covers
-    /// the dispatch in both directions, and the sweep's own flat/chunked
-    /// dispatch at `SEARCH_MINIMUM_STONES` as well.
+    /// the dispatch in both directions.
     #[test]
     fn fused_settled_matches_the_reference_builder() {
         // Both sizes sample the legal set at the output resolution.

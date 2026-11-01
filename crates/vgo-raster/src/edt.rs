@@ -14,9 +14,8 @@
 //! rather than `O(pixels · n²)`, which means it stays flat as stones accumulate
 //! instead of tripling between 28 and 52.
 //!
-//! `D_L` uses the exact separable Euclidean transform (Felzenszwalb and
-//! Huttenlocher, *Distance Transforms of Sampled Functions*): a 1-D lower
-//! envelope of parabolas per column, then per row, each linear in the row
+//! `D_L` uses an exact separable Euclidean transform: a vertical distance per
+//! column, then a lower envelope of parabolas per row, each linear in the row
 //! length. `D_S` is taken from the continuous stone coordinates rather than the
 //! grid, because it is cheap and exact there.
 //!
@@ -32,79 +31,13 @@ use vgo_core::{
     no_legal_point_closer_than_indexed,
 };
 
+use std::sync::Arc;
+
 use crate::RasterConfig;
 
-/// Stands in for "no source here".
-///
-/// A literal infinity breaks the parabola intersection below: two infinite
-/// parabolas give inf - inf, and the resulting NaN or -inf walks `k` off the
-/// bottom of the hull. A finite sentinel keeps every intersection finite and
-/// well-ordered, and is far beyond any real squared distance on a unit board
-/// (the largest is 2, in pixel units at most `2 * size²`).
+/// The whole field when the mask has no `true` cell, far beyond any real squared
+/// distance on a unit board, so every pixel reads as settled by a wide margin.
 const ABSENT: f64 = 1.0e20;
-
-/// Squared exact Euclidean distance transform of `f`, in place into `d`.
-///
-/// `f` holds 0 where the set is present and [`ABSENT`] elsewhere. Scratch
-/// buffers are passed in so the 2-D driver can reuse them across every row and
-/// column.
-fn transform_1d(f: &[f64], d: &mut [f64], v: &mut [usize], z: &mut [f64]) {
-    let n = f.len();
-    if n == 0 {
-        return;
-    }
-    let mut k = 0usize;
-    v[0] = 0;
-    z[0] = f64::NEG_INFINITY;
-    z[1] = f64::INFINITY;
-    for q in 1..n {
-        let mut s = intersection(f, q, v[k]);
-        // `k > 0` is a guard, not an optimisation: z[0] is -inf and a finite
-        // sentinel keeps s finite, so s <= z[0] is false in the well-behaved
-        // case -- but a degenerate row should not be able to underflow.
-        while k > 0 && s <= z[k] {
-            k -= 1;
-            s = intersection(f, q, v[k]);
-        }
-        if k == 0 && s <= z[0] {
-            v[0] = q;
-            z[1] = f64::INFINITY;
-            continue;
-        }
-        k += 1;
-        v[k] = q;
-        z[k] = s;
-        z[k + 1] = f64::INFINITY;
-    }
-    let mut k = 0usize;
-    for q in 0..n {
-        while z[k + 1] < q as f64 {
-            k += 1;
-        }
-        let offset = q as f64 - v[k] as f64;
-        d[q] = offset * offset + f[v[k]];
-    }
-}
-
-fn intersection(f: &[f64], q: usize, vk: usize) -> f64 {
-    let (fq, fv) = (f[q], f[vk]);
-    let (qf, vf) = (q as f64, vk as f64);
-    ((fq + qf * qf) - (fv + vf * vf)) / (2.0 * qf - 2.0 * vf)
-}
-
-/// Squared distance, in pixel units, from each cell to the nearest `true` cell.
-/// Columns processed this many at a time.
-///
-/// A column gather strides by `width`, so it touches one cache line per row and
-/// uses eight of its sixty-four bytes. Doing eight columns together uses the
-/// whole line, which cuts the pass's memory traffic eightfold -- and that
-/// traffic, not the transform, is where the time went: a profile put the
-/// gather/scatter wrapper at 18.6% of all samples against `transform_1d`'s
-/// 9.8%, so the bookkeeping cost twice the algorithm it wraps.
-///
-/// Eight because a cache line holds eight `f64`. Sixteen would halve the passes
-/// again but doubles the scratch and starts missing L1 on the transposed side.
-const COLUMN_BLOCK: usize = 8;
 
 /// Pixel columns processed together by the nearest-stone search. The same
 /// chunking shape is used by the packed writer: it amortizes the grid-ring
@@ -121,10 +54,9 @@ const NEAREST_SEARCH_MINIMUM_STONES: usize = 96;
 pub(crate) struct EdtScratch {
     legal: Vec<bool>,
     field: Vec<f64>,
-    sources: Vec<f64>,
-    results: Vec<f64>,
-    vertices: Vec<usize>,
-    boundaries: Vec<f64>,
+    gaps: Vec<u32>,
+    parabolas: Vec<u32>,
+    starts: Vec<u32>,
     fine_column_xs: Vec<f64>,
     fine_row_ys: Vec<f64>,
     column_xs: Vec<f64>,
@@ -148,6 +80,21 @@ pub(crate) fn squared_distance_transform(mask: &[bool], width: usize, height: us
     scratch.field
 }
 
+/// Squared Euclidean distance, in pixels, from each cell to the nearest `true`
+/// cell, or [`ABSENT`] everywhere if no cell is `true`.
+///
+/// Each result is an exact integer, so any correct method gives identical bits.
+/// This one suits a binary mask (Meijster, Roerdink and Hesselink's transform):
+///
+///   1. Each cell's vertical distance to a `true` cell comes from one forward
+///      and one backward sweep. Both run across whole rows, so they vectorize
+///      and never stride through memory a column at a time.
+///   2. Each row then takes a lower envelope of parabolas in integers. The
+///      overlap test evaluates two parabolas instead of dividing.
+///
+/// `none` exceeds every real vertical distance by enough that a column with no
+/// `true` cell can never win: its parabola is above `width^2 + height^2`
+/// everywhere, and the mask is known to hold a `true` cell.
 fn squared_distance_transform_into(
     mask: &[bool],
     width: usize,
@@ -155,55 +102,82 @@ fn squared_distance_transform_into(
     scratch: &mut EdtScratch,
 ) {
     scratch.field.resize(mask.len(), 0.0);
-    for (value, inside) in scratch.field.iter_mut().zip(mask) {
-        *value = if *inside { 0.0 } else { ABSENT };
+    if !mask.iter().any(|inside| *inside) {
+        scratch.field.fill(ABSENT);
+        return;
     }
-
-    let longest = width.max(height);
-    scratch.sources.resize(COLUMN_BLOCK * longest, 0.0);
-    scratch.results.resize(COLUMN_BLOCK * longest, 0.0);
-    scratch.vertices.resize(longest, 0);
-    scratch.boundaries.resize(longest + 1, 0.0);
-
-    // Columns, a cache line's worth at a time. `transform_1d` still sees one
-    // contiguous line and is untouched; only the order of the gather changes,
-    // and a minimum does not care in which order it is fed.
-    for block in (0..width).step_by(COLUMN_BLOCK) {
-        let columns = COLUMN_BLOCK.min(width - block);
-        for row in 0..height {
-            let base = row * width + block;
-            for column in 0..columns {
-                scratch.sources[column * longest + row] = scratch.field[base + column];
-            }
+    let none = (width + height + 1) as u32;
+    scratch.gaps.resize(mask.len(), 0);
+    let gaps = scratch.gaps.as_mut_slice();
+    let mut above = vec![none; width];
+    for (cells, inside) in gaps.chunks_exact_mut(width).zip(mask.chunks_exact(width)) {
+        for ((cell, previous), &inside) in cells.iter_mut().zip(above.iter_mut()).zip(inside) {
+            let next = (*previous + 1).min(none);
+            *previous = if inside { 0 } else { next };
+            *cell = *previous;
         }
-        for column in 0..columns {
-            let from = column * longest;
-            transform_1d(
-                &scratch.sources[from..from + height],
-                &mut scratch.results[from..from + height],
-                &mut scratch.vertices,
-                &mut scratch.boundaries,
-            );
-        }
-        for row in 0..height {
-            let base = row * width + block;
-            for column in 0..columns {
-                scratch.field[base + column] = scratch.results[column * longest + row];
-            }
+    }
+    above.fill(none);
+    for cells in gaps.chunks_exact_mut(width).rev() {
+        for (cell, previous) in cells.iter_mut().zip(above.iter_mut()) {
+            let next = (*previous + 1).min(none);
+            *previous = next.min(*cell);
+            *cell = (*previous) * (*previous);
         }
     }
 
-    // Rows are already contiguous, so they need none of that.
-    for row in 0..height {
-        let base = row * width;
-        scratch.sources[..width].copy_from_slice(&scratch.field[base..base + width]);
-        transform_1d(
-            &scratch.sources[..width],
-            &mut scratch.results[..width],
-            &mut scratch.vertices,
-            &mut scratch.boundaries,
-        );
-        scratch.field[base..base + width].copy_from_slice(&scratch.results[..width]);
+    scratch.parabolas.resize(width, 0);
+    scratch.starts.resize(width, 0);
+    for (row, out) in gaps
+        .chunks_exact(width)
+        .zip(scratch.field.chunks_exact_mut(width))
+    {
+        envelope_row(row, &mut scratch.parabolas, &mut scratch.starts, out);
+    }
+}
+
+/// `min over c of (x - c)^2 + row[c]` at every `x`.
+fn envelope_row(row: &[u32], parabolas: &mut [u32], starts: &mut [u32], out: &mut [f64]) {
+    let height_at = |at: i64, of: u32| {
+        let offset = at - i64::from(of);
+        offset * offset + i64::from(row[of as usize])
+    };
+    let width = row.len() as i64;
+    let mut top = 0usize;
+    parabolas[0] = 0;
+    starts[0] = 0;
+    for column in 1..row.len() as u32 {
+        let beaten = loop {
+            let start = i64::from(starts[top]);
+            if height_at(start, parabolas[top]) <= height_at(start, column) {
+                break false;
+            }
+            if top == 0 {
+                break true;
+            }
+            top -= 1;
+        };
+        if beaten {
+            parabolas[0] = column;
+            continue;
+        }
+        // First pixel where `column` is strictly below the parabola on top.
+        let left = i64::from(parabolas[top]);
+        let right = i64::from(column);
+        let numerator =
+            right * right - left * left + i64::from(row[right as usize]) - i64::from(row[left as usize]);
+        let crossing = numerator.div_euclid(2 * (right - left)) + 1;
+        if crossing < width {
+            top += 1;
+            parabolas[top] = column;
+            starts[top] = crossing as u32;
+        }
+    }
+    for at in (0..row.len()).rev() {
+        out[at] = height_at(at as i64, parabolas[top]) as f64;
+        if at as u32 == starts[top] && top > 0 {
+            top -= 1;
+        }
     }
 }
 
@@ -638,7 +612,7 @@ pub(crate) struct SettledRows {
     half_diagonal: f64,
     spacing_squared: f64,
     slack: f64,
-    index: Option<LegalSetIndex>,
+    index: Option<Arc<LegalSetIndex>>,
     vertices: VertexGrid,
     pub(crate) exact_tests: usize,
 }
@@ -651,7 +625,7 @@ pub(crate) fn prepare_settled_rows(
 ) -> SettledRows {
     let scale = oversample.max(1) | 1;
     let (fine_width, fine_height) = (config.width * scale, config.height * scale);
-    let index = LegalSetIndex::build(position);
+    let index = Arc::clone(position.legal_index());
     sampled_legal_set_into(position, fine_width, fine_height, index.vertices(), scratch);
     let legal = std::mem::take(&mut scratch.legal);
     squared_distance_transform_into(&legal, fine_width, fine_height, scratch);
@@ -715,7 +689,7 @@ impl SettledRows {
                 self.exact_tests += 1;
                 let known = self
                     .index
-                    .get_or_insert_with(|| LegalSetIndex::build(position));
+                    .get_or_insert_with(|| Arc::clone(position.legal_index()));
                 let nearest = nearest_squares[column].sqrt();
                 no_legal_point_closer_than_indexed(
                     position,
@@ -1098,6 +1072,41 @@ mod tests {
                     }
                 }
                 assert_eq!(chunked[column], expected, "row {row}, column {column}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_transform_matches_brute_force() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (width, height, per_thousand) in [
+            (1, 1, 500), (1, 9, 300), (9, 1, 300), (17, 5, 2), (5, 17, 2),
+            (32, 32, 1), (32, 32, 20), (32, 32, 300), (31, 47, 950), (64, 64, 3),
+        ] {
+            for _ in 0..40 {
+                let mask: Vec<bool> = (0..width * height)
+                    .map(|_| next() % 1000 < per_thousand)
+                    .collect();
+                let got = squared_distance_transform(&mask, width, height);
+                let sources: Vec<(i64, i64)> = (0..width * height)
+                    .filter(|&cell| mask[cell])
+                    .map(|cell| ((cell % width) as i64, (cell / width) as i64))
+                    .collect();
+                for (cell, value) in got.iter().enumerate() {
+                    let (x, y) = ((cell % width) as i64, (cell / width) as i64);
+                    let expected = sources
+                        .iter()
+                        .map(|(a, b)| (a - x).pow(2) + (b - y).pow(2))
+                        .min()
+                        .map_or(ABSENT, |square| square as f64);
+                    assert_eq!(*value, expected, "{width}x{height}, cell {cell}");
+                }
             }
         }
     }
