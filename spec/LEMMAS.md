@@ -542,9 +542,11 @@ every stone, so the next pass moves at most `m + e + M`. From `M = 0` that gives
 a stone in `C` is within `sqrt(2)(m + e)` of the box. A stone's candidate is
 `Pi(stone + w * v)` for a unit vector `v`, so it is within `w + sqrt(2)(m + e) < w + 2m` of
 the stone. If that candidate is within `rho + M*` of `q`, the stone is
-within `rho + M* + w + 2m < rho + 64m + w` of `q`, and `for_each_near` reports it. The
-other candidates (the clamped query, the four sides and the vertices) are all considered
-directly. So every candidate within `rho + M*` is in the bounded list.
+within `rho + M* + w + 2m < rho + 64m + w` of `q`, and `for_each_near` reports it, as does
+the scan of squared distances used below the bucket threshold. The vertex grid reports
+every vertex within `rho + 64m`, and the other candidates (the clamped query and the four
+sides) are considered directly. So every candidate within `rho + M*` is in the bounded
+list.
 
 *Selection.* The unbounded search returns the legal candidate of least key, moved by
 `clear_by_margin`. The bounded search rejects any exact tie in its list by falling back

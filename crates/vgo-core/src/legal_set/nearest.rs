@@ -1,6 +1,7 @@
 use crate::{Point, Position, Stone, numeric};
 
 use super::buckets::StoneBuckets;
+use super::vertices::VertexBuckets;
 use super::{LegalSetIndex, contains_with, vertices};
 
 /// Where a placement lands after projecting it onto the legal set.
@@ -56,7 +57,7 @@ pub fn nearest_with(
     point: Point,
     known_vertices: Option<&[Point]>,
 ) -> Nearest {
-    nearest_from(position, point, known_vertices, None, None)
+    nearest_from(position, point, known_vertices, None, None, None)
 }
 
 /// [`nearest_with`], against a prebuilt index.
@@ -67,6 +68,7 @@ pub fn nearest_indexed(position: &Position, point: Point, index: &LegalSetIndex)
         point,
         Some(&index.vertices),
         index.buckets.as_ref(),
+        None,
         None,
     )
 }
@@ -89,6 +91,7 @@ pub fn nearest_indexed_within(
         point,
         Some(&index.vertices),
         index.buckets.as_ref(),
+        Some(&index.vertex_buckets),
         Some(reach),
     )
 }
@@ -188,8 +191,8 @@ fn nearest_bounded(
     position: &Position,
     point: Point,
     reach: f64,
-    buckets: &StoneBuckets,
-    known_vertices: Option<&[Point]>,
+    buckets: Option<&StoneBuckets>,
+    vertex_buckets: &VertexBuckets,
     snap: &Snap,
 ) -> Option<Nearest> {
     let padded = reach + 64.0 * numeric::SNAP_MARGIN;
@@ -203,11 +206,27 @@ fn nearest_bounded(
         }
     };
     consider(snap.clamped_query(point));
-    buckets.for_each_near(point, padded + snap.diameter, &mut |index| {
-        snap.off_stone(point, position.stones()[index], &mut consider);
-    });
+    let stone_reach = padded + snap.diameter;
+    match buckets {
+        Some(buckets) => buckets.for_each_near(point, stone_reach, &mut |index| {
+            snap.off_stone(point, position.stones()[index], &mut consider);
+        }),
+        None => {
+            // Loosened so rounding cannot drop a stone the reach covers.
+            let stone_limit = stone_reach * stone_reach * (1.0 + 1.0e-9);
+            for &stone in position.stones() {
+                let (dx, dy) = (stone.x - point.x, stone.y - point.y);
+                if dx * dx + dy * dy <= stone_limit {
+                    snap.off_stone(point, stone, &mut consider);
+                }
+            }
+        }
+    }
     snap.on_sides(point).into_iter().for_each(&mut consider);
-    known_vertices?.iter().copied().for_each(&mut consider);
+    vertex_buckets.any_near(point, padded, &mut |vertex| {
+        consider(vertex);
+        false
+    });
 
     near.sort_unstable_by_key(|&(key, _)| key);
     if near.windows(2).any(|pair| pair[0].0 == pair[1].0) {
@@ -216,8 +235,8 @@ fn nearest_bounded(
     let found = near
         .iter()
         .map(|&(_, candidate)| candidate)
-        .find(|candidate| contains_with(position, Some(buckets), candidate.x, candidate.y));
-    Some(snapped(position, point, found, Some(buckets)))
+        .find(|candidate| contains_with(position, buckets, candidate.x, candidate.y));
+    Some(snapped(position, point, found, buckets))
 }
 
 fn nearest_from(
@@ -225,6 +244,7 @@ fn nearest_from(
     point: Point,
     known_vertices: Option<&[Point]>,
     buckets: Option<&StoneBuckets>,
+    vertex_buckets: Option<&VertexBuckets>,
     within: Option<f64>,
 ) -> Nearest {
     if contains_with(position, buckets, point.x, point.y) {
@@ -235,9 +255,9 @@ fn nearest_from(
         };
     }
     let snap = Snap::new(position.radius());
-    if let (Some(reach), Some(buckets)) = (within, buckets)
+    if let (Some(reach), Some(vertex_buckets)) = (within, vertex_buckets)
         && let Some(answer) =
-            nearest_bounded(position, point, reach, buckets, known_vertices, &snap)
+            nearest_bounded(position, point, reach, buckets, vertex_buckets, &snap)
     {
         return answer;
     }

@@ -13,11 +13,9 @@
 //! The exact sampling probability is `beta = P_coarse(C) * P_fine(a | C)`, which
 //! we return so the training side can importance-correct the target.
 
-use std::sync::Arc;
-use vgo_core::{
-    COORDINATE_EPSILON, Point, Position, is_inside_legal_inset,
-    nearest_legal_placement_indexed_within,
-};
+use std::cell::RefCell;
+use std::sync::{Arc, OnceLock};
+use vgo_core::{COORDINATE_EPSILON, Point, Position, nearest_legal_placement_indexed_within};
 
 /// A sampled placement candidate and the probability it was drawn with.
 #[derive(Clone, Copy, Debug)]
@@ -27,6 +25,11 @@ pub struct CandidateSample {
     /// with-replacement sampler. Used for the Sampled-AlphaZero importance
     /// correction on the training target.
     pub beta: f64,
+}
+
+thread_local! {
+    /// One grid per tree node, each needing this only while it is built.
+    static NEAREST_SQUARES: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A fine placement grid of logits over `[0,1]^2`, plus the legal mask, ready for
@@ -42,9 +45,37 @@ pub struct FineGrid {
     /// cell, keyed by row-major cell index. Ordinary legal cells place at their
     /// centre and need no stored point. Build order keeps this sorted for lookup.
     placement_overrides: Vec<(usize, Point)>,
+    /// The coarse distribution, kept because every widening of a node reads the
+    /// same immutable logits and would otherwise rescan the whole grid.
+    coarse_distribution: OnceLock<CoarseDistribution>,
+}
+
+/// Legal coarse cells with their max logit, and the softmax over them.
+struct CoarseDistribution {
+    cells: Vec<(usize, usize, f32)>,
+    probabilities: Vec<f64>,
 }
 
 impl FineGrid {
+    fn coarse_distribution(&self) -> &CoarseDistribution {
+        self.coarse_distribution.get_or_init(|| {
+            let (width, height) = self.coarse_dims();
+            let mut cells = Vec::new();
+            for crow in 0..height {
+                for ccol in 0..width {
+                    if let Some(maximum) = self.coarse_max(crow, ccol) {
+                        cells.push((crow, ccol, maximum));
+                    }
+                }
+            }
+            let probabilities = softmax(cells.iter().map(|&(_, _, maximum)| maximum));
+            CoarseDistribution {
+                cells,
+                probabilities,
+            }
+        })
+    }
+
     fn legal_at(&self, index: usize) -> bool {
         self.legal[index / 64] & (1u64 << (index % 64)) != 0
     }
@@ -62,6 +93,13 @@ impl FineGrid {
             crate::HeapAllocation::vector(&self.placement_overrides),
         ] {
             counter.allocation(allocation, false);
+        }
+        if let Some(distribution) = self.coarse_distribution.get() {
+            counter.allocation(crate::HeapAllocation::vector(&distribution.cells), false);
+            counter.allocation(
+                crate::HeapAllocation::vector(&distribution.probabilities),
+                false,
+            );
         }
     }
     // The production-like 128x128/35-stone fixture has 219 snapped cells. A
@@ -164,45 +202,66 @@ impl FineGrid {
         // product is constant: O(cells), whatever the board size. Cells no
         // stone reaches keep infinity, which satisfies both thresholds exactly
         // as an untouched cell should.
-        let nearest_squared = nearest_stone_squares(position, width, height, exclusion);
-        for row in 0..height {
-            for col in 0..width {
-                let point = cell_center(row, col, width, height);
-                let idx = row * width + col;
-                let nearest = nearest_squared[idx];
-                let placement_override = if is_inside_legal_inset(position, point.x, point.y)
-                    && nearest >= minimum_squared
+        NEAREST_SQUARES.with_borrow_mut(|nearest_squared| {
+            // Per axis, not per cell: the board's edges and each cell's centre are
+            // products of one row and one column, so a grid per node need not
+            // divide or compare them 16,384 times.
+            let radius = position.radius();
+            let xs: Vec<f64> = (0..width)
+                .map(|col| (col as f64 + 0.5) / width as f64)
+                .collect();
+            nearest_stone_squares(position, &xs, height, exclusion, nearest_squared);
+            let inset = |value: f64| {
+                value >= radius - COORDINATE_EPSILON && value <= 1.0 - radius + COORDINATE_EPSILON
+            };
+            let side_slack = |value: f64| (value - radius).min(1.0 - radius - value);
+            let columns: Vec<(bool, f64)> = xs.iter().map(|&x| (inset(x), side_slack(x))).collect();
+            let threshold = exclusion - half_diagonal;
+            let threshold_squared = threshold * threshold;
+            for row in 0..height {
+                let y = (row as f64 + 0.5) / height as f64;
+                let (row_inset, row_slack) = (inset(y), side_slack(y));
+                let base = row * width;
+                let cells = &nearest_squared[base..base + width];
+                for (col, (&nearest, &(column_inset, column_slack))) in
+                    cells.iter().zip(&columns).enumerate()
                 {
-                    None
-                } else if straddles_boundary_at(position, point, nearest, exclusion, half_diagonal)
-                {
-                    // Only a point inside this cell is kept, and such a point
-                    // is within half a diagonal of its centre.
-                    let snapped = nearest_legal_placement_indexed_within(
-                        position,
-                        point,
-                        index,
-                        half_diagonal,
-                    );
-                    let inside = snapped.legal
-                        && (snapped.point.x - point.x).abs() <= half_x
-                        && (snapped.point.y - point.y).abs() <= half_y;
-                    if !inside {
-                        continue;
+                    let idx = base + col;
+                    let placement_override =
+                        if row_inset && column_inset && nearest >= minimum_squared {
+                            None
+                        } else if column_slack.min(row_slack) >= -half_diagonal
+                            && (threshold <= 0.0 || nearest >= threshold_squared)
+                        {
+                            // Only a point inside this cell is kept, and such a point
+                            // is within half a diagonal of its centre.
+                            let point = Point::new(xs[col], y);
+                            let snapped = nearest_legal_placement_indexed_within(
+                                position,
+                                point,
+                                index,
+                                half_diagonal,
+                            );
+                            let inside = snapped.legal
+                                && (snapped.point.x - point.x).abs() <= half_x
+                                && (snapped.point.y - point.y).abs() <= half_y;
+                            if !inside {
+                                continue;
+                            }
+                            Some(snapped.point)
+                        } else {
+                            continue;
+                        };
+                    legal[idx / 64] |= 1u64 << (idx % 64);
+                    if shared.is_none() {
+                        logits[idx] = logit_at(row, col);
                     }
-                    Some(snapped.point)
-                } else {
-                    continue;
-                };
-                legal[idx / 64] |= 1u64 << (idx % 64);
-                if shared.is_none() {
-                    logits[idx] = logit_at(row, col);
-                }
-                if let Some(point) = placement_override {
-                    placement_overrides.push((idx, point));
+                    if let Some(point) = placement_override {
+                        placement_overrides.push((idx, point));
+                    }
                 }
             }
-        }
+        });
         // Scratch headroom is useful while snapping; it need not live in every
         // retained tree node. Empty grids also release the initial 6 KiB slab.
         placement_overrides.shrink_to_fit();
@@ -213,6 +272,7 @@ impl FineGrid {
             logits: shared.unwrap_or_else(|| Arc::new(logits)),
             legal,
             placement_overrides,
+            coarse_distribution: OnceLock::new(),
         }
     }
 
@@ -370,27 +430,26 @@ fn sample_candidates_with(
     mut rng: impl FnMut() -> f64,
     mut placement_at: impl FnMut(usize, usize) -> Point,
 ) -> Vec<CandidateSample> {
-    let (cwidth, cheight) = grid.coarse_dims();
-
     // Coarse distribution: softmax over per-coarse-cell max logits (legal only).
-    let mut coarse_cells: Vec<(usize, usize, f32)> = Vec::new();
-    for crow in 0..cheight {
-        for ccol in 0..cwidth {
-            if let Some(m) = grid.coarse_max(crow, ccol) {
-                coarse_cells.push((crow, ccol, m));
-            }
-        }
-    }
+    let distribution = grid.coarse_distribution();
+    let coarse_cells = &distribution.cells;
     if coarse_cells.is_empty() {
         return Vec::new();
     }
-    let mut coarse_probs = softmax(coarse_cells.iter().map(|&(_, _, m)| m));
-    mix_uniform(&mut coarse_probs, noise);
+    let mixed;
+    let coarse_probs = if noise > 0.0 {
+        let mut probabilities = distribution.probabilities.clone();
+        mix_uniform(&mut probabilities, noise);
+        mixed = probabilities;
+        &mixed
+    } else {
+        &distribution.probabilities
+    };
 
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         // Stage 1: sample a coarse cell.
-        let ci = sample_index(&coarse_probs, rng());
+        let ci = sample_index(coarse_probs, rng());
         let (crow, ccol, _) = coarse_cells[ci];
         let p_coarse = coarse_probs[ci];
 
@@ -433,10 +492,18 @@ fn sample_candidates_with(
 /// which is what makes the bounded scatter sound: a cell no stone comes within
 /// `reach` of keeps infinity, and infinity satisfies any such threshold just as
 /// its true distance would.
-fn nearest_stone_squares(position: &Position, width: usize, height: usize, reach: f64) -> Vec<f64> {
-    let mut nearest = vec![f64::INFINITY; width * height];
+fn nearest_stone_squares(
+    position: &Position,
+    xs: &[f64],
+    height: usize,
+    reach: f64,
+    nearest: &mut Vec<f64>,
+) {
+    let width = xs.len();
+    nearest.clear();
+    nearest.resize(width * height, f64::INFINITY);
     if reach <= 0.0 {
-        return nearest;
+        return;
     }
     for stone in position.stones() {
         // Cells whose centre can lie within `reach` of this stone.
@@ -450,8 +517,7 @@ fn nearest_stone_squares(position: &Position, width: usize, height: usize, reach
             let dy_squared = dy * dy;
             let base = row * width;
             for col in low_col..=high_col.min(width - 1) {
-                let x = (col as f64 + 0.5) / width as f64;
-                let dx = x - stone.x;
+                let dx = xs[col] - stone.x;
                 let squared = dx.mul_add(dx, dy_squared);
                 let slot = &mut nearest[base + col];
                 if squared < *slot {
@@ -460,35 +526,11 @@ fn nearest_stone_squares(position: &Position, width: usize, height: usize, reach
             }
         }
     }
-    nearest
-}
-
-/// [`straddles_boundary`] with the stone distance already in hand.
-fn straddles_boundary_at(
-    position: &Position,
-    point: Point,
-    nearest_squared: f64,
-    exclusion: f64,
-    half_diagonal: f64,
-) -> bool {
-    let radius = position.radius();
-    let edge_slack = (point.x - radius)
-        .min(1.0 - radius - point.x)
-        .min(point.y - radius)
-        .min(1.0 - radius - point.y);
-    if edge_slack < -half_diagonal {
-        return false;
-    }
-    let threshold = exclusion - half_diagonal;
-    if threshold <= 0.0 {
-        return true;
-    }
-    nearest_squared >= threshold * threshold
 }
 
 /// The original per-cell predicate, kept as the reference the scattered path is
-/// tested against. Production goes through `straddles_boundary_at`, which takes
-/// the stone distance already computed for the whole grid.
+/// tested against. Production applies it per axis to the stone distances already
+/// computed for the whole grid.
 #[cfg(test)]
 fn straddles_boundary(
     position: &Position,

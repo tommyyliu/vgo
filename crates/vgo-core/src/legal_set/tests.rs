@@ -653,3 +653,39 @@ fn nearest_reports_failure_when_nothing_is_legal() {
         assert_eq!(found.point, Point::new(0.1, 0.9));
     }
 }
+
+/// [E6] below the bucket threshold, where the bounded search scans stones itself:
+/// an answer within `reach` must be the unbounded answer, and an answer beyond it
+/// may only be reported as illegal or as something farther than `reach`.
+#[test]
+fn bounded_snapping_matches_the_full_search_without_buckets() {
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1_u64 << 53) as f64
+    };
+    let radius = 1.0 / 18.0;
+    let mut bounded_answers = 0;
+    for count in [1, 4, 12, 24, 31] {
+        let position = scattered(count, radius, 91);
+        let index = super::LegalSetIndex::build(&position);
+        assert!(index.buckets.is_none());
+        for _ in 0..4000 {
+            let point = Point::new(next(), next());
+            let full = nearest_with(&position, point, Some(&index.vertices));
+            for reach in [0.002, 0.0055, 0.02, 0.2] {
+                let bounded = super::nearest_indexed_within(&position, point, &index, reach);
+                let distance = |found: Point| (found.x - point.x).hypot(found.y - point.y);
+                if full.legal && distance(full.point) <= reach {
+                    assert_eq!(bounded, full, "{count} stones, {point:?}, reach {reach}");
+                    bounded_answers += 1;
+                } else {
+                    assert!(!bounded.legal || distance(bounded.point) > reach);
+                }
+            }
+        }
+    }
+    assert!(bounded_answers > 1000, "{bounded_answers} bounded answers");
+}
