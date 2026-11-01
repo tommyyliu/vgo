@@ -20,6 +20,7 @@
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,6 +51,11 @@ struct Arguments {
     /// Run only the paths whose name contains this.
     #[arg(long)]
     only: Option<String>,
+    /// Report whole-search throughput at each of these thread counts instead,
+    /// so the cost of sharing a machine shows up where single-thread timings
+    /// cannot see it.
+    #[arg(long, value_delimiter = ',')]
+    scaling: Vec<usize>,
     /// Run complete neural searches on the saved positions instead of CPU-only paths.
     #[arg(long)]
     model: Option<PathBuf>,
@@ -167,6 +173,10 @@ fn run_benchmarks(arguments: &Arguments) {
         neural_benchmark(arguments, positions);
         return;
     }
+    if !arguments.scaling.is_empty() {
+        scaling_benchmark(arguments, &positions);
+        return;
+    }
     let budget = Duration::from_secs_f64(arguments.seconds);
     let evaluator = FixedEvaluator::new();
     let policy_grid = RasterConfig::square(POLICY_RESOLUTION);
@@ -282,6 +292,59 @@ fn run_benchmarks(arguments: &Arguments) {
         }
     }
     println!("{{{}}}", results.join(","));
+}
+
+/// Raster-backed search throughput at each thread count, sharing one process.
+///
+/// Every thread walks the same positions from a different start, so all stages
+/// are always in flight. Perfect scaling keeps `per thread` at the one-thread
+/// figure; what it loses is memory bandwidth, SMT and allocator contention.
+fn scaling_benchmark(arguments: &Arguments, positions: &[Position]) {
+    let mut search = SearchConfig::canary(SEARCH_SIMULATIONS);
+    search.coarse_pool = COARSE_POOL;
+    search.widening_coefficient = 6.0;
+    search.maximum_candidates = 321;
+    search.leaf_batch = 4;
+    let evaluator = RasterizingEvaluator {
+        inner: FixedEvaluator::new(),
+        raster: RasterConfig::square_of(arguments.resolution, RasterKind::CompactRadius),
+    };
+    let budget = Duration::from_secs_f64(arguments.seconds);
+    let mut base = None;
+    for &threads in &arguments.scaling {
+        let stop = AtomicBool::new(false);
+        let done = AtomicU64::new(0);
+        let started = Instant::now();
+        thread::scope(|scope| {
+            for thread in 0..threads {
+                let (evaluator, stop, done) = (&evaluator, &stop, &done);
+                scope.spawn(move || {
+                    let offset = thread * positions.len() / threads;
+                    for index in (0..).map(|step| (step + offset) % positions.len()) {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let _ = black_box(search_with_evaluator(
+                            &positions[index],
+                            search,
+                            index as u64,
+                            evaluator,
+                        ));
+                        done.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            thread::sleep(budget);
+            stop.store(true, Ordering::Relaxed);
+        });
+        let rate = done.load(Ordering::Relaxed) as f64 / started.elapsed().as_secs_f64();
+        let per_thread = rate / threads as f64;
+        let first = *base.get_or_insert(per_thread);
+        println!(
+            "{threads:>3} threads {rate:>8.1} searches/s {per_thread:>7.2} per thread {:>5.0}%",
+            100.0 * per_thread / first
+        );
+    }
 }
 
 fn neural_benchmark(arguments: &Arguments, positions: Vec<Position>) {
