@@ -264,19 +264,18 @@ fn sampled_legal_set_into(
 
 /// The settled mask, using distance-transform bounds to skip most of the work.
 ///
-/// The sampled `D_L` is not merely approximate, it is approximate in a *known
-/// direction*: it measures the distance to the nearest legal pixel centre, and
-/// every such centre is a point of the legal set, so
+/// The sampled `D_L` is the distance to the nearest marked cell centre. A marked
+/// centre is a legal point or within half a cell diagonal `h` of one, and a legal
+/// point normally has a marked centre within a full diagonal `2h`, so
 ///
 /// ```text
-///     D_L_true  <=  D_L_grid  <=  D_L_true + e
+///     D_L_grid - 2h  <=  D_L_true  <=  D_L_grid + h
 /// ```
 ///
-/// where `e` is half a grid diagonal. That two-sided bound decides almost every
-/// pixel outright:
+/// That two-sided bound decides almost every pixel outright:
 ///
-///   * `D_S <= D_L_grid - e`  implies `D_S <= D_L_true`  — settled
-///   * `D_S >  D_L_grid`      implies `D_S >  D_L_true`  — not settled
+///   * `D_S <= D_L_grid - 2h`  implies `D_S <= D_L_true`  — settled
+///   * `D_S >  D_L_grid + h`   implies `D_S >  D_L_true`  — not settled
 ///
 /// Only the band between them is genuinely undecided, and those pixels get the
 /// exact continuous test, which is what made the direct formulation 42x too slow
@@ -284,12 +283,11 @@ fn sampled_legal_set_into(
 /// stone is its own disk, so it is not small: 1,600 of 16,384 pixels on a 1/38
 /// board, before [E9] answers the ones inside a disk and leaves 950.
 ///
-/// **The upper bound is not guaranteed.** It assumes every point of the legal
-/// set has a sampled cell centre within half a diagonal, which fails where the
-/// legal set is a sliver thinner than the grid — then `D_L_grid` overshoots by
-/// more than the slack and a pixel can be called settled when it is not. The
-/// lower direction (`D_S > D_L_grid` implies not settled) is always sound,
-/// since every legal cell centre really is a point of the set.
+/// **The settled direction is not guaranteed.** It assumes every legal point has
+/// a marked centre within a full diagonal, which can fail where the legal set is a
+/// sliver thinner than the grid: then `D_L_grid` overshoots by more than the slack
+/// and a pixel can be called settled when it is not. The other direction is always
+/// sound, since a marked centre is at most `h` from a real legal point.
 ///
 /// In practice that costs at most one pixel of 16384 at the densest fixture
 /// tested. Oversampling to 3 removed it entirely on every fixture.
