@@ -48,7 +48,22 @@ fn visit_candidates(
     known_vertices: Option<&[Point]>,
     mut visit: impl FnMut(Point) -> bool,
 ) -> bool {
-    visit_candidates_within(position, point, None, known_vertices, None, &mut visit)
+    visit_candidates_within::<false>(position, point, None, known_vertices, None, &mut visit)
+}
+
+/// Whether a candidate is legal and accepted, in the order the caller can afford.
+#[inline]
+fn admit<const VISIT_FIRST: bool>(
+    position: &Position,
+    buckets: Option<&StoneBuckets>,
+    candidate: Point,
+    visit: &mut impl FnMut(Point) -> bool,
+) -> bool {
+    if VISIT_FIRST {
+        visit(candidate) && contains_with(position, buckets, candidate.x, candidate.y)
+    } else {
+        contains_with(position, buckets, candidate.x, candidate.y) && visit(candidate)
+    }
 }
 
 /// [`visit_candidates`], skipping stones whose candidate cannot land within
@@ -63,7 +78,11 @@ fn visit_candidates(
 /// Only sound for a caller asking whether *anything* is within `threshold`.
 /// [`distance`] passes `None` because it needs the true minimum, which any
 /// skipped stone could hold.
-fn visit_candidates_within(
+///
+/// With `VISIT_FIRST`, `visit` runs before the legality test. Only for a `visit`
+/// that is a pure predicate: it then sees illegal candidates too, so one that
+/// records what it was shown would keep a candidate that goes on to fail.
+fn visit_candidates_within<const VISIT_FIRST: bool>(
     position: &Position,
     point: Point,
     threshold: Option<f64>,
@@ -71,7 +90,7 @@ fn visit_candidates_within(
     buckets: Option<&StoneBuckets>,
     visit: &mut impl FnMut(Point) -> bool,
 ) -> bool {
-    if contains_with(position, buckets, point.x, point.y) && visit(point) {
+    if admit::<VISIT_FIRST>(position, buckets, point, visit) {
         return true;
     }
     let radius = position.radius();
@@ -94,7 +113,7 @@ fn visit_candidates_within(
         };
         for &(ux, uy) in directions {
             let candidate = Point::new(stone.x + diameter * ux, stone.y + diameter * uy);
-            if contains_with(position, buckets, candidate.x, candidate.y) && visit(candidate) {
+            if admit::<VISIT_FIRST>(position, buckets, candidate, &mut *visit) {
                 return true;
             }
         }
@@ -122,7 +141,7 @@ fn visit_candidates_within(
         Point::new(point.x, radius),
         Point::new(point.x, 1.0 - radius),
     ] {
-        if contains_with(position, buckets, candidate.x, candidate.y) && visit(candidate) {
+        if admit::<VISIT_FIRST>(position, buckets, candidate, visit) {
             return true;
         }
     }
@@ -233,6 +252,20 @@ impl StoneBuckets {
             }
         }
         false
+    }
+
+    /// The index of every stone within `reach` of `point`, plus possibly others.
+    fn for_each_near(&self, point: Point, reach: f64, visit: &mut impl FnMut(usize)) {
+        let margin = reach + numeric::COORDINATE_EPSILON;
+        let (first_column, first_row) = self.cell_of(point.x - margin, point.y - margin);
+        let (last_column, last_row) = self.cell_of(point.x + margin, point.y + margin);
+        for row in first_row..=last_row {
+            for column in first_column..=last_column {
+                for &index in self.bucket(row, column) {
+                    visit(index as usize);
+                }
+            }
+        }
     }
 
     /// Every stone after `first` that could pair with the point, in index order.
@@ -449,8 +482,9 @@ pub fn none_closer_than_indexed(
     threshold: f64,
     index: &LegalSetIndex,
 ) -> bool {
-    let mut visit = |candidate: Point| point.distance(candidate) < threshold;
-    !visit_candidates_within(
+    let mut visit =
+        |candidate: Point| numeric::length_below(point.x - candidate.x, point.y - candidate.y, threshold);
+    !visit_candidates_within::<true>(
         position,
         point,
         Some(threshold),
@@ -466,8 +500,9 @@ pub fn none_closer_than(
     threshold: f64,
     known_vertices: Option<&[Point]>,
 ) -> bool {
-    let mut visit = |candidate: Point| point.distance(candidate) < threshold;
-    !visit_candidates_within(
+    let mut visit =
+        |candidate: Point| numeric::length_below(point.x - candidate.x, point.y - candidate.y, threshold);
+    !visit_candidates_within::<true>(
         position,
         point,
         Some(threshold),
@@ -515,6 +550,13 @@ pub struct Nearest {
 /// legal point is always one of these -- the legal set is an intersection of
 /// half-planes and disc complements, so its closest point to a query lies on a
 /// boundary feature, and those are exactly what this enumerates.
+/// `value` as an integer ordered exactly as `f64::total_cmp` orders floats.
+#[inline]
+fn total_order_key(value: f64) -> i64 {
+    let bits = value.to_bits() as i64;
+    bits ^ (((bits >> 63) as u64) >> 1) as i64
+}
+
 #[must_use]
 pub fn nearest(position: &Position, point: Point) -> Nearest {
     nearest_with(position, point, None)
@@ -532,7 +574,108 @@ pub fn nearest_with(
     point: Point,
     known_vertices: Option<&[Point]>,
 ) -> Nearest {
-    if contains(position, point.x, point.y) {
+    nearest_from(position, point, known_vertices, None, None)
+}
+
+/// [`nearest_with`], against a prebuilt index.
+#[must_use]
+pub fn nearest_indexed(position: &Position, point: Point, index: &LegalSetIndex) -> Nearest {
+    nearest_from(position, point, Some(&index.vertices), index.buckets.as_ref(), None)
+}
+
+/// [`nearest_indexed`] for a caller that only accepts answers within `reach` of
+/// `point`.
+///
+/// When the answer is within `reach`, this returns exactly what
+/// [`nearest_indexed`] returns. Otherwise it may return `legal: false` instead,
+/// so a result is only meaningful once checked against `reach`.
+#[must_use]
+pub fn nearest_indexed_within(
+    position: &Position,
+    point: Point,
+    index: &LegalSetIndex,
+    reach: f64,
+) -> Nearest {
+    nearest_from(position, point, Some(&index.vertices), index.buckets.as_ref(), Some(reach))
+}
+
+/// [`nearest_from`] over only the candidates that can land within `reach`, or
+/// `None` when an exact tie needs the full scan to decide it.
+///
+/// Stones lie inside the inset and clamping to that box never increases a
+/// distance, so a stone's clamped candidate stays within `diameter` of the stone.
+/// A stone further than `reach + diameter` from `point` therefore has no
+/// candidate within `reach`. Clearing the margin moves the winner by a few
+/// `SNAP_MARGIN`s at most, so a winner beyond the padded disc stays beyond `reach`.
+fn nearest_bounded(
+    position: &Position,
+    point: Point,
+    reach: f64,
+    buckets: &StoneBuckets,
+    known_vertices: Option<&[Point]>,
+    diameter: f64,
+    inset: f64,
+) -> Option<Nearest> {
+    let clamp = |value: f64| value.clamp(inset.min(1.0 - inset), inset.max(1.0 - inset));
+    let padded = reach + 16.0 * numeric::SNAP_MARGIN;
+    let limit = padded * padded;
+    let mut near: Vec<(i64, Point)> = Vec::with_capacity(16);
+    let mut consider = |candidate: Point| {
+        let (dx, dy) = (candidate.x - point.x, candidate.y - point.y);
+        let square = dx.mul_add(dx, dy * dy);
+        if square <= limit {
+            near.push((total_order_key(square), candidate));
+        }
+    };
+    consider(Point::new(clamp(point.x), clamp(point.y)));
+    buckets.for_each_near(point, padded + diameter, &mut |index| {
+        let stone = position.stones()[index];
+        let (dx, dy) = (point.x - stone.x, point.y - stone.y);
+        let radial = numeric::length(dx, dy);
+        if radial < numeric::EDGE_EPSILON {
+            for (ux, uy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                consider(Point::new(clamp(stone.x + diameter * ux), clamp(stone.y + diameter * uy)));
+            }
+        } else {
+            consider(Point::new(
+                clamp(stone.x + diameter * dx / radial),
+                clamp(stone.y + diameter * dy / radial),
+            ));
+        }
+    });
+    consider(Point::new(inset, clamp(point.y)));
+    consider(Point::new(1.0 - inset, clamp(point.y)));
+    consider(Point::new(clamp(point.x), inset));
+    consider(Point::new(clamp(point.x), 1.0 - inset));
+    for &vertex in known_vertices? {
+        consider(vertex);
+    }
+    near.sort_unstable_by_key(|&(key, _)| key);
+    if near.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return None;
+    }
+    let found = near
+        .iter()
+        .map(|&(_, candidate)| candidate)
+        .find(|candidate| contains_with(position, Some(buckets), candidate.x, candidate.y));
+    Some(found.map_or(
+        Nearest { point, legal: false, snapped: false },
+        |found| Nearest {
+            point: clear_by_margin(position, found, Some(buckets)),
+            legal: true,
+            snapped: true,
+        },
+    ))
+}
+
+fn nearest_from(
+    position: &Position,
+    point: Point,
+    known_vertices: Option<&[Point]>,
+    buckets: Option<&StoneBuckets>,
+    within: Option<f64>,
+) -> Nearest {
+    if contains_with(position, buckets, point.x, point.y) {
         return Nearest {
             point,
             legal: true,
@@ -551,6 +694,12 @@ pub fn nearest_with(
     // not invert the clamp range on the way to reporting that.
     let inset = (radius + numeric::SNAP_MARGIN).min(0.5);
     let clamp = |value: f64| value.clamp(inset.min(1.0 - inset), inset.max(1.0 - inset));
+
+    if let (Some(reach), Some(buckets)) = (within, buckets) {
+        if let Some(answer) = nearest_bounded(position, point, reach, buckets, known_vertices, diameter, inset) {
+            return answer;
+        }
+    }
 
     let mut candidates = vec![Point::new(clamp(point.x), clamp(point.y))];
     for stone in position.stones() {
@@ -593,33 +742,39 @@ pub fn nearest_with(
     // minimum instead costs one linear pass per candidate actually tested, so
     // an answer found immediately does almost no work and an answer found last
     // degrades to the exhaustive scan rather than losing to it.
-    let mut ranked: Vec<(f64, Point)> = candidates
-        .into_iter()
+    //
+    // Keys are `f64::total_cmp`'s integer form, not floats: a NaN key must not
+    // silently win the minimum, candidates are clamped but not proven finite, and
+    // a minimum over integers vectorizes where a comparator closure does not.
+    let mut candidates = candidates;
+    let mut keys: Vec<i64> = candidates
+        .iter()
         .map(|candidate| {
             let dx = candidate.x - point.x;
             let dy = candidate.y - point.y;
-            (dx.mul_add(dx, dy * dy), candidate)
+            total_order_key(dx.mul_add(dx, dy * dy))
         })
         .collect();
     let mut best = None;
-    let mut remaining = ranked.len();
+    let mut remaining = keys.len();
     while remaining > 0 {
-        // `total_cmp` rather than `partial_cmp`: a NaN key must not silently
-        // win the minimum, and candidates are clamped but not proven finite.
-        let (index, _) = ranked[..remaining]
+        let unscanned = &keys[..remaining];
+        let smallest = unscanned.iter().copied().fold(i64::MAX, i64::min);
+        // The first of equals, which is what the choice has always been.
+        let index = unscanned
             .iter()
-            .enumerate()
-            .min_by(|a, b| a.1.0.total_cmp(&b.1.0))
+            .position(|&key| key == smallest)
             .expect("remaining is non-zero");
-        let (_, candidate) = ranked[index];
-        if contains(position, candidate.x, candidate.y) {
+        let candidate = candidates[index];
+        if contains_with(position, buckets, candidate.x, candidate.y) {
             best = Some(candidate);
             break;
         }
         // Retire the rejected candidate by swapping the unscanned tail over it,
         // so the next pass never reconsiders it.
         remaining -= 1;
-        ranked.swap(index, remaining);
+        keys.swap(index, remaining);
+        candidates.swap(index, remaining);
     }
     match best {
         // No legal point exists anywhere: the board is full, and the caller
@@ -630,7 +785,7 @@ pub fn nearest_with(
             snapped: false,
         },
         Some(found) => Nearest {
-            point: clear_by_margin(position, found),
+            point: clear_by_margin(position, found, buckets),
             legal: true,
             snapped: true,
         },
@@ -648,7 +803,7 @@ pub fn nearest_with(
 ///
 /// Nudging the winner rather than the candidates keeps the two uses separate:
 /// the geometry stays exact, and only the point that becomes a move is moved.
-fn clear_by_margin(position: &Position, point: Point) -> Point {
+fn clear_by_margin(position: &Position, point: Point, buckets: Option<&StoneBuckets>) -> Point {
     let radius = position.radius();
     let target = 2.0 * radius + numeric::SNAP_MARGIN;
     let mut moved = point;
@@ -656,16 +811,29 @@ fn clear_by_margin(position: &Position, point: Point) -> Point {
     // point nearer another, and the margin is small enough that a fixed number
     // of passes settles it.
     for _ in 0..4 {
-        let mut worst: Option<(f64, &crate::Stone)> = None;
-        for stone in position.stones() {
-            let distance = numeric::length(moved.x - stone.x, moved.y - stone.y);
-            if distance < target && worst.is_none_or(|(seen, _)| distance < seen) {
-                worst = Some((distance, stone));
+        // Ties go to the lower index, as they do scanning stones in order, which
+        // is what lets the buckets visit them in any order.
+        let mut worst: Option<(f64, usize)> = None;
+        let mut consider = |index: usize| {
+            let stone = &position.stones()[index];
+            let (dx, dy) = (moved.x - stone.x, moved.y - stone.y);
+            if numeric::length_below(dx, dy, target) {
+                let distance = numeric::length(dx, dy);
+                if worst.is_none_or(|(seen, first)| {
+                    distance < seen || (distance == seen && index < first)
+                }) {
+                    worst = Some((distance, index));
+                }
             }
+        };
+        match buckets {
+            Some(buckets) => buckets.for_each_near(moved, target, &mut consider),
+            None => (0..position.stones().len()).for_each(&mut consider),
         }
-        let Some((distance, stone)) = worst else {
+        let Some((distance, index)) = worst else {
             break;
         };
+        let stone = &position.stones()[index];
         if distance < numeric::EDGE_EPSILON {
             // Concentric with a stone: no ray to push along, and the candidate
             // generator already covers this case by trying the four axes.
@@ -681,7 +849,7 @@ fn clear_by_margin(position: &Position, point: Point) -> Point {
     let inset = (radius + numeric::SNAP_MARGIN).min(0.5);
     let (low, high) = (inset.min(1.0 - inset), inset.max(1.0 - inset));
     let clamped = Point::new(moved.x.clamp(low, high), moved.y.clamp(low, high));
-    if contains(position, clamped.x, clamped.y) {
+    if contains_with(position, buckets, clamped.x, clamped.y) {
         clamped
     } else {
         point
@@ -709,7 +877,7 @@ pub(crate) fn escape_witness(
     // keeps the geometric cut strictly looser than the interval-arithmetic
     // comparison below, so the two cannot disagree about a boundary case.
     let reach = numeric::length(vertex.x - stone.x, vertex.y - stone.y) + numeric::SNAP_MARGIN;
-    visit_candidates_within(
+    visit_candidates_within::<false>(
         position,
         vertex,
         Some(reach),
@@ -737,7 +905,7 @@ pub(crate) fn escape_witness_indexed(
     index: &LegalSetIndex,
 ) -> Option<Point> {
     let mut witness = None;
-    visit_candidates_within(
+    visit_candidates_within::<false>(
         position,
         vertex,
         None,
@@ -1038,6 +1206,50 @@ mod tests {
     }
 
     #[test]
+    fn indexed_nearest_matches_the_unindexed_scan() {
+        for (count, radius, seed) in [(40, 1.0 / 38.0, 3), (90, 1.0 / 38.0, 5), (200, 1.0 / 38.0, 7)] {
+            let position = scattered(count, radius, seed);
+            let index = super::LegalSetIndex::build(&position);
+            for row in 0..64 {
+                for column in 0..64 {
+                    let query = Point::new((column as f64 + 0.5) / 64.0, (row as f64 + 0.5) / 64.0);
+                    let plain = nearest_with(&position, query, Some(index.vertices()));
+                    let fast = super::nearest_indexed(&position, query, &index);
+                    assert_eq!(
+                        (plain.legal, plain.snapped, plain.point.x.to_bits(), plain.point.y.to_bits()),
+                        (fast.legal, fast.snapped, fast.point.x.to_bits(), fast.point.y.to_bits()),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_bounded_nearest_matches_the_full_one_within_its_reach() {
+        for (count, radius, seed) in [(40, 1.0 / 38.0, 3), (90, 1.0 / 38.0, 5), (60, 1.0 / 18.0, 7)] {
+            let position = scattered(count, radius, seed);
+            let index = super::LegalSetIndex::build(&position);
+            for reach in [0.002, 0.01, 0.05] {
+                for row in 0..128 {
+                    for column in 0..128 {
+                        let query = Point::new((column as f64 + 0.5) / 128.0, (row as f64 + 0.5) / 128.0);
+                        let full = super::nearest_indexed(&position, query, &index);
+                        let bounded = super::nearest_indexed_within(&position, query, &index, reach);
+                        if full.legal && full.point.distance(query) <= reach {
+                            assert_eq!(
+                                (bounded.legal, bounded.point.x.to_bits(), bounded.point.y.to_bits()),
+                                (true, full.point.x.to_bits(), full.point.y.to_bits()),
+                            );
+                        } else if bounded.legal {
+                            assert!(bounded.point.distance(query) > reach);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn nearest_returns_a_legal_query_unchanged() {
         let position = Position::new(
             0.1,
@@ -1200,7 +1412,7 @@ mod tests {
         }
         match best {
             None => (false, point, false),
-            Some((_, found)) => (true, super::clear_by_margin(position, found), true),
+            Some((_, found)) => (true, super::clear_by_margin(position, found, None), true),
         }
     }
 

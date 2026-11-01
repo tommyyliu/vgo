@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{Position, numeric};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -47,7 +49,15 @@ pub struct Cell {
     pub polygon: Vec<Point>,
     pub area: f64,
     pub edges: Vec<Edge>,
+    /// A stone added strictly beyond this distance leaves this cell's bits
+    /// unchanged. See [`compute`].
+    reach: f64,
+    degenerate_edges: usize,
+    unclassified_edges: usize,
 }
+
+/// One cell per stone, shared between a position and its children.
+pub type SharedCells = Arc<Vec<Arc<Cell>>>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GeometryDiagnostics {
@@ -57,7 +67,7 @@ pub struct GeometryDiagnostics {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Geometry {
-    pub cells: Vec<Cell>,
+    pub cells: SharedCells,
     pub adjacency: Vec<Vec<usize>>,
     pub groups: Vec<usize>,
     pub diagnostics: GeometryDiagnostics,
@@ -334,110 +344,204 @@ fn circumradius(polygon: &[Vertex], site: Point) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// Stones sorted per step of [`compute`]'s visit order; doubles on each step.
+const FIRST_SORTED_PREFIX: usize = 16;
+
+/// Sorts the next block of `order[sorted..]` into place, returning the new length
+/// of the sorted prefix. Everything after it stays unsorted but no smaller.
+fn sort_next_prefix(order: &mut [u128], sorted: usize) -> usize {
+    let block = sorted.max(FIRST_SORTED_PREFIX);
+    let rest = &mut order[sorted..];
+    if block >= rest.len() {
+        rest.sort_unstable();
+        return order.len();
+    }
+    let (near, _, _) = rest.select_nth_unstable(block);
+    near.sort_unstable();
+    sorted + block
+}
+
+/// A distance and stone index as one integer whose order is `f64::total_cmp` on
+/// the distance, then the index, so sorting needs no float comparator.
+#[inline]
+fn order_key(distance: f64, index: usize) -> u128 {
+    let bits = distance.to_bits() as i64;
+    // `total_cmp`'s own transform: negative floats sort by reversed magnitude.
+    let total = bits ^ (((bits >> 63) as u64) >> 1) as i64;
+    (u128::from((total as u64) ^ (1 << 63)) << 64) | index as u128
+}
+
+#[inline]
+fn decode_order_key(key: u128) -> (f64, usize) {
+    let total = (((key >> 64) as u64) ^ (1 << 63)) as i64;
+    let bits = total ^ (((total >> 63) as u64) >> 1) as i64;
+    (f64::from_bits(bits as u64), key as u64 as usize)
+}
+
+/// Reusable buffers for [`compute_cell`].
+#[derive(Default)]
+struct CellBuffers {
+    order: Vec<u128>,
+    clip: Scratch,
+}
+
+/// One stone's cell, clipped from the board square.
+fn compute_cell(position: &Position, stone: usize, buffers: &mut CellBuffers) -> Cell {
+    let count = position.stones().len();
+    let CellBuffers { order, clip: scratch } = buffers;
+    // The starting square's sides are board edges, each vertex owning the
+    // side that leaves it: (0,0) to (1,0) is the top, and so on round.
+    let mut polygon = vec![
+        Vertex {
+            point: Point::new(0.0, 0.0),
+            outgoing: Some(EdgeSource::Board(BoardSide::Top)),
+        },
+        Vertex {
+            point: Point::new(1.0, 0.0),
+            outgoing: Some(EdgeSource::Board(BoardSide::Right)),
+        },
+        Vertex {
+            point: Point::new(1.0, 1.0),
+            outgoing: Some(EdgeSource::Board(BoardSide::Bottom)),
+        },
+        Vertex {
+            point: Point::new(0.0, 1.0),
+            outgoing: Some(EdgeSource::Board(BoardSide::Left)),
+        },
+    ];
+    let site = {
+        let s = position.stones()[stone];
+        Point::new(s.x, s.y)
+    };
+    order.clear();
+    for other in 0..count {
+        if other == stone {
+            continue;
+        }
+        let o = position.stones()[other];
+        order.push(order_key(numeric::length(o.x - site.x, o.y - site.y), other));
+    }
+    // `total_cmp` so a NaN coordinate cannot make the comparator
+    // inconsistent; ties break by index, which keeps the clip sequence a
+    // function of the position rather than of sort implementation details.
+    //
+    // Sorted in growing prefixes rather than whole, because the cutoff usually
+    // stops after a few neighbours. The comparator is a total order, so this
+    // visits exactly the sequence a full sort would.
+    let mut sorted = 0;
+    let mut position_in_order = 0;
+    let mut last_clip = 0.0_f64;
+    // The stopping distance for the polygon as it stands, once one was computed.
+    let mut stopping_at = None;
+    loop {
+        if position_in_order == sorted {
+            if sorted == order.len() {
+                break;
+            }
+            sorted = sort_next_prefix(order, sorted);
+        }
+        let (distance, other) = decode_order_key(order[position_in_order]);
+        position_in_order += 1;
+        if polygon.is_empty() {
+            break;
+        }
+        // Claim 1: |p - s| <= R for every p in the polygon, so a site
+        // further than 2R has |p - o| >= |o - s| - |p - s| > R >= |p - s|
+        // and its bisector cannot cut. Claim 2: R is non-increasing and
+        // `distance` non-decreasing, so this holds for every later
+        // candidate too and the loop stops rather than skipping.
+        //
+        // The margin is one epsilon of slack against `R` reading an ulp
+        // high, which would stop a clip early and leave the cell wrong.
+        // Erring the other way costs a no-op clip.
+        let stop = 2.0f64.mul_add(circumradius(&polygon, site), numeric::COORDINATE_EPSILON);
+        if distance > stop {
+            stopping_at = Some(stop);
+            break;
+        }
+        let constraint = bisector_constraint(position, stone, other);
+        clip_half_plane(&mut polygon, constraint, scratch);
+        last_clip = distance;
+    }
+    // A later stone beyond both of these sorts after the last clip and trips
+    // the cutoff, so the clip sequence, and with it every rounding, is the same.
+    let reach = if polygon.is_empty() {
+        f64::INFINITY
+    } else {
+        let stop = stopping_at.unwrap_or_else(|| {
+            2.0f64.mul_add(circumradius(&polygon, site), numeric::COORDINATE_EPSILON)
+        });
+        stop.max(last_clip)
+    };
+    normalize_polygon(&mut polygon, scratch);
+    let mut degenerate_edges = 0;
+    let mut unclassified_edges = 0;
+    let mut edges = Vec::with_capacity(polygon.len());
+    for index in 0..polygon.len() {
+        let start = polygon[index];
+        let end = polygon[(index + 1) % polygon.len()].point;
+        if start.point.distance(end) <= numeric::EDGE_EPSILON {
+            degenerate_edges += 1;
+            continue;
+        }
+        let source = start.outgoing;
+        if source.is_none() {
+            unclassified_edges += 1;
+        }
+        edges.push(Edge {
+            start: start.point,
+            end,
+            source,
+        });
+    }
+    let points: Vec<Point> = polygon.iter().map(|vertex| vertex.point).collect();
+    Cell {
+        area: polygon_area(&points),
+        polygon: points,
+        edges,
+        reach,
+        degenerate_edges,
+        unclassified_edges,
+    }
+}
+
+/// The diagram of `position`, reusing what it can from its parent's.
+///
+/// When `position` is its parent plus one appended stone, a parent cell is reused
+/// if the new stone lies strictly beyond the cell's `reach`. Not cutting the
+/// final polygon would not be enough: a stone can cut an intermediate polygon
+/// and be clipped away later, which leaves the same shape with different
+/// rounding. Beyond `reach` it never enters the clip sequence at all.
 #[must_use]
 pub fn compute(position: &Position) -> Geometry {
     let count = position.stones().len();
+    let parent = position.parent_cells().filter(|cells| cells.len() + 1 == count);
     let mut cells = Vec::with_capacity(count);
     let mut adjacency = vec![Vec::new(); count];
     let mut diagnostics = GeometryDiagnostics::default();
-
-    // Candidates are visited in increasing distance so the cutoff below can
-    // stop rather than merely skip: clipping only shrinks the polygon, so its
-    // circumradius falls monotonically while the distance rises, and once the
-    // two cross they stay crossed. Sorting is O(n log n) per cell against the
-    // O(n) clips it saves, which is why this is a stepping stone -- a grid
-    // walked outward enumerates in approximately this order for far less. See
-    // docs/research/VORONOI_CUTOFF.md.
-    let mut order: Vec<(f64, usize)> = Vec::with_capacity(count.saturating_sub(1));
     // One set of buffers for the whole call; see `Scratch`.
-    let mut scratch = Scratch::default();
+    let mut buffers = CellBuffers {
+        order: Vec::with_capacity(count.saturating_sub(1)),
+        clip: Scratch::default(),
+    };
 
     for (stone, neighbors) in adjacency.iter_mut().enumerate() {
-        // The starting square's sides are board edges, each vertex owning the
-        // side that leaves it: (0,0) to (1,0) is the top, and so on round.
-        let mut polygon = vec![
-            Vertex {
-                point: Point::new(0.0, 0.0),
-                outgoing: Some(EdgeSource::Board(BoardSide::Top)),
-            },
-            Vertex {
-                point: Point::new(1.0, 0.0),
-                outgoing: Some(EdgeSource::Board(BoardSide::Right)),
-            },
-            Vertex {
-                point: Point::new(1.0, 1.0),
-                outgoing: Some(EdgeSource::Board(BoardSide::Bottom)),
-            },
-            Vertex {
-                point: Point::new(0.0, 1.0),
-                outgoing: Some(EdgeSource::Board(BoardSide::Left)),
-            },
-        ];
-        let site = {
-            let s = position.stones()[stone];
-            Point::new(s.x, s.y)
-        };
-        order.clear();
-        for other in 0..count {
-            if other == stone {
-                continue;
-            }
-            let o = position.stones()[other];
-            order.push((numeric::length(o.x - site.x, o.y - site.y), other));
-        }
-        // `total_cmp` so a NaN coordinate cannot make the comparator
-        // inconsistent; ties break by index, which keeps the clip sequence a
-        // function of the position rather than of sort implementation details.
-        order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-
-        for &(distance, other) in &order {
-            if polygon.is_empty() {
-                break;
-            }
-            // Claim 1: |p - s| <= R for every p in the polygon, so a site
-            // further than 2R has |p - o| >= |o - s| - |p - s| > R >= |p - s|
-            // and its bisector cannot cut. Claim 2: R is non-increasing and
-            // `distance` non-decreasing, so this holds for every later
-            // candidate too and the loop stops rather than skipping.
-            //
-            // The margin is one epsilon of slack against `R` reading an ulp
-            // high, which would stop a clip early and leave the cell wrong.
-            // Erring the other way costs a no-op clip.
-            if distance > 2.0f64.mul_add(circumradius(&polygon, site), numeric::COORDINATE_EPSILON)
-            {
-                break;
-            }
-            let constraint = bisector_constraint(position, stone, other);
-            clip_half_plane(&mut polygon, constraint, &mut scratch);
-        }
-        normalize_polygon(&mut polygon, &mut scratch);
-        let mut edges = Vec::with_capacity(polygon.len());
-        for index in 0..polygon.len() {
-            let start = polygon[index];
-            let end = polygon[(index + 1) % polygon.len()].point;
-            if start.point.distance(end) <= numeric::EDGE_EPSILON {
-                diagnostics.degenerate_edges += 1;
-                continue;
-            }
-            let source = start.outgoing;
-            if source.is_none() {
-                diagnostics.unclassified_edges += 1;
-            }
-            if let Some(EdgeSource::Bisector { other, .. }) = source {
+        let reused = parent.and_then(|parent| {
+            let cell = parent.get(stone)?;
+            let site = position.stones()[stone];
+            let added = position.stones()[count - 1];
+            (numeric::length(added.x - site.x, added.y - site.y) > cell.reach)
+                .then(|| Arc::clone(cell))
+        });
+        let cell = reused.unwrap_or_else(|| Arc::new(compute_cell(position, stone, &mut buffers)));
+        diagnostics.degenerate_edges += cell.degenerate_edges;
+        diagnostics.unclassified_edges += cell.unclassified_edges;
+        for edge in &cell.edges {
+            if let Some(EdgeSource::Bisector { other, .. }) = edge.source {
                 neighbors.push(other);
             }
-            edges.push(Edge {
-                start: start.point,
-                end,
-                source,
-            });
         }
-        let points: Vec<Point> = polygon.iter().map(|vertex| vertex.point).collect();
-        cells.push(Cell {
-            area: polygon_area(&points),
-            polygon: points,
-            edges,
-        });
+        cells.push(cell);
     }
 
     for stone in 0..count {
@@ -479,7 +583,7 @@ pub fn compute(position: &Position) -> Geometry {
     }
     let groups = (0..count).map(|index| find(&mut parent, index)).collect();
     Geometry {
-        cells,
+        cells: Arc::new(cells),
         adjacency,
         groups,
         diagnostics,
@@ -491,6 +595,65 @@ mod tests {
     use crate::{Color, Point, Position, Stone};
 
     use super::{EdgeSource, compute, edge_source};
+
+    fn bits(geometry: &super::Geometry) -> Vec<u64> {
+        let mut out = Vec::new();
+        for cell in geometry.cells.iter() {
+            out.push(cell.area.to_bits());
+            out.extend(cell.polygon.iter().flat_map(|p| [p.x.to_bits(), p.y.to_bits()]));
+            for edge in &cell.edges {
+                out.extend([edge.start.x.to_bits(), edge.start.y.to_bits()]);
+                out.extend([edge.end.x.to_bits(), edge.end.y.to_bits()]);
+            }
+        }
+        out
+    }
+
+    /// A cell shared with the parent must be the cell a full build would make,
+    /// to the last bit, at every stone count from sparse to dense.
+    #[test]
+    fn a_child_diagram_matches_a_full_build_bit_for_bit() {
+        let radius = 1.0 / 38.0;
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        let (mut reused, mut total) = (0, 0);
+        for _ in 0..6 {
+            let mut stones: Vec<Stone> = Vec::new();
+            for _ in 0..6000 {
+                let x = radius + next() * (1.0 - 2.0 * radius);
+                let y = radius + next() * (1.0 - 2.0 * radius);
+                if stones.iter().any(|s| (s.x - x).hypot(s.y - y) < 2.0 * radius) {
+                    continue;
+                }
+                let color = if stones.len() % 2 == 0 { Color::Black } else { Color::White };
+                let parent = Position::new(radius, stones.clone(), Color::Black);
+                let shared = compute(&parent).cells;
+                stones.push(Stone::new(x, y, color));
+                let plain = Position::new(radius, stones.clone(), Color::Black);
+                let mut child = plain.clone();
+                child.link_parent_cells(std::sync::Arc::clone(&shared));
+
+                let fast = compute(&child);
+                let full = compute(&plain);
+                assert_eq!(bits(&fast), bits(&full), "{} stones", stones.len());
+                assert_eq!(fast.adjacency, full.adjacency);
+                assert_eq!(fast.groups, full.groups);
+                assert_eq!(fast.diagnostics, full.diagnostics);
+                total += shared.len();
+                reused += shared
+                    .iter()
+                    .zip(fast.cells.iter())
+                    .filter(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+                    .count();
+            }
+        }
+        assert!(reused * 2 > total, "reused only {reused} of {total} cells");
+    }
 
     /// Clipping against every stone, the way `compute` did before the cutoff.
     ///
@@ -536,6 +699,49 @@ mod tests {
             out.push((points, area));
         }
         out
+    }
+
+    #[test]
+    fn prefix_sorting_visits_the_full_sort_order() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for count in (0..300).chain([1000, 5000]) {
+            // Repeated distances, so ties have to break by index too.
+            let mut order: Vec<u128> = (0..count)
+                .map(|index| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    super::order_key((state % 40) as f64 / 7.0, index)
+                })
+                .collect();
+            let mut expected = order.clone();
+            expected.sort_unstable();
+            let mut sorted = 0;
+            while sorted < order.len() {
+                let next = super::sort_next_prefix(&mut order, sorted);
+                assert!(next > sorted);
+                assert_eq!(order[..next], expected[..next], "count {count}");
+                sorted = next;
+            }
+        }
+    }
+
+    #[test]
+    fn order_keys_sort_like_total_cmp_and_round_trip() {
+        let values = [
+            f64::NEG_INFINITY, -2.5, -1e-300, -0.0, 0.0, 1e-320, 1e-300, 0.5, 2.5,
+            f64::MAX, f64::INFINITY, f64::NAN, -f64::NAN,
+        ];
+        for &a in &values {
+            for &b in &values {
+                for (i, j) in [(1usize, 2usize), (2, 1), (1, 1)] {
+                    let expected = a.total_cmp(&b).then(i.cmp(&j));
+                    assert_eq!(super::order_key(a, i).cmp(&super::order_key(b, j)), expected);
+                }
+            }
+            let (decoded, index) = super::decode_order_key(super::order_key(a, 7));
+            assert_eq!((decoded.to_bits(), index), (a.to_bits(), 7));
+        }
     }
 
     /// The distance cutoff must not change the diagram, only how long it takes.

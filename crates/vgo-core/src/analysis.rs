@@ -227,7 +227,7 @@ impl Settlement {
             |index| index.vertices().to_vec(),
         );
         #[cfg(not(feature = "iteration-lab"))]
-        let legal_vertices = legal_set::vertices(position);
+        let legal_vertices = position.legal_index().vertices().to_vec();
         let alive_groups = alive_groups_of::<WITNESSES_FIRST, QUERY_FIRST>(
             position,
             &geometry,

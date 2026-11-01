@@ -1,3 +1,8 @@
+use std::sync::{Arc, OnceLock};
+
+use crate::legal_set::LegalSetIndex;
+use crate::voronoi::SharedCells;
+
 use crate::numeric::{self, COORDINATE_EPSILON};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,8 +101,53 @@ pub enum Phase {
     Finished,
 }
 
+/// A position's [`LegalSetIndex`], built on first use and kept with the position.
+///
+/// A search leaf needs it for settlement, the raster and the fine grid, and it
+/// was once built for each. It is a function of the stones and radius alone, so
+/// it plays no part in equality, and every constructor taking new stones starts
+/// from an empty cache.
+#[derive(Clone, Default)]
+struct LegalIndexCache(OnceLock<Arc<LegalSetIndex>>);
+
+/// This position's Voronoi cells, and the parent's for building them from.
+///
+/// Derived data like [`LegalIndexCache`], so it never affects equality.
+#[derive(Clone, Default)]
+struct GeometryCache {
+    own: OnceLock<SharedCells>,
+    /// Only valid while `stones` is the parent's stones plus one appended.
+    parent: Option<SharedCells>,
+}
+
+impl PartialEq for GeometryCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for GeometryCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GeometryCache")
+    }
+}
+
+impl PartialEq for LegalIndexCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for LegalIndexCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LegalIndexCache")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Position {
+    legal_index: LegalIndexCache,
+    geometry: GeometryCache,
     radius: f64,
     stones: Vec<Stone>,
     to_move: Color,
@@ -123,11 +173,15 @@ pub struct Position {
 impl Position {
     #[cfg(feature = "iteration-lab")]
     pub(crate) fn take_stones_for_lab(&mut self) -> Vec<Stone> {
+        self.legal_index = LegalIndexCache::default();
+        self.geometry = GeometryCache::default();
         std::mem::take(&mut self.stones)
     }
     #[must_use]
     pub fn new(radius: f64, stones: Vec<Stone>, to_move: Color) -> Self {
         Self {
+            legal_index: LegalIndexCache::default(),
+            geometry: GeometryCache::default(),
             radius,
             stones,
             to_move,
@@ -136,6 +190,45 @@ impl Position {
             komi: 0.0,
             ruleset: Ruleset::Vgo,
         }
+    }
+
+    /// This position's Voronoi cells, shared with its children.
+    pub(crate) fn shared_cells(&self) -> &SharedCells {
+        self.geometry
+            .own
+            .get_or_init(|| Arc::clone(&crate::voronoi::compute(self).cells))
+    }
+
+    /// Records cells already computed for exactly these stones.
+    pub(crate) fn store_cells(&self, cells: SharedCells) {
+        let _ = self.geometry.own.set(cells);
+    }
+
+    pub(crate) fn parent_cells(&self) -> Option<&SharedCells> {
+        self.geometry.parent.as_ref()
+    }
+
+    /// Records the cells of the position this one extends by its last stone.
+    pub(crate) fn link_parent_cells(&mut self, cells: SharedCells) {
+        self.geometry.parent = Some(cells);
+    }
+
+    /// Takes `other`'s legal-set index, if it has one. `other` must hold the same
+    /// radius and stones, which are all the index depends on.
+    pub(crate) fn adopt_legal_index(&self, other: &Self) {
+        debug_assert_eq!(self.stones, other.stones);
+        debug_assert!(self.radius.to_bits() == other.radius.to_bits());
+        if let Some(index) = other.legal_index.0.get() {
+            let _ = self.legal_index.0.set(Arc::clone(index));
+        }
+    }
+
+    /// This position's legal-set index, shared by everything that needs it.
+    #[must_use]
+    pub fn legal_index(&self) -> &Arc<LegalSetIndex> {
+        self.legal_index
+            .0
+            .get_or_init(|| Arc::new(LegalSetIndex::build(self)))
     }
 
     /// The same position played under `ruleset`.
@@ -266,6 +359,9 @@ impl Position {
     pub(crate) fn with_stones(&self, stones: Vec<Stone>) -> Self {
         let mut next = self.clone();
         next.stones = stones;
+        // The clone brought the old stones' index with it.
+        next.legal_index = LegalIndexCache::default();
+        next.geometry = GeometryCache::default();
         next
     }
 
@@ -295,6 +391,8 @@ impl Position {
         };
         let finished = passes >= 2;
         Self {
+            legal_index: LegalIndexCache::default(),
+            geometry: GeometryCache::default(),
             radius: self.radius,
             stones,
             to_move: if finished {
@@ -318,6 +416,8 @@ impl Position {
         let passes = self.consecutive_passes + 1;
         let finished = passes >= 2;
         Self {
+            legal_index: LegalIndexCache::default(),
+            geometry: GeometryCache::default(),
             radius: self.radius,
             stones: self.stones.clone(),
             to_move: if finished {
@@ -365,6 +465,39 @@ impl Validation {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_parent_link_never_outlives_its_stones() {
+        use std::sync::Arc;
+
+        let stone = |x, color| Stone::new(x, 0.5, color);
+        let parent = Position::new(0.05, vec![stone(0.2, Color::Black)], Color::White);
+        let cells = Arc::clone(parent.shared_cells());
+        let mut child = parent.with_stones(vec![stone(0.2, Color::Black), stone(0.7, Color::White)]);
+        child.link_parent_cells(cells);
+        assert!(child.clone().parent_cells().is_some());
+        // Same stone count as the linked child, so only the reset can catch this.
+        let moved = child.with_stones(vec![stone(0.4, Color::Black), stone(0.7, Color::White)]);
+        assert!(moved.parent_cells().is_none());
+    }
+
+    #[test]
+    fn a_legal_index_never_outlives_its_stones() {
+        use std::sync::Arc;
+
+        // A stone in the corner removes that corner's vertex, so the two sets differ.
+        let first = Stone::new(0.06, 0.06, Color::Black);
+        let position = Position::new(0.05, vec![first], Color::White);
+        let before = position.legal_index().vertices().to_vec();
+        let moved = position.with_stones(vec![Stone::new(0.94, 0.94, Color::Black)]);
+        assert_eq!(moved.legal_index().vertices(), crate::legal_set::vertices(&moved));
+        assert_ne!(moved.legal_index().vertices(), before);
+        // A clone shares the built index.
+        let clone = position.clone();
+        assert!(Arc::ptr_eq(position.legal_index(), clone.legal_index()));
+        // And the cache plays no part in equality.
+        assert_eq!(Position::new(0.05, vec![first], Color::White), position);
+    }
+
     use super::{Color, Phase, Position, Stone, ValidationIssue};
 
     #[test]

@@ -42,6 +42,31 @@ pub fn length(dx: f64, dy: f64) -> f64 {
     dx.mul_add(dx, dy * dy).sqrt()
 }
 
+/// Whether `length(dx, dy) < threshold`, without the root on almost every call.
+///
+/// Answers from the squares when they are clearly apart, and takes the root only
+/// inside a few ulps of the boundary, where rounding could change the answer. It
+/// therefore agrees with the direct comparison on every input, including NaN.
+#[inline]
+#[must_use]
+pub fn length_below(dx: f64, dy: f64, threshold: f64) -> bool {
+    // Four ulps: one each from rounding `limit`, the root and the margin, plus one
+    // to spare. Below this range the relative margin stops being meaningful.
+    const SLACK: f64 = 4.0 * f64::EPSILON;
+    const SMALLEST_THRESHOLD: f64 = 1e-140;
+    let square = dx.mul_add(dx, dy * dy);
+    if threshold >= SMALLEST_THRESHOLD {
+        let limit = threshold * threshold;
+        if square > limit * (1.0 + SLACK) {
+            return false;
+        }
+        if square < limit * (1.0 - SLACK) {
+            return true;
+        }
+    }
+    square.sqrt() < threshold
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct StrictDistanceComparison {
     pub is_strictly_less: bool,
@@ -212,6 +237,50 @@ pub(crate) fn strictly_closer(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn length_below_always_agrees_with_the_direct_comparison() {
+        // A fixed multiplicative sequence: the crate carries no RNG dependency.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let check = |dx: f64, dy: f64, threshold: f64| {
+            assert_eq!(
+                super::length_below(dx, dy, threshold),
+                super::length(dx, dy) < threshold,
+                "dx={dx:e} dy={dy:e} threshold={threshold:e}"
+            );
+        };
+        for _ in 0..2_000_000 {
+            let (dx, dy) = (next() * 2.0 - 1.0, next() * 2.0 - 1.0);
+            let exact = super::length(dx, dy);
+            check(dx, dy, next() * 1.5);
+            // The boundary itself, and every threshold within eight ulps of it.
+            let mut near = exact;
+            check(dx, dy, near);
+            for _ in 0..8 {
+                near = near.next_up();
+                check(dx, dy, near);
+            }
+            near = exact;
+            for _ in 0..8 {
+                near = near.next_down();
+                check(dx, dy, near);
+            }
+        }
+        for threshold in [0.0, -0.0, -1.0, 1e-300, 1e-141, 1e300, f64::INFINITY, f64::NAN] {
+            for (dx, dy) in [
+                (0.0, 0.0), (1.0, 0.0), (1e-160, 0.0), (1e200, 1e200),
+                (f64::NAN, 0.0), (f64::INFINITY, 1.0),
+            ] {
+                check(dx, dy, threshold);
+            }
+        }
+    }
     use crate::Point;
 
     use super::{length, strictly_closer};

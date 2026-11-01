@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::{Analysis, Color, Phase, Position, Ruleset, Settlement, Stone, legal_set};
 
@@ -105,6 +106,7 @@ pub(crate) fn place_with(
     let mut stones = position.stones().to_vec();
     stones.push(Stone::new(x, y, mover));
     let mut provisional = position.with_stones(stones);
+    provisional.link_parent_cells(Arc::clone(position.shared_cells()));
     // Settlement first: captures may still change either provisional board, so
     // scoring it eagerly would usually be throwaway work. If self-capture leaves
     // the final one unchanged, it is promoted into the committed analysis below.
@@ -159,10 +161,12 @@ pub(crate) fn place_with(
     // building the same diagram for a second time. Self-capture changes stones,
     // so that branch still needs a fresh analysis.
     let analysis = if self_count == 0 {
+        committed.adopt_legal_index(&after_self);
         current_settlement.into_analysis(&committed)
     } else {
         settle(&committed).into_analysis(&committed)
     };
+    committed.store_cells(Arc::clone(&analysis.geometry.cells));
     let mut events = Vec::new();
     if enemy_count > 0 {
         events.push(GameEvent::Capture {
@@ -243,7 +247,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         for (actual_cell, expected_cell) in
-            actual.geometry.cells.iter().zip(&expected.geometry.cells)
+            actual.geometry.cells.iter().zip(expected.geometry.cells.iter())
         {
             assert_eq!(actual_cell.area.to_bits(), expected_cell.area.to_bits());
             assert_eq!(

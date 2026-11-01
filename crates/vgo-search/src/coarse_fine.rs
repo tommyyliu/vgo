@@ -15,8 +15,8 @@
 
 use std::sync::Arc;
 use vgo_core::{
-    COORDINATE_EPSILON, Point, Position, is_inside_legal_inset, legal_set_vertices,
-    nearest_legal_placement_with,
+    COORDINATE_EPSILON, Point, Position, is_inside_legal_inset,
+    nearest_legal_placement_indexed_within,
 };
 
 /// A sampled placement candidate and the probability it was drawn with.
@@ -138,7 +138,7 @@ impl FineGrid {
         // projection's cost, and this loop projects several hundred cells.
         // Computing it once per grid rather than once per cell is the
         // difference between snapping being affordable and not.
-        let known_vertices = legal_set_vertices(position);
+        let index = position.legal_index();
         let half_diagonal =
             0.5 * ((1.0 / width as f64).powi(2) + (1.0 / height as f64).powi(2)).sqrt();
         let exclusion = 2.0 * position.radius();
@@ -176,8 +176,14 @@ impl FineGrid {
                     None
                 } else if straddles_boundary_at(position, point, nearest, exclusion, half_diagonal)
                 {
-                    let snapped =
-                        nearest_legal_placement_with(position, point, Some(&known_vertices));
+                    // Only a point inside this cell is kept, and such a point
+                    // is within half a diagonal of its centre.
+                    let snapped = nearest_legal_placement_indexed_within(
+                        position,
+                        point,
+                        index,
+                        half_diagonal,
+                    );
                     let inside = snapped.legal
                         && (snapped.point.x - point.x).abs() <= half_x
                         && (snapped.point.y - point.y).abs() <= half_y;
@@ -687,7 +693,7 @@ mod tests {
     ) -> (Vec<bool>, Vec<Point>) {
         let mut legal = vec![false; width * height];
         let mut placement = vec![Point::new(0.0, 0.0); width * height];
-        let known_vertices = legal_set_vertices(position);
+        let known_vertices = vgo_core::legal_set_vertices(position);
         let half_diagonal =
             0.5 * ((1.0 / width as f64).powi(2) + (1.0 / height as f64).powi(2)).sqrt();
         let exclusion = 2.0 * position.radius();
@@ -701,7 +707,7 @@ mod tests {
                     Some(point)
                 } else if straddles_boundary(position, point, exclusion, half_diagonal) {
                     let snapped =
-                        nearest_legal_placement_with(position, point, Some(&known_vertices));
+                        vgo_core::nearest_legal_placement_with(position, point, Some(&known_vertices));
                     let inside = snapped.legal
                         && (snapped.point.x - point.x).abs() <= half_x
                         && (snapped.point.y - point.y).abs() <= half_y;
