@@ -129,12 +129,13 @@ and that cell is where the argument above finds its corner.
 
 That also strengthens `LEMMAS.md`'s A16, which records each `R_s` as star-shaped
 about `s`. True, but weaker than the fact: it is convex. The radial solve in
-`settled.rs` only needs star-shapedness, so nothing there is wrong -- but a
-future reader deriving bounds from A16 is leaving something on the table.
+`js-app/src/geometry/settled-contour.js` only needs star-shapedness, so nothing
+there is wrong -- but a future reader deriving bounds from A16 is leaving
+something on the table.
 
-`examples/settled_vertex_gap.rs` checks that the code implements this, over
-136,122 cells against a 256-sample sweep of every edge. It is a test of the
-implementation, not an argument for the theorem.
+`examples/settled_vertex_gap.rs`, pruned in 3709771, checked that the code
+implements this, over 136,122 cells against a 256-sample sweep of every edge. It
+was a test of the implementation, not an argument for the theorem.
 
 **None of it transfers to `Ruleset::Official`.** Its question is whether the
 region comes within `r` of a legal point -- a distance band with curved edges,

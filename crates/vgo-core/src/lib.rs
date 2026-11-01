@@ -6,9 +6,6 @@ mod game;
 mod legal_set;
 mod model;
 mod numeric;
-// `!(t > 0.0)` is deliberate: a NaN root must take the rejecting branch.
-#[allow(clippy::neg_cmp_op_on_partial_ord, clippy::needless_range_loop)]
-mod settled;
 mod voronoi;
 
 pub use analysis::{Analysis, Outcome, Score, Settlement};
@@ -27,5 +24,4 @@ pub use legal_set::{
 };
 pub use model::{Color, Phase, Position, Ruleset, Stone, Validation, ValidationIssue};
 pub use numeric::{COORDINATE_EPSILON, distance_to_segment, length as planar_length, length_below};
-pub use settled::SettledRegion;
 pub use voronoi::{Cell, Edge, EdgeSource, Geometry, Point};

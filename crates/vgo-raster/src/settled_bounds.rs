@@ -680,9 +680,7 @@ mod tests {
         }
     }
 
-    /// The bounded form must agree with the definition, not merely with the
-    /// other implementation -- which walks a contour at 1/128 and is itself
-    /// wrong on a pixel or two at high stone counts.
+    /// The bounded form must agree with the definition at every pixel.
     #[test]
     fn bounded_distance_agrees_with_the_definition() {
         let radius = 0.055_714_285_714_285_716;
