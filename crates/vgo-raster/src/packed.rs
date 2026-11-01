@@ -16,6 +16,8 @@
 //! `training/vgo_training/packed_input.py`, whose `compress` is the reference
 //! this has to agree with, and `bit_expansion_table` for the bit order.
 
+use std::cell::RefCell;
+
 use half::{f16, slice::HalfFloatSliceExt};
 use vgo_core::{Color, Position};
 
@@ -70,16 +72,20 @@ pub const fn bit_plane_bytes(pixels: usize) -> usize {
 /// One position, in the three tensors the packed graph takes.
 // No `Eq`: the fp16 planes are floats, and a raster comparing equal to
 // itself is not something anything here relies on.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PackedRaster {
     config: RasterConfig,
     layout: PackedLayout,
     bits: Vec<u8>,
     dense: Vec<f16>,
     scalars: Vec<f16>,
-    scratch: PackedScratch,
 }
 
+/// Work buffers, one set per thread.
+///
+/// A raster leaves for the broker the moment it is written, so anything it owned
+/// would be allocated and zeroed again for the next leaf, 300 KB of it at 128,
+/// and freed on another thread. Nothing here outlives a call.
 #[derive(Debug, Default)]
 struct PackedScratch {
     settled_scratch: SettledScratch,
@@ -89,31 +95,12 @@ struct PackedScratch {
     nearest_squares: Vec<f64>,
     second_squares: Vec<f64>,
     candidates: Vec<u32>,
+    ridges: Vec<f32>,
+    coordinates: Vec<f64>,
 }
 
-impl Clone for PackedRaster {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config,
-            layout: self.layout,
-            bits: self.bits.clone(),
-            dense: self.dense.clone(),
-            scalars: self.scalars.clone(),
-            // Scratch is deliberately not cloned: cloning an inference input
-            // should copy the raster, not duplicate its retained work buffers.
-            scratch: PackedScratch::default(),
-        }
-    }
-}
-
-impl PartialEq for PackedRaster {
-    fn eq(&self, other: &Self) -> bool {
-        self.config == other.config
-            && self.layout == other.layout
-            && self.bits == other.bits
-            && self.dense == other.dense
-            && self.scalars == other.scalars
-    }
+thread_local! {
+    static SCRATCH: RefCell<PackedScratch> = RefCell::default();
 }
 
 impl PackedRaster {
@@ -132,7 +119,6 @@ impl PackedRaster {
             bits: vec![0; layout.binary.len() * bit_plane_bytes(pixels)],
             dense: vec![f16::ZERO; layout.continuous.len() * pixels],
             scalars: vec![f16::ZERO; layout.scalar.len()],
-            scratch: PackedScratch::default(),
         }
     }
 
@@ -292,8 +278,12 @@ fn sweep_tile(
                     // by comparing this distance against a sampled one, so one
                     // ulp is a different pixel.
                     let square = dx.mul_add(dx, dy_square);
-                    *second = second.min(square.max(*nearest));
-                    *nearest = nearest.min(square);
+                    // Comparisons rather than `f64::min`, which pays to handle
+                    // NaN: nothing here is NaN, so this is one `vminpd` with
+                    // the same result, on the hottest line of the sweep.
+                    let larger = if square > *nearest { square } else { *nearest };
+                    *second = if larger < *second { larger } else { *second };
+                    *nearest = if square < *nearest { square } else { *nearest };
                 }
             }
         }
@@ -366,8 +356,7 @@ fn set_bit(plane: &mut [u8], pixel: usize, value: bool) {
 
 /// Allocates and fills a packed raster, mirroring `rasterize`.
 ///
-/// The reusing form is `rasterize_compact_radius_packed_into`; prefer it on the
-/// hot path, where one buffer per actor outlives every position it renders.
+/// The reusing form is `rasterize_compact_radius_packed_into`.
 #[must_use]
 pub fn rasterize_packed(position: &Position, config: RasterConfig) -> PackedRaster {
     let mut out = PackedRaster::new(config);
@@ -387,6 +376,15 @@ pub(crate) fn rasterize_compact_radius_packed_into(
     position: &Position,
     config: RasterConfig,
     out: &mut PackedRaster,
+) {
+    SCRATCH.with_borrow_mut(|scratch| write_packed(position, config, out, scratch));
+}
+
+fn write_packed(
+    position: &Position,
+    config: RasterConfig,
+    out: &mut PackedRaster,
+    scratch: &mut PackedScratch,
 ) {
     assert_eq!(config.kind, RasterKind::CompactRadius);
     assert_eq!(out.config, config);
@@ -418,7 +416,6 @@ pub(crate) fn rasterize_compact_radius_packed_into(
     let PackedRaster {
         bits,
         dense: dense_plane,
-        scratch,
         ..
     } = out;
     let PackedScratch {
@@ -429,6 +426,8 @@ pub(crate) fn rasterize_compact_radius_packed_into(
         nearest_squares,
         second_squares,
         candidates,
+        ridges,
+        coordinates,
     } = scratch;
     for byte in bits.iter_mut() {
         *byte = 0;
@@ -477,9 +476,9 @@ pub(crate) fn rasterize_compact_radius_packed_into(
     let stone_ys = stone_ys.as_slice();
 
     let height = config.height;
-    let mut ridges = vec![0.0f32; width];
+    ridges.resize(width, 0.0);
     let ridges = ridges.as_mut_slice();
-    let mut coordinates = vec![0.0f64; width + height];
+    coordinates.resize(width + height, 0.0);
     let (xs, ys) = coordinates.split_at_mut(width);
     for (column, x) in xs.iter_mut().enumerate() {
         *x = (column as f64 + 0.5) / width as f64;

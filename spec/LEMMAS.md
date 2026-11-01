@@ -460,8 +460,9 @@ replaces it at start 0. Otherwise let `a` be the surviving top. Expanding,
 below `w`. This restores the invariant, and reading the stack back gives the minimum at
 every `x`.
 
-*Exactness.* All arithmetic is on integers below `2^63`. `G` fits `u32` under the stated
-bound, and results are below `2^53`, so conversion to `f64` is exact. QED
+*Exactness.* `envelope_row` works in `i32`, and the transform asserts `m < 2^14`. Every
+height is at most `w^2 + m^2 < 2^29`, and `N` is a sum of two squares below `2^28` and two
+values below `2^28`, so nothing overflows. Conversion to `f64` is exact. QED
 
 Since the values are exact integers, any correct transform produces the same bits.
 
@@ -565,16 +566,65 @@ far smaller than the slack in `64m`.
 
 *Status: Proved in exact arithmetic.* Used by `visit_candidates_within`.
 
-**Claim.** (a) A stone at distance `a >= t + 2r` from `q` has its projected candidate at
-distance at least `t` from `q`. (b) For pure predicates `A` and `B`, testing `A` before
-`B` gives the same `exists c : A(c) and B(c)` as the opposite order.
+**Claim.** (a) A stone at distance `a` from `q` with `|a - 2r| >= t` has its projected
+candidate at distance at least `t` from `q`. (b) For pure predicates `A` and `B`, testing
+`A` before `B` gives the same `exists c : A(c) and B(c)` as the opposite order.
 
 **Proof.** (a) The candidate lies on the ray from the stone through `q` at distance `2r`
-from the stone, so it is `|a - 2r| >= t` from `q`. (b) Conjunction of pure predicates is
-commutative. QED
+from the stone, so it is `|a - 2r| >= t` from `q`. When `a` is too small to give a
+direction, all four candidates are `2r` from the stone and the same bound holds up to `a`.
+(b) Conjunction of pure predicates is commutative. QED
+
+The code tests `a^2` against the squares of `(2r + t)(1 + 1e-12)` and
+`max(2r - t, 0)(1 - 1e-12)`, skipping only outside them. On a unit board rounding is near
+`1e-16`, so a skipped stone's candidate cannot pass the comparison it was spared.
 
 Part (b) does not cover a visitor that records what it sees, so `escape_witness` keeps
 legality first.
+
+### E9. A pixel inside a stone's disk is settled
+
+*Status: Proved, with rounding bounded by the margin.* Used by `classify_row`.
+
+**Claim.** Let `e` be `COORDINATE_EPSILON`. If a pixel `p` has nearest stone `s` and its
+computed squared distance `q` satisfies `q <= (r - e)^2`, the three-case classification
+returns settled, so it may return settled without reading the sampled field.
+
+**Proof.** Write `d = |p - s|`, so `d <= r - e` up to relative rounding near `1e-16`.
+Legal-set membership requires every stone at distance at least `2r - e`. Each legal-set
+vertex meets that too: other stones by the same test, and the one or two it was built on
+because it lies on their circles of radius `2r`, up to rounding, or farther when a
+discriminant is clamped to zero. So every candidate `c` the exact test can accept has
+`|c - s| >= 2r - e - 1e-15`, and by the triangle inequality
+
+`|c - p| >= |c - s| - d >= 2r - e - 1e-15 - (r - e) = r - 1e-15 > d`,
+
+since `d <= r - e` and `e = 1e-7`. The exact test therefore accepts nothing and says
+settled, and so does the vertex check that precedes it.
+
+The cheap "certainly unsettled" case cannot fire first. It needs `d > D + h/sqrt(2)`, where
+`D` is the distance to the nearest sampled cell centre and `h` the spacing. A sampled cell
+is either a legal centre, so `D >= r - 1e-15`, or holds a vertex, whose centre is within
+`h/sqrt(2)` of it, so `D + h/sqrt(2) >= r - 1e-15`. Either way `D + h/sqrt(2) > d`. The
+remaining case is settled, so all paths agree. QED
+
+This holds whether or not [O1] does, because it depends only on the candidates being clear
+of stones, not on the sampled grid seeing every legal point.
+
+### E10. The vertex grid replaces the exact test's vertex scan
+
+*Status: Proved.* Used by `VertexGrid::any_closer` and `none_closer_than_except_vertices`.
+
+**Claim.** Let `A` be whether some legal-set vertex passes `length_below(v - p, d)`, and `B`
+whether the exact test accepts a non-vertex candidate. The exact test's answer is
+`not (A or B)`, and `any_closer` computes `A`.
+
+**Proof.** The exact test accepts a vertex exactly when that comparison passes, and it
+tests no other property of a vertex, so its answer is `not (A or B)`. `any_closer` applies
+the same comparison, to the vertices in the buckets within `d(1 + 1e-9) + 1e-12` of `p`. By
+[N1] a passing vertex has computed length below `d`, so its true distance is within that
+reach and its bucket is read. Reading more vertices cannot add a false positive, because
+each still has to pass the comparison. QED
 
 ### E8. Derived data on a position
 

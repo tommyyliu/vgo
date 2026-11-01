@@ -3,6 +3,10 @@ use crate::{Point, Position, numeric};
 use super::buckets::StoneBuckets;
 use super::{LegalSetIndex, contains_with, vertices};
 
+/// Relative slack on the annulus test. Far above rounding, which is near 1e-16 on
+/// a unit board, and it only widens the set of stones that take the exact path.
+const ANNULUS_SLACK: f64 = 1.0e-12;
+
 fn visit_candidates(
     position: &Position,
     point: Point,
@@ -34,9 +38,10 @@ fn admit<const VISIT_FIRST: bool>(
 ///
 /// A stone contributes the point one diameter from it along the ray to the
 /// query, so that candidate sits `|radial - diameter|` from the query. A stone
-/// farther than `threshold + diameter` therefore cannot produce anything within
-/// `threshold`, and skipping it also skips the O(stones) legality check that
-/// would have screened it -- which is what makes the whole call quadratic.
+/// outside the annulus `|radial - diameter| < threshold` therefore cannot produce
+/// anything within `threshold`, and skipping it also skips the O(stones) legality
+/// check that would have screened it -- which is what makes the whole call
+/// quadratic. The test is on squares, so most stones never pay for a root.
 ///
 /// Proof: [E7].
 ///
@@ -62,9 +67,20 @@ fn visit_candidates_within<const VISIT_FIRST: bool>(
     let diameter = 2.0 * radius;
 
     let stone_reach = threshold.map(|t| t + diameter);
+    // Squared bounds of the annulus, each loosened so rounding can only let a
+    // stone through to the exact arithmetic below, never skip one it would keep.
+    let (inner_square, outer_square) = threshold.map_or((-1.0, f64::INFINITY), |t| {
+        let inner = (diameter - t).max(0.0) * (1.0 - ANNULUS_SLACK);
+        let outer = (diameter + t) * (1.0 + ANNULUS_SLACK);
+        (inner * inner, outer * outer)
+    });
     let mut visit_stone = |stone: &crate::Stone| {
         let dx = point.x - stone.x;
         let dy = point.y - stone.y;
+        let square = dx * dx + dy * dy;
+        if square >= outer_square || (square <= inner_square && inner_square > 0.0) {
+            return false;
+        }
         let radial_distance = numeric::length(dx, dy);
         if let Some(reach) = stone_reach
             && radial_distance >= reach
@@ -142,6 +158,29 @@ pub fn none_closer_than_indexed(
         point,
         Some(threshold),
         Some(&index.vertices),
+        index.buckets.as_ref(),
+        &mut visit,
+    )
+}
+
+/// [`none_closer_than_indexed`] for a caller that has already compared `point`
+/// with every legal-set vertex, so only the other candidates remain. A raster's
+/// undecided pixel does exactly that through its own vertex grid.
+#[must_use]
+pub fn none_closer_than_except_vertices(
+    position: &Position,
+    point: Point,
+    threshold: f64,
+    index: &LegalSetIndex,
+) -> bool {
+    let mut visit = |candidate: Point| {
+        numeric::length_below(point.x - candidate.x, point.y - candidate.y, threshold)
+    };
+    !visit_candidates_within::<true>(
+        position,
+        point,
+        Some(threshold),
+        Some(&[]),
         index.buckets.as_ref(),
         &mut visit,
     )

@@ -15,7 +15,8 @@
 use std::sync::Arc;
 
 use vgo_core::{
-    COORDINATE_EPSILON, LegalSetIndex, Point, Position, no_legal_point_closer_than_indexed,
+    COORDINATE_EPSILON, LegalSetIndex, Point, Position, length_below,
+    none_closer_than_except_vertices,
 };
 
 use crate::RasterConfig;
@@ -308,17 +309,15 @@ impl VertexGrid {
         }
     }
 
-    /// Whether a vertex lies strictly closer than `distance` to `point`. Errs
-    /// toward no at the boundary, which only sends a pixel to the exact test.
+    /// Whether a vertex lies strictly closer than `distance` to `point`, by the
+    /// exact test's own comparison, so this replaces that test's vertex scan. The
+    /// buckets are chosen by a slightly longer reach and only limit what is read.
+    /// Proof: [E10].
     fn any_closer(&self, point: Point, distance: f64) -> bool {
         if self.points.is_empty() {
             return false;
         }
-        let reach = distance * (1.0 - 1e-9) - 1e-12;
-        if reach <= 0.0 {
-            return false;
-        }
-        let reach_squared = reach * reach;
+        let reach = distance * (1.0 + 1e-9) + 1e-12;
         let low = |v: f64| (((v - reach) / self.cell).floor().max(0.0) as usize).min(self.side - 1);
         let high =
             |v: f64| (((v + reach) / self.cell).floor().max(0.0) as usize).min(self.side - 1);
@@ -329,8 +328,7 @@ impl VertexGrid {
                 self.starts[base + high(point.x) + 1] as usize,
             );
             for mark in &self.points[first..last] {
-                let (dx, dy) = (mark.x - point.x, mark.y - point.y);
-                if dx.mul_add(dx, dy * dy) < reach_squared {
+                if length_below(mark.x - point.x, mark.y - point.y, distance) {
                     return true;
                 }
             }
@@ -415,6 +413,20 @@ pub(crate) struct SettledRows {
     index: Arc<LegalSetIndex>,
     vertices: VertexGrid,
     pub(crate) exact_tests: usize,
+    undecided: Vec<bool>,
+    /// Squared distance from a stone within which a pixel is certainly settled.
+    disk_square: f64,
+}
+
+/// Column of `field` that `column` of the output reads.
+#[inline]
+const fn fine_index(index: usize, scale: usize, fine_size: usize) -> usize {
+    let fine = index * scale + scale / 2;
+    if fine < fine_size {
+        fine
+    } else {
+        fine_size - 1
+    }
 }
 
 pub(crate) fn prepare_settled_rows(
@@ -446,6 +458,8 @@ pub(crate) fn prepare_settled_rows(
         slack,
         index,
         exact_tests: 0,
+        undecided: Vec::new(),
+        disk_square: (position.radius() - COORDINATE_EPSILON).powi(2),
     }
 }
 
@@ -471,33 +485,49 @@ impl SettledRows {
         out: &mut [bool],
     ) {
         let scale = self.scale;
-        let fine_row = (row * scale + scale / 2).min(self.fine_height - 1);
-        let base = fine_row * self.fine_width;
-        for (column, ((&x, &nearest_square), settled)) in
-            xs.iter().zip(nearest_squares).zip(out).enumerate()
+        let base = fine_index(row, scale, self.fine_height) * self.fine_width;
+        let width = xs.len();
+        self.undecided.resize(width, false);
+        // The two cheap cases for the whole row first, with no branch and no call
+        // in the loop, so its roots and comparisons vectorize. Only what they leave
+        // undecided costs anything per pixel.
+        let (spacing_squared, slack, half_diagonal, disk_square) = (
+            self.spacing_squared,
+            self.slack,
+            self.half_diagonal,
+            self.disk_square,
+        );
+        let fine_row = &field[base..base + self.fine_width];
+        for (column, ((&nearest_square, settled), undecided)) in nearest_squares
+            .iter()
+            .zip(out.iter_mut())
+            .zip(self.undecided.iter_mut())
+            .enumerate()
         {
-            let fine_column = (column * scale + scale / 2).min(self.fine_width - 1);
-            let sampled = (field[base + fine_column] * self.spacing_squared).sqrt();
-            let sampled_minus_slack = sampled - self.slack;
-            let upper = sampled + self.half_diagonal;
-            *settled = if sampled_minus_slack > 0.0
-                && nearest_square <= sampled_minus_slack * sampled_minus_slack
-            {
-                true
-            } else if nearest_square > upper * upper
-                || self
-                    .vertices
-                    .any_closer(Point::new(x, y), nearest_square.sqrt())
-            {
-                false
+            let sampled = fine_row[if scale == 1 {
+                column
             } else {
+                fine_index(column, scale, self.fine_width)
+            }];
+            let sampled = (sampled * spacing_squared).sqrt();
+            let lower = sampled - slack;
+            let upper = sampled + half_diagonal;
+            // Inside a stone's own disk nothing legal can be closer: [E9].
+            let inside =
+                nearest_square <= disk_square || (lower > 0.0 && nearest_square <= lower * lower);
+            let outside = nearest_square > upper * upper;
+            *settled = inside;
+            *undecided = !inside & !outside;
+        }
+        for (column, undecided) in self.undecided.iter().enumerate() {
+            if !*undecided {
+                continue;
+            }
+            let point = Point::new(xs[column], y);
+            let distance = nearest_squares[column].sqrt();
+            out[column] = !self.vertices.any_closer(point, distance) && {
                 self.exact_tests += 1;
-                no_legal_point_closer_than_indexed(
-                    position,
-                    Point::new(x, y),
-                    nearest_square.sqrt(),
-                    &self.index,
-                )
+                none_closer_than_except_vertices(position, point, distance, &self.index)
             };
         }
     }
@@ -701,6 +731,42 @@ mod tests {
                 wrong, 0,
                 "{count} stones: {wrong} pixels disagree with the definition"
             );
+        }
+    }
+
+    /// [E9] on its own terms: every pixel the disk rule answers must also be
+    /// settled by the exact test it replaces, on boards with near-tangent stones.
+    #[test]
+    fn a_pixel_inside_a_stone_disk_is_settled_by_the_exact_test() {
+        let radius = 1.0 / 38.0;
+        for count in [28usize, 120, 240] {
+            let position = fixture(count, radius);
+            let disk = (radius - COORDINATE_EPSILON).powi(2);
+            let mut tested = 0;
+            for row in 0..128 {
+                for column in 0..128 {
+                    let point =
+                        Point::new((column as f64 + 0.5) / 128.0, (row as f64 + 0.5) / 128.0);
+                    let nearest = position
+                        .stones()
+                        .iter()
+                        .map(|s| {
+                            let (dx, dy) = (point.x - s.x, point.y - s.y);
+                            dx.mul_add(dx, dy * dy)
+                        })
+                        .fold(f64::INFINITY, f64::min);
+                    if nearest <= disk {
+                        tested += 1;
+                        assert!(vgo_core::no_legal_point_closer_than_indexed(
+                            &position,
+                            point,
+                            nearest.sqrt(),
+                            position.legal_index(),
+                        ));
+                    }
+                }
+            }
+            assert!(tested > 0);
         }
     }
 

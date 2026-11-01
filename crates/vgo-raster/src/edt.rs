@@ -48,6 +48,10 @@ pub(crate) fn squared_distance_transform_into(
         return;
     }
     let none = (width + height + 1) as u32;
+    assert!(
+        none < 1 << 14,
+        "the envelope works in i32: see `envelope_row`"
+    );
     scratch.gaps.resize(mask.len(), 0);
     let gaps = scratch.gaps.as_mut_slice();
     let mut above = vec![none; width];
@@ -78,18 +82,23 @@ pub(crate) fn squared_distance_transform_into(
 }
 
 /// `min over c of (x - c)^2 + row[c]` at every `x`.
+///
+/// In `i32`, which [E3] shows holds every value here. The narrower divide is the
+/// point: 64-bit division costs several times the 32-bit one on many server CPUs.
 fn envelope_row(row: &[u32], parabolas: &mut [u32], starts: &mut [u32], out: &mut [f64]) {
-    let height_at = |at: i64, of: u32| {
-        let offset = at - i64::from(of);
-        offset * offset + i64::from(row[of as usize])
+    let parabolas = &mut parabolas[..row.len()];
+    let starts = &mut starts[..row.len()];
+    let height_at = |at: i32, of: u32| {
+        let offset = at - of as i32;
+        offset * offset + row[of as usize] as i32
     };
-    let width = row.len() as i64;
+    let width = row.len() as i32;
     let mut top = 0usize;
     parabolas[0] = 0;
     starts[0] = 0;
     for column in 1..row.len() as u32 {
         let beaten = loop {
-            let start = i64::from(starts[top]);
+            let start = starts[top] as i32;
             if height_at(start, parabolas[top]) <= height_at(start, column) {
                 break false;
             }
@@ -103,10 +112,10 @@ fn envelope_row(row: &[u32], parabolas: &mut [u32], starts: &mut [u32], out: &mu
             continue;
         }
         // First pixel where `column` is strictly below the parabola on top.
-        let left = i64::from(parabolas[top]);
-        let right = i64::from(column);
-        let numerator = right * right - left * left + i64::from(row[right as usize])
-            - i64::from(row[left as usize]);
+        let left = parabolas[top] as i32;
+        let right = column as i32;
+        let numerator =
+            right * right - left * left + row[right as usize] as i32 - row[left as usize] as i32;
         let crossing = numerator.div_euclid(2 * (right - left)) + 1;
         if crossing < width {
             top += 1;
@@ -115,7 +124,7 @@ fn envelope_row(row: &[u32], parabolas: &mut [u32], starts: &mut [u32], out: &mu
         }
     }
     for at in (0..row.len()).rev() {
-        out[at] = height_at(at as i64, parabolas[top]) as f64;
+        out[at] = f64::from(height_at(at as i32, parabolas[top]));
         if at as u32 == starts[top] && top > 0 {
             top -= 1;
         }

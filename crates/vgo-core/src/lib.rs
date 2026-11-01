@@ -22,9 +22,10 @@ pub use legal_set::{
     nearest_indexed as nearest_legal_placement_indexed,
     nearest_indexed_within as nearest_legal_placement_indexed_within,
     nearest_with as nearest_legal_placement_with, none_closer_than as no_legal_point_closer_than,
+    none_closer_than_except_vertices,
     none_closer_than_indexed as no_legal_point_closer_than_indexed, vertices as legal_set_vertices,
 };
 pub use model::{Color, Phase, Position, Ruleset, Stone, Validation, ValidationIssue};
-pub use numeric::{COORDINATE_EPSILON, distance_to_segment, length as planar_length};
+pub use numeric::{COORDINATE_EPSILON, distance_to_segment, length as planar_length, length_below};
 pub use settled::SettledRegion;
 pub use voronoi::{Cell, Edge, EdgeSource, Geometry, Point};
