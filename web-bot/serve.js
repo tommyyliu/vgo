@@ -1,9 +1,9 @@
-// Static server for the client, the benchmark and the reference pages.
+// Static server for the app, the bot and the benchmark pages.
 //
-// Serves the repository root rather than client/, because the pages that use
-// the bot and the bot itself live in different trees: reference/js-reference/
-// imports ../../client/src/index.js, and a server rooted at client/ cannot see
-// the importer. Rooting it here also gets the reference test pages served, which
+// Serves the repository root rather than web-bot/, because the app that uses the
+// bot and the bot itself live in different trees: js-app/index.html imports
+// ../web-bot/src/index.js, and a server rooted at web-bot/ cannot see the importer.
+// Rooting it here also gets the test pages served, which
 // they must be -- they load their modules over http and do not run from disk.
 //
 // Sets cross-origin isolation headers so `SharedArrayBuffer` -- and with it
@@ -15,8 +15,8 @@ import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 
 const ROOT = new URL('..', import.meta.url).pathname;
-// The client is the reference page; there is no second one to maintain.
-const PAGE = '/reference/js-reference/voronoi_go.html';
+// The one playable page.
+const PAGE = '/js-app/index.html';
 const TYPES = {
   '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
   '.wasm': 'application/wasm', '.onnx': 'application/octet-stream',
@@ -50,6 +50,6 @@ createServer(async (request, response) => {
   }
 }).listen(8123, () => {
   console.log(`http://localhost:8123${PAGE}`);
-  console.log('http://localhost:8123/client/public/bench.html   (inference benchmark)');
-  console.log('http://localhost:8123/reference/tests/engine-tests.html');
+  console.log('http://localhost:8123/web-bot/public/bench.html   (inference benchmark)');
+  console.log('http://localhost:8123/js-app/tests/engine-tests.html');
 });

@@ -190,15 +190,15 @@
   </div>
 </div>
 
-<script src="../src/engine/numeric.js"></script>
-<script src="../src/engine/model.js"></script>
-<script src="../src/geometry/voronoi.js"></script>
-<script src="../src/geometry/legal-set.js"></script>
-<script src="../src/geometry/settled-contour.js"></script>
-<script src="../src/engine/analysis.js"></script>
-<script src="../src/engine/game.js"></script>
-<script src="../src/io/vgo-sgf.js"></script>
-<script src="../src/io/game-tree.js"></script>
+<script src="./src/engine/numeric.js"></script>
+<script src="./src/engine/model.js"></script>
+<script src="./src/geometry/voronoi.js"></script>
+<script src="./src/geometry/legal-set.js"></script>
+<script src="./src/geometry/settled-contour.js"></script>
+<script src="./src/engine/analysis.js"></script>
+<script src="./src/engine/game.js"></script>
+<script src="./src/io/vgo-sgf.js"></script>
+<script src="./src/io/game-tree.js"></script>
 <script>
 "use strict";
 /* =========================================================================
@@ -865,7 +865,7 @@ document.getElementById('pass').onclick = () => {
 
    Neither path re-implements anything, and both are the same shape from here:
    serialise the position, get a move back, apply it. The browser path calls
-   `createBot` from client/src/index.js -- the same API a host site embeds -- so
+   `createBot` from web-bot/src/index.js -- the same API a host site embeds -- so
    this page is also the thing that keeps that API honest.
    ========================================================================= */
 
@@ -1015,7 +1015,7 @@ function explainAiFailure(error) {
     if (error && (error.code === 'invalid-position' || error.code === 'finished')) return message;
     return `${message}\n` +
       'the in-browser engine needs this page served over http, not opened from disk:\n' +
-      '  node client/serve.js   then   http://localhost:8123/reference/js-reference/voronoi_go.html\n' +
+      '  node web-bot/serve.js   then   http://localhost:8123/js-app/index.html\n' +
       'it also needs the WASM build and the model:\n' +
       '  see docs/CLIENT_BOT.md';
   }
@@ -1268,14 +1268,14 @@ draw();
 
      Serve the repository root and open
 
-       node client/serve.js
-       http://localhost:8123/reference/js-reference/voronoi_go.html
+       node web-bot/serve.js
+       http://localhost:8123/js-app/index.html
 
      What it loads:
 
-       client/public/ort.all.min.mjs   onnxruntime-web, which supplies WebGPU
-       client/src/index.js             the bot's public API
-       client/public/model.onnx        the exported weights
+       web-bot/public/ort.all.min.mjs   onnxruntime-web, which supplies WebGPU
+       web-bot/src/index.js             the bot's public API
+       web-bot/public/model.onnx        the exported weights
 
      This uses `src/index.js` rather than the built `dist/vgo-bot.js` on purpose.
      They are the same code -- the bundle is that file with the engine's WASM
@@ -1288,7 +1288,7 @@ draw();
 <script type="module">
 "use strict";
 // Relative to this document, since an inline module resolves against the page.
-const CLIENT = '../../client/';
+const CLIENT = '../web-bot/';
 
 window.VGO_BROWSER_ENGINE = {
   async load(say) {

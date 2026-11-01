@@ -38,15 +38,15 @@ being over. Those belong to the site, which already has them, and a bot that
 kept its own copy would be a second source of truth to keep in sync. You hand it
 a position; it hands back a move.
 
-It is not a UI. There is no rendering here — `reference/js-reference/voronoi_go.html`
+It is not a UI. There is no rendering here — `js-app/index.html`
 is the reference client if you want to see one, but it is a development tool
 rather than something to ship.
 
 ## Building
 
 ```bash
-npm --prefix client run build:wasm   # crates/vgo-wasm -> client/vendor/
-npm --prefix client run build        # vendor/ + src/  -> client/dist/vgo-bot.js
+npm --prefix web-bot run build:wasm   # crates/vgo-wasm -> web-bot/vendor/
+npm --prefix web-bot run build        # vendor/ + src/  -> web-bot/dist/vgo-bot.js
 ```
 
 `build:wasm` needs the Rust toolchain with the `wasm32-unknown-unknown` target
@@ -253,7 +253,7 @@ Stated because they will be noticed:
     serve.js           development server for the repository root
     bench/, public/    inference benchmarks and their assets
 
-`reference/js-reference/voronoi_go.html` imports `src/index.js` rather than the
+`js-app/index.html` imports `src/index.js` rather than the
 built bundle, deliberately: the API a site integrates against is the one
 exercised there, so it cannot rot while still appearing to work.
 

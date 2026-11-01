@@ -4,7 +4,7 @@
 //! `||x - s|| <= dist(x, L)`. Nothing can ever be played nearer to it than that
 //! stone already is, so the territory is decided.
 //!
-//! A port of `reference/src/geometry/settled-contour.js`, which the client draws
+//! A port of `js-app/src/geometry/settled-contour.js`, which the client draws
 //! as its "lock" overlay. Three facts from that derivation carry over and are
 //! what make this affordable:
 //!

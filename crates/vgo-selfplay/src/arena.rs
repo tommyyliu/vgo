@@ -337,7 +337,7 @@ fn validate_arguments(arguments: &Arguments) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// One game as SGF, in the dialect `reference/src/io/vgo-sgf.js` reads.
+/// One game as SGF, in the dialect `js-app/src/io/vgo-sgf.js` reads.
 ///
 /// Coordinates print with `{}` rather than a fixed precision: placements come
 /// from a continuous space and a snapped move can sit within 1e-6 of a

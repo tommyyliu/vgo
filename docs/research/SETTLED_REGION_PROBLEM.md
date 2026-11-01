@@ -36,7 +36,7 @@ grid.
 **Exactness.** This feeds a neural network as one input channel, so the mask
 must match the current implementation on essentially every pixel; pixels within
 floating-point epsilon of the boundary may differ. It must also stay consistent
-with `reference/src/geometry/settled-contour.js`, which draws the same region as
+with `js-app/src/geometry/settled-contour.js`, which draws the same region as
 a client-side overlay.
 
 ## Why it is worth optimising

@@ -27,7 +27,7 @@ regress previously discovered gameplay cases.
 
 ## Progress
 
-`reference/tests/run-tests.ps1` now fails nonzero and exercises the production
+`js-app/tests/run-tests.ps1` now fails nonzero and exercises the production
 modules and the real UI. Current fixtures cover immutable move transactions, empty legal
 space, board and disk tangency, point-only cell contact, pass/pass conclusion,
 post-game blocking, setup validation, Load, and Undo. The capture-specific

@@ -23,7 +23,7 @@ and no amount of analysis substitutes for playing it.
 
 - **Free** — no new mathematics; existing machinery is already parameterised for it.
 - **Bounded** — new derivations, but the exactness commitment in
-  [`ARCHITECTURE.md`](../../reference/ARCHITECTURE.md) survives.
+  [`ARCHITECTURE.md`](../../js-app/ARCHITECTURE.md) survives.
 - **Structural** — breaks an axiom the engine is built on, or forces approximation
   into the rules rather than the rendering.
 

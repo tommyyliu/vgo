@@ -12,11 +12,11 @@ __pycache__/
 .worktree/
 
 # Client build inputs and outputs that are fetched or generated, not authored.
-/client/node_modules
-/client/vendor/
-/client/public/model.onnx
-/client/public/ort*.mjs
-/client/public/ort*.wasm
-# Built by client/build.js from vendor/ and src/.
-/client/dist/
+/web-bot/node_modules
+/web-bot/vendor/
+/web-bot/public/model.onnx
+/web-bot/public/ort*.mjs
+/web-bot/public/ort*.wasm
+# Built by web-bot/build.js from vendor/ and src/.
+/web-bot/dist/
 

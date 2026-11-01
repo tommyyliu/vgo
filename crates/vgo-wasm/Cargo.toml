@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 # The browser bot's Rust half. Exists so the client does not become a fourth
-# implementation of the rules: `game.rs` and `reference/src/engine/game.js`
+# implementation of the rules: `game.rs` and `js-app/src/engine/game.js`
 # already carry mutual "must match" comments, and they have diverged in practice
 # -- the even-trade bug, where a placement capturing exactly one stone read as a
 # pass and ended live games, had to be found and fixed on both sides.

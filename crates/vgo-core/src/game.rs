@@ -129,7 +129,7 @@ pub fn place(position: &Position, x: f64, y: f64) -> Result<MoveResult, MoveErro
     // player had finished. Self-capture is legal and global here, so unlike
     // in Go a static count does not imply a capture happened.
     //
-    // Must match `place` in reference/src/engine/game.js.
+    // Must match `place` in js-app/src/engine/game.js.
     // Under the official rules a move that removes only the mover's stones is
     // rejected outright, so the question below never arises there: with no
     // self-capture there is no placement that leaves the board unchanged, and

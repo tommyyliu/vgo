@@ -12,7 +12,7 @@ The last recorded ply has no successor to difference against, so its move is not
 recoverable and the game is written one move short of what was played.
 
 Dialect matches `game_sgf` in crates/vgo-selfplay/src/arena.rs, which is what
-reference/src/io/vgo-sgf.js reads.
+js-app/src/io/vgo-sgf.js reads.
 
     scripts/selfplay-sgf.py <game-directory> [output.sgf]
 """

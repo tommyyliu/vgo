@@ -16,7 +16,7 @@ An AlphaZero-style reinforcement learning system for **Voronoi Go**, a
 continuous-action variant of Go. A stone is placed at any real coordinate, not
 on a grid intersection; territory is decided by Voronoi cells. The rules are in
 [`spec/FORMAL.md`](../spec/FORMAL.md), with a JavaScript implementation
-in [`reference/`](../reference/README.md) that serves as the behavioural oracle.
+in [`js-app/`](../js-app/README.md) that serves as the behavioural oracle.
 
 Continuous placement is the fact that drives most design decisions below. There
 is no finite action set, so:

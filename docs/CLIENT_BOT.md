@@ -2,16 +2,16 @@
 
 Written 2026-08-16 as a plan; updated the same day, once it was built, to say
 what actually happened. **It is built and wired into
-`reference/js-reference/voronoi_go.html`** — pick `engine: in browser` in the
+`js-app/index.html`** — pick `engine: in browser` in the
 model-opponent panel.
 
-    npm --prefix client run build:wasm     # crates/vgo-wasm -> client/vendor
-    node client/serve.js                   # serves the repository root
-    # http://localhost:8123/reference/js-reference/voronoi_go.html
+    npm --prefix web-bot run build:wasm     # crates/vgo-wasm -> web-bot/vendor
+    node web-bot/serve.js                   # serves the repository root
+    # http://localhost:8123/js-app/index.html
 
 Two build inputs are fetched or generated rather than tracked, and both must be
-present: `client/vendor/vgo_wasm*` from the command above, and
-`client/public/model.onnx`, an exported checkpoint.
+present: `web-bot/vendor/vgo_wasm*` from the command above, and
+`web-bot/public/model.onnx`, an exported checkpoint.
 
 The headline correction is below in **The mistake to avoid**: the design that
 document argued for — rasterize in a compute shader so the tensor never leaves
@@ -94,7 +94,7 @@ a simulation count, so the same code is sensible on a desktop and a phone.
 ### Why compile the Rust instead of rewriting in JS
 
 There are already two implementations of the rules, and `game.rs` carries the
-comment *"Must match `place` in reference/src/engine/game.js"*. They have
+comment *"Must match `place` in js-app/src/engine/game.js"*. They have
 diverged in practice: the even-trade bug — a placement capturing exactly one
 stone read as a pass, ending live games — had to be fixed in both. A third
 implementation in JavaScript would make that worse, and search and rules are the
@@ -179,9 +179,9 @@ select less informatively. Self-play uses 4. This is measurable natively with
 to avoid*.
 
 **Phase 3 — WASM build. Done.** `crates/vgo-wasm` exposes `Game` and `Search`;
-`client/src/bot.js` drives the loop.
+`web-bot/src/bot.js` drives the loop.
 
-**Phase 4 — packaging. Done, apart from difficulty.** `client/dist/vgo-bot.js`
+**Phase 4 — packaging. Done, apart from difficulty.** `web-bot/dist/vgo-bot.js`
 is one 360 KB ES module with the engine's WASM inlined; see *Embedding* below.
 The bot is also wired into the reference client behind an engine selector, with
 the server backend as the default.
@@ -193,11 +193,11 @@ equal time is unequal strength across machines, so a site running a ladder wants
 
 ## Embedding
 
-    npm --prefix client run build:wasm    # crates/vgo-wasm -> client/vendor/
-    npm --prefix client run build         # vendor/ + src/  -> client/dist/vgo-bot.js
+    npm --prefix web-bot run build:wasm    # crates/vgo-wasm -> web-bot/vendor/
+    npm --prefix web-bot run build         # vendor/ + src/  -> web-bot/dist/vgo-bot.js
 
-`client/examples/embed.html` is the smallest working integration and the smoke
-test for the bundle. The API is `client/src/index.js`, which is also what the
+`web-bot/examples/embed.html` is the smallest working integration and the smoke
+test for the bundle. The API is `web-bot/src/index.js`, which is also what the
 reference client imports — deliberately, so the API a host integrates against is
 the one that gets exercised here and cannot rot while still appearing to work.
 
@@ -283,7 +283,7 @@ Tiers 1 and 2 are chosen at runtime by ORT, from `executionProviders:
 selector in the client, and is the default there because that page is often
 opened straight off disk, where ES modules and WASM cannot load at all.
 
-Cross-origin isolation (COOP/COEP) is what `client/serve.js` sets, and it is
+Cross-origin isolation (COOP/COEP) is what `web-bot/serve.js` sets, and it is
 worth being precise about who needs it. WebGPU does not. Multi-threaded WASM
 inference does, because it needs `SharedArrayBuffer`, and that is the difference
 between ~95 ms and ~25 ms per position on the fallback tier. So a host that

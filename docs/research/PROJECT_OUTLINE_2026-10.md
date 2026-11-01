@@ -584,7 +584,7 @@ training a stronger model.
 
 | Layer | Main location | Responsibility |
 | --- | --- | --- |
-| Rule definition and reference | `reference/` | Rules, proofs, JavaScript oracle, reference UI/tests |
+| Rule definition and reference | `js-app/` | Rules, proofs, JavaScript oracle, reference UI/tests |
 | Native state and geometry | `crates/vgo-core/` | Validation, cells, legal space, settlement, transactions, scoring |
 | Move search | `crates/vgo-search/` | Proposals, widening, PUCT, backups, stepped search |
 | Model inputs | `crates/vgo-raster/` | Raster planes, legal grids, packed inputs, shard helpers |
@@ -592,7 +592,7 @@ training a stronger model.
 | Games and datasets | `crates/vgo-selfplay/` | Continuous generation, arenas, replay publication, telemetry |
 | Learning | `training/vgo_training/` | Replay preparation, targets, augmentation, model, optimizer, export |
 | Run orchestration | `scripts/` | Bulk loop, evaluation, calibration, setup, benchmarks |
-| Browser delivery | `crates/vgo-wasm/`, `client/` | Native engine in WASM, inference integration, bot API |
+| Browser delivery | `crates/vgo-wasm/`, `web-bot/` | Native engine in WASM, inference integration, bot API |
 | Evidence and work order | `docs/research/`, `benchmarks/`, `todo/` | Results, reproducible measurements, prioritized work |
 
 ### 12.3 The next questions

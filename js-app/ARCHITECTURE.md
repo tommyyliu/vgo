@@ -149,7 +149,7 @@ remains ticket 001.
 Run all browser and engine checks from the repository root:
 
 ```powershell
-.\reference\tests\run-tests.ps1
+.\js-app\tests\run-tests.ps1
 ```
 
 The engine fixtures call the production modules directly. The UI fixture loads

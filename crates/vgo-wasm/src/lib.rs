@@ -1,7 +1,7 @@
 //! The browser bot's Rust half.
 //!
 //! Exists so the client does not become a fourth implementation of the rules.
-//! `crates/vgo-core/src/game.rs` and `reference/src/engine/game.js` already
+//! `crates/vgo-core/src/game.rs` and `js-app/src/engine/game.js` already
 //! carry mutual "must match" comments and have diverged in practice: a
 //! placement capturing exactly one stone read as a pass and ended live games,
 //! and the fix had to be found twice. Everything below is the same code

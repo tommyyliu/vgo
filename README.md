@@ -25,9 +25,9 @@ Run `scripts/check.sh` before merging.
 | [`crates/vgo-selfplay`](crates/vgo-selfplay) | `vgo-generate-continuous`, `vgo-arena`, `vgo-serve-move`, `vgo-bench` |
 | [`crates/vgo-wasm`](crates/vgo-wasm) | the engine for the browser client |
 | [`training/`](training) | PyTorch model, learner, ONNX export |
-| [`client/`](client/README.md) | the embeddable browser bot |
+| [`web-bot/`](web-bot/README.md) | the embeddable browser bot: engine as WebAssembly, no UI |
 | [`scripts/`](scripts) | the loop (`bulk-loop.sh`), checks and tools |
-| [`reference/`](reference/README.md) | JavaScript implementation, kept as a behavioural oracle |
+| [`js-app/`](js-app/README.md) | the playable game, whose JS engine is also the behavioural oracle |
 | [`docs/`](docs) | system docs; [`docs/research/`](docs/research/README.md) holds dated, frozen notes |
 | [`todo/`](todo/README.md) | backlog tickets |
 | `benchmarks/` | fixture positions, timing history, golden digests |
@@ -41,9 +41,10 @@ Run `scripts/check.sh` before merging.
 | | Inference | Rust, ONNX Runtime through `ort` (CUDA, TensorRT) |
 | Training | Rasterization | Rust binaries called from Python, with a NumPy fallback |
 | | ML loop | Python, PyTorch, ONNX export, `uv`; driven by Bash |
-| Website | Browser bot | Rust compiled to WebAssembly, plain JS, `onnxruntime-web`; no server |
+| Website | Game | Plain JavaScript and HTML |
+| | Browser bot | Rust compiled to WebAssembly, `onnxruntime-web`; no server |
 | Evaluation | Arena and ratings | Rust `vgo-arena`, Python Bradley-Terry |
-| Reference | Oracle | JavaScript, tests run through PowerShell |
+| Oracle | JS engine in the game | Tests run through PowerShell |
 
 Code for experiments that were concluded (the shard pipeline, Muon, the flat and
 U-Net nets, RGB rasters, tournament tooling and the rest) was removed on

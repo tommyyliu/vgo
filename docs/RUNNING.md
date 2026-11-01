@@ -35,7 +35,7 @@ cargo test --release --workspace
 cd training && .venv/bin/python -m unittest discover -s tests
 ```
 
-The browser suite for the reference implementation is `reference/tests/`; see
+The browser suite for the reference implementation is `js-app/tests/`; see
 its README.
 
 ## The loop
@@ -203,7 +203,7 @@ scripts/resign-calibration.py artifacts/my-run/games --games 400
 ```
 
 The SGF loads in the reference application: open
-`reference/js-reference/voronoi_go.html` in a browser and paste it into the
+`js-app/index.html` in a browser and paste it into the
 VGO-SGF box.
 
 To play the current model yourself:
