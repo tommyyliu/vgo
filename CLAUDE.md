@@ -52,7 +52,8 @@ Share of a fixture search with a fixed policy, so inference is absent.
 | Vertex check | 6% | 6% |
 | Candidate snapping | 8% | 9% |
 
-In real generation the GPU is the limit, not this table: one card at 128 reaches about
-20k positions/s with 6 of 16 cores busy. See "Sizing a machine" in `docs/RUNNING.md`.
+In real generation the GPU is the limit, not this table, as long as the host has enough cores:
+see "Sizing a machine" in `docs/RUNNING.md`. Measure over whole games. Early-game runs read
+about half the CPU of later boards and overstated what three lanes and 8 cores could do.
 
 Bigger nets are closed in `docs/FINDINGS.md`. Tree reuse is parked in `dashboard/ideas.json`.

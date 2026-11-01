@@ -193,10 +193,11 @@ impl OnnxBatchService {
                 //
                 // All within noise. Batch is already at its optimum: single-session
                 // inference saturates by batch 16-32, and batch 48 and 64 are slower.
-                // Lanes, measured 2026-11-01 on real self-play at 128: one 13.4k
-                // positions/s, two 19.8k, three 21.1k, with the card at 75%, 100%
-                // and 100%. An earlier measure had three worse than two, on a
-                // saturated host, so the CPU may have been what it saw.
+                // Lanes, measured 2026-11-01 over whole games: two and three both
+                // gave 18.5k positions/s at 128 and 7.4k at 192, and one gave 13.4k
+                // early in games. Three hung at 256 both times it ran, after about
+                // 40 s, with the card at 100% and 60 W, until the watchdog ended it.
+                // The cause is not known, so keep to two.
                 //
                 // trt_cuda_graph_enable is deliberately absent. It panics here
                 // ("expected typeinfo_ptr to not be null") because ORT's

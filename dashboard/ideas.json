@@ -41,8 +41,8 @@
     "bucket": "Speed",
     "effort": "M",
     "title": "Confirm 128 input as the efficient default",
-    "why": "128 searches 2-3.6x faster and scored 30-18 at equal time on the big board. Equal-sim arenas are inconclusive and need replication.",
-    "test": "Run a larger equal-time arena on both boards before starting a new campaign."
+    "why": "128 searches 2-3.6x faster and scored 30-18 at equal time on the big board. One card plays 18.6k positions/s at 128, 7.4k at 192 and 4.1k at 256, so at 61 Elo a doubling 192 has to beat 128 by about 80 Elo at equal simulations and 256 by about 130.",
+    "test": "Bootstrap at 128. Train a 192 net from scratch on the same window, then play them at equal time with --opponent-resolution on both boards. Move up once it wins."
   },
   {
     "id": "score-head",
@@ -196,23 +196,5 @@
     "why": "A hand-kept second rasterizer is a correctness risk if Rust covers every case.",
     "test": "Delete it unless something still needs the fallback.",
     "effort": "S"
-  },
-  {
-    "id": "settled-small-boards",
-    "status": "Later",
-    "bucket": "Speed",
-    "effort": "S",
-    "title": "Decide the small-board settled path",
-    "why": "Below 20 stones the per-stone solver is two thirds of a raster, and it is slightly less exact than the distance path.",
-    "test": "Lower DISTANCE_SETTLED_MINIMUM_STONES and refresh golden. This changes model input, so it needs a decision first."
-  },
-  {
-    "id": "three-lanes",
-    "status": "Later",
-    "bucket": "Speed",
-    "effort": "S",
-    "title": "Try three inference lanes in the loop",
-    "why": "Three lanes reached 21.1k positions/s against 19.8k for two, in a 40-second early-game run.",
-    "test": "Compare whole games, including late boards, before changing the loop's default."
   }
 ]

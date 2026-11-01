@@ -23,3 +23,4 @@ Don't reopen these without new evidence.
 | Bigger nets at this compute | Dead end. One doubling of simulations is worth about 61 Elo |
 | Tanh value head with MSE | Gradient vanished on confidently wrong positions |
 | Random-candidate sampler | Target carried no board-dependent signal |
+| Three inference lanes | No gain over whole games: 18.5k positions/s against 18.6k at 128, 7.3k against 7.4k at 192. Hung at 256, 2 runs of 2 |

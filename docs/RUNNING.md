@@ -28,13 +28,23 @@ TensorRT is an optional extra. A venv created by a bare `uv sync` or `uv run`
 lacks it, and `--provider tensorrt` then fails on a missing `libnvinfer.so.10`.
 Restore it with `uv sync --frozen --extra tensorrt` in `training/`.
 
-**Sizing a machine.** One GPU sets the ceiling, and the CPU only has to keep it fed. On
-one 300 W card at 128 with 32 actors, 4 physical cores held the card near 60%, 8 near 90%,
-and 16 pinned it at 100% with 6 cores busy. Those runs were early-game, the cheapest part
-of a game, so allow more. Search and raster together reach 42k positions/s on 16 cores at
-128 and 21k at 256 across the fixture positions, against 20k from that card at 128. The
-card's rate at 256 has not been measured. `vgo-bench --scaling 1,16,32` measures the CPU
-side on a new machine.
+**Sizing a machine.** One GPU sets the ceiling, and the CPU has to keep it fed. One 300 W
+card with 32 actors and 2 inference lanes, on a 16-core, 32-thread host:
+
+| Input | Positions/s | CPU threads busy |
+|---|---|---|
+| 128 | 18.6k | 9, rising to 12 by minute five |
+| 192 | 7.4k | 7 |
+| 256 | 4.1k | 4 |
+
+128 ran 5 minutes at 1000 simulations. 192 and 256 ran 150 seconds at 200, which plays more
+of each game but costs more CPU per position. Pinned to 8 physical cores at 128, the card fell
+from 91% to 69% over 5 minutes as boards filled, so 8 is not enough. Plan on 16 physical cores
+for a card of this speed at 128, or about 7 per 10k positions/s on a faster one. Big boards
+were still filling when these ended, so leave headroom. `vgo-bench --scaling 1,16,32` measures
+the CPU side on a new machine.
+
+Games store positions, not pictures, so a window played at 128 trains at any resolution.
 
 What the machine needs: an NVIDIA **driver** (the wheels carry their own CUDA
 and TensorRT, including for Blackwell/sm_120), Rust via `rust-toolchain.toml`,

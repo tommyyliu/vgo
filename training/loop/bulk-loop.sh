@@ -210,11 +210,11 @@ PY
 }
 
 # `--inference-slots 2` and `--maximum-batch 32` are the known-good pair. Do not
-# raise them without watching a game actually land: at 4 slots the inference
-# threads livelock, spinning at 100% CPU while every actor blocks on a result
-# that never arrives. `nvidia-smi` reports 100% utilization throughout, because
-# a spin-wait is indistinguishable from work by that metric -- the tell is power
-# draw, which sits at idle (~52 W) instead of the 200 W+ of real load.
+# raise them. Three gain nothing over whole games and hang at 256 within a minute;
+# at 4 the inference threads livelock, spinning at 100% CPU while every actor
+# blocks on a result that never arrives. `nvidia-smi` reports 100% utilization
+# either way, so the tell is power draw, which sits near idle (~60 W) instead of
+# the 200 W+ of real load.
 #
 # `--leaf-batch` stays at 4 for a different reason: leaf parallelism trades
 # search quality for throughput, measured at -70 Elo for batch 32 in the browser

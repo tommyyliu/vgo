@@ -41,14 +41,14 @@ if (( gpu_memory < 15000 )); then
   warn "under 16 GB: lower --actors and --inference-batch, or generation will OOM"
 fi
 
-# One GPU sets the ceiling, and the CPU only has to keep it fed. On one 300 W card
-# at 128, with 32 actors and two lanes, 4 cores held it near 60%, 8 near 90%, and
-# 16 pinned it at 100% with 6 busy. Say so here because renting a large CPU for one
-# GPU buys nothing. See docs/RUNNING.md.
+# One GPU sets the ceiling, and the CPU has to keep it fed. One 300 W card at 128,
+# with 32 actors and two lanes, needs about 12 busy threads by minute five of real
+# games, and 8 physical cores let it fall to 69%. See "Sizing a machine" in
+# docs/RUNNING.md before renting: 16 cores per card of this speed is the plan.
 cores=$(nproc)
 ok "$cores logical cores"
-if (( cores < 8 )); then
-  warn "under 8 cores the GPU will wait on the CPU"
+if (( cores < 16 )); then
+  warn "under 16 cores the GPU will wait on the CPU at 128"
 fi
 
 # ------------------------------------------------------------ the toolchains
