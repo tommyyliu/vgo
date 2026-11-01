@@ -582,6 +582,18 @@ The code tests `a^2` against the squares of `(2r + t)(1 + 1e-12)` and
 Part (b) does not cover a visitor that records what it sees, so `escape_witness` keeps
 legality first.
 
+### E8. Derived data on a position
+
+*Status: Proved.* Used by `Position::legal_index`, `shared_cells` and
+`adopt_legal_index`.
+
+**Claim.** A cached value computed from `(r, stones)` by a deterministic function equals a
+fresh computation, provided it is discarded whenever those inputs change.
+
+**Proof.** A deterministic function of equal inputs gives equal results. Stones change only
+through `with_stones` and the constructors, which all reset the
+caches, and `adopt_legal_index` is called only when no self-capture changed the stones. QED
+
 ### E9. A pixel inside a stone's disk is settled
 
 *Status: Proved, with rounding bounded by the margin.* Used by `classify_row`.
@@ -626,17 +638,23 @@ the same comparison, to the vertices in the buckets within `d(1 + 1e-9) + 1e-12`
 reach and its bucket is read. Reading more vertices cannot add a false positive, because
 each still has to pass the comparison. QED
 
-### E8. Derived data on a position
+`has_escape` reads vertices the same way, under [E7]: its comparison passes only within
+`reach`, and it asks whether any candidate passes, so the order they are read in is
+immaterial. The stone buckets return the same answer as the full scan for the same reason.
 
-*Status: Proved.* Used by `Position::legal_index`, `shared_cells` and
-`adopt_legal_index`.
+### E11. Validity survives a legal move
 
-**Claim.** A cached value computed from `(r, stones)` by a deterministic function equals a
-fresh computation, provided it is discarded whenever those inputs change.
+*Status: Proved.* Used by `Position::mark_valid` and `place`.
 
-**Proof.** A deterministic function of equal inputs gives equal results. Stones change only
-through `with_stones` and the constructors, which all reset the
-caches, and `adopt_legal_index` is called only when no self-capture changed the stones. QED
+**Claim.** If a position validates and `legal_set::contains` accepts `p`, the stones with
+`p` appended validate, and so does any subset of them.
+
+**Proof.** `validate` checks the radius, and each stone and each pair of stones on their
+own, so a subset of a valid list passes and only `p` needs checking. `contains` requires
+`p` finite and applies the same inset expressions. For each earlier stone it requires the
+computed `q = FMA(dx, dx, dy^2) >= rnd(m^2)` with `m = 2r - e`, and `validate` tests
+`rnd(sqrt(q)) < m` on the same `q`. Rounding is monotone, and `rnd(sqrt(rnd(m^2))) = m` for
+binary64 without overflow or underflow, so `rnd(sqrt(q)) >= m` and no issue is raised. QED
 
 ## Floating-point lemmas
 

@@ -84,6 +84,7 @@ fn alive_groups_of(
     if !playable {
         return alive_groups;
     }
+    let index = position.legal_index();
     for (stone_index, cell) in geometry.cells.iter().enumerate() {
         let group = geometry.groups[stone_index];
         if alive_groups.contains(&group) {
@@ -92,10 +93,10 @@ fn alive_groups_of(
         let stone = position.stones()[stone_index];
         let stone_point = Point::new(stone.x, stone.y);
         let alive = match position.ruleset() {
-            Ruleset::Vgo => cell.polygon.iter().any(|&vertex| {
-                legal_set::escape_witness(position, vertex, stone_point, Some(legal_vertices))
-                    .is_some()
-            }),
+            Ruleset::Vgo => cell
+                .polygon
+                .iter()
+                .any(|&vertex| legal_set::has_escape(position, vertex, stone_point, index)),
             Ruleset::Official => {
                 official_cell_is_alive(position, stone_index, cell, legal_vertices)
             }
@@ -181,7 +182,7 @@ impl Settlement {
     /// Settlement alone, skipping the score and outcome a full analysis builds.
     #[must_use]
     pub fn new(position: &Position) -> Self {
-        let validation = position.validate();
+        let validation = position.validation();
         let geometry = voronoi::compute(position);
         let legal_vertices = position.legal_index().vertices().to_vec();
         let alive_groups = alive_groups_of(

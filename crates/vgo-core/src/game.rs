@@ -93,11 +93,16 @@ pub fn place(position: &Position, x: f64, y: f64) -> Result<MoveResult, MoveErro
         return Err(MoveError::IllegalPlacement);
     }
 
+    // A legal stone on a valid board, and any subset of that, stays valid: [E11].
+    let valid = position.is_valid();
     let mover = position.to_move();
     let mut stones = position.stones().to_vec();
     stones.push(Stone::new(x, y, mover));
     let mut provisional = position.with_stones(stones);
     provisional.link_parent_cells(Arc::clone(position.shared_cells()));
+    if valid {
+        provisional.mark_valid();
+    }
     // Settlement first: captures may still change either provisional board, so
     // scoring it eagerly would usually be throwaway work. If self-capture leaves
     // the final one unchanged, it is promoted into the committed analysis below.
@@ -107,6 +112,9 @@ pub fn place(position: &Position, x: f64, y: f64) -> Result<MoveResult, MoveErro
         remove_settled(&provisional, &current_settlement, mover.other());
     let enemy_count = enemy_doomed.len();
     provisional = after_enemy;
+    if valid {
+        provisional.mark_valid();
+    }
     if enemy_count > 0 {
         current_settlement = Settlement::new(&provisional);
     }
@@ -146,6 +154,9 @@ pub fn place(position: &Position, x: f64, y: f64) -> Result<MoveResult, MoveErro
         enemy_count == 0 && self_doomed.len() == 1 && self_doomed.contains(&placed_index);
     let changed = !unchanged;
     let committed = position.after_placement(after_self.stones().to_vec(), changed);
+    if valid {
+        committed.mark_valid();
+    }
     // With no self-capture, `committed` has exactly the radius and stones that
     // `current_settlement` analysed; committing only changed turn/pass metadata.
     // Promote those already-computed geometry and liveness results instead of
@@ -188,6 +199,9 @@ pub fn pass(position: &Position) -> Result<MoveResult, MoveError> {
         "position handed to the move generator is not playable"
     );
     let next = position.after_pass();
+    if position.is_valid() {
+        next.mark_valid();
+    }
     let analysis = Analysis::new(&next);
     let event = if next.phase() == Phase::Finished {
         GameEvent::GameFinished
@@ -797,5 +811,58 @@ mod tests {
             }
         }
         assert!(checked > 1000, "only {checked} samples of settled cells");
+    }
+}
+
+#[cfg(test)]
+mod validity {
+    use super::*;
+
+    /// [E11]: what `place` marks as valid has to be what `validate` says, through
+    /// captures and self-captures, on a board crowded enough to have both.
+    #[test]
+    fn a_position_marked_valid_validates() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        let empty = Position::new(1.0 / 12.0, Vec::new(), Color::Black);
+        let mut position = empty.clone();
+        let (mut moves, mut captured, mut misses) = (0, 0, 0);
+        for _ in 0..60_000 {
+            let Ok(result) = place(&position, next(), next()) else {
+                // A crowded board has little legal space left for a random point.
+                misses += 1;
+                if misses == 200 {
+                    (position, misses) = (empty.clone(), 0);
+                }
+                continue;
+            };
+            assert!(result.position.is_valid());
+            assert!(result.position.validate().is_playable());
+            moves += 1;
+            captured += result.captured;
+            misses = 0;
+            position = result.position;
+            if position.phase() == Phase::Finished {
+                position = empty.clone();
+            }
+        }
+        assert!(moves > 500, "{moves} moves is too few to mean anything");
+        assert!(captured > 0, "no capture was exercised in {moves} moves");
+    }
+
+    #[test]
+    fn an_invalid_position_is_never_marked() {
+        let stones = vec![
+            Stone::new(0.5, 0.5, Color::Black),
+            Stone::new(0.5, 0.5, Color::White),
+        ];
+        let position = Position::new(0.1, stones, Color::Black);
+        assert!(!position.is_valid());
+        assert!(!position.validation().is_playable());
     }
 }

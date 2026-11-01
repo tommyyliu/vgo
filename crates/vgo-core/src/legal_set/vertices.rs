@@ -107,7 +107,74 @@ pub(super) fn vertices_with(position: &Position, buckets: Option<&StoneBuckets>)
     result
 }
 
-/// The vertices and bucket grid for one position, built once and reused across
+/// Legal-set vertices bucketed by location, so a query reads the few near it.
+///
+/// Liveness tests every cell vertex against the legal set, and a raster tests
+/// hundreds of undecided pixels, so a scan of every vertex here is quadratic in
+/// the board. Wider than the stone buckets because there are few vertices.
+pub(super) struct VertexBuckets {
+    cell: f64,
+    side: usize,
+    starts: Vec<u32>,
+    points: Vec<Point>,
+}
+
+impl VertexBuckets {
+    fn build(vertices: &[Point], cell: f64) -> Self {
+        let side = ((1.0 / cell).ceil() as usize).clamp(1, 512);
+        let bucket = |point: &Point| {
+            let column = ((point.x / cell) as usize).min(side - 1);
+            let row = ((point.y / cell) as usize).min(side - 1);
+            row * side + column
+        };
+        let mut starts = vec![0u32; side * side + 1];
+        for vertex in vertices {
+            starts[bucket(vertex) + 1] += 1;
+        }
+        for index in 1..starts.len() {
+            starts[index] += starts[index - 1];
+        }
+        let mut cursor = starts.clone();
+        let mut points = vec![Point::new(0.0, 0.0); vertices.len()];
+        for vertex in vertices {
+            let slot = &mut cursor[bucket(vertex)];
+            points[*slot as usize] = *vertex;
+            *slot += 1;
+        }
+        Self {
+            cell,
+            side,
+            starts,
+            points,
+        }
+    }
+
+    /// Visit every vertex within `reach` of `point`, plus possibly others, in no
+    /// useful order, until `visit` accepts one. `reach` must be finite.
+    pub(super) fn any_near(
+        &self,
+        point: Point,
+        reach: f64,
+        visit: &mut impl FnMut(Point) -> bool,
+    ) -> bool {
+        // Longer than asked, so rounding cannot leave a bucket unread. The caller
+        // still compares each vertex, so this only limits what is read: [E10].
+        let reach = reach * (1.0 + 1e-9) + 1e-12;
+        let bucket =
+            |value: f64| ((value / self.cell).floor().max(0.0) as usize).min(self.side - 1);
+        for row in bucket(point.y - reach)..=bucket(point.y + reach) {
+            let base = row * self.side;
+            let first = self.starts[base + bucket(point.x - reach)] as usize;
+            let last = self.starts[base + bucket(point.x + reach) + 1] as usize;
+            if self.points[first..last].iter().any(|&vertex| visit(vertex)) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// The vertices and bucket grids for one position, built once and reused across
 /// the many point queries a raster makes of it.
 ///
 /// Every exact test in the settled classification screens its candidates with
@@ -118,6 +185,7 @@ pub(super) fn vertices_with(position: &Position, buckets: Option<&StoneBuckets>)
 pub struct LegalSetIndex {
     pub(super) buckets: Option<StoneBuckets>,
     pub(super) vertices: Vec<Point>,
+    pub(super) vertex_buckets: VertexBuckets,
 }
 
 impl LegalSetIndex {
@@ -126,11 +194,26 @@ impl LegalSetIndex {
         let buckets = (position.stones().len() >= BUCKET_MINIMUM_STONES)
             .then(|| StoneBuckets::build(position));
         let vertices = vertices_with(position, buckets.as_ref());
-        Self { buckets, vertices }
+        let vertex_buckets = VertexBuckets::build(&vertices, 4.0 * position.radius());
+        Self {
+            buckets,
+            vertices,
+            vertex_buckets,
+        }
     }
 
     #[must_use]
     pub fn vertices(&self) -> &[Point] {
         &self.vertices
+    }
+
+    /// Whether a vertex lies strictly closer than `distance` to `point`, by the
+    /// comparison the exact test makes. Proof: [E10].
+    #[must_use]
+    pub fn any_vertex_closer(&self, point: Point, distance: f64) -> bool {
+        self.vertex_buckets
+            .any_near(point, distance, &mut |vertex| {
+                numeric::length_below(vertex.x - point.x, vertex.y - point.y, distance)
+            })
     }
 }

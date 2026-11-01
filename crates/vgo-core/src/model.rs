@@ -144,10 +144,24 @@ impl std::fmt::Debug for LegalIndexCache {
     }
 }
 
+/// Set once this position is known to validate, so it need not be checked again.
+///
+/// Derived data like [`LegalIndexCache`], so it never affects equality. Validation
+/// is quadratic in stones and a search plays a move per simulation. Proof: [E11].
+#[derive(Clone, Debug, Default)]
+struct ValidityCache(OnceLock<()>);
+
+impl PartialEq for ValidityCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Position {
     legal_index: LegalIndexCache,
     geometry: GeometryCache,
+    known_valid: ValidityCache,
     radius: f64,
     stones: Vec<Stone>,
     to_move: Color,
@@ -176,6 +190,7 @@ impl Position {
         Self {
             legal_index: LegalIndexCache::default(),
             geometry: GeometryCache::default(),
+            known_valid: ValidityCache::default(),
             radius,
             stones,
             to_move,
@@ -205,6 +220,29 @@ impl Position {
     /// Records the cells of the position this one extends by its last stone.
     pub(crate) fn link_parent_cells(&mut self, cells: SharedCells) {
         self.geometry.parent = Some(cells);
+    }
+
+    /// Whether this position is playable, remembering a yes.
+    pub(crate) fn is_valid(&self) -> bool {
+        let valid = self.known_valid.0.get().is_some() || self.validate().is_playable();
+        if valid {
+            self.mark_valid();
+        }
+        valid
+    }
+
+    /// Records that these stones validate, which the caller has established.
+    pub(crate) fn mark_valid(&self) {
+        let _ = self.known_valid.0.set(());
+    }
+
+    /// [`Self::validate`], without the work when the answer is already known.
+    pub(crate) fn validation(&self) -> Validation {
+        if self.known_valid.0.get().is_some() {
+            Validation::default()
+        } else {
+            self.validate()
+        }
     }
 
     /// Takes `other`'s legal-set index, if it has one. `other` must hold the same
@@ -356,6 +394,7 @@ impl Position {
         // The clone brought the old stones' index with it.
         next.legal_index = LegalIndexCache::default();
         next.geometry = GeometryCache::default();
+        next.known_valid = ValidityCache::default();
         next
     }
 
@@ -387,6 +426,7 @@ impl Position {
         Self {
             legal_index: LegalIndexCache::default(),
             geometry: GeometryCache::default(),
+            known_valid: ValidityCache::default(),
             radius: self.radius,
             stones,
             to_move: if finished {
@@ -412,6 +452,7 @@ impl Position {
         Self {
             legal_index: LegalIndexCache::default(),
             geometry: GeometryCache::default(),
+            known_valid: ValidityCache::default(),
             radius: self.radius,
             stones: self.stones.clone(),
             to_move: if finished {
@@ -439,7 +480,7 @@ pub enum ValidationIssue {
     OverlappingStones { first: usize, second: usize },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Validation {
     issues: Vec<ValidationIssue>,
 }

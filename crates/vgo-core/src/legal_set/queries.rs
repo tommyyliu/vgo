@@ -1,6 +1,7 @@
 use crate::{Point, Position, numeric};
 
 use super::buckets::StoneBuckets;
+use super::vertices::VertexBuckets;
 use super::{LegalSetIndex, contains_with, vertices};
 
 /// Relative slack on the annulus test. Far above rounding, which is near 1e-16 on
@@ -13,7 +14,15 @@ fn visit_candidates(
     known_vertices: Option<&[Point]>,
     mut visit: impl FnMut(Point) -> bool,
 ) -> bool {
-    visit_candidates_within::<false>(position, point, None, known_vertices, None, &mut visit)
+    visit_candidates_within::<false>(
+        position,
+        point,
+        None,
+        known_vertices,
+        None,
+        None,
+        &mut visit,
+    )
 }
 
 /// Whether a candidate is legal and accepted, in the order the caller can afford.
@@ -58,6 +67,7 @@ fn visit_candidates_within<const VISIT_FIRST: bool>(
     threshold: Option<f64>,
     known_vertices: Option<&[Point]>,
     buckets: Option<&StoneBuckets>,
+    vertex_buckets: Option<&VertexBuckets>,
     visit: &mut impl FnMut(Point) -> bool,
 ) -> bool {
     if admit::<VISIT_FIRST>(position, buckets, point, visit) {
@@ -127,6 +137,13 @@ fn visit_candidates_within<const VISIT_FIRST: bool>(
         }
     }
 
+    if let (Some(grid), Some(reach)) = (vertex_buckets, threshold)
+        && reach.is_finite()
+        && point.x.is_finite()
+        && point.y.is_finite()
+    {
+        return grid.any_near(point, reach, visit);
+    }
     let owned_vertices;
     let candidates = if let Some(known) = known_vertices {
         known
@@ -159,6 +176,7 @@ pub fn none_closer_than_indexed(
         Some(threshold),
         Some(&index.vertices),
         index.buckets.as_ref(),
+        Some(&index.vertex_buckets),
         &mut visit,
     )
 }
@@ -182,6 +200,7 @@ pub fn none_closer_than_except_vertices(
         Some(threshold),
         Some(&[]),
         index.buckets.as_ref(),
+        None,
         &mut visit,
     )
 }
@@ -215,6 +234,7 @@ pub fn none_closer_than(
         Some(threshold),
         known_vertices,
         None,
+        None,
         &mut visit,
     )
 }
@@ -228,41 +248,33 @@ pub fn distance(position: &Position, point: Point, known_vertices: Option<&[Poin
     best
 }
 
+/// Whether some legal point lies strictly nearer `vertex` than `stone` does.
+///
+/// A candidate can only win by sitting strictly nearer `vertex` than `stone`
+/// does, so nothing beyond that distance ever qualifies, and the thresholded walk
+/// reads only the stones and vertices that can land inside it. Only existence is
+/// asked, so the buckets' visiting order cannot change the answer.
+///
+/// The bound is the exact predicate, not the locality theorem: a stone
+/// contributes the point one diameter along the ray to the query, so a stone
+/// outside that annulus cannot land within `reach`. `SNAP_MARGIN` keeps the
+/// geometric cut strictly looser than the interval-arithmetic comparison below,
+/// so the two cannot disagree about a boundary case.
 #[must_use]
-pub(crate) fn escape_witness(
+pub(crate) fn has_escape(
     position: &Position,
     vertex: Point,
     stone: Point,
-    known_vertices: Option<&[Point]>,
-) -> Option<Point> {
-    let mut witness = None;
-    // A candidate can only win by sitting strictly nearer `vertex` than `stone`
-    // does, so nothing beyond that distance ever qualifies -- and
-    // `visit_candidates_within` already knows how to skip the stones that
-    // cannot reach inside it. This was the call that never passed the bound, so
-    // every cell of every position paid the O(stones) clearance test once per
-    // stone on the board, to screen candidates that lost on distance anyway.
-    //
-    // The bound is the exact predicate, not the locality theorem: a stone
-    // contributes the point one diameter along the ray to the query, so a stone
-    // farther than `reach + diameter` cannot land within `reach`. `SNAP_MARGIN`
-    // keeps the geometric cut strictly looser than the interval-arithmetic
-    // comparison below, so the two cannot disagree about a boundary case.
+    index: &LegalSetIndex,
+) -> bool {
     let reach = numeric::length(vertex.x - stone.x, vertex.y - stone.y) + numeric::SNAP_MARGIN;
     visit_candidates_within::<false>(
         position,
         vertex,
         Some(reach),
-        known_vertices,
-        None,
-        &mut |candidate| {
-            if numeric::strictly_closer(vertex, candidate, stone).is_strictly_less {
-                witness = Some(candidate);
-                true
-            } else {
-                false
-            }
-        },
-    );
-    witness
+        Some(&index.vertices),
+        index.buckets.as_ref(),
+        Some(&index.vertex_buckets),
+        &mut |candidate| numeric::strictly_closer(vertex, candidate, stone).is_strictly_less,
+    )
 }

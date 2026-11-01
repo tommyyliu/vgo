@@ -15,8 +15,7 @@
 use std::sync::Arc;
 
 use vgo_core::{
-    COORDINATE_EPSILON, LegalSetIndex, Point, Position, length_below,
-    none_closer_than_except_vertices,
+    COORDINATE_EPSILON, LegalSetIndex, Point, Position, none_closer_than_except_vertices,
 };
 
 use crate::RasterConfig;
@@ -262,81 +261,6 @@ fn sampled_legal_set_into(
     }
 }
 
-/// The legal set's vertices, bucketed so an undecided pixel can look for one
-/// nearer than its own stone before paying for the exact test.
-///
-/// A vertex is an exact legal point. If one is strictly closer to a pixel than
-/// the pixel's nearest stone, a new stone could be placed nearer than the owner
-/// and the pixel is not settled -- no further geometry needed. The undecided
-/// band is mostly pixels beside a thin legal gap, which are exactly the pixels
-/// the vertex marks rescued from being wrongly called settled, and a gap's own
-/// vertices are right there. Marks are few -- a handful per legal speck -- so
-/// the buckets are coarse and mostly empty.
-struct VertexGrid {
-    cell: f64,
-    side: usize,
-    starts: Vec<u32>,
-    points: Vec<Point>,
-}
-
-impl VertexGrid {
-    fn build(marks: &[Point], cell: f64) -> Self {
-        let side = ((1.0 / cell).ceil() as usize).max(1);
-        let bucket = |p: &Point| {
-            let column = ((p.x / cell) as usize).min(side - 1);
-            let row = ((p.y / cell) as usize).min(side - 1);
-            row * side + column
-        };
-        let mut counts = vec![0u32; side * side + 1];
-        for mark in marks {
-            counts[bucket(mark) + 1] += 1;
-        }
-        for index in 1..counts.len() {
-            counts[index] += counts[index - 1];
-        }
-        let mut fill = counts.clone();
-        let mut points = vec![Point::new(0.0, 0.0); marks.len()];
-        for mark in marks {
-            let slot = &mut fill[bucket(mark)];
-            points[*slot as usize] = *mark;
-            *slot += 1;
-        }
-        Self {
-            cell,
-            side,
-            starts: counts,
-            points,
-        }
-    }
-
-    /// Whether a vertex lies strictly closer than `distance` to `point`, by the
-    /// exact test's own comparison, so this replaces that test's vertex scan. The
-    /// buckets are chosen by a slightly longer reach and only limit what is read.
-    /// Proof: [E10].
-    fn any_closer(&self, point: Point, distance: f64) -> bool {
-        if self.points.is_empty() {
-            return false;
-        }
-        let reach = distance * (1.0 + 1e-9) + 1e-12;
-        let low = |v: f64| (((v - reach) / self.cell).floor().max(0.0) as usize).min(self.side - 1);
-        let high =
-            |v: f64| (((v + reach) / self.cell).floor().max(0.0) as usize).min(self.side - 1);
-        for row in low(point.y)..=high(point.y) {
-            let base = row * self.side;
-            let (first, last) = (
-                self.starts[base + low(point.x)] as usize,
-                self.starts[base + high(point.x) + 1] as usize,
-            );
-            for mark in &self.points[first..last] {
-                if length_below(mark.x - point.x, mark.y - point.y, distance) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-}
-
 /// The settled mask, using distance-transform bounds to skip most of the work.
 ///
 /// The sampled `D_L` is not merely approximate, it is approximate in a *known
@@ -411,7 +335,6 @@ pub(crate) struct SettledRows {
     spacing_squared: f64,
     slack: f64,
     index: Arc<LegalSetIndex>,
-    vertices: VertexGrid,
     pub(crate) exact_tests: usize,
     undecided: Vec<bool>,
     /// Squared distance from a stone within which a pixel is certainly settled.
@@ -447,9 +370,7 @@ pub(crate) fn prepare_settled_rows(
     // the set's boundary. A full diagonal covers that. Nothing covers a sliver
     // narrower than a cell, which is why this is not proved exact: see [O1].
     let slack = spacing * std::f64::consts::SQRT_2;
-    let vertices = VertexGrid::build(index.vertices(), (2.0 * position.radius()).max(spacing));
     SettledRows {
-        vertices,
         scale,
         fine_width,
         fine_height,
@@ -525,7 +446,11 @@ impl SettledRows {
             }
             let point = Point::new(xs[column], y);
             let distance = nearest_squares[column].sqrt();
-            out[column] = !self.vertices.any_closer(point, distance) && {
+            // A vertex is an exact legal point. If one is strictly closer than the
+            // pixel's nearest stone the pixel is not settled, with no further
+            // geometry. The undecided band is mostly pixels beside a thin legal
+            // gap, and a gap's own vertices are right there.
+            out[column] = !self.index.any_vertex_closer(point, distance) && {
                 self.exact_tests += 1;
                 none_closer_than_except_vertices(position, point, distance, &self.index)
             };

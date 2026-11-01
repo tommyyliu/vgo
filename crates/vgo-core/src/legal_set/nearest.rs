@@ -49,7 +49,7 @@ pub fn nearest(position: &Position, point: Point) -> Nearest {
 /// The vertices depend only on the position, but make up ~78% of a single
 /// `nearest` call. A caller projecting many points against one position -- the
 /// sampler does several hundred per grid -- should compute them once and pass
-/// them here, matching how `distance` and `escape_witness` take them.
+/// them here, matching how `distance` and `has_escape` take them.
 #[must_use]
 pub fn nearest_with(
     position: &Position,
@@ -303,7 +303,7 @@ fn nearest_from(
 ///
 /// The stone-tangent candidates already carry `SNAP_MARGIN`, but the vertex set
 /// does not: `vertices` is the exact vertex set of the legal region, and
-/// `distance` and `escape_witness` need it that way. `nearest` draws from the
+/// `distance` and `has_escape` need it that way. `nearest` draws from the
 /// same list, so it could still return a point sitting exactly on a constraint
 /// -- which is what the margin exists to prevent. A browser game stalled on a
 /// vertex 1.1e-16 from a stone, legal to the search and illegal to the page.

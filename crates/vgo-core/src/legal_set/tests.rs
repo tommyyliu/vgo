@@ -526,7 +526,7 @@ fn nearest_reaches_a_region_no_lattice_cell_can_name() {
 fn a_snap_that_lands_on_a_vertex_still_clears_the_margin() {
     // `nearest` chooses from the stone-tangent candidates *and* the vertex
     // set. The tangents carry SNAP_MARGIN; the vertices deliberately do
-    // not, because `distance` and `escape_witness` need the exact vertex
+    // not, because `distance` and `has_escape` need the exact vertex
     // set of the legal region. So a snap could still return a point resting
     // exactly on a constraint whenever a vertex was the closest candidate.
     //
