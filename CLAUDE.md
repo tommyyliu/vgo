@@ -45,12 +45,12 @@ Share of a fixture search with a fixed policy, so inference is absent.
 
 | Path | Big board | Small board |
 |---|---|---|
-| Nearest-stone sweep | 21% | 17% |
-| Move rules, mainly Voronoi | 20% | 9% |
-| Exact settled test | 17% | 15% |
-| Distance transform | 10% | 11% |
-| Vertex check | 6% | 6% |
-| Candidate snapping | 8% | 9% |
+| Move rules, mainly Voronoi | 36% | 15% |
+| Candidate snapping | 16% | 15% |
+| Distance transform | 13% | 24% |
+| Nearest-stone sweep and fold | 11% | 6% |
+| Cheap settled cases | 5% | 8% |
+| Exact settled test and vertex check | 2% | 6% |
 
 In real generation the GPU is the limit, not this table, from 8 physical cores up: see "Sizing
 a machine" in `docs/RUNNING.md`. Measure over whole games. Early-game runs read about half the
