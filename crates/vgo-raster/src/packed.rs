@@ -20,7 +20,7 @@
 use half::{f16, slice::HalfFloatSliceExt};
 use vgo_core::{Color, Position};
 
-use crate::edt::{EdtScratch, prepare_settled_rows};
+use crate::settled_bounds::{SettledScratch, prepare_settled_rows};
 use crate::{RasterConfig, RasterKind, settled_for_raster_into, settled_oversample};
 
 /// Which planes of a layout are binary, continuous, and constant.
@@ -83,7 +83,7 @@ pub struct PackedRaster {
 
 #[derive(Debug, Default)]
 struct PackedScratch {
-    edt: EdtScratch,
+    settled_scratch: SettledScratch,
     settled: Vec<bool>,
     stone_xs: Vec<f64>,
     stone_ys: Vec<f64>,
@@ -421,7 +421,7 @@ pub(crate) fn rasterize_compact_radius_packed_into(
         ..
     } = out;
     let PackedScratch {
-        edt,
+        settled_scratch,
         settled,
         stone_xs,
         stone_ys,
@@ -450,9 +450,9 @@ pub(crate) fn rasterize_compact_radius_packed_into(
     let mut settled_rows = if let Some(scale) = settled_oversample(position, config) {
         settled.clear();
         settled.resize(pixels, false);
-        Some(prepare_settled_rows(position, config, scale, edt))
+        Some(prepare_settled_rows(position, config, scale, settled_scratch))
     } else {
-        settled_for_raster_into(position, config, edt, settled);
+        settled_for_raster_into(position, config, settled_scratch, settled);
         None
     };
     assert_eq!(settled.len(), pixels);
@@ -518,11 +518,10 @@ pub(crate) fn rasterize_compact_radius_packed_into(
             rows.classify_row(
                 position,
                 row,
-                width,
                 y,
                 xs,
                 nearest_row,
-                edt.field(),
+                settled_scratch.edt.field(),
                 &mut settled[base..base + width],
             );
         }

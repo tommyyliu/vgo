@@ -665,7 +665,7 @@ from the sampled legal set and an exact fallback. The upper bound assumes every 
 has a sampled cell within a known distance, and that fails for a sliver of legal space
 narrower than a cell. Marking the legal set's vertices covers every bounded component, and
 the tests agree with the definition on every fixture tried, but no proof shows the plane
-equals the definition on every position. `edt.rs` documents the failure mode.
+equals the definition on every position. `settled_bounds.rs` documents the failure mode.
 
 This affects model input, not the rules: capture uses A5.
 

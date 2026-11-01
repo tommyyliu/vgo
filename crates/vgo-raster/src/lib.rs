@@ -3,14 +3,12 @@
 use vgo_core::{Color, Position, SettledRegion, legal_set_vertices};
 
 
-pub mod edt;
+mod edt;
 pub mod packed;
 mod policy;
+mod settled_bounds;
 pub use policy::DensePolicy;
-pub use edt::{
-    settled_mask_by_bounded_distance,
-    settled_mask_by_distance,
-};
+pub use settled_bounds::settled_mask_by_bounded_distance;
 
 /// Stone count above which the distance-transform settled mask is worth its
 /// fixed cost. Measured crossover sits between 14 and 28 stones.
@@ -363,7 +361,7 @@ pub fn settled_for_raster(position: &Position, config: RasterConfig) -> Vec<bool
     //
     // So the fast path is simply the path now, and there is no flag to forget.
     match settled_oversample(position, config) {
-        Some(scale) => edt::settled_mask_by_bounded_distance(position, config, scale).0,
+        Some(scale) => settled_mask_by_bounded_distance(position, config, scale).0,
         None => settled_mask(position, config),
     }
 }
@@ -371,11 +369,11 @@ pub fn settled_for_raster(position: &Position, config: RasterConfig) -> Vec<bool
 pub(crate) fn settled_for_raster_into(
     position: &Position,
     config: RasterConfig,
-    scratch: &mut edt::EdtScratch,
+    scratch: &mut settled_bounds::SettledScratch,
     output: &mut Vec<bool>,
 ) {
     if let Some(scale) = settled_oversample(position, config) {
-        edt::settled_mask_by_bounded_distance_into(position, config, scale, scratch, output);
+        settled_bounds::settled_mask_by_bounded_distance_into(position, config, scale, scratch, output);
     } else {
         output.clear();
         output.extend_from_slice(&settled_for_raster(position, config));

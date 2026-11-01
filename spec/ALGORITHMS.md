@@ -72,7 +72,7 @@ and an exact legal-space test decides the narrow band between them.
 
 - **Relies on:** A15, E3, N1. **Not proved exact: see O1.**
 - **Cost:** linear in pixels, plus about 1,300 exact tests per 128-pixel big-board raster.
-- **Code:** `vgo-raster/src/edt.rs`
+- **Code:** `vgo-raster/src/settled_bounds.rs`, `edt.rs`
 
 ## Search
 
