@@ -79,8 +79,8 @@ The split exists because self-play throughput is the binding constraint on
 learning speed, and the per-move work (legality, Voronoi geometry, scoring) is
 branch-heavy exact computation that does not vectorize.
 
-Read [`SELFPLAY_ARCHITECTURE.md`](SELFPLAY_ARCHITECTURE.md) for the ownership
-boundaries and [`ADR 0001`](adr/0001-native-simulator.md) for why the simulator
+Read [`SELFPLAY_ARCHITECTURE.md`](reference/SELFPLAY.md) for the ownership
+boundaries and [`ADR 0001`](history/ADR_0001_NATIVE_SIMULATOR.md) for why the simulator
 is native.
 
 ## 4. Board representation
@@ -100,11 +100,11 @@ the unit square). An empty board renders identically at every radius without
 it.
 
 Game datasets store positions, not pixels, and are rasterized at load time by
-`vgo-render-shard`. See [`POSITION_SHARDS.md`](POSITION_SHARDS.md) for why, and
-[`RASTER_REPRESENTATION.md`](RASTER_REPRESENTATION.md) for the channel semantics.
+`vgo-render-shard`. See [`POSITION_SHARDS.md`](reference/POSITION_SHARDS.md) for why, and
+[`RASTER_REPRESENTATION.md`](reference/RASTER_REPRESENTATION.md) for the channel semantics.
 
 The `settled` plane is 92-96% of raster cost. It is computed by a distance
-transform ([`research/SETTLED_REGION_PROBLEM.md`](research/SETTLED_REGION_PROBLEM.md)).
+transform ([`history/SETTLED_REGION_PROBLEM.md`](history/SETTLED_REGION_PROBLEM.md)).
 
 ## 5. Search and the policy target
 
@@ -116,7 +116,7 @@ loop can try moves its policy does not already favour.
 
 This replaced a random-candidate sampler that could not train: with candidates
 drawn independently of the board, the policy target carried no board-dependent
-signal. See [`POLICY_REDESIGN.md`](POLICY_REDESIGN.md).
+signal. See [`POLICY_REDESIGN.md`](history/POLICY_REDESIGN.md).
 
 The widening coefficient matters more than any model-side lever: raising it
 from 2 was worth about +240 Elo. The loop generates at 6.0 and rates at 4.0.
@@ -152,7 +152,7 @@ loop. Bigger nets are a dead end at this compute: one doubling of simulations is
 worth about 61 Elo, which is the exchange rate to judge capacity results by.
 
 Exact shapes and the per-stage budget are in
-[`MODEL_ARCHITECTURE.md`](MODEL_ARCHITECTURE.md).
+[`MODEL_ARCHITECTURE.md`](reference/MODEL_ARCHITECTURE.md).
 
 ## 7. Serving
 
@@ -170,7 +170,7 @@ The generator asks CUDA to block rather than spin while waiting on the GPU,
 which frees two cores that were otherwise pinned at 100%.
 
 The protocol and evaluator interface are in
-[`INFERENCE_PROTOCOL.md`](INFERENCE_PROTOCOL.md).
+[`INFERENCE_PROTOCOL.md`](reference/INFERENCE_PROTOCOL.md).
 
 ## 8. Decisions worth knowing, with evidence
 
@@ -197,13 +197,13 @@ levels are not comparable across rounds. Judge by play.
 
 - **Running it:** [`RUNNING.md`](RUNNING.md).
 - **Changing the loop:** the header of [`scripts/bulk-loop.sh`](../scripts/bulk-loop.sh),
-  then [`SELFPLAY_ARCHITECTURE.md`](SELFPLAY_ARCHITECTURE.md).
-- **Changing the model:** §6, then [`MODEL_ARCHITECTURE.md`](MODEL_ARCHITECTURE.md)
+  then [`SELFPLAY_ARCHITECTURE.md`](reference/SELFPLAY.md).
+- **Changing the model:** §6, then [`MODEL_ARCHITECTURE.md`](reference/MODEL_ARCHITECTURE.md)
   and `model.py`.
 - **Changing the representation:** §4, then
-  [`RASTER_REPRESENTATION.md`](RASTER_REPRESENTATION.md) and
-  [`POSITION_SHARDS.md`](POSITION_SHARDS.md).
+  [`RASTER_REPRESENTATION.md`](reference/RASTER_REPRESENTATION.md) and
+  [`POSITION_SHARDS.md`](reference/POSITION_SHARDS.md).
 - **Geometry performance research** (locality bounds, support certificates,
-  iteration lab): [`research/`](research).
+  iteration lab): [`history/`](history/README.md).
 - **History:** commit messages carry the reasoning for individual changes, and
   everything removed in the 2026-09-23 prune is on `archive/pre-prune`.

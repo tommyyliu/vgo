@@ -22,4 +22,4 @@ The precise statement is [`FORMAL.md`](FORMAL.md), which wins if the two differ.
 
 `Ruleset::Official` follows voronoigo.com instead, where a group lives while a stone
 could still touch its territory and self-capture is restricted. See
-[`docs/OFFICIAL_RULES.md`](../docs/OFFICIAL_RULES.md).
+[`spec/OFFICIAL.md`](OFFICIAL.md).

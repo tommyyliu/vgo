@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check that cited lemmas exist and that links in maintained docs resolve.
 
-Research notes are dated records, so their links are not checked.
+Files under docs/history are dated records, so their links are not checked.
 """
 
 import re
@@ -32,7 +32,7 @@ def main() -> int:
                 problems.append(f"{path.relative_to(ROOT)}: cites unknown [{lemma}]")
     for lemma in sorted(k for k in known if k[0] in "EN" and k not in used):
         problems.append(f"{lemma} is cited by no code")
-    docs = [p for p in tracked("*.md") if "docs/research/" not in str(p)]
+    docs = [p for p in tracked("*.md") if "docs/history/" not in str(p)]
     for path in docs:
         for target in LINK.findall(path.read_text()):
             if re.match(r"[a-z]+:|#", target):

@@ -3,7 +3,7 @@
 This note documents `voronoigo.com`'s current behavior, exposed as
 `Ruleset::Official` in `crates/vgo-core`. Here, *Official* is a compatibility
 label: it means website-compatible, not canonical or preferred. This
-repository's rules remain the game defined in [`spec/FORMAL.md`](../spec/FORMAL.md).
+repository's rules remain the game defined in [`spec/FORMAL.md`](FORMAL.md).
 
 The purpose of this note is to record what differs, what our compatibility
 implementation does about it, and what is still weaker here than in the

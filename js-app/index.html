@@ -1017,7 +1017,7 @@ function explainAiFailure(error) {
       'the in-browser engine needs this page served over http, not opened from disk:\n' +
       '  node web-bot/serve.js   then   http://localhost:8123/js-app/index.html\n' +
       'it also needs the WASM build and the model:\n' +
-      '  see docs/CLIENT_BOT.md';
+      '  see docs/history/CLIENT_BOT.md';
   }
   // fetch throws the same opaque TypeError for a refused connection and for a
   // blocked cross-origin response, so name both rather than guess.
@@ -1283,7 +1283,7 @@ draw();
      site integrates against, so it cannot rot unnoticed while still appearing to
      work here. It also means no rebuild between editing the API and trying it.
 
-     docs/CLIENT_BOT.md has the build commands for the generated pieces.
+     docs/history/CLIENT_BOT.md has the build commands for the generated pieces.
      ========================================================================= -->
 <script type="module">
 "use strict";

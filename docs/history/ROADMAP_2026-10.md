@@ -55,7 +55,7 @@ first optimization target. See [restart measurements](RESTART_2026-10-13.md).
   sufficient to choose the first CPU optimization. Concurrent timing totals
   must not be presented as additive shares of wall time.
 
-`docs/SELFPLAY_ARCHITECTURE.md` and `docs/RUNNING.md` now describe the actual
+`docs/reference/SELFPLAY.md` and `docs/RUNNING.md` now describe the actual
 continuous reporting and distinguish summed/position-weighted timings from CPU
 time. Startup metadata records the backend's actual input layout; export
 sidecars were also corrected to stop advertising packed graphs as dense inputs.
@@ -117,7 +117,7 @@ campaign, subject to a larger strength replication. See [results and recipes](RE
   with model artifacts and reproducible commands.
 
 Evidence: [resolution match](../../artifacts/res-ab/arena-r38.json) and
-[normalization measurements](../MODEL_ARCHITECTURE.md). One norm per block
+[normalization measurements](../reference/MODEL_ARCHITECTURE.md). One norm per block
 has measured speed gains but no measured strength result.
 
 ### 4. Randomized search budgets and sample quality

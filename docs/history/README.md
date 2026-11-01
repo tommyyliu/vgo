@@ -1,4 +1,7 @@
-# Research
+# History
+
+Dated records, not maintained. For current behaviour read [`OVERVIEW.md`](../OVERVIEW.md),
+[`reference/`](../reference) and [`spec/`](../../spec/RULES.md).
 
 Write-ups of geometry and search-performance research: exact locality bounds
 for contestability, support certificates, the board-iteration lab, the settled

@@ -2,7 +2,7 @@
 """Reconstruct an SGF from a self-play game's position shard.
 
 Generation stores positions, not moves -- a record is the board before the ply
-its `to_move` is about to play (see docs/POSITION_SHARDS.md). Only the arena
+its `to_move` is about to play (see docs/reference/POSITION_SHARDS.md). Only the arena
 writes SGF, and only for games it played itself, so a self-play game has to be
 recovered by differencing: the stone present at ply k+1 and absent at ply k is
 the move played at ply k. Captures remove stones, which is why this looks for

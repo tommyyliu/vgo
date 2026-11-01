@@ -18,7 +18,7 @@ pub(crate) const REPLAY_MAGIC: [u8; 8] = *b"VGORPLY1";
 // v4 stores the *position* rather than a rendered raster, and the policy
 // targets sparsely. Rendering then becomes a training-time choice over a shard
 // generated once, which is what makes comparing rasterizations affordable --
-// see docs/POSITION_SHARDS.md. Nothing about the targets changes: they are
+// see docs/reference/POSITION_SHARDS.md. Nothing about the targets changes: they are
 // functions of board state and search, not of how the board was drawn.
 //
 // Records stay fixed-size so the Python loader can keep memory-mapping them, so

@@ -149,7 +149,7 @@ Records distinguish work in flight from published data, include process memory,
 and group search work by rounded board size, thirds of the game cap, and soft
 resignation status. Neural runs include interval and cumulative broker counters.
 The bulk loop's `events.jsonl` marks training and generator handoffs. See
-[`RUNNING.md`](RUNNING.md#continuous-run-performance) for fields and interpretation.
+[`RUNNING.md`](../RUNNING.md#continuous-run-performance) for fields and interpretation.
 
 Search wall time includes inference waits, parallel duration sums overlap, and
 queue durations are position-weighted. These metrics expose stage costs; their

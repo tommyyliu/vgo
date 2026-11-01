@@ -3,7 +3,7 @@
 //! The net emits a fine grid of placement logits. Candidates are drawn from the
 //! net's own distribution (not an external quasi-random sequence) so the same
 //! board yields a stable candidate distribution and the policy target becomes a
-//! learnable function of the board. See docs/POLICY_REDESIGN.md.
+//! learnable function of the board. See docs/history/POLICY_REDESIGN.md.
 //!
 //! Each candidate is sampled in two stages, with replacement:
 //!   1. a coarse cell `C` ~ softmax over the coarse map (coarse cell value = MAX

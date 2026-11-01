@@ -468,7 +468,7 @@ Since the values are exact integers, any correct transform produces the same bit
 ### E4. Voronoi cutoff
 
 *Status: Proved in exact arithmetic.* Used by `compute_cell`. The argument with
-measurements is in [`VORONOI_CUTOFF.md`](../docs/research/VORONOI_CUTOFF.md).
+measurements is in [`VORONOI_CUTOFF.md`](../docs/history/VORONOI_CUTOFF.md).
 
 **Claim.** Let `P` be a polygon containing `s`, with circumradius `R` about `s`. If
 `|o - s| > 2R`, the bisector of `s` and `o` does not cut `P`. If stones are visited by

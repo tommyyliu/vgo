@@ -37,7 +37,7 @@ the oldest dispatched batch so successful peers cannot hide a stalled slot.
 Diagnostics identify model/provider, slot, batch, request IDs and elapsed time.
 On timeout callers disconnect and the native worker detaches; the process must
 exit before retrying. Healthy shutdown still joins workers. See
-[deadline operations](RUNNING.md#native-inference-deadlines).
+[deadline operations](../RUNNING.md#native-inference-deadlines).
 A final three-second native-failure watchdog bounds exit cleanup too; Linux
 uses `exit_group(70)` to bypass stuck native handlers.
 

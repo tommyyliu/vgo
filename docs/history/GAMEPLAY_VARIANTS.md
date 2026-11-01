@@ -118,5 +118,5 @@ Both players commit a move; collisions resolve by some rule.
 
 ## Related
 
-- [006: Repetition and ko policy](../006-repetition-and-ko.md) and
-  [Human 001](001-find-ko-scenario.md) — an open rules question, not a variant.
+- [006: Repetition and ko policy](../../todo/006-repetition-and-ko.md) and
+  [Human 001](../../todo/human/001-find-ko-scenario.md) — an open rules question, not a variant.

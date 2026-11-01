@@ -789,7 +789,7 @@ def _load_replay_v4(
 
     v4 stores the position rather than a picture of it, so the raster is
     produced here and the layout is a training-time choice rather than a
-    property of the data -- see docs/POSITION_SHARDS.md.
+    property of the data -- see docs/reference/POSITION_SHARDS.md.
     """
     record_dtype = _v4_record_dtype(policy_size, version, capacity, stone_capacity)
     expected_bytes = header_size(version) + samples * record_dtype.itemsize
@@ -1318,7 +1318,7 @@ def replay_diagnostics(dataset: RasterDataset, *, maximum_pairs: int = 400) -> d
     coarse-to-fine sampler is drawing from a board-dependent map, those sets
     should substantially agree. Near zero means the target's support relocates
     every game, which is the unlearnable-target failure the redesign exists to
-    fix -- see docs/POLICY_REDESIGN.md.
+    fix -- see docs/history/POLICY_REDESIGN.md.
 
     `top1_visit_share` is the mean fraction of root visits landing on the
     most-visited child. Very high with a small candidate count suggests search is

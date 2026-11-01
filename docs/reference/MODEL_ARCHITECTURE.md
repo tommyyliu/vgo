@@ -2,10 +2,10 @@
 
 The network the search evaluates. Reference-level detail: exact shapes, where
 the parameters and the time go, and what each piece is for. For how it fits the
-rest of the system see [`OVERVIEW.md`](OVERVIEW.md) §6; for the decisions and
+rest of the system see [`OVERVIEW.md`](../OVERVIEW.md) §6; for the decisions and
 their evidence see §8 there.
 
-Source: [`training/vgo_training/model.py`](../training/vgo_training/model.py).
+Source: [`training/vgo_training/model.py`](../../training/vgo_training/model.py).
 The loop trains `width=64, blocks=16, norm_groups=8`, one attention block per
 context stage, on a 256x256 `compact-radius` raster (about 8.2M parameters).
 The shapes and timings below were measured on an earlier w96 model at 128x128;
@@ -14,7 +14,7 @@ the structure is the same.
 ## Why this shape
 
 Placement is continuous, so the board is rendered to a raster and the policy is
-a spatial map (see [`POLICY_REDESIGN.md`](POLICY_REDESIGN.md)). That leaves two
+a spatial map (see [`POLICY_REDESIGN.md`](../history/POLICY_REDESIGN.md)). That leaves two
 demands in tension:
 
 - **Placement needs resolution.** A move is a real coordinate, and the policy

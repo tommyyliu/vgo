@@ -29,8 +29,7 @@ Run `scripts/check.sh` before merging.
 | [`web-bot/`](web-bot/README.md) | the embeddable browser bot: engine as WebAssembly, no UI |
 | [`scripts/`](scripts) | the loop (`bulk-loop.sh`), checks and tools |
 | [`js-app/`](js-app/README.md) | the playable game, whose JS engine is also the behavioural oracle |
-| [`docs/`](docs) | system docs; [`docs/research/`](docs/research/README.md) holds dated, frozen notes |
-| [`todo/`](todo/README.md) | backlog tickets |
+| [`docs/`](docs) | overview, commands, backlog, [`reference/`](docs/reference) for interfaces, [`history/`](docs/history/README.md) for dated records |
 | [`benchmarks/`](benchmarks/README.md) | runner, fixture positions, timing history, golden digests |
 | `artifacts/` | run output, not tracked. `artifacts/old/` is the archive |
 

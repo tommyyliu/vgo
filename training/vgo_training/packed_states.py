@@ -13,7 +13,7 @@ of a training step -- and the smaller host-to-device copy more than pays it
 back (40.0 MB at 0.813 ms dense against 9.5 MB at 0.312 ms packed).
 
 The packed form is a runtime representation only. Shards store stone positions,
-not rasters (see docs/POSITION_SHARDS.md), so nothing here touches the on-disk
+not rasters (see docs/reference/POSITION_SHARDS.md), so nothing here touches the on-disk
 format and no migration is needed.
 """
 

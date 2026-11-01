@@ -11,7 +11,7 @@ client. `Vgo` rules are primary, and `Official` is a compatibility target.
 
 ## Active bets
 
-At most three. Anything else waits in [`todo/`](todo/README.md).
+At most three. Anything else waits in [`docs/BACKLOG.md`](docs/BACKLOG.md).
 
 | Bet | Question | Done when |
 |---|---|---|
@@ -40,11 +40,3 @@ Don't reopen these without new evidence.
 | Bigger nets at this compute | Dead end. One doubling of simulations is worth about 61 Elo |
 | Tanh value head with MSE | Gradient vanished on confidently wrong positions |
 | Random-candidate sampler | Target carried no board-dependent signal |
-
-## Known gaps
-
-- **Learnings.** Most runs in `artifacts/old/` are not recorded in any note. Write them up
-  before that folder is deleted.
-- **Conformance.** The JS reference and Rust have no shared fixtures yet (ticket 004).
-- **Formatting.** `cargo fmt` isn't applied across the repo, so `check.sh` doesn't enforce it.
-- **CI.** None yet. A hosted workflow can call `scripts/check.sh`.

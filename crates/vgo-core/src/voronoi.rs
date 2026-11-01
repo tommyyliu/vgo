@@ -658,7 +658,7 @@ mod tests {
     /// Clipping against every stone, the way `compute` did before the cutoff.
     ///
     /// The specification the cutoff is measured against: it must produce the
-    /// same diagram, not a close one. See docs/research/VORONOI_CUTOFF.md.
+    /// same diagram, not a close one. See docs/history/VORONOI_CUTOFF.md.
     fn compute_exhaustively(position: &Position) -> Vec<(Vec<Point>, f64)> {
         let count = position.stones().len();
         let mut out = Vec::with_capacity(count);

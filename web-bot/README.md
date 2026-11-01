@@ -258,4 +258,4 @@ built bundle, deliberately: the API a site integrates against is the one
 exercised there, so it cannot rot while still appearing to work.
 
 Design rationale, measurements and the things that turned out to be wrong are in
-[`../docs/CLIENT_BOT.md`](../docs/CLIENT_BOT.md).
+[`../docs/history/CLIENT_BOT.md`](../docs/history/CLIENT_BOT.md).

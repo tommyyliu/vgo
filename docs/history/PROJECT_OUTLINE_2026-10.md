@@ -106,7 +106,7 @@ experiments must identify their ruleset explicitly.
 
 Sources: [rules](../../spec/FORMAL.md),
 [derived properties](../../spec/LEMMAS.md),
-[official-rule differences](../OFFICIAL_RULES.md).
+[official-rule differences](../../spec/OFFICIAL.md).
 
 ## 3. The mathematical reduction that makes the engine possible
 
@@ -219,7 +219,7 @@ The experiments establish useful possibilities, with mixed evidence on real
 positions. Their synthetic speedups must not be treated as neural self-play
 speedups.
 
-Sources: [native simulator decision](../adr/0001-native-simulator.md),
+Sources: [native simulator decision](ADR_0001_NATIVE_SIMULATOR.md),
 [iteration lab](BOARD_ITERATION_LAB.md),
 [search memory](MCTS_MEMORY_LAB.md),
 [support integration](SUPPORT_SEARCH_INTEGRATION.md).
@@ -333,7 +333,7 @@ The resulting target is a practical estimator for this schedule, not a proof
 of unbiased policy improvement. Storing the raw ingredients makes it possible
 to audit or change the estimator without regenerating every game.
 
-Source: [policy redesign and estimator assumptions](../POLICY_REDESIGN.md).
+Source: [policy redesign and estimator assumptions](POLICY_REDESIGN.md).
 
 ## 7. Representation and the model
 
@@ -389,8 +389,8 @@ Ownership is an auxiliary head and currently has zero loss weight in the bulk
 recipe. Final board and score records now provide material for further
 auxiliary-target experiments, but their learning benefit is unestablished.
 
-Sources: [raster contract](../RASTER_REPRESENTATION.md),
-[model architecture](../MODEL_ARCHITECTURE.md),
+Sources: [raster contract](../reference/RASTER_REPRESENTATION.md),
+[model architecture](../reference/MODEL_ARCHITECTURE.md),
 [model code](../../training/vgo_training/model.py).
 
 ## 8. Games, outcomes, and replay
@@ -444,8 +444,8 @@ A high cap rate alone does not reopen this investigation. The useful remaining
 question is whether capped scoring or cheap-tail sample weighting causes a
 specific learning/evaluation problem.
 
-Sources: [self-play architecture](../SELFPLAY_ARCHITECTURE.md),
-[position records](../POSITION_SHARDS.md),
+Sources: [self-play architecture](../reference/SELFPLAY.md),
+[position records](../reference/POSITION_SHARDS.md),
 [shared generation](../../crates/vgo-selfplay/src/generation.rs).
 
 ## 9. Learning and model replacement
@@ -524,7 +524,7 @@ Queue durations are position-weighted; search and inference wall times overlap
 across actors and slots. Their sums can exceed elapsed time. GPU utilization
 alone cannot distinguish useful work from a stalled or spinning runtime.
 
-Sources: [inference contract](../INFERENCE_PROTOCOL.md),
+Sources: [inference contract](../reference/INFERENCE_PROTOCOL.md),
 [packed graph input](../../training/vgo_training/packed_input.py),
 [RAM measurements](RAM_SCALING.md).
 
