@@ -42,7 +42,7 @@ its README.
 
 ```bash
 VGO_OUTPUT=artifacts/my-run VGO_SEED_MODEL=artifacts/sl-w64b16/sl-w64b16.onnx \
-  ./scripts/bulk-loop.sh
+  ./training/loop/bulk-loop.sh
 ```
 
 Every knob is an environment variable documented in the script header:
@@ -111,11 +111,11 @@ A run directory holds:
 To stop without losing games in flight:
 
 ```bash
-./scripts/stop-continuous.sh         # drain: each generator finishes its games
-./scripts/stop-continuous.sh --now   # kill immediately
+./training/loop/stop-continuous.sh         # drain: each generator finishes its games
+./training/loop/stop-continuous.sh --now   # kill immediately
 ```
 
-`scripts/memory-watchdog.sh` kills training before the box swaps. A window that
+`training/loop/memory-watchdog.sh` kills training before the box swaps. A window that
 does not fit fills swap during loading, and a thrashing machine is worse than a
 clean abort.
 
@@ -123,7 +123,7 @@ clean abort.
 
 ```bash
 cd training
-../scripts/train-once.py --games-root ../artifacts/my-run/games --window-samples 150000 \
+../training/loop/train-once.py --games-root ../artifacts/my-run/games --window-samples 150000 \
   --output ../artifacts/scratch/model.pt --raster-kind compact-radius \
   --model-width 64 --blocks 16 --context-attention-blocks 1 --norm-groups 8 --epochs 8
 .venv/bin/python -m vgo_training.export_onnx --checkpoint ../artifacts/scratch/model.pt \
@@ -169,9 +169,9 @@ are specified, the earlier positive deadline wins.
 ## Measuring strength
 
 ```bash
-scripts/ratings.py artifacts/my-run/anchor.jsonl       # fit the loop's rating graph
-scripts/bigboard-curve.sh                               # re-rate checkpoints at radius 1/38
-scripts/bigboard-ratings.py artifacts/bigboard-curve/matches.jsonl
+evaluation/ratings.py artifacts/my-run/anchor.jsonl       # fit the loop's rating graph
+evaluation/bigboard-curve.sh                               # re-rate checkpoints at radius 1/38
+evaluation/ratings.py artifacts/bigboard-curve/matches.jsonl --links
 ```
 
 Ratings from different boards, rulesets or komi are different scales. Check the
@@ -190,16 +190,11 @@ overrun the deadline. Reports include each seat's actual average simulations,
 average search milliseconds, and longest search. Keep threads and batching
 fixed between experiments; queue contention is part of this measurement.
 
-The bounded restart recipes are in
-[`scripts/experiments/restart-2026-10-14.py`](../scripts/experiments/restart-2026-10-14.py).
-Run its stages sequentially with an otherwise idle CPU/GPU; it records commands,
-binary digests, process exit codes and elapsed times alongside raw reports.
-
 ## Looking at games
 
 ```bash
-scripts/selfplay-sgf.py artifacts/my-run/games/gen-000003-.../game-000123 out.sgf
-scripts/resign-calibration.py artifacts/my-run/games --games 400
+evaluation/selfplay-sgf.py artifacts/my-run/games/gen-000003-.../game-000123 out.sgf
+training/loop/resign-calibration.py artifacts/my-run/games --games 400
 ```
 
 The SGF loads in the reference application: open
@@ -215,18 +210,18 @@ To play the current model yourself:
 
 ## Performance history
 
-`benchmarks/run.py` times each large CPU path single-threaded on the fixed real
-positions in `benchmarks/positions.txt` (16 at 1/38, 16 at 1/18): move
+`performance/run.py` times each large CPU path single-threaded on the fixed real
+positions in `performance/positions.txt` (16 at 1/38, 16 at 1/18): move
 application, board analysis, the legal-set index, the settled plane and packed
 raster at 128 and 256, the fine grid, and a 200-simulation search with a fixed
 policy standing in for the network. It compares with the last record from the
-same machine and appends to `benchmarks/history.jsonl`, which is committed.
+same machine and appends to `performance/history.jsonl`, which is committed.
 
 ```bash
-benchmarks/run.py              # run, compare, record (needs a clean tree)
-benchmarks/run.py --no-record  # try a change before committing it
-benchmarks/run.py --check      # exit 1 on a regression
-benchmarks/run.py --show       # the history for this machine
+performance/run.py              # run, compare, record (needs a clean tree)
+performance/run.py --no-record  # try a change before committing it
+performance/run.py --check      # exit 1 on a regression
+performance/run.py --show       # the history for this machine
 ```
 
 Run it before merging anything that touches rules, geometry, the raster or

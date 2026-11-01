@@ -25,7 +25,7 @@
 #     skips exactly the stale processes a restart is trying to clear.
 set -uo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 output="${VGO_OUTPUT:-$root/artifacts/vgo-bulk}"
 games="$output/games"
 immediate=0

@@ -1,7 +1,22 @@
 # Backlog
 
-Current priorities are in [`DIRECTION.md`](../DIRECTION.md). This is everything else. Finished
-tickets were removed on 2026-10-31 and remain in git history.
+**Goal:** the strongest Voronoi Go bot per hour of compute, reachable through the browser.
+`Vgo` rules are primary, and `Official` is a compatibility target. The headline metric is Elo
+per hour on fixed hardware against fixed anchors.
+
+## Now
+
+At most three.
+
+| Bet | Question | Done when |
+|---|---|---|
+| Measure real self-play on rented hardware | Are we still CPU-bound after the engine work? | Generation throughput and GPU use are recorded on the rented box |
+| Ownership loss arena | Does sigmago's largest gain carry over? | A multi-seed, matched-compute arena has a verdict |
+| Settled plane (O1) | Is its approximation harmless, or should it be exact or removed? | O1 is proved or bounded, or the plane's strength value is measured |
+
+## Later
+
+Finished tickets were removed on 2026-10-31 and remain in git history.
 
 | Item | State | Done when |
 |---|---|---|

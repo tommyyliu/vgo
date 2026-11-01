@@ -16,7 +16,7 @@ Only recent games count. Calibration describes the model that generated them,
 and a model still learning invalidates its own history -- one recorded run fired
 on 15 of 1625 games over fifteen shards and 440 of 1686 over the next sixteen.
 
-    scripts/resign-calibration.py [games-root] [--games N] [--window W] [--minimum-ply P]
+    training/loop/resign-calibration.py [games-root] [--games N] [--window W] [--minimum-ply P]
 
 The picker matches the minimum-ply floor (default zero for legacy standalone
 calls). The bulk loop supplies its live floor, default 20. Legacy records omit

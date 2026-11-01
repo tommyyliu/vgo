@@ -14,7 +14,7 @@ recoverable and the game is written one move short of what was played.
 Dialect matches `game_sgf` in crates/vgo-selfplay/src/arena.rs, which is what
 js-app/src/io/vgo-sgf.js reads.
 
-    scripts/selfplay-sgf.py <game-directory> [output.sgf]
+    evaluation/selfplay-sgf.py <game-directory> [output.sgf]
 """
 import json
 import sys

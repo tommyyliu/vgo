@@ -3,7 +3,7 @@
 
 Usage:
 
-    scripts/train-once.py --games-root artifacts/vgo-bulk/games \\
+    training/loop/train-once.py --games-root artifacts/vgo-bulk/games \\
         --window-samples 1200000 --output artifacts/scratch/model.pt \\
         --raster-kind compact-radius --epochs 4
 """
@@ -16,7 +16,7 @@ import re
 import sys
 from pathlib import Path
 
-_TRAINING = Path(__file__).resolve().parents[1] / "training"
+_TRAINING = Path(__file__).resolve().parents[2] / "training"
 sys.path.insert(0, str(_TRAINING))
 from vgo_training.learner import LearnerConfig, LearnerUpdate, PersistentLearner  # noqa: E402
 

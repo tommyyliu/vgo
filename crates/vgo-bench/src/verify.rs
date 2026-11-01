@@ -8,8 +8,8 @@
 //!
 //! The fixture digest sees two board sizes under one ruleset. The fuzz plays
 //! games across board sizes and both rulesets and hashes every ply's geometry,
-//! legal set, liveness, score and rasters. `scripts/check.sh` compares both
-//! against `benchmarks/golden.txt`.
+//! legal set, liveness, score and rasters. `correctness/check.sh` compares both
+//! against `correctness/golden.txt`.
 //!
 //! These compare builds. They find differences and prove nothing: claims about
 //! the engine belong in `spec/LEMMAS.md`.
@@ -35,7 +35,7 @@ struct Arguments {
     #[arg(long)]
     fuzz_games: Option<u64>,
     /// Fixture positions, one per line.
-    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/../../benchmarks/positions.txt"))]
+    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/../../performance/positions.txt"))]
     positions: PathBuf,
 }
 

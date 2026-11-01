@@ -115,5 +115,5 @@ step "Ready"
 cat <<'EOF'
     Next: launch the loop.
 
-      ./scripts/bulk-loop.sh
+      ./training/loop/bulk-loop.sh
 EOF

@@ -1,6 +1,6 @@
 # Voronoi Go: project and idea outline
 
-> Frozen on 2026-10-31. For current material see [`spec/`](../../spec/LEMMAS.md), [`OVERVIEW.md`](../OVERVIEW.md) and [`DIRECTION.md`](../../DIRECTION.md).
+> Frozen on 2026-10-31. For current material see [`spec/`](../../spec/LEMMAS.md), [`OVERVIEW.md`](../OVERVIEW.md) and [`BACKLOG.md`](../BACKLOG.md).
 
 Current implementation reviewed on 2026-10-13. This is a conceptual map of the
 system and the reasoning needed to understand it. Commands live in
@@ -485,7 +485,7 @@ Loss screens an experiment and exposes failures. Playing fresh games decides
 whether the resulting player improved. Compare both equal-search-budget
 strength and equal-time strength when an experiment changes execution speed.
 
-Sources: [bulk loop and defaults](../../scripts/bulk-loop.sh),
+Sources: [bulk loop and defaults](../../training/loop/bulk-loop.sh),
 [learner](../../training/vgo_training/learner.py),
 [supervision](../../training/vgo_training/supervision.py).
 

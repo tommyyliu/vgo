@@ -6,12 +6,13 @@ square, and territory is decided by Voronoi cells.
 | Read this | For |
 |---|---|
 | [`spec/RULES.md`](spec/RULES.md) | the game, in one page |
-| [`DIRECTION.md`](DIRECTION.md) | the goal, active bets and working rules |
+| [`docs/BACKLOG.md`](docs/BACKLOG.md) | the goal and what is next |
+| [`docs/FINDINGS.md`](docs/FINDINGS.md) | what we have learned and how results are decided |
 | [`docs/OVERVIEW.md`](docs/OVERVIEW.md) | how the system fits together |
 | [`spec/ALGORITHMS.md`](spec/ALGORITHMS.md) | the core ideas, separate from the code |
 | [`docs/RUNNING.md`](docs/RUNNING.md) | commands |
 
-Run `scripts/check.sh` before merging.
+Run `correctness/check.sh` before merging.
 
 ## Layout
 
@@ -25,12 +26,14 @@ Run `scripts/check.sh` before merging.
 | [`crates/vgo-selfplay`](crates/vgo-selfplay) | `vgo-generate-continuous`, `vgo-arena`, `vgo-serve-move` |
 | [`crates/vgo-bench`](crates/vgo-bench) | `vgo-bench` timings, `vgo-verify` output digests |
 | [`crates/vgo-wasm`](crates/vgo-wasm) | the engine for the browser client |
-| [`training/`](training) | PyTorch model, learner, ONNX export |
+| [`training/`](training) | PyTorch model, learner, ONNX export; [`loop/`](training/loop) runs the RL loop |
+| [`evaluation/`](evaluation) | ratings and checkpoint curves |
 | [`web-bot/`](web-bot/README.md) | the embeddable browser bot: engine as WebAssembly, no UI |
-| [`scripts/`](scripts) | the loop (`bulk-loop.sh`), checks and tools |
+| [`scripts/`](scripts) | setup, environment and `play.sh` |
 | [`js-app/`](js-app/README.md) | the playable game, whose JS engine is also the behavioural oracle |
 | [`docs/`](docs) | overview, commands, backlog, [`reference/`](docs/reference) for interfaces, [`history/`](docs/history/README.md) for dated records |
-| [`benchmarks/`](benchmarks/README.md) | runner, fixture positions, timing history, golden digests |
+| [`performance/`](performance/README.md) | timing runner, fixture positions and history |
+| [`correctness/`](correctness) | `check.sh`, spec and link checks, golden digests |
 | `artifacts/` | run output, not tracked. `artifacts/old/` is the archive |
 
 ## Tech stack

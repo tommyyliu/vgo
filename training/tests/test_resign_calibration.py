@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).resolve().parents[2] / 'scripts/resign-calibration.py'
+SCRIPT = Path(__file__).resolve().parents[2] / 'training/loop/resign-calibration.py'
 spec = importlib.util.spec_from_file_location('resign_calibration', SCRIPT)
 calibration = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(calibration)

@@ -1,6 +1,6 @@
 # Project restart roadmap
 
-> Frozen on 2026-10-31. The current plan is [`DIRECTION.md`](../../DIRECTION.md).
+> Frozen on 2026-10-31. The current plan is [`BACKLOG.md`](../BACKLOG.md).
 
 Updated: 2026-10-14. Status: items 1–5 have completed bounded measurements;
 item 6 has a measured arena prototype; item 7 has bounded failure
@@ -88,7 +88,7 @@ pruning and prioritize model cost next. See [production results](RESTART_2026-10
   improvement beyond timing noise in both the affected benchmark and a matched
   neural self-play run.
 
-Evidence: [benchmark history](../../benchmarks/history.jsonl),
+Evidence: [benchmark history](../../performance/history.jsonl),
 [geometry lab](BOARD_ITERATION_LAB.md), and
 [support throughput](DENSE_SUPPORT_THROUGHPUT.md). The support
 backend's large synthetic-grid wins did not reliably transfer to played

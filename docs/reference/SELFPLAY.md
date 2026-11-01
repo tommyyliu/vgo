@@ -15,7 +15,7 @@ serialization:
   per-game dataset publication.
 
 Python owns replay preparation, optimization, checkpoints and ONNX export.
-`scripts/bulk-loop.sh` orchestrates. Python never imports the
+`training/loop/bulk-loop.sh` orchestrates. Python never imports the
 simulator, and Rust never implements neural-network layers. Replay shards and
 self-describing model artifacts are the durable boundary.
 
@@ -122,7 +122,7 @@ one's stop file, so the old generator finishes the games it holds while the new
 one is already producing. Policy lag is therefore explicit and bounded by one
 game per actor, and nothing swaps an evaluator on the per-leaf hot path.
 
-`scripts/train-once.py` selects the newest games totalling the window by game
+`training/loop/train-once.py` selects the newest games totalling the window by game
 number, not directory order, and trains a fresh learner process. Nothing
 persists between rounds except files.
 

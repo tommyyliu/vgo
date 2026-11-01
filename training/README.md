@@ -14,9 +14,9 @@ writes.
 | `packed_states.py`, `packed_policy.py` | compact in-memory forms of the replay window |
 | `packed_input.py` | the in-graph unpacking used by `export_onnx --packed-input` |
 | `export_onnx.py` | checkpoint -> ONNX plus a `.json` manifest |
-| `bradley_terry.py` | the rating fit used by `scripts/ratings.py` |
+| `bradley_terry.py` | the rating fit used by `evaluation/ratings.py` |
 
-The entry point for training is [`scripts/train-once.py`](../scripts/train-once.py),
+The entry point for training is [`training/loop/train-once.py`](loop/train-once.py),
 which the loop calls once per round. See [`docs/RUNNING.md`](../docs/RUNNING.md).
 
 ```bash

@@ -831,7 +831,7 @@ fn run_match(
             // Which model played the candidate seat. Without it a record says
             // who was beaten but not by whom, so a history of matches cannot be
             // assembled into a rating graph -- which is what
-            // `scripts/ratings.py` needs now that the loop samples opponents
+            // `evaluation/ratings.py` needs now that the loop samples opponents
             // instead of always using one anchor.
             "  \"candidate_model\": \"{}\",\n",
             "  \"opponent\": \"{}\",\n",

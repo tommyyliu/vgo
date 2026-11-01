@@ -110,7 +110,7 @@ Python's standard library and `Fraction`; all decision comparisons are exact.
 Only the printed summaries are converted to floating point.
 
 ```sh
-python scripts/check_locality_floor.py
+python docs/history/check_locality_floor.py
 cargo test -p vgo-core --features iteration-lab --lib iteration_lab::locality -- --nocapture
 ```
 

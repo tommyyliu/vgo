@@ -8,9 +8,9 @@
 //! leave inference out. With `--model`, run concurrent neural searches instead,
 //! including encoding, broker scheduling and actual model inference.
 //!
-//! Positions come from `benchmarks/positions.txt`, 16 at radius 1/38 and 16 at
+//! Positions come from `performance/positions.txt`, 16 at radius 1/38 and 16 at
 //! 1/18, and each path is reported per board size because cost scales with
-//! stone count. `benchmarks/run.py` runs this, keeps the history, and compares.
+//! stone count. `performance/run.py` runs this, keeps the history, and compares.
 //!
 //!     vgo-bench [--positions PATH] [--seconds S] [--only NAME]
 //!
@@ -42,7 +42,7 @@ struct Arguments {
     #[arg(long)]
     profile_output: Option<PathBuf>,
     /// Fixture positions, one per line.
-    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/../../benchmarks/positions.txt"))]
+    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/../../performance/positions.txt"))]
     positions: PathBuf,
     /// Time budget per path and board size, after one warm-up pass.
     #[arg(long, default_value_t = 2.0)]

@@ -1,7 +1,7 @@
 """Certify a 7.4918r locality lower bound using exact rational arithmetic.
 
 Run with Python's standard library only:
-    python scripts/check_locality_floor.py
+    python docs/history/check_locality_floor.py
 
 All assertions use Fraction, including the Voronoi clipping and disk coverage.
 Decimals in the report are for display only. See docs/history/LOCAL_CONTESTABILITY_FLOOR.md.

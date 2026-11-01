@@ -51,7 +51,7 @@
 # changes need a separate strength experiment.
 set -uo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 output="${VGO_OUTPUT:-$root/artifacts/vgo-bulk}"
 # Absolute, always. Training runs inside `( cd "$root/training" && ... )`, so a
 # relative --games-root resolves against the wrong directory and dies with
@@ -232,7 +232,7 @@ pick_resign_threshold () {
   if [ "$(echo "$resign_target_false_positive > 0" | bc -l 2>/dev/null)" != "1" ]; then
     echo "$resign_threshold"; return
   fi
-  chosen=$("$python" "$root/scripts/resign-calibration.py" "$games" --pick \
+  chosen=$("$python" "$root/training/loop/resign-calibration.py" "$games" --pick \
     --games "$resign_calibration_games" --window "$resign_window" \
     --minimum-ply "$resign_minimum_ply" \
     --target "$resign_target_false_positive" --fallback "$resign_threshold" 2>/dev/null)
@@ -357,7 +357,7 @@ for ((update = first_update; update < first_update + updates; update++)); do
   #
   # Nothing below may be interrupted by a comment: a `#` on a backslash-continued
   # line comments out every remaining argument and the command runs truncated.
-  ( cd "$root/training" && "$python" "$root/scripts/train-once.py" \
+  ( cd "$root/training" && "$python" "$root/training/loop/train-once.py" \
       --games-root "$games" --window-samples "$window" \
       --output "$checkpoint" \
       --raster-kind compact-radius --resolution "$resolution" \
@@ -411,7 +411,7 @@ print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$onnx")
     #
     # Instead sample `anchor_samples` earlier models and play a short match
     # against each. Any single match is noise at this size; what accumulates is
-    # a connected graph of pairwise results, and `scripts/ratings.py` fits every
+    # a connected graph of pairwise results, and `evaluation/ratings.py` fits every
     # model's rating over the whole history at once. Sampling keeps the graph
     # connected without anyone having to choose a ladder, and re-fitting from
     # scratch means old matches keep informing new ratings.

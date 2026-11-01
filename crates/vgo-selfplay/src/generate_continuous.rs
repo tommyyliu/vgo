@@ -306,7 +306,7 @@ fn write_game(
     // cannot be un-summed; 36 rows of small integers per game is cheaper than
     // regenerating.
     //
-    // `scripts/resign-calibration.py` is the consumer: it pools these over the
+    // `training/loop/resign-calibration.py` is the consumer: it pools these over the
     // trailing window, requires at least thirty firings before trusting a rate,
     // and picks the lowest threshold whose false-positive rate stays under the
     // target. Nothing qualifying leaves the fallback in place, which is what

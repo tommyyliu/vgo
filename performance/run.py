@@ -2,9 +2,9 @@
 """Time the large CPU paths, keep the history, and flag regressions.
 
 Builds and runs `vgo-bench` (crates/vgo-bench/src/bench.rs), which times
-each path single-threaded on the fixed positions in benchmarks/positions.txt,
+each path single-threaded on the fixed positions in performance/positions.txt,
 then compares against the most recent record from this machine and appends the
-new one to benchmarks/history.jsonl. The history is committed, so the cost of
+new one to performance/history.jsonl. The history is committed, so the cost of
 every path can be read across the project's life.
 
 Only records from the same host are compared: the numbers are wall-clock and
@@ -12,10 +12,10 @@ mean nothing across machines. A change counts as a regression when it is slower
 by more than --threshold *and* by more than the combined run-to-run spread of
 the two measurements, so noise on a cheap path does not raise an alarm.
 
-    benchmarks/run.py              # run, compare, record
-    benchmarks/run.py --no-record  # run and compare only, e.g. on a dirty tree
-    benchmarks/run.py --check      # exit 1 on any regression
-    benchmarks/run.py --show       # print the history for this host, no run
+    performance/run.py              # run, compare, record
+    performance/run.py --no-record  # run and compare only, e.g. on a dirty tree
+    performance/run.py --check      # exit 1 on any regression
+    performance/run.py --show       # print the history for this host, no run
 
 A busy machine inflates every number, so this refuses to run while the load
 average is above --maximum-load (a generator running is the usual cause).
@@ -33,7 +33,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-HISTORY = ROOT / "benchmarks" / "history.jsonl"
+HISTORY = ROOT / "performance" / "history.jsonl"
 
 
 def git(*args: str) -> str:

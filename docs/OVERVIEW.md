@@ -5,8 +5,8 @@ the load-bearing decisions are what they are. Each section ends with where to
 read more.
 
 The game and its mathematics are in [`spec/`](../spec/RULES.md), including
-[`the core algorithms`](../spec/ALGORITHMS.md). The current plan is
-[`DIRECTION.md`](../DIRECTION.md).
+[`the core algorithms`](../spec/ALGORITHMS.md). The plan is in
+[`BACKLOG.md`](BACKLOG.md), and results are in [`FINDINGS.md`](FINDINGS.md).
 
 ---
 
@@ -37,10 +37,10 @@ is no finite action set, so:
                                                               |
                                           every few updates:  v
                                      vgo-arena vs sampled earlier models
-                                     -> anchor.jsonl -> scripts/ratings.py
+                                     -> anchor.jsonl -> evaluation/ratings.py
 ```
 
-[`scripts/bulk-loop.sh`](../scripts/bulk-loop.sh) runs it, and its header is the
+[`training/loop/bulk-loop.sh`](../training/loop/bulk-loop.sh) runs it, and its header is the
 design document. In short:
 
 - **Generation never stops.** One generator writes each finished game as its
@@ -54,16 +54,16 @@ design document. In short:
   on the same corpus; retraining breaks the chain, so a bad round only affects
   the games it produces.
 - **Rating is a graph, not a gate.** Every `anchor_every` updates the new model
-  plays short matches against a few sampled earlier models. `scripts/ratings.py`
+  plays short matches against a few sampled earlier models. `evaluation/ratings.py`
   fits everything at once (Bradley-Terry), anchored at `sl-w64b16 = 0`.
 - **Resignation is soft and self-calibrating.** A conceded game plays on at a
   cheaper search budget, so every game still reaches a real result. The
   threshold is re-picked before each generator from the measured false
-  positives (`scripts/resign-calibration.py`).
+  positives (`training/loop/resign-calibration.py`).
 - **Boards are mixed.** Generation draws 50% at radius 1/38, 25% at 1/18, and
   25% uniformly between them, with komi set per board (a fixed number of points,
   as in Go). The loop's own rating runs at 1/18, and
-  [`scripts/bigboard-curve.sh`](../scripts/bigboard-curve.sh) re-rates
+  [`evaluation/bigboard-curve.sh`](../evaluation/bigboard-curve.sh) re-rates
   checkpoints at 1/38.
 
 To run any of it, see [`RUNNING.md`](RUNNING.md).
@@ -196,7 +196,7 @@ levels are not comparable across rounds. Judge by play.
 ## 9. Where to read next
 
 - **Running it:** [`RUNNING.md`](RUNNING.md).
-- **Changing the loop:** the header of [`scripts/bulk-loop.sh`](../scripts/bulk-loop.sh),
+- **Changing the loop:** the header of [`training/loop/bulk-loop.sh`](../training/loop/bulk-loop.sh),
   then [`SELFPLAY_ARCHITECTURE.md`](reference/SELFPLAY.md).
 - **Changing the model:** §6, then [`MODEL_ARCHITECTURE.md`](reference/MODEL_ARCHITECTURE.md)
   and `model.py`.

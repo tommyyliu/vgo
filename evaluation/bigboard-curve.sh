@@ -25,7 +25,7 @@
 # A ladder of adjacent checkpoints plus one end-to-end link. Adjacent pairs are
 # close in strength, so each link is the slope of the curve there; the long link
 # measures the total and catches non-transitivity between the two. Ratings come
-# from fitting the whole graph at once (`scripts/bigboard-ratings.py`), so the
+# from fitting the whole graph at once (`evaluation/ratings.py --links`), so the
 # links constrain each other rather than being read one at a time.
 #
 # Games are long here -- a full board is ~330 stones against the mini board's

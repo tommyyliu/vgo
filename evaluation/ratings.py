@@ -17,11 +17,19 @@ are comparable with every number measured against it directly. Otherwise the
 first non-update model seen -- usually the run's seed -- is the anchor, and
 failing that the earliest update.
 
-    scripts/ratings.py [artifacts/vgo-bulk/anchor.jsonl]
+    evaluation/ratings.py [artifacts/vgo-bulk/anchor.jsonl]
+
+`--links` is for a checkpoint curve such as `evaluation/bigboard-curve.sh`: it anchors
+at the earliest checkpoint and prints each link's score. Those ratings are gains
+over that checkpoint, on that board. They aren't comparable with the main scale,
+because nothing in that graph has a path to sl-w64b16.
+
+    evaluation/ratings.py artifacts/bigboard-curve/matches.jsonl --links
 """
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -58,14 +66,39 @@ def label(identifier: int) -> str:
     return f"update-{identifier - 1:06d}"
 
 
+def wilson(wins: float, games: int, z: float = 1.96) -> tuple[float, float]:
+    """95% interval on a score, reliable near 0 and 1 where the normal one is not."""
+    p = wins / games
+    d = 1 + z * z / games
+    centre = (p + z * z / (2 * games)) / d
+    half = z * math.sqrt(p * (1 - p) / games + z * z / (4 * games * games)) / d
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def print_links(rows: list[tuple[int, int, dict]]) -> None:
+    print(f"\n  {'link':<30} {'score':>7} {'95% CI':>16} {'games':>6}"
+          f" {'plies':>6} {'capped':>7}")
+    for a, b, record in rows:
+        score = record["candidate_wins"] + 0.5 * record.get("draws", 0)
+        games = record["candidate_wins"] + record["candidate_losses"] + record.get("draws", 0)
+        low, high = wilson(score, games)
+        print(f"  {label(a)} vs {label(b)}   {score / games:>7.3f}"
+              f"  [{low:>5.3f}, {high:>5.3f}] {games:>6}"
+              f" {record.get('average_plies', 0):>6.0f} {record.get('reached_ply_cap', 0):>7}")
+
+
 def main() -> None:
-    path = Path(sys.argv[1] if len(sys.argv) > 1
-                else "artifacts/vgo-bulk/anchor.jsonl")
+    arguments = [argument for argument in sys.argv[1:] if argument != "--links"]
+    links = "--links" in sys.argv[1:]
+    path = Path(arguments[0] if arguments else "artifacts/vgo-bulk/anchor.jsonl")
+    if not path.exists():
+        print(f"  no matches yet at {path}")
+        return
     raw = path.read_text()
     records = [json.loads(m) for m in
                re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", raw)]
 
-    matches, skipped = [], 0
+    matches, rows, skipped = [], [], 0
     for record in records:
         # The candidate is not named in the record, so it comes from the file's
         # own ordering: every arena run writes its opponents in sequence for one
@@ -80,6 +113,7 @@ def main() -> None:
                         "a_wins": record["candidate_wins"],
                         "b_wins": record["candidate_losses"],
                         "draws": record.get("draws", 0)})
+        rows.append((a, b, record))
 
     if not matches:
         print(f"  no usable matches in {path}"
@@ -98,7 +132,7 @@ def main() -> None:
         adjacency[m["a"]].add(m["b"])
         adjacency[m["b"]].add(m["a"])
     players = {m["a"] for m in matches} | {m["b"] for m in matches}
-    anchor = ANCHOR_ID if ANCHOR_ID in players else min(players)
+    anchor = min(players) if links or ANCHOR_ID not in players else ANCHOR_ID
     anchored, stack = set(), [anchor]
     while stack:
         node = stack.pop()
@@ -118,6 +152,8 @@ def main() -> None:
           f"{len(ratings)} models   (anchor {label(anchor)} = 0)")
     if skipped:
         print(f"  {skipped} record(s) skipped for missing model names")
+    if links:
+        print_links(rows)
     print(f"\n  {'model':<20} {'rating':>8} {'games':>7}")
     for identifier, rating in sorted(ratings.items(), key=lambda kv: -kv[1]):
         if identifier in floating:
@@ -130,6 +166,13 @@ def main() -> None:
         for identifier in sorted(floating, key=lambda i: -ratings[i]):
             print(f"    {label(identifier):<18} {ratings[identifier]:>+8.0f} "
                   f"{games.get(identifier, 0):>7}  (floating)")
+    if links:
+        # Reaching the cap is the normal ending on a big board, so this is context
+        # and not a warning. `truncated` is a game that produced no result.
+        capped = sum(record.get("reached_ply_cap", 0) for _, _, record in rows)
+        truncated = sum(record.get("truncated", 0) for _, _, record in rows)
+        print(f"\n  {capped}/{sum(games.values()) // 2} games decided by area at the ply cap"
+              f"{f', {truncated} produced no result' if truncated else ''}")
 
 
 if __name__ == "__main__":
