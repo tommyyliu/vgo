@@ -26,7 +26,11 @@ use vgo_bench::{COARSE_POOL, FixedEvaluator, SEARCH_SIMULATIONS, load};
 use vgo_core::{
     Analysis, Color, Phase, Point, Position, Ruleset, nearest_legal_placement, pass, place,
 };
-use vgo_raster::{RasterConfig, RasterKind, packed::rasterize_packed, settled_for_raster};
+use vgo_raster::{
+    RasterConfig, RasterKind,
+    packed::{next_raster_is_search_root, rasterize_packed},
+    settled_for_raster,
+};
 use vgo_search::{Evaluation, EvaluationError, Evaluator, SearchConfig, search_with_evaluator};
 
 #[derive(Parser)]
@@ -55,6 +59,10 @@ struct DigestEvaluator {
 }
 
 impl Evaluator for DigestEvaluator {
+    fn begin_search(&self, _root: &Position) {
+        next_raster_is_search_root();
+    }
+
     fn evaluate(&self, position: &Position) -> Result<Evaluation, EvaluationError> {
         let mut hasher = self.hasher.lock().unwrap();
         for size in [128, 256] {

@@ -58,12 +58,13 @@ a tile. Discarding only selects candidates, so stored distances stay exact.
 
 ### Reusing the nearest field across a search
 
-Every leaf of a search holds the root's stones plus the few on its path. Each thread keeps
-one swept field and folds in only the stones past it, comparing exact coordinates to prove
-the saved stones are a prefix. A capture breaks the prefix, so that leaf is swept.
+Every leaf of a search holds the root's stones plus the few on its path. The search
+announces its root, each thread keeps that one field, and a leaf folds in only the stones
+past it, comparing exact coordinates to prove the root's stones are a prefix. A capture
+breaks the prefix, so that leaf is swept.
 
-- **Relies on:** E15.
-- **Cost:** a copy plus one pass per stone past the anchor, instead of a sweep.
+- **Relies on:** E1, E15.
+- **Cost:** a copy plus one pass per stone past the root, instead of a sweep.
 - **Code:** `vgo-raster/src/packed.rs`, `nearest_field`
 
 ### Stone planes by stamping
@@ -87,11 +88,12 @@ and an exact legal-space test decides the narrow band between them.
 ### Reusing exact answers across a search
 
 The exact test asks whether a legal point lies within `d` of a pixel, so a stone farther
-than `d + 2r` cannot change the answer. A leaf's new stones are usually that far from most
-of the band, so each thread saves the answers for the stones its leaves share.
+than `d + 2r` cannot change the answer, whether it was added or captured. A leaf differs
+from the root by few stones, usually that far from most of the band, so each thread saves
+the root's answers and leaves read them.
 
 - **Relies on:** E15, E16.
-- **Cost:** a distance check per new stone for each undecided pixel, in place of the test.
+- **Cost:** a distance check per differing stone for each undecided pixel, not the test.
 - **Code:** `vgo-raster/src/settled_bounds.rs`, `KnownAnswers`
 
 ## Search

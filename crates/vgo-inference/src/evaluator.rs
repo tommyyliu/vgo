@@ -210,6 +210,10 @@ impl BatchedEvaluatorPool {
 }
 
 impl Evaluator for BatchedEvaluatorPool {
+    fn begin_search(&self, _root: &Position) {
+        vgo_raster::packed::next_raster_is_search_root();
+    }
+
     fn evaluate(&self, position: &Position) -> Result<Evaluation, EvaluationError> {
         self.evaluate_positions(std::slice::from_ref(position))
             .map(|mut evaluations| {

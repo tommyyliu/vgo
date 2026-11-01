@@ -340,6 +340,7 @@ pub fn search_at_ply(
         "cannot search a finished position"
     );
     let mut stats = SearchStats::default();
+    evaluator.begin_search(position);
     let mut root = Node::new(position.clone(), None, match_seed, evaluator, &mut stats)?;
     root.mark_root();
     if config.leaf_batch > 1 {

@@ -304,25 +304,20 @@ fn fold_stone_into_row(
     }
 }
 
-/// Stones a position may have past the anchor before a sweep is the better deal.
-const MOST_STONES_PAST_ANCHOR: usize = 12;
+/// Most stones a position can differ from the anchor by and still read its answers.
+/// Past this the position is not really a leaf of the anchor.
+const MOST_DIFFERING_STONES: usize = 32;
 
-/// Stones a new anchor leaves off the end of the position that prompted it. A
-/// search's leaves share the root, not each other's last few moves, and this
-/// starts the anchor near the root without being told where that is.
-const NEW_ANCHOR_BACK_OFF: usize = 4;
-
-/// Misses in a row before the anchor moves. A lone capture in the tree breaks the
-/// prefix for that leaf and no other, so it should not cost the anchor.
-const ANCHOR_PATIENCE: u32 = 2;
-
-/// What this thread's leaves can share about a run of stones they all start with.
+/// What this thread's leaves can share about a search's root.
 ///
 /// Every leaf of a search is the root's stones plus the few on its path, so
 /// rendering each one repeats nearly all the work of the last. This keeps the
-/// nearest field of that run, which a leaf extends by folding in its own stones,
-/// and each pixel's exact settled answer, which a leaf reuses wherever its own
-/// stones are too far away to matter. Both give the same bits as starting over.
+/// root's nearest field, which a leaf extends by folding in its own stones, and
+/// each pixel's exact settled answer, which a leaf reuses wherever the stones it
+/// differs by are too far away to matter. Both give the same bits as starting over.
+///
+/// Nothing here is needed for correctness: with no root announced, every raster
+/// sweeps and tests from nothing.
 #[derive(Debug, Default)]
 struct SweepAnchor {
     width: usize,
@@ -334,44 +329,84 @@ struct SweepAnchor {
     second_squares: Vec<f64>,
     /// Filled in as leaves reach the exact test. See `KnownAnswers`.
     answers: Vec<u8>,
-    misses: u32,
+    /// Set by [`next_raster_is_search_root`], and spent by the next raster.
+    next_is_root: bool,
+    /// The anchor's stones the position lost, then the position's stones past
+    /// the anchor. Between them these are everything that differs.
+    differing_xs: Vec<f64>,
+    differing_ys: Vec<f64>,
+}
+
+/// How a position relates to the anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnchorFit {
+    /// The anchor's stones are a prefix of the position's.
+    Extends,
+    /// It lost stones too, as a capture does, so only the answers carry over.
+    Differs,
+    /// Nothing carries over.
+    Unrelated,
 }
 
 impl SweepAnchor {
-    /// How many leading stones the anchor shares with these, by exact coordinates.
-    fn shared_stones(&self, stone_xs: &[f64], stone_ys: &[f64]) -> usize {
-        let anchored = self.stone_xs.iter().zip(&self.stone_ys);
-        let wanted = stone_xs.iter().zip(stone_ys);
-        anchored
-            .zip(wanted)
-            .take_while(|((ax, ay), (x, y))| {
-                ax.to_bits() == x.to_bits() && ay.to_bits() == y.to_bits()
-            })
-            .count()
+    /// Lists the stones this position differs from the anchor by.
+    ///
+    /// A stone keeps its place in the list until it is captured, so walking both
+    /// lists together splits them into the stones they share, the anchor's stones
+    /// the position lost, and the position's stones past the last one shared.
+    fn fit(&mut self, input: &SweepInput<'_>, radius: f64) -> AnchorFit {
+        self.differing_xs.clear();
+        self.differing_ys.clear();
+        if self.width != input.xs.len()
+            || self.height != input.ys.len()
+            || self.radius_bits != radius.to_bits()
+        {
+            return AnchorFit::Unrelated;
+        }
+        let (stone_xs, stone_ys) = (input.stone_xs, input.stone_ys);
+        let mut shared = 0;
+        for (&x, &y) in self.stone_xs.iter().zip(&self.stone_ys) {
+            if shared < stone_xs.len()
+                && x.to_bits() == stone_xs[shared].to_bits()
+                && y.to_bits() == stone_ys[shared].to_bits()
+            {
+                shared += 1;
+            } else {
+                self.differing_xs.push(x);
+                self.differing_ys.push(y);
+                if self.differing_xs.len() > MOST_DIFFERING_STONES {
+                    return AnchorFit::Unrelated;
+                }
+            }
+        }
+        let lost = self.differing_xs.len();
+        self.differing_xs.extend_from_slice(&stone_xs[shared..]);
+        self.differing_ys.extend_from_slice(&stone_ys[shared..]);
+        if self.differing_xs.len() > MOST_DIFFERING_STONES {
+            AnchorFit::Unrelated
+        } else if lost == 0 {
+            AnchorFit::Extends
+        } else {
+            AnchorFit::Differs
+        }
     }
 
-    /// Makes this the field of `input`'s first `length` stones.
-    fn rebuild(
-        &mut self,
-        input: &SweepInput<'_>,
-        radius: f64,
-        length: usize,
-        candidates: &mut Vec<u32>,
-    ) {
+    /// Makes this the anchor for all of `input`'s stones.
+    fn rebuild(&mut self, input: &SweepInput<'_>, radius: f64, candidates: &mut Vec<u32>) {
         self.width = input.xs.len();
         self.height = input.ys.len();
         self.radius_bits = radius.to_bits();
-        self.misses = 0;
         self.answers.clear();
         self.answers
             .resize(self.width * self.height, ANSWER_UNKNOWN);
         self.stone_xs.clear();
-        self.stone_xs.extend_from_slice(&input.stone_xs[..length]);
+        self.stone_xs.extend_from_slice(input.stone_xs);
         self.stone_ys.clear();
-        self.stone_ys.extend_from_slice(&input.stone_ys[..length]);
+        self.stone_ys.extend_from_slice(input.stone_ys);
+        self.differing_xs.clear();
+        self.differing_ys.clear();
         sweep_stones(
             input,
-            length,
             candidates,
             &mut self.nearest_squares,
             &mut self.second_squares,
@@ -379,10 +414,9 @@ impl SweepAnchor {
     }
 }
 
-/// Sweeps the first `length` stones into a cleared field.
+/// Sweeps every stone into a cleared field.
 fn sweep_stones(
     input: &SweepInput<'_>,
-    length: usize,
     candidates: &mut Vec<u32>,
     nearest_squares: &mut Vec<f64>,
     second_squares: &mut Vec<f64>,
@@ -393,7 +427,7 @@ fn sweep_stones(
     second_squares.clear();
     second_squares.resize(width * height, f64::INFINITY);
     candidates.clear();
-    candidates.extend(0..length as u32);
+    candidates.extend(0..input.stone_xs.len() as u32);
     sweep_tile(
         input,
         0..width,
@@ -407,8 +441,7 @@ fn sweep_stones(
 
 /// The two smallest squared distances at every pixel, by folding the stones past
 /// the anchor into its field where this position extends the anchor, and by a
-/// sweep where it does not. Returns whether the position extends the anchor, which
-/// is what lets it read the anchor's exact answers. Proof: [E15].
+/// sweep where it does not. Returns how the position fits the anchor. Proof: [E15].
 fn nearest_field(
     input: &SweepInput<'_>,
     radius: f64,
@@ -416,55 +449,47 @@ fn nearest_field(
     candidates: &mut Vec<u32>,
     nearest_squares: &mut Vec<f64>,
     second_squares: &mut Vec<f64>,
-) -> bool {
-    let (width, height) = (input.xs.len(), input.ys.len());
-    let count = input.stone_xs.len();
-    let same_board =
-        anchor.width == width && anchor.height == height && anchor.radius_bits == radius.to_bits();
-    let shared = if same_board {
-        anchor.shared_stones(input.stone_xs, input.stone_ys)
-    } else {
-        0
-    };
-    let past = count - shared;
-    if same_board && shared == anchor.stone_xs.len() && past <= MOST_STONES_PAST_ANCHOR {
-        anchor.misses = 0;
-    } else {
-        anchor.misses += 1;
-        if same_board && anchor.misses < ANCHOR_PATIENCE {
-            sweep_stones(input, count, candidates, nearest_squares, second_squares);
-            return false;
-        }
-        let length = if same_board && past <= MOST_STONES_PAST_ANCHOR {
-            shared
-        } else {
-            count.saturating_sub(NEW_ANCHOR_BACK_OFF)
-        };
-        anchor.rebuild(input, radius, length, candidates);
+) -> AnchorFit {
+    let mut fit = anchor.fit(input, radius);
+    if std::mem::take(&mut anchor.next_is_root)
+        && (fit != AnchorFit::Extends || !anchor.differing_xs.is_empty())
+    {
+        anchor.rebuild(input, radius, candidates);
+        fit = AnchorFit::Extends;
+    }
+    if fit != AnchorFit::Extends {
+        sweep_stones(input, candidates, nearest_squares, second_squares);
+        return fit;
     }
 
     nearest_squares.clear();
     nearest_squares.extend_from_slice(&anchor.nearest_squares);
     second_squares.clear();
     second_squares.extend_from_slice(&anchor.second_squares);
-    let first_past = anchor.stone_xs.len();
-    let stones_past = input.stone_xs[first_past..]
-        .iter()
-        .copied()
-        .zip(input.stone_ys[first_past..].iter().copied());
-    for stone in stones_past {
-        for (row, &y) in input.ys.iter().enumerate() {
+    let width = input.xs.len();
+    let stones_past = anchor.differing_xs.iter().zip(&anchor.differing_ys);
+    for (&x, &y) in stones_past {
+        for (row, &pixel_y) in input.ys.iter().enumerate() {
             let base = row * width;
             fold_stone_into_row(
-                stone,
-                y,
+                (x, y),
+                pixel_y,
                 input.xs,
                 &mut nearest_squares[base..base + width],
                 &mut second_squares[base..base + width],
             );
         }
     }
-    true
+    fit
+}
+
+/// Says the next packed raster on this thread is the root of a search, whose leaves
+/// are the rasters after it.
+///
+/// This is a promise about what comes next and nothing else: a raster that turns
+/// out to share nothing with the root is simply drawn from nothing.
+pub fn next_raster_is_search_root() {
+    SCRATCH.with_borrow_mut(|scratch| scratch.anchor.next_is_root = true);
 }
 
 /// Marks the pixels inside `(x, y)`'s disc.
@@ -615,6 +640,7 @@ fn write_packed(
     // taking 65,536 `sqrt(inf - inf)` paths for a ridge that is known to be 0.
     if position.stones().is_empty() {
         dense_plane.fill(f16::ZERO);
+        anchor.next_is_root = false;
         return;
     }
 
@@ -661,7 +687,7 @@ fn write_packed(
         stamp_disc(plane, (stone.x, stone.y), radius, xs, ys);
     }
 
-    let extends_anchor = nearest_field(
+    let fit = nearest_field(
         &SweepInput {
             stone_xs,
             stone_ys,
@@ -674,7 +700,6 @@ fn write_packed(
         nearest_squares,
         second_squares,
     );
-    let first_past = anchor.stone_xs.len();
 
     for (row, &y) in ys.iter().enumerate() {
         let base = row * width;
@@ -689,9 +714,9 @@ fn write_packed(
             nearest_row,
             settled_scratch.edt.field(),
             &mut settled[base..base + width],
-            extends_anchor.then(|| KnownAnswers {
-                stone_xs: &stone_xs[first_past..],
-                stone_ys: &stone_ys[first_past..],
+            (fit != AnchorFit::Unrelated).then(|| KnownAnswers {
+                stone_xs: &anchor.differing_xs,
+                stone_ys: &anchor.differing_ys,
                 row: &mut anchor.answers[base..base + width],
             }),
         );
@@ -798,7 +823,7 @@ mod tests {
         };
 
         let mut scratch = PackedScratch::default();
-        let (mut folded, mut swept, mut answers) = (0usize, 0usize, 0usize);
+        let (mut saved, mut fits) = (0usize, [0usize; 3]);
         for game in 0..12 {
             let mut root: Vec<usize> = (0..points.len()).collect();
             for at in 0..root.len() {
@@ -813,7 +838,7 @@ mod tests {
                 if leaf % 7 == 3 {
                     picks.remove(next(picks.len()));
                 }
-                // The root moves on, sometimes by more than the anchor reaches.
+                // The root moves on, ready for the next one announced.
                 if leaf % 13 == 12 {
                     let by = 1 + next(20);
                     root.extend(pool.drain(..by));
@@ -823,15 +848,28 @@ mod tests {
                 let position = Position::new(radius, stones_at(&points, &picks), Color::Black);
                 assert!(position.validate().is_playable());
 
-                let xs: Vec<f64> = position.stones().iter().map(|stone| stone.x).collect();
-                let ys: Vec<f64> = position.stones().iter().map(|stone| stone.y).collect();
-                let anchor = &scratch.anchor;
-                let shared = anchor.shared_stones(&xs, &ys);
-                let extends = anchor.width == resolution && shared == anchor.stone_xs.len();
-                let folds = extends && (1..=MOST_STONES_PAST_ANCHOR).contains(&(xs.len() - shared));
-                folded += usize::from(folds);
-                swept += usize::from(!folds);
-                answers += anchor.answers.iter().filter(|&&saved| saved != 0).count();
+                let announced = leaf % 13 == 1;
+                scratch.anchor.next_is_root = announced;
+
+                let stones = position.stones();
+                let stone_xs: Vec<f64> = stones.iter().map(|stone| stone.x).collect();
+                let stone_ys: Vec<f64> = stones.iter().map(|stone| stone.y).collect();
+                let grid: Vec<f64> = (0..resolution)
+                    .map(|index| (index as f64 + 0.5) / resolution as f64)
+                    .collect();
+                let input = SweepInput {
+                    stone_xs: &stone_xs,
+                    stone_ys: &stone_ys,
+                    xs: &grid,
+                    ys: &grid,
+                };
+                if !announced {
+                    fits[match scratch.anchor.fit(&input, radius) {
+                        AnchorFit::Extends => 0,
+                        AnchorFit::Differs => 1,
+                        AnchorFit::Unrelated => 2,
+                    }] += 1;
+                }
 
                 let mut anchored = PackedRaster::new(config);
                 write_packed(&position, config, &mut anchored, &mut scratch);
@@ -839,13 +877,41 @@ mod tests {
                 write_packed(&position, config, &mut fresh, &mut PackedScratch::default());
                 assert_eq!(anchored.bits, fresh.bits, "game {game} leaf {leaf}");
                 assert_eq!(anchored.dense, fresh.dense, "game {game} leaf {leaf}");
+                saved += scratch.anchor.answers.iter().filter(|&&a| a != 0).count();
             }
         }
-        // A run that never folded, never fell back or never saved an answer proved
-        // nothing.
-        assert!(folded > 200, "folded {folded}, swept {swept}");
-        assert!(swept > 50, "folded {folded}, swept {swept}");
-        assert!(answers > 1000, "saved {answers} answers");
+        // A run that missed a path, or never saved an answer, proved nothing.
+        assert!(fits.iter().all(|&count| count > 5), "fits {fits:?}");
+        assert!(saved > 1000, "saved {saved} answers");
+    }
+
+    /// A field belongs to its grid: an arena can render the same stones at two
+    /// sizes on one thread, one seat's leaf after the other's.
+    #[test]
+    fn the_anchor_keeps_to_its_grid() {
+        let radius = 1.0 / 38.0;
+        let points = lattice(radius);
+        let picks: Vec<usize> = (0..50).map(|index| index * 3).collect();
+        let stones = stones_at(&points, &picks);
+        let root = Position::new(radius, stones[..40].to_vec(), Color::Black);
+        let leaf = Position::new(radius, stones, Color::Black);
+        let mut scratch = PackedScratch::default();
+        for (position, size, announced) in [
+            (&root, 128, true),
+            (&leaf, 128, false),
+            (&leaf, 64, false),
+            (&root, 64, false),
+            (&leaf, 128, false),
+        ] {
+            let config = RasterConfig::square_of(size, RasterKind::CompactRadius);
+            scratch.anchor.next_is_root = announced;
+            let mut anchored = PackedRaster::new(config);
+            let mut fresh = PackedRaster::new(config);
+            write_packed(position, config, &mut anchored, &mut scratch);
+            write_packed(position, config, &mut fresh, &mut PackedScratch::default());
+            assert_eq!(anchored.bits, fresh.bits);
+            assert_eq!(anchored.dense, fresh.dense);
+        }
     }
 
     /// Exact answers belong to a radius as well as to stones: the same stones on
@@ -862,7 +928,8 @@ mod tests {
             let position = Position::new(radius, stones.clone(), Color::Black);
             let mut anchored = PackedRaster::new(config);
             let mut fresh = PackedRaster::new(config);
-            for _ in 0..3 {
+            for announced in [false, true, false] {
+                scratch.anchor.next_is_root = announced;
                 write_packed(&position, config, &mut anchored, &mut scratch);
                 write_packed(&position, config, &mut fresh, &mut PackedScratch::default());
                 assert_eq!(anchored.bits, fresh.bits);
@@ -891,8 +958,8 @@ mod tests {
             let position = mirrored(flip_x, flip_y);
             let mut anchored = PackedRaster::new(config);
             let mut fresh = PackedRaster::new(config);
-            // Repeated, because the first miss is forgiven as a lone capture.
-            for _ in 0..3 {
+            for announced in [false, true, false] {
+                scratch.anchor.next_is_root = announced;
                 write_packed(&position, config, &mut anchored, &mut scratch);
                 write_packed(&position, config, &mut fresh, &mut PackedScratch::default());
                 assert_eq!(anchored.bits, fresh.bits);

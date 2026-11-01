@@ -90,6 +90,11 @@ impl fmt::Display for EvaluationError {
 impl Error for EvaluationError {}
 
 pub trait Evaluator: Send + Sync {
+    /// Called on the searching thread as a search of `root` starts, so an evaluator
+    /// that keeps per-thread state can prepare for its leaves. Skipping this may
+    /// cost time and must not change any result.
+    fn begin_search(&self, _root: &Position) {}
+
     fn evaluate(&self, position: &Position) -> Result<Evaluation, EvaluationError>;
 
     /// Evaluate several positions, returning results in the same order.

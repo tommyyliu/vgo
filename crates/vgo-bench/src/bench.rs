@@ -31,7 +31,9 @@ use vgo_inference::{
     BatchedEvaluatorPool, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
 };
 use vgo_raster::{
-    DensePolicy, RasterConfig, RasterKind, packed::rasterize_packed, settled_for_raster,
+    DensePolicy, RasterConfig, RasterKind,
+    packed::{next_raster_is_search_root, rasterize_packed},
+    settled_for_raster,
 };
 use vgo_search::{
     Evaluation, EvaluationError, Evaluator, Policy, SearchConfig, search_with_evaluator,
@@ -91,6 +93,10 @@ struct RasterizingEvaluator {
 }
 
 impl Evaluator for RasterizingEvaluator {
+    fn begin_search(&self, _root: &Position) {
+        next_raster_is_search_root();
+    }
+
     fn evaluate(&self, position: &Position) -> Result<Evaluation, EvaluationError> {
         black_box(rasterize_packed(position, self.raster));
         self.inner.evaluate(position)
