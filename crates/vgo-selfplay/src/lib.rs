@@ -12,15 +12,6 @@ pub mod telemetry;
 
 use vgo_core::{Analysis, Color, GameEvent, Outcome, Phase, Position};
 
-/// Closing plies whose area leader must agree before a truncated game is
-/// awarded.
-///
-/// Short, because the area leader is not a noisy quantity: measured on the
-/// three longest games in a real shard it settled by ply 10, 44, and 48 and
-/// never changed again across the remaining 180-240 plies. A handful of plies
-/// is enough to reject a position genuinely oscillating around even.
-pub const ADJUDICATION_PLIES: usize = 8;
-
 /// Awards a truncated game on its final position alone.
 ///
 /// [`adjudicate_positions`] can refuse -- on a margin, or on the lead changing

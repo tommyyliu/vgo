@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-use std::{cell::RefCell, collections::VecDeque};
 use std::{
+    cell::RefCell,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -21,7 +21,7 @@ use vgo_search::{
     Action, EvaluationError, Evaluator, NaiveEvaluator, ReusableSearch, ReuseMetrics, SearchConfig,
     search_for_duration, search_with_evaluator,
 };
-use vgo_selfplay::{ADJUDICATION_PLIES, award_by_area, play_game as run_playout};
+use vgo_selfplay::{award_by_area, play_game as run_playout};
 
 #[derive(Debug, Parser)]
 #[command(about = "Run a color-swapped held-out arena for an ONNX candidate")]
@@ -199,8 +199,9 @@ struct Arguments {
 
 #[derive(Clone)]
 struct GameResult {
-    completed: bool,
-    outcome: Option<Outcome>,
+    /// Pair order, which is stable where finishing order is not.
+    game: usize,
+    outcome: Outcome,
     candidate_color: Color,
     plies: u32,
     /// The moves played, kept only when `--sgf-directory` asks for them.
@@ -225,6 +226,36 @@ struct SeatSearches {
 }
 
 impl SeatSearches {
+    /// Fold one game's search totals into a match's.
+    fn absorb(&mut self, game: Self) {
+        self.moves += game.moves;
+        self.simulations += game.simulations;
+        self.milliseconds += game.milliseconds;
+        self.maximum_milliseconds = self.maximum_milliseconds.max(game.maximum_milliseconds);
+        self.reuse.searches += game.reuse.searches;
+        self.reuse.hits += game.reuse.hits;
+        self.reuse.inherited_visits += game.reuse.inherited_visits;
+        self.reuse.advances += game.reuse.advances;
+        self.reuse.advance_hits += game.reuse.advance_hits;
+        self.reuse.limit_drops += game.reuse.limit_drops;
+        self.reuse.advance_nanoseconds += game.reuse.advance_nanoseconds;
+        self.reuse.maximum_retained_nodes = self
+            .reuse
+            .maximum_retained_nodes
+            .max(game.reuse.maximum_retained_nodes);
+        self.reuse.maximum_retained_bytes = self
+            .reuse
+            .maximum_retained_bytes
+            .max(game.reuse.maximum_retained_bytes);
+    }
+
+    fn record(&mut self, simulations: u32, milliseconds: f64) {
+        self.moves += 1;
+        self.simulations += u64::from(simulations);
+        self.milliseconds += milliseconds;
+        self.maximum_milliseconds = self.maximum_milliseconds.max(milliseconds);
+    }
+
     fn json(self) -> serde_json::Value {
         let count = self.moves.max(1) as f64;
         serde_json::json!({"moves": self.moves,
@@ -359,147 +390,119 @@ fn game_sgf(result: &GameResult, radius: f64, komi: f64) -> String {
     }
     // Result in SGF's own vocabulary, so a reader knows how the game ended
     // rather than inferring it from the move count.
-    let outcome = match result.outcome {
-        Some(outcome) => match outcome.winner {
-            Some(Color::Black) => format!("B+{:.3}", outcome.margin),
-            Some(Color::White) => format!("W+{:.3}", outcome.margin),
-            None => "0".to_owned(),
-        },
-        None => "Void".to_owned(),
+    let outcome = match result.outcome.winner {
+        Some(Color::Black) => format!("B+{:.3}", result.outcome.margin),
+        Some(Color::White) => format!("W+{:.3}", result.outcome.margin),
+        None => "0".to_owned(),
     };
     text.push_str(&format!("RE[{outcome}])"));
     text
 }
 
+/// One seat's search settings, resolved once from the flags. Index 0 is the
+/// candidate and index 1 its opponent, which falls back to the candidate's
+/// settings for any flag left unset.
+struct Seat<'a> {
+    evaluator: &'a dyn Evaluator,
+    config: SearchConfig,
+    tree_reuse: bool,
+}
+
+fn seats<'a>(
+    candidate: &'a BatchedEvaluatorPool,
+    opponent: Option<&'a BatchedEvaluatorPool>,
+    naive: &'a NaiveEvaluator,
+    arguments: &Arguments,
+) -> [Seat<'a>; 2] {
+    [
+        Seat {
+            evaluator: candidate,
+            config: search_config(
+                arguments.simulations,
+                arguments.coarse_pool,
+                arguments.leaf_batch,
+                arguments.maximum_candidates,
+                arguments.widening_coefficient,
+                arguments.root_exploration_noise,
+            ),
+            tree_reuse: arguments.tree_reuse,
+        },
+        Seat {
+            evaluator: opponent.map_or(naive as &dyn Evaluator, |pool| pool),
+            config: search_config(
+                arguments
+                    .opponent_simulations
+                    .unwrap_or(arguments.simulations),
+                arguments.coarse_pool,
+                arguments
+                    .opponent_leaf_batch
+                    .unwrap_or(arguments.leaf_batch),
+                arguments
+                    .opponent_maximum_candidates
+                    .unwrap_or(arguments.maximum_candidates),
+                arguments
+                    .opponent_widening_coefficient
+                    .unwrap_or(arguments.widening_coefficient),
+                arguments
+                    .opponent_root_exploration_noise
+                    .unwrap_or(arguments.root_exploration_noise),
+            ),
+            tree_reuse: arguments.opponent_tree_reuse,
+        },
+    ]
+}
+
 fn play_game(
-    candidate: &BatchedEvaluatorPool,
-    opponent: Option<&BatchedEvaluatorPool>,
+    seats: &[Seat<'_>; 2],
+    game: usize,
     candidate_color: Color,
     seed: u64,
     arguments: &Arguments,
 ) -> Result<GameResult, EvaluationError> {
-    let naive = NaiveEvaluator;
-    // The closing positions, for adjudicating a game that reaches the cap.
-    // Only the last ADJUDICATION_PLIES are needed, so this stays bounded rather
-    // than retaining the whole game.
-    let mut closing: VecDeque<Position> = VecDeque::with_capacity(ADJUDICATION_PLIES);
     let record_moves = arguments.sgf_directory.is_some();
+    let move_time = arguments.move_time_ms.map(Duration::from_millis);
     let mut moves: Vec<(Color, Option<Point>)> = Vec::new();
     let mut searches = [SeatSearches::default(); 2];
-    let reuse = RefCell::new([
+    let trees = RefCell::new([0, 1].map(|_| {
         ReusableSearch::new(
             arguments.reuse_maximum_nodes,
             arguments.reuse_maximum_mib * 1024 * 1024,
-        ),
-        ReusableSearch::new(
-            arguments.reuse_maximum_nodes,
-            arguments.reuse_maximum_mib * 1024 * 1024,
-        ),
-    ]);
+        )
+    }));
     let playout = run_playout(
         Position::new(arguments.radius, Vec::new(), Color::Black)
             .with_ruleset(arguments.ruleset)
             .with_komi(arguments.komi),
         arguments.maximum_plies,
         |position, ply| {
-            let is_candidate = position.to_move() == candidate_color;
-            let evaluator: &dyn Evaluator = if is_candidate {
-                candidate
-            } else if let Some(opponent) = opponent {
-                opponent
-            } else {
-                &naive
-            };
-            let simulations = if is_candidate {
-                arguments.simulations
-            } else {
-                arguments
-                    .opponent_simulations
-                    .unwrap_or(arguments.simulations)
-            };
-            let candidates = if is_candidate {
-                arguments.maximum_candidates
-            } else {
-                arguments
-                    .opponent_maximum_candidates
-                    .unwrap_or(arguments.maximum_candidates)
-            };
-            let widening = if is_candidate {
-                arguments.widening_coefficient
-            } else {
-                arguments
-                    .opponent_widening_coefficient
-                    .unwrap_or(arguments.widening_coefficient)
-            };
-            let noise = if is_candidate {
-                arguments.root_exploration_noise
-            } else {
-                arguments
-                    .opponent_root_exploration_noise
-                    .unwrap_or(arguments.root_exploration_noise)
-            };
-            let leaf_batch = if is_candidate {
-                arguments.leaf_batch
-            } else {
-                arguments
-                    .opponent_leaf_batch
-                    .unwrap_or(arguments.leaf_batch)
-            };
-            let config = search_config(
-                simulations,
-                arguments.coarse_pool,
-                leaf_batch,
-                candidates,
-                widening,
-                noise,
-            );
+            let index = usize::from(position.to_move() != candidate_color);
+            let seat = &seats[index];
             let started = Instant::now();
-            let enabled = if is_candidate {
-                arguments.tree_reuse
-            } else {
-                arguments.opponent_tree_reuse
-            };
-            let result = if enabled {
-                reuse.borrow_mut()[usize::from(!is_candidate)].search(
+            let result = if seat.tree_reuse {
+                trees.borrow_mut()[index].search(
                     position,
-                    config,
+                    seat.config,
                     seed,
-                    u64::from(!is_candidate),
+                    index as u64,
                     ply,
-                    evaluator,
-                    arguments.move_time_ms.map(Duration::from_millis),
+                    seat.evaluator,
+                    move_time,
                 )
-            } else if let Some(milliseconds) = arguments.move_time_ms {
-                search_for_duration(
-                    position,
-                    config,
-                    seed,
-                    evaluator,
-                    Duration::from_millis(milliseconds),
-                )
+            } else if let Some(limit) = move_time {
+                search_for_duration(position, seat.config, seed, seat.evaluator, limit)
             } else {
-                search_with_evaluator(position, config, seed, evaluator)
+                search_with_evaluator(position, seat.config, seed, seat.evaluator)
             }?;
             let milliseconds = started.elapsed().as_secs_f64() * 1000.0;
-            let seat = &mut searches[usize::from(!is_candidate)];
-            seat.moves += 1;
-            seat.simulations += u64::from(result.stats.simulations);
-            seat.milliseconds += milliseconds;
-            seat.maximum_milliseconds = seat.maximum_milliseconds.max(milliseconds);
+            searches[index].record(result.stats.simulations, milliseconds);
             Ok(result)
         },
         |step| {
-            let mut trees = reuse.borrow_mut();
-            if arguments.tree_reuse {
-                trees[0].advance(step.action, &step.transition.position);
+            for (seat, tree) in seats.iter().zip(trees.borrow_mut().iter_mut()) {
+                if seat.tree_reuse {
+                    tree.advance(step.action, &step.transition.position);
+                }
             }
-            if arguments.opponent_tree_reuse {
-                trees[1].advance(step.action, &step.transition.position);
-            }
-            if closing.len() == ADJUDICATION_PLIES {
-                closing.pop_front();
-            }
-            closing.push_back(step.transition.position.clone());
             if record_moves {
                 moves.push((
                     step.position.to_move(),
@@ -520,12 +523,12 @@ fn play_game(
     // the close ones between similar models that a rating most needs.
     let outcome = playout
         .outcome
-        .or_else(|| closing.back().map(award_by_area));
-    for (seat, tree) in searches.iter_mut().zip(reuse.borrow().iter()) {
+        .unwrap_or_else(|| award_by_area(&playout.final_position));
+    for (seat, tree) in searches.iter_mut().zip(trees.borrow().iter()) {
         seat.reuse = tree.metrics();
     }
     Ok(GameResult {
-        completed: outcome.is_some(),
+        game,
         outcome,
         candidate_color,
         plies: playout.stats.plies,
@@ -607,40 +610,26 @@ struct Tally {
     wins: usize,
     losses: usize,
     draws: usize,
-    undecided: usize,
 }
 
 impl Tally {
     fn record(&mut self, result: &GameResult, games: usize, started: Instant, label: &str) {
         self.finished += 1;
-        let verdict = match result
-            .outcome
-            .filter(|_| result.completed)
-            .map(|o| o.winner)
-        {
-            Some(Some(winner)) if winner == result.candidate_color => {
+        let verdict = match result.outcome.winner {
+            Some(winner) if winner == result.candidate_color => {
                 self.wins += 1;
                 "won"
             }
-            Some(Some(_)) => {
+            Some(_) => {
                 self.losses += 1;
                 "lost"
             }
-            Some(None) => {
+            None => {
                 self.draws += 1;
                 "drew"
             }
-            None => {
-                self.undecided += 1;
-                "undecided"
-            }
         };
-        let decided = self.wins + self.losses + self.draws;
-        let score = if decided == 0 {
-            f64::NAN
-        } else {
-            (self.wins as f64 + 0.5 * self.draws as f64) / decided as f64
-        };
+        let score = (self.wins as f64 + 0.5 * self.draws as f64) / self.finished as f64;
         let elapsed = started.elapsed().as_secs_f64();
         let remaining = elapsed / self.finished as f64 * (games - self.finished) as f64;
         let seat = if result.candidate_color == Color::Black {
@@ -662,6 +651,130 @@ impl Tally {
     }
 }
 
+/// Play one match on `--threads` workers and return its games in pair order.
+fn play_match(
+    arguments: &Arc<Arguments>,
+    candidate: &BatchedEvaluatorPool,
+    opponent: Option<&BatchedEvaluatorPool>,
+    label: &str,
+    seed_base: u64,
+    started: Instant,
+) -> Result<Vec<GameResult>, EvaluationError> {
+    let games = arguments.pairs * 2;
+    let next_game = AtomicUsize::new(0);
+    let tally = Mutex::new(Tally::default());
+    let mut results = thread::scope(|scope| {
+        let worker = || {
+            let naive = NaiveEvaluator;
+            let seats = seats(candidate, opponent, &naive, arguments);
+            let mut results = Vec::new();
+            loop {
+                let game = next_game.fetch_add(1, Ordering::Relaxed);
+                if game >= games {
+                    return Ok::<_, EvaluationError>(results);
+                }
+                let candidate_color = if game.is_multiple_of(2) {
+                    Color::Black
+                } else {
+                    Color::White
+                };
+                let seed = seed_base + (game / 2) as u64;
+                let result = play_game(&seats, game, candidate_color, seed, arguments)?;
+                tally
+                    .lock()
+                    .expect("arena tally")
+                    .record(&result, games, started, label);
+                results.push(result);
+            }
+        };
+        let handles = (0..arguments.threads)
+            .map(|_| scope.spawn(worker))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("arena worker"))
+            .collect::<Result<Vec<_>, _>>()
+    })?
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    results.sort_by_key(|result| result.game);
+    Ok(results)
+}
+
+fn write_sgfs(
+    directory: &std::path::Path,
+    results: &[GameResult],
+    opponent_path: Option<&std::path::Path>,
+    arguments: &Arguments,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(directory)?;
+    // The opponent names the match; no path is the naive player.
+    let label = opponent_path
+        .and_then(|path| path.parent())
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("naive");
+    for result in results {
+        let seat = match result.candidate_color {
+            Color::Black => "B",
+            Color::White => "W",
+        };
+        // Every game is decided now, so "decided" says nothing. What is
+        // worth finding in a directory listing is which games stalled to
+        // the cap rather than ending on their own.
+        let status = if result.plies >= arguments.maximum_plies {
+            "capped"
+        } else {
+            "natural"
+        };
+        let index = result.game;
+        let path = directory.join(format!("{label}-game{index:03}-cand{seat}-{status}.sgf"));
+        std::fs::write(path, game_sgf(result, arguments.radius, arguments.komi))?;
+    }
+    Ok(())
+}
+
+/// What a match's games add up to.
+#[derive(Default)]
+struct MatchTotals {
+    wins: usize,
+    losses: usize,
+    draws: usize,
+    points: f64,
+    plies: u64,
+    /// Games that ran out of plies rather than ending on their own. A hundred
+    /// plies is far past where the board settles, so a high share means the
+    /// sides are stalling rather than that the game is long.
+    capped: usize,
+    searches: [SeatSearches; 2],
+}
+
+impl MatchTotals {
+    fn new(results: &[GameResult], maximum_plies: u32) -> Self {
+        let mut totals = Self::default();
+        for result in results {
+            for (total, game) in totals.searches.iter_mut().zip(result.searches) {
+                total.absorb(game);
+            }
+            totals.plies += u64::from(result.plies);
+            totals.capped += usize::from(result.plies >= maximum_plies);
+            match result.outcome.winner {
+                Some(winner) if winner == result.candidate_color => {
+                    totals.wins += 1;
+                    totals.points += 1.0;
+                }
+                Some(_) => totals.losses += 1,
+                None => {
+                    totals.draws += 1;
+                    totals.points += 0.5;
+                }
+            }
+        }
+        totals
+    }
+}
+
 fn run_match(
     arguments: &Arc<Arguments>,
     candidate: &BatchedEvaluatorPool,
@@ -669,153 +782,24 @@ fn run_match(
     opponent_path: Option<&std::path::Path>,
     seed_base: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let games = arguments.pairs * 2;
-    let next_game = Arc::new(AtomicUsize::new(0));
     // Broker counters are cumulative over the process, and the candidate is
     // shared across every opponent, so report this match's delta.
     let baseline = candidate.metrics();
     let started = Instant::now();
-    let tally = Arc::new(Mutex::new(Tally::default()));
     let label = opponent_path
         .and_then(|path| path.file_stem())
         .and_then(|name| name.to_str())
         .map_or_else(|| "vs naive".to_owned(), |name| format!("vs {name}"));
-    let mut handles = Vec::with_capacity(arguments.threads);
-    for _ in 0..arguments.threads {
-        let arguments = Arc::clone(arguments);
-        let candidate = candidate.clone();
-        let opponent = opponent.cloned();
-        let next_game = Arc::clone(&next_game);
-        let tally = Arc::clone(&tally);
-        let label = label.clone();
-        handles.push(thread::spawn(move || {
-            let mut results = Vec::new();
-            loop {
-                let game = next_game.fetch_add(1, Ordering::Relaxed);
-                if game >= arguments.pairs * 2 {
-                    break;
-                }
-                let candidate_color = if game.is_multiple_of(2) {
-                    Color::Black
-                } else {
-                    Color::White
-                };
-                let result = play_game(
-                    &candidate,
-                    opponent.as_ref(),
-                    candidate_color,
-                    seed_base + (game / 2) as u64,
-                    &arguments,
-                )?;
-                tally
-                    .lock()
-                    .expect("arena tally")
-                    .record(&result, games, started, &label);
-                results.push(result);
-            }
-            Ok::<_, EvaluationError>(results)
-        }));
-    }
-    let results = handles
-        .into_iter()
-        .map(|handle| handle.join().expect("arena worker"))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    let results = play_match(arguments, candidate, opponent, &label, seed_base, started)?;
     let elapsed = started.elapsed().as_secs_f64();
     if let Some(directory) = arguments.sgf_directory.as_ref() {
-        std::fs::create_dir_all(directory)?;
-        // The opponent names the match; no path is the naive player.
-        let label = opponent_path
-            .and_then(|path| path.parent())
-            .and_then(|parent| parent.file_name())
-            .and_then(|name| name.to_str())
-            .unwrap_or("naive")
-            .to_owned();
-        for (index, result) in results.iter().enumerate() {
-            let seat = match result.candidate_color {
-                Color::Black => "B",
-                Color::White => "W",
-            };
-            // Every game is decided now, so "decided" says nothing. What is
-            // worth finding in a directory listing is which games stalled to
-            // the cap rather than ending on their own.
-            let status = if result.plies >= arguments.maximum_plies {
-                "capped"
-            } else {
-                "natural"
-            };
-            let path = directory.join(format!("{label}-game{index:03}-cand{seat}-{status}.sgf"));
-            std::fs::write(path, game_sgf(result, arguments.radius, arguments.komi))?;
-        }
+        write_sgfs(directory, &results, opponent_path, arguments)?;
     }
-    let mut wins = 0_usize;
-    let mut losses = 0_usize;
-    let mut draws = 0_usize;
-    let mut completed = 0_usize;
-    let mut points = 0.0;
-    let mut plies = 0_u64;
-    // Games that ran out of plies rather than ending on their own. A hundred
-    // plies is far past where the board settles, so a high share means the
-    // sides are stalling rather than that the game is long.
-    let mut capped = 0_usize;
-    let mut searches = [SeatSearches::default(); 2];
-    for result in &results {
-        for (total, game) in searches.iter_mut().zip(result.searches) {
-            total.moves += game.moves;
-            total.simulations += game.simulations;
-            total.milliseconds += game.milliseconds;
-            total.maximum_milliseconds = total.maximum_milliseconds.max(game.maximum_milliseconds);
-            total.reuse.searches += game.reuse.searches;
-            total.reuse.hits += game.reuse.hits;
-            total.reuse.inherited_visits += game.reuse.inherited_visits;
-            total.reuse.advances += game.reuse.advances;
-            total.reuse.advance_hits += game.reuse.advance_hits;
-            total.reuse.limit_drops += game.reuse.limit_drops;
-            total.reuse.advance_nanoseconds += game.reuse.advance_nanoseconds;
-            total.reuse.maximum_retained_nodes = total
-                .reuse
-                .maximum_retained_nodes
-                .max(game.reuse.maximum_retained_nodes);
-            total.reuse.maximum_retained_bytes = total
-                .reuse
-                .maximum_retained_bytes
-                .max(game.reuse.maximum_retained_bytes);
-        }
-        plies += u64::from(result.plies);
-        if result.plies >= arguments.maximum_plies {
-            capped += 1;
-        }
-        if !result.completed {
-            continue;
-        }
-        completed += 1;
-        match result.outcome.expect("completed game has outcome").winner {
-            Some(winner) if winner == result.candidate_color => {
-                wins += 1;
-                points += 1.0;
-            }
-            Some(_) => losses += 1,
-            None => {
-                draws += 1;
-                points += 0.5;
-            }
-        }
-    }
-    // No decided game is no evidence, not a defeat -- but `candidate_score`
-    // has to stay a JSON number, so `completed` is what callers must test.
-    // Reporting 0.0 and letting a consumer read it as a result fed the
-    // Bradley-Terry fit a fabricated shutout: one ddrnet-vs pairing decided
-    // none of its 16 games and was recorded as the candidate losing all 16.
-    let score = if completed == 0 {
-        0.0
-    } else {
-        points / completed as f64
-    };
-    let interval = wilson_interval(points, completed);
-    let current = candidate.metrics();
-    let candidate_metrics = current.delta_since(baseline);
+    let totals = MatchTotals::new(&results, arguments.maximum_plies);
+    let games = results.len();
+    let score = totals.points / games as f64;
+    let interval = wilson_interval(totals.points, games);
+    let candidate_metrics = candidate.metrics().delta_since(baseline);
     let opponent_name = if opponent_path.is_some() {
         "onnx"
     } else {
@@ -838,8 +822,9 @@ fn run_match(
             "  \"opponent_model\": \"{}\",\n",
             "  \"pairs\": {},\n",
             "  \"games\": {},\n",
+            // Every game is decided: one that reaches the cap is awarded by area.
             "  \"completed\": {},\n",
-            "  \"truncated\": {},\n",
+            "  \"truncated\": 0,\n",
             "  \"reached_ply_cap\": {},\n",
             "  \"candidate_wins\": {},\n",
             "  \"candidate_losses\": {},\n",
@@ -867,12 +852,11 @@ fn run_match(
         opponent_model,
         arguments.pairs,
         games,
-        completed,
-        games - completed,
-        capped,
-        wins,
-        losses,
-        draws,
+        games,
+        totals.capped,
+        totals.wins,
+        totals.losses,
+        totals.draws,
         score,
         interval.0,
         interval.1,
@@ -880,13 +864,13 @@ fn run_match(
         arguments
             .move_time_ms
             .map_or_else(|| "null".to_owned(), |value| value.to_string()),
-        searches[0].json(),
-        searches[1].json(),
+        totals.searches[0].json(),
+        totals.searches[1].json(),
         arguments
             .opponent_simulations
             .unwrap_or(arguments.simulations),
         arguments.coarse_pool,
-        plies as f64 / games as f64,
+        totals.plies as f64 / games as f64,
         elapsed,
         candidate_metrics.requests,
         candidate_metrics.batches,
