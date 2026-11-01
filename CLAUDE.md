@@ -33,18 +33,26 @@ performance/run.py                 # compare with history and record; needs a qu
 - Keep a baseline binary from before the change. Build a pristine one with `git archive`.
 - Compare `search_*` lines across versions. Fixture paths such as `raster_*` hit caches.
 - `perf` is not installed. Profiles attribute time loosely, so confirm a gain with timings.
+  Sampled self time misled more than once: put timers around stages in a scratch copy first.
+- `vgo-bench --scaling 1,16,32` shows what sharing a machine costs. Check a real generator with
+  `--profile-output` too, because a short run only reaches early-game positions.
 - Never run timings alongside anything else, and bound every background job and wait.
 - Kill processes by exact PID. `pkill -f` and grep loops match their own shell.
 
-## Current cost, 128 raster, 2026-10-31
+## Current cost, 128 raster, 2026-11-01
+
+Share of a fixture search with a fixed policy, so inference is absent.
 
 | Path | Big board | Small board |
 |---|---|---|
-| Exact settled test | 25% | 16% |
-| Distance transform and legal sampling | 10% | 20% |
-| Nearest-stone sweep | 12% | 13% |
-| Fine grid | 10% | 17% |
-| Liveness witnesses | 10% | low |
-| Legal vertices | 9% | low |
+| Nearest-stone sweep | 21% | 17% |
+| Move rules, mainly Voronoi | 20% | 9% |
+| Exact settled test | 17% | 15% |
+| Distance transform | 10% | 11% |
+| Vertex check | 6% | 6% |
+| Candidate snapping | 8% | 9% |
+
+In real generation the GPU is the limit, not this table: one card at 128 reaches about
+20k positions/s with 6 of 16 cores busy. See "Sizing a machine" in `docs/RUNNING.md`.
 
 Bigger nets are closed in `docs/FINDINGS.md`. Tree reuse is parked in `dashboard/ideas.json`.

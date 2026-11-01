@@ -103,7 +103,7 @@ Game datasets store positions, not pixels, and are rasterized at load time by
 `vgo-render-shard`. See [`POSITION_SHARDS.md`](reference/POSITION_SHARDS.md) for why, and
 [`RASTER_REPRESENTATION.md`](reference/RASTER_REPRESENTATION.md) for the channel semantics.
 
-The `settled` plane is 92-96% of raster cost. It is computed by a distance
+The `settled` plane is about two thirds of raster cost. It is computed by a distance
 transform ([`history/SETTLED_REGION_PROBLEM.md`](history/SETTLED_REGION_PROBLEM.md)).
 
 ## 5. Search and the policy target

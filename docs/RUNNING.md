@@ -28,6 +28,14 @@ TensorRT is an optional extra. A venv created by a bare `uv sync` or `uv run`
 lacks it, and `--provider tensorrt` then fails on a missing `libnvinfer.so.10`.
 Restore it with `uv sync --frozen --extra tensorrt` in `training/`.
 
+**Sizing a machine.** One GPU sets the ceiling, and the CPU only has to keep it fed. On
+one 300 W card at 128 with 32 actors, 4 physical cores held the card near 60%, 8 near 90%,
+and 16 pinned it at 100% with 6 cores busy. Those runs were early-game, the cheapest part
+of a game, so allow more. Search and raster together reach 42k positions/s on 16 cores at
+128 and 21k at 256 across the fixture positions, against 20k from that card at 128. The
+card's rate at 256 has not been measured. `vgo-bench --scaling 1,16,32` measures the CPU
+side on a new machine.
+
 What the machine needs: an NVIDIA **driver** (the wheels carry their own CUDA
 and TensorRT, including for Blackwell/sm_120), Rust via `rust-toolchain.toml`,
 `uv`, and a C compiler for `torch.compile`.

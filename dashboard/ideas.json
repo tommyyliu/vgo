@@ -23,7 +23,7 @@
     "bucket": "Extract",
     "effort": "M",
     "title": "Train the ownership head",
-    "why": "Weight 0 in the bulk loop since 219d67a, with no recorded arena result. sigmago measured +194 ± 28 with ownership and score heads together, but -96 ± 49 on a smaller run.",
+    "why": "Weight 0 in the bulk loop since 219d67a, with no recorded arena result. sigmago measured +194 \u00b1 28 with ownership and score heads together, but -96 \u00b1 49 on a smaller run.",
     "test": "Train on one frozen corpus at weights 0, 0.5 and 1.5, then arena at equal sims on both boards."
   },
   {
@@ -162,15 +162,6 @@
     "effort": "M"
   },
   {
-    "id": "1498b8e6",
-    "title": "Incremental legal vertices",
-    "bucket": "Speed",
-    "status": "Later",
-    "why": "About 9% of big-board search rebuilds a list that barely changes.",
-    "test": "Reuse the parent's vertex list with identical output. Vertex order makes this delicate.",
-    "effort": "L"
-  },
-  {
     "id": "a254b512",
     "title": "Official vertex reach test",
     "bucket": "Engineering",
@@ -205,5 +196,23 @@
     "why": "A hand-kept second rasterizer is a correctness risk if Rust covers every case.",
     "test": "Delete it unless something still needs the fallback.",
     "effort": "S"
+  },
+  {
+    "id": "settled-small-boards",
+    "status": "Later",
+    "bucket": "Speed",
+    "effort": "S",
+    "title": "Decide the small-board settled path",
+    "why": "Below 20 stones the per-stone solver is two thirds of a raster, and it is slightly less exact than the distance path.",
+    "test": "Lower DISTANCE_SETTLED_MINIMUM_STONES and refresh golden. This changes model input, so it needs a decision first."
+  },
+  {
+    "id": "three-lanes",
+    "status": "Later",
+    "bucket": "Speed",
+    "effort": "S",
+    "title": "Try three inference lanes in the loop",
+    "why": "Three lanes reached 21.1k positions/s against 19.8k for two, in a 40-second early-game run.",
+    "test": "Compare whole games, including late boards, before changing the loop's default."
   }
 ]

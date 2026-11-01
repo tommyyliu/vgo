@@ -191,12 +191,12 @@ impl OnnxBatchService {
                 //   trt_auxiliary_streams 0            13,078
                 //   default                            13,389
                 //
-                // All within noise. Batch and lane count are already at their
-                // optimum too: single-session inference saturates at ~11.7k
-                // pos/s by batch 16-32 (batch 48 and 64 are slower), and two
-                // broker lanes reach ~14.4k while three and four are *worse*
-                // -- 4.6ms of service time becomes 8.6 and 12.5, so the lanes
-                // contend rather than overlap.
+                // All within noise. Batch is already at its optimum: single-session
+                // inference saturates by batch 16-32, and batch 48 and 64 are slower.
+                // Lanes, measured 2026-11-01 on real self-play at 128: one 13.4k
+                // positions/s, two 19.8k, three 21.1k, with the card at 75%, 100%
+                // and 100%. An earlier measure had three worse than two, on a
+                // saturated host, so the CPU may have been what it saw.
                 //
                 // trt_cuda_graph_enable is deliberately absent. It panics here
                 // ("expected typeinfo_ptr to not be null") because ORT's

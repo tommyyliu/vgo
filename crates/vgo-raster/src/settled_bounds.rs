@@ -279,9 +279,10 @@ fn sampled_legal_set_into(
 ///   * `D_S >  D_L_grid`      implies `D_S >  D_L_true`  — not settled
 ///
 /// Only the band between them is genuinely undecided, and those pixels get the
-/// exact continuous test — 55 of 16384 at oversample 1, so the cost is
-/// dominated by the cheap path, which is the point: the exact test is what made
-/// the direct formulation 42x too slow to use everywhere.
+/// exact continuous test, which is what made the direct formulation 42x too slow
+/// to use everywhere. The band follows the settled boundary, which around an open
+/// stone is its own disk, so it is not small: 1,600 of 16,384 pixels on a 1/38
+/// board, before [E9] answers the ones inside a disk and leaves 950.
 ///
 /// **The upper bound is not guaranteed.** It assumes every point of the legal
 /// set has a sampled cell centre within half a diagonal, which fails where the

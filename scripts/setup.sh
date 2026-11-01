@@ -41,13 +41,14 @@ if (( gpu_memory < 15000 )); then
   warn "under 16 GB: lower --actors and --inference-batch, or generation will OOM"
 fi
 
-# The job is CPU-bound -- generation saturates the CPU while the GPU sits near
-# 60% -- so core count, not GPU class, sets throughput. Say so here because the
-# natural instinct when renting is to buy GPU.
+# One GPU sets the ceiling, and the CPU only has to keep it fed. On one 300 W card
+# at 128, with 32 actors and two lanes, 4 cores held it near 60%, 8 near 90%, and
+# 16 pinned it at 100% with 6 busy. Say so here because renting a large CPU for one
+# GPU buys nothing. See docs/RUNNING.md.
 cores=$(nproc)
 ok "$cores logical cores"
-if (( cores < 16 )); then
-  warn "generation is CPU-bound; under 16 cores this box will be slow regardless of GPU"
+if (( cores < 8 )); then
+  warn "under 8 cores the GPU will wait on the CPU"
 fi
 
 # ------------------------------------------------------------ the toolchains
@@ -74,7 +75,8 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 ok "cargo $(cargo --version | awk '{print $2}') (rust-toolchain.toml pins the version)"
 
-# torch.compile is on by default and needs a C compiler for inductor. Minimal
+# torch.compile is on by default and needs a C compiler for inductor, and the
+# build needs one for mimalloc. Minimal
 # cloud images often ship without one, and the failure surfaces inside the first
 # training step rather than at startup.
 command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 \
