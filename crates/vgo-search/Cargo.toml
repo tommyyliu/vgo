@@ -8,8 +8,5 @@ rust-version.workspace = true
 [dependencies]
 vgo-core = { path = "../vgo-core" }
 
-[features]
-iteration-lab = ["vgo-core/iteration-lab"]
-
 [lib]
 path = "src/lib.rs"

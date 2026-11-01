@@ -112,11 +112,6 @@ fn squared_distance_interval(first: Point, second: Point) -> Interval {
     }
 }
 
-#[cfg(feature = "iteration-lab")]
-pub(crate) fn squared_distance_upper(first: Point, second: Point) -> f64 {
-    squared_distance_interval(first, second).upper
-}
-
 #[derive(Clone, Debug)]
 struct Dyadic {
     coefficient: BigInt,

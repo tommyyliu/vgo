@@ -1,14 +1,6 @@
 use std::collections::HashSet;
 
-use vgo_core::{Point, Position, is_legal_placement, legal_set_vertices, pass};
-
-fn place(position: &Position, x: f64, y: f64) -> Result<vgo_core::MoveResult, vgo_core::MoveError> {
-    #[cfg(feature = "iteration-lab")]
-    if let Some(result) = crate::transition_lab::place(position, x, y) {
-        return result;
-    }
-    vgo_core::place(position, x, y)
-}
+use vgo_core::{Point, Position, is_legal_placement, legal_set_vertices, pass, place};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {

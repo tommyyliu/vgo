@@ -2,13 +2,10 @@
 
 Write-ups of geometry and search-performance research: exact locality bounds
 for contestability, support certificates, the board-iteration lab, the settled
-region problem and Voronoi construction. The code lives behind the
-`iteration-lab` feature in `vgo-core` and `vgo-search`:
+region problem and Voronoi construction.
 
-```bash
-cargo test --release -p vgo-core -p vgo-search --features vgo-search/iteration-lab
-cargo run --release -p vgo-core --features iteration-lab --example iteration_lab -- 10
-```
+The lab code these notes describe was removed from the working tree on 2026-10-31,
+since production never used it. It is on the `archive/iteration-labs` branch.
 
 Some reproduction commands here name drivers that the 2026-09-23 prune removed:
 `vgo-canary`, the `runs/*` measurement scripts, and the `ram_scaling` and

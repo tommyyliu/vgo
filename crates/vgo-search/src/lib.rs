@@ -6,8 +6,6 @@ mod evaluator;
 mod mcts;
 mod memory;
 pub use memory::{HeapAllocation, TreeMemory};
-#[cfg(feature = "iteration-lab")]
-pub mod transition_lab;
 
 pub use candidates::{Action, Candidate, CandidateSequence, CandidateSource, generate_candidates};
 pub use coarse_fine::{CandidateSample, FineGrid, sample_candidates};

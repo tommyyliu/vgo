@@ -585,7 +585,7 @@ legality first.
 fresh computation, provided it is discarded whenever those inputs change.
 
 **Proof.** A deterministic function of equal inputs gives equal results. Stones change only
-through `with_stones`, `take_stones_for_lab` and the constructors, which all reset the
+through `with_stones` and the constructors, which all reset the
 caches, and `adopt_legal_index` is called only when no self-capture changed the stones. QED
 
 ## Floating-point lemmas

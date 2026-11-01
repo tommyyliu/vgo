@@ -7,7 +7,6 @@ rust-version.workspace = true
 
 [features]
 default = []
-iteration-lab = ["vgo-search/iteration-lab"]
 
 
 [dependencies]

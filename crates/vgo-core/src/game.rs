@@ -70,15 +70,6 @@ fn remove_settled(
 }
 
 pub fn place(position: &Position, x: f64, y: f64) -> Result<MoveResult, MoveError> {
-    place_with(position, x, y, Settlement::new)
-}
-
-pub(crate) fn place_with(
-    position: &Position,
-    x: f64,
-    y: f64,
-    settle: impl Fn(&Position) -> Settlement,
-) -> Result<MoveResult, MoveError> {
     if position.phase() != Phase::Playing {
         return Err(MoveError::Finished);
     }
@@ -110,14 +101,14 @@ pub(crate) fn place_with(
     // Settlement first: captures may still change either provisional board, so
     // scoring it eagerly would usually be throwaway work. If self-capture leaves
     // the final one unchanged, it is promoted into the committed analysis below.
-    let mut current_settlement = settle(&provisional);
+    let mut current_settlement = Settlement::new(&provisional);
 
     let (after_enemy, enemy_doomed) =
         remove_settled(&provisional, &current_settlement, mover.other());
     let enemy_count = enemy_doomed.len();
     provisional = after_enemy;
     if enemy_count > 0 {
-        current_settlement = settle(&provisional);
+        current_settlement = Settlement::new(&provisional);
     }
 
     // The placed stone was appended last and belongs to the mover, so it is
@@ -164,7 +155,7 @@ pub(crate) fn place_with(
         committed.adopt_legal_index(&after_self);
         current_settlement.into_analysis(&committed)
     } else {
-        settle(&committed).into_analysis(&committed)
+        Settlement::new(&committed).into_analysis(&committed)
     };
     committed.store_cells(Arc::clone(&analysis.geometry.cells));
     let mut events = Vec::new();

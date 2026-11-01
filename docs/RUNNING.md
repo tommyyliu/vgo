@@ -35,12 +35,6 @@ cargo test --release --workspace
 cd training && .venv/bin/python -m unittest discover -s tests
 ```
 
-The geometry research code sits behind a feature:
-
-```bash
-cargo test --release -p vgo-core -p vgo-search --features vgo-search/iteration-lab
-```
-
 The browser suite for the reference implementation is `reference/tests/`; see
 its README.
 

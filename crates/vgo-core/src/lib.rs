@@ -9,8 +9,6 @@ mod model;
 mod numeric;
 mod voronoi;
 
-#[cfg(feature = "iteration-lab")]
-pub mod iteration_lab;
 
 pub use analysis::{Analysis, Outcome, Score, Settlement};
 pub use connectivity::{

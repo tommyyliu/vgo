@@ -171,12 +171,6 @@ pub struct Position {
 }
 
 impl Position {
-    #[cfg(feature = "iteration-lab")]
-    pub(crate) fn take_stones_for_lab(&mut self) -> Vec<Stone> {
-        self.legal_index = LegalIndexCache::default();
-        self.geometry = GeometryCache::default();
-        std::mem::take(&mut self.stones)
-    }
     #[must_use]
     pub fn new(radius: f64, stones: Vec<Stone>, to_move: Color) -> Self {
         Self {

@@ -14,7 +14,6 @@ mode="${1:-}"
 python3 scripts/check-spec.py
 cargo clippy --release --workspace --exclude vgo-wasm --quiet
 cargo test --release -p vgo-core -p vgo-raster -p vgo-search -p vgo-selfplay --quiet
-cargo test --release -p vgo-core -p vgo-search --features vgo-search/iteration-lab --quiet
 cargo check --release -p vgo-wasm --target wasm32-unknown-unknown --quiet
 (cd training && PYTHONPATH=. uv run --with pytest python -m pytest tests --quiet -p no:cacheprovider)
 
