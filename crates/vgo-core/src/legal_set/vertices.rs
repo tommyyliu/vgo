@@ -380,6 +380,23 @@ impl LegalSetIndex {
         &self.vertices
     }
 
+    /// Visits the index of every stone within `reach` of `point`, plus possibly
+    /// others. Returns false without visiting when no stone buckets were built.
+    pub(crate) fn for_each_stone_near(
+        &self,
+        point: Point,
+        reach: f64,
+        visit: &mut impl FnMut(usize),
+    ) -> bool {
+        match &self.buckets {
+            Some(buckets) if reach.is_finite() => {
+                buckets.for_each_near(point, reach, visit);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a vertex lies strictly closer than `distance` to `point`, by the
     /// comparison the exact test makes. Proof: [E10].
     #[must_use]

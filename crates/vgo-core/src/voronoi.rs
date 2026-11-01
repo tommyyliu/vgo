@@ -117,6 +117,13 @@ struct Scratch {
     output: Vec<Vertex>,
     deduped: Vec<Vertex>,
     clean: Vec<Vertex>,
+    sides: Vec<f64>,
+}
+
+/// The index after `index` around a cycle of `count`.
+#[inline]
+const fn next_index(index: usize, count: usize) -> usize {
+    if index + 1 == count { 0 } else { index + 1 }
 }
 
 fn normalize_polygon(points: &mut Vec<Vertex>, scratch: &mut Scratch) {
@@ -158,17 +165,27 @@ fn normalize_polygon(points: &mut Vec<Vertex>, scratch: &mut Scratch) {
         let clean = &mut scratch.clean;
         clean.clear();
         let mut pending_wrap: Option<Option<EdgeSource>> = None;
-        for index in 0..polygon.len() {
-            let a = polygon[(index + polygon.len() - 1) % polygon.len()].point;
+        let count = polygon.len();
+        for index in 0..count {
+            let a = polygon[if index == 0 { count - 1 } else { index - 1 }].point;
             let b = polygon[index];
-            let c = polygon[(index + 1) % polygon.len()].point;
+            let c = polygon[next_index(index, count)].point;
             let abx = b.point.x - a.x;
             let aby = b.point.y - a.y;
             let bcx = c.x - b.point.x;
             let bcy = c.y - b.point.y;
             let cross = abx.mul_add(bcy, -aby * bcx);
-            let scale = numeric::length(abx, aby) + numeric::length(bcx, bcy);
-            if cross.abs() <= numeric::COLLINEAR_EPSILON * scale.max(1.0) {
+            // Each length is at most its two components' sum, so most vertices
+            // are ruled out here and never pay for the two roots: [E14].
+            let longest = abx.abs() + aby.abs() + bcx.abs() + bcy.abs();
+            let limit = 1.0 + 1.0e-9;
+            let clearly_turning =
+                cross.abs() > numeric::COLLINEAR_EPSILON * longest.max(1.0) * limit;
+            if !clearly_turning
+                && cross.abs()
+                    <= numeric::COLLINEAR_EPSILON
+                        * (numeric::length(abx, aby) + numeric::length(bcx, bcy)).max(1.0)
+            {
                 changed = true;
                 // `b` is collinear between its neighbours, so the span from the
                 // previous vertex through `b` to `c` is one edge. It carries
@@ -197,16 +214,53 @@ fn normalize_polygon(points: &mut Vec<Vertex>, scratch: &mut Scratch) {
     }
 }
 
-fn clip_half_plane(polygon: &mut Vec<Vertex>, constraint: Constraint, scratch: &mut Scratch) {
+/// Whether `normalize_polygon` would merge any two vertices.
+fn has_coincident_vertices(polygon: &[Vertex]) -> bool {
+    let limit = numeric::EDGE_EPSILON.powi(2);
+    polygon
+        .windows(2)
+        .any(|pair| distance_squared(pair[0].point, pair[1].point) <= limit)
+        || (polygon.len() > 1
+            && distance_squared(polygon[0].point, polygon[polygon.len() - 1].point) <= limit)
+}
+
+/// Clips `polygon`, returning whether it changed.
+///
+/// `normalized` says it came from `normalize_polygon`. Most stones near a cell
+/// do not cut it, and such a clip then costs one comparison per vertex: [E14].
+fn clip_half_plane(
+    polygon: &mut Vec<Vertex>,
+    constraint: Constraint,
+    scratch: &mut Scratch,
+    normalized: bool,
+) -> bool {
+    let sides = &mut scratch.sides;
+    sides.clear();
+    sides.extend(polygon.iter().map(|vertex| {
+        constraint
+            .nx
+            .mul_add(vertex.point.x, constraint.ny * vertex.point.y)
+            - constraint.offset
+    }));
+    if normalized
+        && sides
+            .iter()
+            .all(|&side| side <= numeric::COORDINATE_EPSILON)
+        && !has_coincident_vertices(polygon)
+    {
+        return false;
+    }
     // Taken out of the scratch so `polygon` and the output can be borrowed at
     // once; put back at the end, capacity intact.
     let mut output = std::mem::take(&mut scratch.output);
     output.clear();
-    for index in 0..polygon.len() {
+    let count = polygon.len();
+    for index in 0..count {
+        let following = next_index(index, count);
         let a = polygon[index];
-        let b = polygon[(index + 1) % polygon.len()];
-        let fa = constraint.nx.mul_add(a.point.x, constraint.ny * a.point.y) - constraint.offset;
-        let fb = constraint.nx.mul_add(b.point.x, constraint.ny * b.point.y) - constraint.offset;
+        let b = polygon[following];
+        let fa = sides[index];
+        let fb = sides[following];
         let a_inside = fa <= numeric::COORDINATE_EPSILON;
         let b_inside = fb <= numeric::COORDINATE_EPSILON;
         if a_inside {
@@ -250,13 +304,14 @@ fn clip_half_plane(polygon: &mut Vec<Vertex>, constraint: Constraint, scratch: &
     std::mem::swap(polygon, &mut output);
     scratch.output = output;
     normalize_polygon(polygon, scratch);
+    true
 }
 
 fn polygon_area(polygon: &[Point]) -> f64 {
     let mut twice_area = 0.0;
     for index in 0..polygon.len() {
         let a = polygon[index];
-        let b = polygon[(index + 1) % polygon.len()];
+        let b = polygon[next_index(index, polygon.len())];
         twice_area += a.x.mul_add(b.y, -b.x * a.y);
     }
     twice_area.abs() / 2.0
@@ -387,7 +442,12 @@ struct CellBuffers {
 }
 
 /// One stone's cell, clipped from the board square.
-fn compute_cell(position: &Position, stone: usize, buffers: &mut CellBuffers) -> Cell {
+///
+/// `near` is a distance the clipping is expected to stop within. Stones within any
+/// distance are a prefix of the sorted order, so reading those through the index
+/// visits the same sequence as sorting every stone, and only a cell that runs past
+/// them pays for the rest. [E5] is what makes that distance known in advance.
+fn compute_cell(position: &Position, stone: usize, near: f64, buffers: &mut CellBuffers) -> Cell {
     let count = position.stones().len();
     let CellBuffers {
         order,
@@ -418,15 +478,26 @@ fn compute_cell(position: &Position, stone: usize, buffers: &mut CellBuffers) ->
         Point::new(s.x, s.y)
     };
     order.clear();
-    for other in 0..count {
-        if other == stone {
-            continue;
-        }
-        let o = position.stones()[other];
-        order.push(order_key(
-            numeric::length(o.x - site.x, o.y - site.y),
-            other,
-        ));
+    let stones = position.stones();
+    let key = |other: usize| {
+        let o = stones[other];
+        order_key(numeric::length(o.x - site.x, o.y - site.y), other)
+    };
+    // Compared as keys, so a NaN distance falls in the remainder, where it sorts.
+    let near_key = order_key(near, usize::MAX);
+    let mut remainder_pending =
+        position
+            .legal_index()
+            .for_each_stone_near(site, near, &mut |other| {
+                if other != stone {
+                    let key = key(other);
+                    if key < near_key {
+                        order.push(key);
+                    }
+                }
+            });
+    if !remainder_pending {
+        order.extend((0..count).filter(|&other| other != stone).map(key));
     }
     // `total_cmp` so a NaN coordinate cannot make the comparator
     // inconsistent; ties break by index, which keeps the clip sequence a
@@ -440,10 +511,26 @@ fn compute_cell(position: &Position, stone: usize, buffers: &mut CellBuffers) ->
     let mut last_clip = 0.0_f64;
     // The stopping distance for the polygon as it stands, once one was computed.
     let mut stopping_at = None;
+    // That distance while the polygon is unchanged, and whether it has been through
+    // normalization, which the starting square has not.
+    let mut stop_for_polygon = None;
+    let mut normalized = false;
     loop {
         if position_in_order == sorted {
             if sorted == order.len() {
-                break;
+                if !remainder_pending {
+                    break;
+                }
+                remainder_pending = false;
+                order.extend(
+                    (0..count)
+                        .filter(|&other| other != stone)
+                        .map(key)
+                        .filter(|&other| other > near_key),
+                );
+                if sorted == order.len() {
+                    break;
+                }
             }
             sorted = sort_next_prefix(order, sorted);
         }
@@ -461,13 +548,18 @@ fn compute_cell(position: &Position, stone: usize, buffers: &mut CellBuffers) ->
         // The margin is one epsilon of slack against `R` reading an ulp
         // high, which would stop a clip early and leave the cell wrong.
         // Erring the other way costs a no-op clip.
-        let stop = 2.0f64.mul_add(circumradius(&polygon, site), numeric::COORDINATE_EPSILON);
+        let stop = *stop_for_polygon.get_or_insert_with(|| {
+            2.0f64.mul_add(circumradius(&polygon, site), numeric::COORDINATE_EPSILON)
+        });
         if distance > stop {
             stopping_at = Some(stop);
             break;
         }
         let constraint = bisector_constraint(position, stone, other);
-        clip_half_plane(&mut polygon, constraint, scratch);
+        if clip_half_plane(&mut polygon, constraint, scratch, normalized) {
+            normalized = true;
+            stop_for_polygon = None;
+        }
         last_clip = distance;
     }
     // A later stone beyond both of these sorts after the last clip and trips
@@ -475,7 +567,7 @@ fn compute_cell(position: &Position, stone: usize, buffers: &mut CellBuffers) ->
     let reach = if polygon.is_empty() {
         f64::INFINITY
     } else {
-        let stop = stopping_at.unwrap_or_else(|| {
+        let stop = stopping_at.or(stop_for_polygon).unwrap_or_else(|| {
             2.0f64.mul_add(circumradius(&polygon, site), numeric::COORDINATE_EPSILON)
         });
         stop.max(last_clip)
@@ -486,7 +578,7 @@ fn compute_cell(position: &Position, stone: usize, buffers: &mut CellBuffers) ->
     let mut edges = Vec::with_capacity(polygon.len());
     for index in 0..polygon.len() {
         let start = polygon[index];
-        let end = polygon[(index + 1) % polygon.len()].point;
+        let end = polygon[next_index(index, polygon.len())].point;
         if start.point.distance(end) <= numeric::EDGE_EPSILON {
             degenerate_edges += 1;
             continue;
@@ -528,6 +620,8 @@ pub fn compute(position: &Position) -> Geometry {
     let mut cells = Vec::with_capacity(count);
     let mut adjacency = vec![Vec::new(); count];
     let mut diagnostics = GeometryDiagnostics::default();
+    // Where a cell without a parent is expected to stop: a few stones across.
+    let fresh_reach = 12.0 * position.radius();
     // One set of buffers for the whole call; see `Scratch`.
     let mut buffers = CellBuffers {
         order: Vec::with_capacity(count.saturating_sub(1)),
@@ -542,7 +636,12 @@ pub fn compute(position: &Position) -> Geometry {
             (numeric::length(added.x - site.x, added.y - site.y) > cell.reach)
                 .then(|| Arc::clone(cell))
         });
-        let cell = reused.unwrap_or_else(|| Arc::new(compute_cell(position, stone, &mut buffers)));
+        let cell = reused.unwrap_or_else(|| {
+            let near = parent
+                .and_then(|parent| parent.get(stone))
+                .map_or(fresh_reach, |cell| cell.reach.min(fresh_reach));
+            Arc::new(compute_cell(position, stone, near, &mut buffers))
+        });
         diagnostics.degenerate_edges += cell.degenerate_edges;
         diagnostics.unclassified_edges += cell.unclassified_edges;
         for edge in &cell.edges {
@@ -554,8 +653,8 @@ pub fn compute(position: &Position) -> Geometry {
     }
 
     for stone in 0..count {
-        let neighbors = adjacency[stone].clone();
-        for other in neighbors {
+        for index in 0..adjacency[stone].len() {
+            let other = adjacency[stone][index];
             if !adjacency[other].contains(&stone) {
                 adjacency[other].push(stone);
             }
@@ -723,6 +822,7 @@ mod tests {
                     &mut polygon,
                     super::bisector_constraint(position, stone, other),
                     &mut scratch,
+                    false,
                 );
             }
             super::normalize_polygon(&mut polygon, &mut scratch);

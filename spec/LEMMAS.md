@@ -694,6 +694,29 @@ Otherwise `extend` declines and the full enumeration runs.
 `second`. `t` has the highest index, so its wall candidates end the wall section, and each
 pair `(f, t)` ends the section for `f`. QED
 
+### E14. A clip that cuts nothing changes nothing
+
+*Status: Proved.* Used by `clip_half_plane` and `normalize_polygon`.
+
+**Claim.** (a) If every vertex of a polygon is on the kept side, and the polygon came from
+`normalize_polygon`, and no two neighbouring vertices are within `EDGE_EPSILON`, then the
+clip and the normalization after it leave the polygon unchanged. (b) A vertex with
+`|cross| > c * max(L, 1) * (1 + 1e-9)`, where `L` is the sum of the absolute components of
+both edges, is not removed as collinear.
+
+**Proof.** (a) With no vertex outside there is no crossing, and each vertex is copied with
+its source, so the clip's output is the polygon. Normalization first merges coincident
+neighbours, of which there are none. Its collinearity pass is a deterministic function of
+the polygon, and `normalize_polygon` returns only when that pass changed nothing or fewer
+than three vertices remain, so it changes nothing here either. The spike case, where
+removing a collinear vertex brings two vertices together with no pass to merge them, is
+exactly what the coincidence test excludes. Since the polygon is unchanged, so is its
+circumradius, which may therefore be kept.
+
+(b) The test removes `b` when `|cross| <= c * max(s, 1)` with `s = |ab| + |bc|`. A length is
+at most the sum of its components' magnitudes, so `s <= L` up to relative rounding of a few
+`u`, far below `1e-9`. QED
+
 ## Floating-point lemmas
 
 ### N1. Length comparison
