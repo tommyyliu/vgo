@@ -22,7 +22,8 @@ Run `scripts/check.sh` before merging.
 | [`crates/vgo-search`](crates/vgo-search) | progressive-widening MCTS with coarse-to-fine candidate sampling |
 | [`crates/vgo-raster`](crates/vgo-raster) | position to model input; `vgo-render-shard`, `vgo-pack-shard` |
 | [`crates/vgo-inference`](crates/vgo-inference) | ONNX Runtime sessions behind a batching broker |
-| [`crates/vgo-selfplay`](crates/vgo-selfplay) | `vgo-generate-continuous`, `vgo-arena`, `vgo-serve-move`, `vgo-bench` |
+| [`crates/vgo-selfplay`](crates/vgo-selfplay) | `vgo-generate-continuous`, `vgo-arena`, `vgo-serve-move` |
+| [`crates/vgo-bench`](crates/vgo-bench) | `vgo-bench` timings, `vgo-verify` output digests |
 | [`crates/vgo-wasm`](crates/vgo-wasm) | the engine for the browser client |
 | [`training/`](training) | PyTorch model, learner, ONNX export |
 | [`web-bot/`](web-bot/README.md) | the embeddable browser bot: engine as WebAssembly, no UI |
@@ -30,7 +31,7 @@ Run `scripts/check.sh` before merging.
 | [`js-app/`](js-app/README.md) | the playable game, whose JS engine is also the behavioural oracle |
 | [`docs/`](docs) | system docs; [`docs/research/`](docs/research/README.md) holds dated, frozen notes |
 | [`todo/`](todo/README.md) | backlog tickets |
-| `benchmarks/` | fixture positions, timing history, golden digests |
+| [`benchmarks/`](benchmarks/README.md) | runner, fixture positions, timing history, golden digests |
 | `artifacts/` | run output, not tracked. `artifacts/old/` is the archive |
 
 ## Tech stack

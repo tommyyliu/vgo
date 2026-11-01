@@ -1,0 +1,30 @@
+[package]
+name = "vgo-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+profiling = ["dep:pprof"]
+
+[dependencies]
+clap.workspace = true
+cudarc = { version = "0.19", default-features = false, features = [
+    "driver", "cuda-13000", "fallback-dynamic-loading", "std",
+] }
+serde_json = "1"
+pprof = { version = "0.15", features = ["flamegraph"], optional = true }
+vgo-core = { path = "../vgo-core" }
+vgo-inference = { path = "../vgo-inference" }
+vgo-raster = { path = "../vgo-raster" }
+vgo-search = { path = "../vgo-search" }
+vgo-selfplay = { path = "../vgo-selfplay" }
+
+[[bin]]
+name = "vgo-bench"
+path = "src/bench.rs"
+
+[[bin]]
+name = "vgo-verify"
+path = "src/verify.rs"

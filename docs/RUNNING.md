@@ -215,7 +215,7 @@ To play the current model yourself:
 
 ## Performance history
 
-`scripts/bench.py` times each large CPU path single-threaded on the fixed real
+`benchmarks/run.py` times each large CPU path single-threaded on the fixed real
 positions in `benchmarks/positions.txt` (16 at 1/38, 16 at 1/18): move
 application, board analysis, the legal-set index, the settled plane and packed
 raster at 128 and 256, the fine grid, and a 200-simulation search with a fixed
@@ -223,10 +223,10 @@ policy standing in for the network. It compares with the last record from the
 same machine and appends to `benchmarks/history.jsonl`, which is committed.
 
 ```bash
-scripts/bench.py              # run, compare, record (needs a clean tree)
-scripts/bench.py --no-record  # try a change before committing it
-scripts/bench.py --check      # exit 1 on a regression
-scripts/bench.py --show       # the history for this machine
+benchmarks/run.py              # run, compare, record (needs a clean tree)
+benchmarks/run.py --no-record  # try a change before committing it
+benchmarks/run.py --check      # exit 1 on a regression
+benchmarks/run.py --show       # the history for this machine
 ```
 
 Run it before merging anything that touches rules, geometry, the raster or

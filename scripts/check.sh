@@ -13,16 +13,16 @@ mode="${1:-}"
 
 python3 scripts/check-spec.py
 cargo clippy --release --workspace --exclude vgo-wasm --quiet
-cargo test --release -p vgo-core -p vgo-raster -p vgo-search -p vgo-selfplay --quiet
+cargo test --release -p vgo-core -p vgo-raster -p vgo-search -p vgo-selfplay -p vgo-bench --quiet
 cargo check --release -p vgo-wasm --target wasm32-unknown-unknown --quiet
 (cd training && PYTHONPATH=. uv run --with pytest python -m pytest tests --quiet -p no:cacheprovider)
 
 [[ "$mode" == --quick ]] && exit 0
 
-cargo build --release -p vgo-selfplay --bin vgo-bench --quiet
+cargo build --release -p vgo-bench --bin vgo-verify --quiet
 digests() {
-  target/release/vgo-bench --digest --positions benchmarks/positions.txt
-  echo "fuzz-200 $(target/release/vgo-bench --fuzz-games 200 | sha256sum | cut -d' ' -f1)"
+  target/release/vgo-verify
+  echo "fuzz-200 $(target/release/vgo-verify --fuzz-games 200 | sha256sum | cut -d' ' -f1)"
 }
 if [[ "$mode" == --update-golden ]]; then
   digests > benchmarks/golden.txt

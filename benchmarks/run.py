@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Time the large CPU paths, keep the history, and flag regressions.
 
-Builds and runs `vgo-bench` (crates/vgo-selfplay/src/bench.rs), which times
+Builds and runs `vgo-bench` (crates/vgo-bench/src/bench.rs), which times
 each path single-threaded on the fixed positions in benchmarks/positions.txt,
 then compares against the most recent record from this machine and appends the
 new one to benchmarks/history.jsonl. The history is committed, so the cost of
@@ -12,10 +12,10 @@ mean nothing across machines. A change counts as a regression when it is slower
 by more than --threshold *and* by more than the combined run-to-run spread of
 the two measurements, so noise on a cheap path does not raise an alarm.
 
-    scripts/bench.py              # run, compare, record
-    scripts/bench.py --no-record  # run and compare only, e.g. on a dirty tree
-    scripts/bench.py --check      # exit 1 on any regression
-    scripts/bench.py --show       # print the history for this host, no run
+    benchmarks/run.py              # run, compare, record
+    benchmarks/run.py --no-record  # run and compare only, e.g. on a dirty tree
+    benchmarks/run.py --check      # exit 1 on any regression
+    benchmarks/run.py --show       # print the history for this host, no run
 
 A busy machine inflates every number, so this refuses to run while the load
 average is above --maximum-load (a generator running is the usual cause).
@@ -122,7 +122,7 @@ def main() -> None:
         )
 
     subprocess.run(
-        ["cargo", "build", "--release", "-p", "vgo-selfplay", "--bin", "vgo-bench"],
+        ["cargo", "build", "--release", "-p", "vgo-bench", "--bin", "vgo-bench"],
         cwd=ROOT, check=True,
     )
     completed = subprocess.run(
