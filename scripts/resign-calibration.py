@@ -50,7 +50,7 @@ def main() -> None:
     if "--pick" in sys.argv:
         argv = sys.argv[1:]
         root = Path(argv[0]) if not argv[0].startswith("--") \
-            else Path("artifacts/vgo-continuous/games")
+            else Path("artifacts/vgo-bulk/games")
         def opt(name, default):
             return type(default)(argv[argv.index(name) + 1]) if name in argv else default
         print(pick(root, opt("--games", 400), opt("--window", 5),
@@ -59,7 +59,7 @@ def main() -> None:
         return
     argv = sys.argv[1:]
     root = Path(argv[0]) if argv and not argv[0].startswith("--") \
-        else Path("artifacts/vgo-continuous/games")
+        else Path("artifacts/vgo-bulk/games")
     recent = int(argv[argv.index("--games") + 1]) if "--games" in argv else 400
     only_window = int(argv[argv.index("--window") + 1]) if "--window" in argv else None
     only_minimum = int(argv[argv.index("--minimum-ply") + 1]) if "--minimum-ply" in argv else None

@@ -3,7 +3,7 @@
 
 Usage:
 
-    scripts/train-once.py --games-root artifacts/vgo-continuous/games \\
+    scripts/train-once.py --games-root artifacts/vgo-bulk/games \\
         --window-samples 1200000 --output artifacts/scratch/model.pt \\
         --raster-kind compact-radius --epochs 4
 """

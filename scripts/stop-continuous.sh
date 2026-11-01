@@ -26,7 +26,7 @@
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-output="${VGO_OUTPUT:-$root/artifacts/vgo-continuous}"
+output="${VGO_OUTPUT:-$root/artifacts/vgo-bulk}"
 games="$output/games"
 immediate=0
 timeout_minutes="${VGO_STOP_TIMEOUT_MINUTES:-180}"

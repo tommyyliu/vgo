@@ -17,7 +17,7 @@ are comparable with every number measured against it directly. Otherwise the
 first non-update model seen -- usually the run's seed -- is the anchor, and
 failing that the earliest update.
 
-    scripts/ratings.py [artifacts/vgo-continuous/anchor.jsonl]
+    scripts/ratings.py [artifacts/vgo-bulk/anchor.jsonl]
 """
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ def label(identifier: int) -> str:
 
 def main() -> None:
     path = Path(sys.argv[1] if len(sys.argv) > 1
-                else "artifacts/vgo-continuous/anchor.jsonl")
+                else "artifacts/vgo-bulk/anchor.jsonl")
     raw = path.read_text()
     records = [json.loads(m) for m in
                re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", raw)]

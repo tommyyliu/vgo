@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rate a handful of vgo-continuous checkpoints on the board they were trained on.
+# Rate a handful of a run's checkpoints on the board they were trained on.
 #
 # ## Why this exists
 #
@@ -45,7 +45,7 @@
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-models="${VGO_MODELS:-$root/artifacts/vgo-continuous/models}"
+models="${VGO_MODELS:-$root/artifacts/vgo-bulk/models}"
 output="${VGO_OUTPUT:-$root/artifacts/bigboard-curve}"
 matches="$output/matches.jsonl"
 log="$output/curve.log"
