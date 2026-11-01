@@ -37,6 +37,12 @@ use vgo_search::{
     Evaluation, EvaluationError, Evaluator, Policy, SearchConfig, search_with_evaluator,
 };
 
+// Rasters are allocated by actors and freed by the broker, and a move churns
+// position state: mimalloc measured 3-9% faster than glibc here, and no worse on
+// 32 threads.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 struct Arguments {
     /// Write sampled CPU stacks as folded text. Requires the `profiling` feature.

@@ -9,6 +9,7 @@ rust-version.workspace = true
 profiling = ["dep:pprof"]
 
 [dependencies]
+mimalloc.workspace = true
 clap.workspace = true
 cudarc = { version = "0.19", default-features = false, features = [
     "driver", "cuda-13000", "fallback-dynamic-loading", "std",

@@ -10,6 +10,7 @@ profiling = ["dep:pprof"]
 default = []
 
 [dependencies]
+mimalloc.workspace = true
 # For `use_blocking_sync` only -- the driver flag that stops the inference
 # threads busy-polling while the GPU works. cudarc loads libcuda at runtime, so
 # this adds no link-time CUDA requirement.

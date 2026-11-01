@@ -64,9 +64,14 @@ impl StoneBuckets {
         (column, row)
     }
 
-    pub(super) fn bucket(&self, row: usize, column: usize) -> &[u32] {
-        let index = row * self.columns + column;
-        &self.indices[self.starts[index] as usize..self.starts[index + 1] as usize]
+    /// Every stone in `columns` of `row`. Consecutive cells of a row are
+    /// consecutive in `indices`, so a range of them is one slice, in cell order.
+    #[inline]
+    fn row_span(&self, row: usize, columns: std::ops::RangeInclusive<usize>) -> &[u32] {
+        let base = row * self.columns;
+        let first = self.starts[base + columns.start()] as usize;
+        let last = self.starts[base + columns.end() + 1] as usize;
+        &self.indices[first..last]
     }
 
     /// Visit a conservative bounding square of the radial candidate reach.
@@ -84,11 +89,9 @@ impl StoneBuckets {
         let (first_column, first_row) = self.cell_of(point.x - margin, point.y - margin);
         let (last_column, last_row) = self.cell_of(point.x + margin, point.y + margin);
         for row in first_row..=last_row {
-            for column in first_column..=last_column {
-                for &index in self.bucket(row, column) {
-                    if visit(&position.stones()[index as usize]) {
-                        return true;
-                    }
+            for &index in self.row_span(row, first_column..=last_column) {
+                if visit(&position.stones()[index as usize]) {
+                    return true;
                 }
             }
         }
@@ -101,10 +104,8 @@ impl StoneBuckets {
         let (first_column, first_row) = self.cell_of(point.x - margin, point.y - margin);
         let (last_column, last_row) = self.cell_of(point.x + margin, point.y + margin);
         for row in first_row..=last_row {
-            for column in first_column..=last_column {
-                for &index in self.bucket(row, column) {
-                    visit(index as usize);
-                }
+            for &index in self.row_span(row, first_column..=last_column) {
+                visit(index as usize);
             }
         }
     }
@@ -119,12 +120,11 @@ impl StoneBuckets {
     /// distances, never correctness.
     pub(super) fn partners_into(&self, x: f64, y: f64, first: usize, out: &mut Vec<usize>) {
         let (column, row) = self.cell_of(x, y);
+        let columns = column.saturating_sub(3)..=(column + 3).min(self.columns - 1);
         for r in row.saturating_sub(3)..=(row + 3).min(self.rows - 1) {
-            for c in column.saturating_sub(3)..=(column + 3).min(self.columns - 1) {
-                for &index in self.bucket(r, c) {
-                    if index as usize > first {
-                        out.push(index as usize);
-                    }
+            for &index in self.row_span(r, columns.clone()) {
+                if index as usize > first {
+                    out.push(index as usize);
                 }
             }
         }
@@ -152,19 +152,18 @@ pub(super) fn clear_of_stones_pruned(
     let minimum = 2.0 * position.radius() - numeric::COORDINATE_EPSILON;
     let minimum_squared = minimum * minimum;
     let (column, row) = buckets.cell_of(x, y);
+    let columns = column.saturating_sub(1)..=(column + 1).min(buckets.columns - 1);
     for r in row.saturating_sub(1)..=(row + 1).min(buckets.rows - 1) {
-        for c in column.saturating_sub(1)..=(column + 1).min(buckets.columns - 1) {
-            for &index in buckets.bucket(r, c) {
-                let index = index as usize;
-                if Some(index) == skip_a || Some(index) == skip_b {
-                    continue;
-                }
-                let stone = &stones[index];
-                let dx = x - stone.x;
-                let dy = y - stone.y;
-                if dx.mul_add(dx, dy * dy) < minimum_squared {
-                    return false;
-                }
+        for &index in buckets.row_span(r, columns.clone()) {
+            let index = index as usize;
+            if Some(index) == skip_a || Some(index) == skip_b {
+                continue;
+            }
+            let stone = &stones[index];
+            let dx = x - stone.x;
+            let dy = y - stone.y;
+            if dx.mul_add(dx, dy * dy) < minimum_squared {
+                return false;
             }
         }
     }

@@ -23,6 +23,12 @@ use vgo_search::{
 };
 use vgo_selfplay::{award_by_area, play_game as run_playout};
 
+// Rasters are allocated by actors and freed by the broker, and a move churns
+// position state: mimalloc measured 3-9% faster than glibc here, and no worse on
+// 32 threads.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Debug, Parser)]
 #[command(about = "Run a color-swapped held-out arena for an ONNX candidate")]
 struct Arguments {
