@@ -60,10 +60,10 @@ use vgo_inference::{
 use vgo_raster::{RasterConfig, RasterKind};
 use vgo_search::{Evaluator, NaiveEvaluator};
 use vgo_selfplay::generation::{
-    GameSamples, GameSettings, KOMI_AREA_COEFFICIENT, generate_game_observed, parse_board_mix,
-    replay_capacity_for,
+    GameRecord, GameSamples, GameSettings, KOMI_AREA_COEFFICIENT, ResignTrial,
+    generate_game_observed, parse_board_mix, replay_capacity_for,
 };
-use vgo_selfplay::replay_stream::{ReplayStream, stone_capacity_for_radius};
+use vgo_selfplay::replay_stream::{PublishedReplay, ReplayStream, stone_capacity_for_radius};
 use vgo_selfplay::telemetry::GenerationTelemetry;
 
 #[derive(Parser, Debug, Clone)]
@@ -209,8 +209,11 @@ struct Config {
 }
 
 impl Config {
-    fn game_settings(&self) -> GameSettings {
-        GameSettings {
+    /// Fails on a malformed `--board-mix` rather than dropping it: a run that
+    /// ignores its mix plays every game on the fallback board with nothing else
+    /// looking wrong.
+    fn game_settings(&self) -> Result<GameSettings, String> {
+        Ok(GameSettings {
             policy_resolution: self.policy_resolution,
             simulations: self.simulations,
             full_search_fraction: self.full_search_fraction,
@@ -224,7 +227,7 @@ impl Config {
             widening_coefficient: self.widening_coefficient,
             seed: self.seed,
             radius: self.radius,
-            board_mix: parse_board_mix(&self.board_mix).unwrap_or_default(),
+            board_mix: parse_board_mix(&self.board_mix)?,
             komi_low: self.komi_low,
             komi_high: self.komi_high,
             komi_area_coefficient: self.komi_area_coefficient,
@@ -235,20 +238,7 @@ impl Config {
             resign_minimum_ply: self.resign_minimum_ply,
             resign_soft_simulations: self.resign_soft_simulations,
             resign_disable_fraction: self.resign_disable_fraction,
-        }
-    }
-
-    /// The smallest radius this run can play, which is the board that holds the
-    /// most stones and therefore sizes the record.
-    ///
-    /// Taken from `--radius` alone it would fit the mini board and fail on a
-    /// standard one *after* the games are played.
-    fn smallest_radius(&self) -> f64 {
-        parse_board_mix(&self.board_mix)
-            .unwrap_or_default()
-            .iter()
-            .map(|band| 1.0 / band.high_units)
-            .fold(self.radius, f64::min)
+        })
     }
 }
 
@@ -258,159 +248,199 @@ fn file_sha256(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Writes one completed game as a one-game shard.
-///
-/// The directory is built under a temporary name and renamed once the manifest
-/// is in place, so a reader can never observe a game that is missing its
-/// checksum -- the same discipline the shard writer uses, at a finer grain.
-fn write_game(
-    root: &Path,
-    game_id: u64,
-    mut game: GameSamples,
-    config: &Config,
+/// Everything a game's directory shares with the rest of the run.
+struct GameWriter {
+    root: PathBuf,
     raster: RasterConfig,
     policy_size: usize,
-    model_sha256: Option<&str>,
-) -> io::Result<usize> {
-    let name = format!("game-{game_id:09}");
-    let staging = root.join(format!("{name}.staging"));
-    let final_path = root.join(&name);
-    if final_path.exists() {
-        // Already written, so the game in hand is a duplicate of it and there is
-        // nothing to do. Say so: reaching here means the index range is being
-        // replayed, and every game the run finishes from now on is discarded
-        // after paying its full search cost, with nothing else looking wrong.
-        eprintln!(
-            "warning: {name} already exists in {}; discarding the finished game. \
-             Game indices are being reused -- check --first-game.",
-            root.display()
-        );
-        return Ok(0);
-    }
-    if staging.exists() {
-        fs::remove_dir_all(&staging)?;
-    }
-    fs::create_dir_all(&staging)?;
+    replay_capacity: usize,
+    stone_capacity: usize,
+    simulations: u32,
+    radius: f64,
+    model_sha256: Option<String>,
+}
 
-    // Taken before `game.samples` is moved into the stream below.
-    //
-    // One row per (threshold, window) the rule could have used, describing what
-    // it would have done to *this* game: whether it would have conceded, whether
-    // that concession would have been wrong, and how many plies it would have
-    // skipped. Under soft resignation every game calibrates, because the game
-    // plays on to a real terminal state and the counterfactual is therefore
-    // known rather than sampled.
-    //
-    // Written raw, per game, rather than pre-pooled. The generator does not know
-    // which window a future run will pool over, and a shard-level aggregate
-    // cannot be un-summed; 36 rows of small integers per game is cheaper than
-    // regenerating.
-    //
-    // `training/loop/resign-calibration.py` is the consumer: it pools these over the
-    // trailing window, requires at least thirty firings before trusting a rate,
-    // and picks the lowest threshold whose false-positive rate stays under the
-    // target. Nothing qualifying leaves the fallback in place, which is what
-    // makes adaptation safe to leave on while the value head is still learning.
-    let calibration = std::mem::take(&mut game.calibration);
+impl GameWriter {
+    fn new(
+        config: &Config,
+        settings: &GameSettings,
+        root: PathBuf,
+        raster: RasterConfig,
+        policy_size: usize,
+        model_sha256: Option<String>,
+    ) -> Self {
+        // The smallest radius this run can play, which is the board that holds
+        // the most stones and therefore sizes the record. Taken from `--radius`
+        // alone it would fit the mini board and fail on a standard one *after*
+        // the games are played.
+        let smallest_radius = settings
+            .board_mix
+            .iter()
+            .map(|band| 1.0 / band.high_units)
+            .fold(settings.radius, f64::min);
+        Self {
+            root,
+            raster,
+            policy_size,
+            replay_capacity: replay_capacity_for(config.maximum_candidates, policy_size),
+            stone_capacity: stone_capacity_for_radius(smallest_radius),
+            simulations: config.simulations,
+            radius: config.radius,
+            model_sha256,
+        }
+    }
 
-    let dataset = staging.join("dataset.vgo");
-    let mut stream = ReplayStream::create(
-        &dataset,
-        game.samples.len(),
-        raster,
-        policy_size,
-        0,
-        replay_capacity_for(config.maximum_candidates, policy_size),
-        stone_capacity_for_radius(config.smallest_radius()),
+    /// Writes one completed game as a one-game shard.
+    ///
+    /// The directory is built under a temporary name and renamed once the manifest
+    /// is in place, so a reader can never observe a game that is missing its
+    /// checksum -- the same discipline the shard writer uses, at a finer grain.
+    fn write(&self, game_id: u64, game: GameSamples) -> io::Result<usize> {
+        let name = format!("game-{game_id:09}");
+        let staging = self.root.join(format!("{name}.staging"));
+        let final_path = self.root.join(&name);
+        if final_path.exists() {
+            // Already written, so the game in hand is a duplicate of it and there is
+            // nothing to do. Say so: reaching here means the index range is being
+            // replayed, and every game the run finishes from now on is discarded
+            // after paying its full search cost, with nothing else looking wrong.
+            eprintln!(
+                "warning: {name} already exists in {}; discarding the finished game. \
+                 Game indices are being reused -- check --first-game.",
+                self.root.display()
+            );
+            return Ok(0);
+        }
+        if staging.exists() {
+            fs::remove_dir_all(&staging)?;
+        }
+        fs::create_dir_all(&staging)?;
+
+        let GameSamples {
+            samples,
+            record,
+            calibration,
+        } = game;
+        let mut stream = ReplayStream::create(
+            &staging.join("dataset.vgo"),
+            samples.len(),
+            self.raster,
+            self.policy_size,
+            0,
+            self.replay_capacity,
+            self.stone_capacity,
+        )?;
+        stream.write_game(samples)?;
+        let published = stream.publish()?;
+        write_game_record(&staging.join("games.jsonl"), &record, published.samples)?;
+        if !calibration.is_empty() {
+            write_calibration(&staging.join("resign-calibration.jsonl"), &calibration)?;
+        }
+        self.write_manifest(&staging.join("manifest.json"), &published)?;
+        fs::rename(&staging, &final_path)?;
+        Ok(published.samples)
+    }
+
+    fn write_manifest(&self, path: &Path, published: &PublishedReplay) -> io::Result<()> {
+        let mut writer = BufWriter::new(fs::File::create(path)?);
+        writeln!(writer, "{{")?;
+        writeln!(writer, "  \"schema\": \"vgo.replay-shard.v1\",")?;
+        writeln!(writer, "  \"dataset\": \"dataset.vgo\",")?;
+        writeln!(writer, "  \"games\": \"games.jsonl\",")?;
+        writeln!(writer, "  \"samples\": {},", published.samples)?;
+        writeln!(writer, "  \"completed_games\": 1,")?;
+        writeln!(writer, "  \"channels\": {},", self.raster.channels())?;
+        writeln!(writer, "  \"height\": {},", self.raster.height)?;
+        writeln!(writer, "  \"width\": {},", self.raster.width)?;
+        writeln!(writer, "  \"policy_size\": {},", self.policy_size)?;
+        writeln!(writer, "  \"simulations\": {},", self.simulations)?;
+        writeln!(writer, "  \"radius\": {},", self.radius)?;
+        if let Some(sha) = &self.model_sha256 {
+            writeln!(writer, "  \"behavior_model_sha256\": \"{sha}\",")?;
+        }
+        writeln!(writer, "  \"dataset_sha256\": \"{}\"", published.sha256)?;
+        writeln!(writer, "}}")?;
+        writer.flush()
+    }
+}
+
+/// The game's sidecar line.
+///
+/// The final board and both areas are what the score and ownership targets are
+/// built from. They cannot be recovered afterwards -- the last recorded position
+/// is one move short of the end -- so every game written without them is score
+/// data lost for good.
+fn write_game_record(path: &Path, record: &GameRecord, samples: usize) -> io::Result<()> {
+    let mut writer = BufWriter::new(fs::File::create(path)?);
+    writeln!(
+        writer,
+        concat!(
+            r#"{{"game":{},"komi":{:.6},"radius":{:.8},"plies":{},"passes":{},"#,
+            r#""self_captures":{},"black_utility":{},"margin":{:.6},"#,
+            r#""black_area":{:.8},"white_area":{:.8},"#,
+            r#""reached_ply_cap":{},"resigned":{},"soft_resign_ply":{},"#,
+            r#""first_sample":0,"sample_count":{},"final_stones":[{}],"search_budgets":{},"policy_eligible":{}}}"#
+        ),
+        record.game,
+        record.komi,
+        record.radius,
+        record.plies,
+        record.passes,
+        record.self_captures,
+        record.black_utility,
+        record.margin,
+        record.black_area,
+        record.white_area,
+        record.reached_ply_cap,
+        record.resigned,
+        record
+            .soft_resign_ply
+            .map_or_else(|| "null".to_owned(), |ply| ply.to_string()),
+        samples,
+        record
+            .final_stones
+            .iter()
+            .map(|(x, y, colour)| format!("[{x:.9},{y:.9},{colour}]"))
+            .collect::<Vec<_>>()
+            .join(","),
+        serde_json::to_string(&record.search_budgets)?,
+        serde_json::to_string(&record.policy_eligible)?,
     )?;
-    stream.write_game(game.samples)?;
-    let published = stream.publish()?;
+    writer.flush()
+}
 
-    if let Some(record) = game.record.as_ref() {
-        let mut writer = BufWriter::new(fs::File::create(staging.join("games.jsonl"))?);
-        // The final board and both areas are what the score and ownership
-        // targets are built from. They cannot be recovered afterwards -- the
-        // last recorded position is one move short of the end -- so every
-        // game written without them is score data lost for good.
+/// One row per (threshold, window) the rule could have used, describing what it
+/// would have done to *this* game: whether it would have conceded, whether that
+/// concession would have been wrong, and how many plies it would have skipped.
+/// Under soft resignation every game calibrates, because the game plays on to a
+/// real terminal state and the counterfactual is therefore known rather than
+/// sampled.
+///
+/// Written raw, per game, rather than pre-pooled. The generator does not know
+/// which window a future run will pool over, and a shard-level aggregate cannot
+/// be un-summed; 36 rows of small integers per game is cheaper than regenerating.
+///
+/// `training/loop/resign-calibration.py` is the consumer: it pools these over the
+/// trailing window, requires at least thirty firings before trusting a rate, and
+/// picks the lowest threshold whose false-positive rate stays under the target.
+/// Nothing qualifying leaves the fallback in place, which is what makes
+/// adaptation safe to leave on while the value head is still learning.
+fn write_calibration(path: &Path, calibration: &[ResignTrial]) -> io::Result<()> {
+    let mut writer = BufWriter::new(fs::File::create(path)?);
+    for trial in calibration {
         writeln!(
             writer,
-            concat!(
-                r#"{{"game":{},"komi":{:.6},"radius":{:.8},"plies":{},"passes":{},"#,
-                r#""self_captures":{},"black_utility":{},"margin":{:.6},"#,
-                r#""black_area":{:.8},"white_area":{:.8},"#,
-                r#""reached_ply_cap":{},"resigned":{},"soft_resign_ply":{},"#,
-                r#""first_sample":0,"sample_count":{},"final_stones":[{}],"search_budgets":{},"policy_eligible":{}}}"#
-            ),
-            record.game,
-            record.komi,
-            record.radius,
-            record.plies,
-            record.passes,
-            record.self_captures,
-            record.black_utility,
-            record.margin,
-            record.black_area,
-            record.white_area,
-            record.reached_ply_cap,
-            record.resigned,
-            record
-                .soft_resign_ply
-                .map_or_else(|| "null".to_owned(), |ply| ply.to_string()),
-            published.samples,
-            record
-                .final_stones
-                .iter()
-                .map(|(x, y, colour)| format!("[{x:.9},{y:.9},{colour}]"))
-                .collect::<Vec<_>>()
-                .join(","),
-            serde_json::to_string(&record.search_budgets)?,
-            serde_json::to_string(&record.policy_eligible)?,
+            r#"{{"threshold":{:.4},"window":{},"minimum_ply":{},"fired":{},"wrong":{},"plies_saved":{},"confidence":{:.4}}}"#,
+            trial.threshold,
+            trial.window,
+            trial.minimum_ply,
+            u32::from(trial.fired),
+            u32::from(trial.wrong),
+            trial.plies_saved,
+            trial.fired_confidence,
         )?;
-        writer.flush()?;
     }
-
-    if !calibration.is_empty() {
-        let mut writer =
-            BufWriter::new(fs::File::create(staging.join("resign-calibration.jsonl"))?);
-        for trial in &calibration {
-            writeln!(
-                writer,
-                r#"{{"threshold":{:.4},"window":{},"minimum_ply":{},"fired":{},"wrong":{},"plies_saved":{},"confidence":{:.4}}}"#,
-                trial.threshold,
-                trial.window,
-                trial.minimum_ply,
-                u32::from(trial.fired),
-                u32::from(trial.wrong),
-                trial.plies_saved,
-                trial.fired_confidence,
-            )?;
-        }
-        writer.flush()?;
-    }
-
-    let manifest = staging.join("manifest.json");
-    let mut writer = BufWriter::new(fs::File::create(&manifest)?);
-    writeln!(writer, "{{")?;
-    writeln!(writer, "  \"schema\": \"vgo.replay-shard.v1\",")?;
-    writeln!(writer, "  \"dataset\": \"dataset.vgo\",")?;
-    writeln!(writer, "  \"games\": \"games.jsonl\",")?;
-    writeln!(writer, "  \"samples\": {},", published.samples)?;
-    writeln!(writer, "  \"completed_games\": 1,")?;
-    writeln!(writer, "  \"channels\": {},", raster.channels())?;
-    writeln!(writer, "  \"height\": {},", raster.height)?;
-    writeln!(writer, "  \"width\": {},", raster.width)?;
-    writeln!(writer, "  \"policy_size\": {},", policy_size)?;
-    writeln!(writer, "  \"simulations\": {},", config.simulations)?;
-    writeln!(writer, "  \"radius\": {},", config.radius)?;
-    if let Some(sha) = model_sha256 {
-        writeln!(writer, "  \"behavior_model_sha256\": \"{sha}\",")?;
-    }
-    writeln!(writer, "  \"dataset_sha256\": \"{}\"", published.sha256)?;
-    writeln!(writer, "}}")?;
-    writer.flush()?;
-
-    fs::rename(&staging, &final_path)?;
-    Ok(published.samples)
+    writer.flush()
 }
 
 /// Stop the run after `--profile-seconds` so the profile can be written.
@@ -438,24 +468,17 @@ fn expected_deadline_cancellation(error: &vgo_search::EvaluationError, deadline:
     deadline && error.to_string() == "replay generation cancelled"
 }
 
-fn arm_deadline(
-    config: &Config,
-    stopping: &Arc<AtomicBool>,
-    cancelled: &Arc<AtomicBool>,
-    deadline: &Arc<AtomicBool>,
-) {
+fn arm_deadline(config: &Config, run: &Arc<RunState>) {
     let Some(seconds) = deadline_seconds(config) else {
         return;
     };
-    let stopping = Arc::clone(stopping);
-    let cancelled = Arc::clone(cancelled);
-    let deadline = Arc::clone(deadline);
+    let run = Arc::clone(run);
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(seconds));
         eprintln!("[deadline] {seconds}s elapsed, abandoning games in flight");
-        deadline.store(true, Ordering::Release);
-        stopping.store(true, Ordering::Release);
-        cancelled.store(true, Ordering::Release);
+        run.deadline.store(true, Ordering::Release);
+        run.stopping.store(true, Ordering::Release);
+        run.cancelled.store(true, Ordering::Release);
     });
 }
 
@@ -554,198 +577,153 @@ fn use_blocking_sync(device: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn main() -> io::Result<()> {
-    let config = Config::parse();
-    if config.profile_seconds > 0 && config.profile_output.is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--profile-seconds needs --profile-output; use --run-seconds for an unprofiled timed run",
-        ));
-    }
-    // Before anything touches CUDA: the driver refuses to change this flag once
-    // the primary context is active, and ONNX Runtime retains that same
-    // context when the first session is built.
-    if config.blocking_sync {
-        match use_blocking_sync(config.device_id.max(0) as usize) {
-            Ok(()) => eprintln!("[cuda] waiting on the GPU will block, not spin"),
-            Err(error) => eprintln!("[cuda] blocking sync unavailable, continuing: {error}"),
-        }
-    }
-    start_profiler(config.profile_output.as_deref())?;
-    if config.actors == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--actors must be positive",
-        ));
-    }
-    let raster = RasterConfig::square_of(config.resolution, config.raster_kind);
-    let policy_size = RasterConfig::square(config.policy_resolution).pixels() + 1;
-    let root = config.output_root.join(&config.label);
-    fs::create_dir_all(&root)?;
-
-    let model_sha256 = match &config.model {
-        Some(path) => Some(file_sha256(path)?),
-        None => None,
+/// Load the model's lanes behind one broker, or fall back to the naive evaluator.
+fn load_evaluator(
+    config: &Config,
+    raster: RasterConfig,
+) -> io::Result<(Arc<dyn Evaluator>, Option<BatchedEvaluatorPool>)> {
+    let Some(model) = &config.model else {
+        return Ok((Arc::new(NaiveEvaluator), None));
     };
-
-    let (evaluator, broker): (Arc<dyn Evaluator>, Option<BatchedEvaluatorPool>) =
-        match &config.model {
-            None => (Arc::new(NaiveEvaluator), None),
-            Some(model) => {
-                let mut services = Vec::with_capacity(config.inference_slots);
-                // Sequential loads: TensorRT reuses its engine cache rather than
-                // racing two builders over the same directory.
-                for _slot in 0..config.inference_slots {
-                    services.push(
-                        OnnxBatchService::load(&OnnxServiceConfig {
-                            policy: Some(RasterConfig::square(config.policy_resolution)),
-                            model: model.clone(),
-                            raster,
-                            maximum_batch: config.maximum_batch,
-                            provider: config.provider,
-                            device_id: config.device_id,
-                            fp16: config.fp16,
-                            cache_directory: config.cache_directory.clone(),
-                        })
-                        .map_err(io::Error::other)?,
-                    );
-                }
-                let pool = BatchedEvaluatorPool::spawn(
-                    BrokerConfig {
-                        maximum_delay: Duration::from_millis(config.delay_ms),
-                        queue_capacity: (config.actors * 4).max(config.maximum_batch * 2),
-                    },
-                    services,
-                )
-                .map_err(io::Error::other)?;
-                (Arc::new(pool.clone()), Some(pool))
-            }
-        };
-
-    // Two signals, not one. `stopping` means take no new games -- the game in
-    // hand plays to its end, which is the whole point of making a game the unit.
-    // `cancelled` aborts mid-game and is only set when something has actually
-    // failed; `generate_game` reports it as an error, so conflating the two
-    // turns an orderly stop into a spurious failure in every other actor.
-    let stopping = Arc::new(AtomicBool::new(false));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let deadline = Arc::new(AtomicBool::new(false));
-    arm_deadline(&config, &stopping, &cancelled, &deadline);
-    let next_game = Arc::new(AtomicU64::new(config.first_game));
-    let games_written = Arc::new(AtomicU64::new(0));
-    let samples_written = Arc::new(AtomicU64::new(0));
-    let settings = config.game_settings();
-    let telemetry = Arc::new(GenerationTelemetry::new(config.actors));
-    let reporter = telemetry_writer::Reporter::start(
-        &config,
-        &root,
-        model_sha256.as_deref(),
-        Arc::clone(&telemetry),
-        broker.clone(),
-        Arc::clone(&cancelled),
-    )?;
-
-    // Each actor owns the whole cycle: play a game, write it, take the next.
-    // There is no collector and no channel, because there is nothing to batch --
-    // which is also why no actor can ever be left waiting on another's game.
-    let mut handles = Vec::with_capacity(config.actors);
-    for actor in 0..config.actors {
-        let evaluator = Arc::clone(&evaluator);
-        let stopping = Arc::clone(&stopping);
-        let cancelled = Arc::clone(&cancelled);
-        let deadline = Arc::clone(&deadline);
-        let next_game = Arc::clone(&next_game);
-        let games_written = Arc::clone(&games_written);
-        let samples_written = Arc::clone(&samples_written);
-        let settings = settings.clone();
-        let config = config.clone();
-        let root = root.clone();
-        let model_sha256 = model_sha256.clone();
-        let telemetry = Arc::clone(&telemetry);
-        handles.push(thread::spawn(move || -> io::Result<()> {
-            let result = (|| -> io::Result<()> {
-                loop {
-                    if stopping.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) {
-                        return Ok(());
-                    }
-                    if let Some(path) = &config.stop_file
-                        && path.exists()
-                    {
-                        stopping.store(true, Ordering::Release);
-                        return Ok(());
-                    }
-                    if config.maximum_games > 0
-                        && games_written.load(Ordering::Relaxed) >= config.maximum_games
-                    {
-                        stopping.store(true, Ordering::Release);
-                        return Ok(());
-                    }
-                    let index = next_game.fetch_add(1, Ordering::Relaxed);
-                    telemetry.phase(actor, "playing");
-                    let game = match generate_game_observed(
-                        &settings,
-                        evaluator.as_ref(),
-                        index,
-                        &cancelled,
-                        |progress| telemetry.searched(actor, progress),
-                    ) {
-                        Ok(game) => game,
-                        Err(error) => {
-                            if expected_deadline_cancellation(
-                                &error,
-                                deadline.load(Ordering::Acquire),
-                            ) {
-                                telemetry.discarded(actor);
-                                return Ok(());
-                            }
-                            cancelled.store(true, Ordering::Release);
-                            return Err(io::Error::other(error));
-                        }
-                    };
-                    // A game with no terminal label teaches nothing; it is dropped
-                    // rather than written, and the actor moves on.
-                    if !game.completed || game.samples.is_empty() {
-                        telemetry.discarded(actor);
-                        continue;
-                    }
-                    let capped = game.reached_ply_cap;
-                    let radius = game.samples[0].position.radius();
-                    let soft_resigned = game
-                        .record
-                        .as_ref()
-                        .is_some_and(|record| record.soft_resign_ply.is_some());
-                    telemetry.phase(actor, "writing");
-                    let writing_started = Instant::now();
-                    let written = write_game(
-                        &root,
-                        index,
-                        game,
-                        &config,
-                        raster,
-                        policy_size,
-                        model_sha256.as_deref(),
-                    )?;
-                    telemetry.published(
-                        actor,
-                        radius,
-                        written,
-                        capped,
-                        soft_resigned,
-                        writing_started.elapsed(),
-                    );
-                    if written > 0 {
-                        games_written.fetch_add(1, Ordering::Relaxed);
-                        samples_written.fetch_add(written as u64, Ordering::Relaxed);
-                    }
-                }
-            })();
-            telemetry.phase(actor, "done");
-            if result.is_err() {
-                cancelled.store(true, Ordering::Release);
-            }
-            result
-        }));
+    let mut services = Vec::with_capacity(config.inference_slots);
+    // Sequential loads: TensorRT reuses its engine cache rather than racing two
+    // builders over the same directory.
+    for _slot in 0..config.inference_slots {
+        services.push(
+            OnnxBatchService::load(&OnnxServiceConfig {
+                policy: Some(RasterConfig::square(config.policy_resolution)),
+                model: model.clone(),
+                raster,
+                maximum_batch: config.maximum_batch,
+                provider: config.provider,
+                device_id: config.device_id,
+                fp16: config.fp16,
+                cache_directory: config.cache_directory.clone(),
+            })
+            .map_err(io::Error::other)?,
+        );
     }
+    let pool = BatchedEvaluatorPool::spawn(
+        BrokerConfig {
+            maximum_delay: Duration::from_millis(config.delay_ms),
+            queue_capacity: (config.actors * 4).max(config.maximum_batch * 2),
+        },
+        services,
+    )
+    .map_err(io::Error::other)?;
+    Ok((Arc::new(pool.clone()), Some(pool)))
+}
+
+/// The flags and counters every actor shares.
+///
+/// Two stop signals, not one. `stopping` means take no new games -- the game in
+/// hand plays to its end, which is the whole point of making a game the unit.
+/// `cancelled` aborts mid-game and is only set when something has actually
+/// failed; `generate_game` reports it as an error, so conflating the two turns an
+/// orderly stop into a spurious failure in every other actor.
+#[derive(Default)]
+struct RunState {
+    stopping: AtomicBool,
+    cancelled: Arc<AtomicBool>,
+    deadline: AtomicBool,
+    next_game: AtomicU64,
+    games_written: AtomicU64,
+    samples_written: AtomicU64,
+}
+
+/// One actor owns the whole cycle: play a game, write it, take the next. There is
+/// no collector and no channel, because there is nothing to batch -- which is
+/// also why no actor can ever be left waiting on another's game.
+struct Actor {
+    index: usize,
+    stop_file: Option<PathBuf>,
+    maximum_games: u64,
+    evaluator: Arc<dyn Evaluator>,
+    settings: Arc<GameSettings>,
+    writer: Arc<GameWriter>,
+    telemetry: Arc<GenerationTelemetry>,
+    run: Arc<RunState>,
+}
+
+impl Actor {
+    fn should_stop(&self) -> bool {
+        let run = &self.run;
+        if run.stopping.load(Ordering::Acquire) || run.cancelled.load(Ordering::Acquire) {
+            return true;
+        }
+        let stop_file = self.stop_file.as_ref().is_some_and(|path| path.exists());
+        let enough = self.maximum_games > 0
+            && run.games_written.load(Ordering::Relaxed) >= self.maximum_games;
+        if stop_file || enough {
+            run.stopping.store(true, Ordering::Release);
+        }
+        stop_file || enough
+    }
+
+    /// Play and publish games until the run stops. A cancellation the deadline
+    /// asked for is a normal end; any other failure stops every actor.
+    fn run(&self) -> io::Result<()> {
+        let result = self.play_games();
+        self.telemetry.phase(self.index, "done");
+        if result.is_err() {
+            self.run.cancelled.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn play_games(&self) -> io::Result<()> {
+        let (run, telemetry, actor) = (&self.run, &self.telemetry, self.index);
+        while !self.should_stop() {
+            let index = run.next_game.fetch_add(1, Ordering::Relaxed);
+            telemetry.phase(actor, "playing");
+            let game = match generate_game_observed(
+                &self.settings,
+                self.evaluator.as_ref(),
+                index,
+                &run.cancelled,
+                |progress| telemetry.searched(actor, progress),
+            ) {
+                Ok(game) => game,
+                Err(error) => {
+                    let deadline = run.deadline.load(Ordering::Acquire);
+                    if expected_deadline_cancellation(&error, deadline) {
+                        telemetry.discarded(actor);
+                        return Ok(());
+                    }
+                    return Err(io::Error::other(error));
+                }
+            };
+            // A game with no terminal label teaches nothing; it is dropped
+            // rather than written, and the actor moves on.
+            if game.samples.is_empty() {
+                telemetry.discarded(actor);
+                continue;
+            }
+            let capped = game.record.reached_ply_cap;
+            let radius = game.samples[0].position.radius();
+            let soft_resigned = game.record.soft_resign_ply.is_some();
+            telemetry.phase(actor, "writing");
+            let writing_started = Instant::now();
+            let written = self.writer.write(index, game)?;
+            telemetry.published(
+                actor,
+                radius,
+                written,
+                capped,
+                soft_resigned,
+                writing_started.elapsed(),
+            );
+            if written > 0 {
+                run.games_written.fetch_add(1, Ordering::Relaxed);
+                run.samples_written
+                    .fetch_add(written as u64, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn join_actors(handles: Vec<thread::JoinHandle<io::Result<()>>>) -> Option<io::Error> {
     let mut failure = None;
     for handle in handles {
         match handle.join() {
@@ -758,30 +736,103 @@ fn main() -> io::Result<()> {
             }
         }
     }
+    failure
+}
+
+fn print_summary(label: &str, run: &RunState) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    writeln!(out, "{{")?;
+    writeln!(out, "  \"label\": \"{label}\",")?;
+    let games = run.games_written.load(Ordering::Relaxed);
+    writeln!(out, "  \"games\": {games},")?;
+    let samples = run.samples_written.load(Ordering::Relaxed);
+    writeln!(out, "  \"samples\": {samples}")?;
+    writeln!(out, "}}")
+}
+
+fn main() -> io::Result<()> {
+    let config = Config::parse();
+    if config.profile_seconds > 0 && config.profile_output.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--profile-seconds needs --profile-output; use --run-seconds for an unprofiled timed run",
+        ));
+    }
+    if config.actors == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--actors must be positive",
+        ));
+    }
+    let settings = Arc::new(
+        config
+            .game_settings()
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?,
+    );
+    // Before anything touches CUDA: the driver refuses to change this flag once
+    // the primary context is active, and ONNX Runtime retains that same
+    // context when the first session is built.
+    if config.blocking_sync {
+        match use_blocking_sync(config.device_id.max(0) as usize) {
+            Ok(()) => eprintln!("[cuda] waiting on the GPU will block, not spin"),
+            Err(error) => eprintln!("[cuda] blocking sync unavailable, continuing: {error}"),
+        }
+    }
+    start_profiler(config.profile_output.as_deref())?;
+    let raster = RasterConfig::square_of(config.resolution, config.raster_kind);
+    let policy_size = RasterConfig::square(config.policy_resolution).pixels() + 1;
+    let root = config.output_root.join(&config.label);
+    fs::create_dir_all(&root)?;
+
+    let model_sha256 = config.model.as_deref().map(file_sha256).transpose()?;
+    let (evaluator, broker) = load_evaluator(&config, raster)?;
+
+    let run = Arc::new(RunState {
+        next_game: AtomicU64::new(config.first_game),
+        ..RunState::default()
+    });
+    arm_deadline(&config, &run);
+    let telemetry = Arc::new(GenerationTelemetry::new(config.actors));
+    let reporter = telemetry_writer::Reporter::start(
+        &config,
+        &root,
+        model_sha256.as_deref(),
+        Arc::clone(&telemetry),
+        broker,
+        Arc::clone(&run.cancelled),
+    )?;
+
+    let writer = Arc::new(GameWriter::new(
+        &config,
+        &settings,
+        root,
+        raster,
+        policy_size,
+        model_sha256,
+    ));
+    let handles = (0..config.actors)
+        .map(|index| {
+            let actor = Actor {
+                index,
+                stop_file: config.stop_file.clone(),
+                maximum_games: config.maximum_games,
+                evaluator: Arc::clone(&evaluator),
+                settings: Arc::clone(&settings),
+                writer: Arc::clone(&writer),
+                telemetry: Arc::clone(&telemetry),
+                run: Arc::clone(&run),
+            };
+            thread::spawn(move || actor.run())
+        })
+        .collect();
+    let failure = join_actors(handles);
     reporter.finish()?;
     // Preserve the profile even when a genuine actor/backend failure occurred.
     finish_profiler((), config.profile_output.as_deref())?;
-
-    if let Some(error) = failure {
-        return Err(error);
+    match failure {
+        Some(error) => Err(error),
+        None => print_summary(&config.label, &run),
     }
-
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    writeln!(out, "{{")?;
-    writeln!(out, "  \"label\": \"{}\",", config.label)?;
-    writeln!(
-        out,
-        "  \"games\": {},",
-        games_written.load(Ordering::Relaxed)
-    )?;
-    writeln!(
-        out,
-        "  \"samples\": {}",
-        samples_written.load(Ordering::Relaxed)
-    )?;
-    writeln!(out, "}}")?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -842,14 +893,14 @@ mod tests {
         let cancelled = AtomicBool::new(false);
         let mut updates = Vec::new();
         let game = generate_game_observed(
-            &config.game_settings(),
+            &config.game_settings().unwrap(),
             &NaiveEvaluator,
             99,
             &cancelled,
             |update| updates.push(update),
         )
         .unwrap();
-        let record = game.record.unwrap();
+        let record = game.record;
         assert_eq!(record.search_budgets.len(), updates.len());
         assert_eq!(
             record.policy_eligible.iter().filter(|&&keep| keep).count(),
@@ -873,12 +924,29 @@ mod tests {
             );
         }
         assert_eq!(game.calibration.len(), 36);
-        let again =
-            generate_game(&config.game_settings(), &NaiveEvaluator, 99, &cancelled).unwrap();
-        assert_eq!(
-            again.record.unwrap().policy_eligible,
-            record.policy_eligible
-        );
+        let again = generate_game(
+            &config.game_settings().unwrap(),
+            &NaiveEvaluator,
+            99,
+            &cancelled,
+        )
+        .unwrap();
+        assert_eq!(again.record.policy_eligible, record.policy_eligible);
+    }
+
+    #[test]
+    fn a_malformed_board_mix_is_an_error_rather_than_the_default_board() {
+        let config = Config::parse_from([
+            "generator",
+            "--output-root",
+            "unused",
+            "--label",
+            "test",
+            "--board-mix",
+            "1:9",
+        ]);
+        let error = config.game_settings().unwrap_err();
+        assert!(error.contains("goes below"), "{error}");
     }
 
     #[test]
@@ -896,7 +964,7 @@ mod tests {
             "--policy-resolution",
             "16",
         ]);
-        let settings = config.game_settings();
+        let settings = config.game_settings().unwrap();
         let cancelled = AtomicBool::new(false);
         let plain = generate_game(&settings, &NaiveEvaluator, 123, &cancelled).unwrap();
         let mut updates = Vec::new();
@@ -907,10 +975,7 @@ mod tests {
             .unwrap();
         assert_eq!(updates.len(), observed.samples.len());
         assert_eq!(plain.samples.len(), observed.samples.len());
-        assert_eq!(
-            plain.record.as_ref().unwrap().final_stones,
-            observed.record.as_ref().unwrap().final_stones
-        );
+        assert_eq!(plain.record.final_stones, observed.record.final_stones);
         for (index, (left, right)) in plain.samples.iter().zip(&observed.samples).enumerate() {
             assert_eq!(left.position, right.position);
             assert_eq!(left.policy, right.policy);
