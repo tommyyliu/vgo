@@ -665,6 +665,35 @@ computed `q = FMA(dx, dx, dy^2) >= rnd(m^2)` with `m = 2r - e`, and `validate` t
 `rnd(sqrt(q)) < m` on the same `q`. Rounding is monotone, and `rnd(sqrt(rnd(m^2))) = m` for
 binary64 without overflow or underflow, so `rnd(sqrt(q)) >= m` and no issue is raised. QED
 
+### E13. Legal vertices of a position extended by one stone
+
+*Status: Proved.* Used by `vertices::extend`.
+
+**Claim.** Let `S` be a stone list and `S' = S + t`, with `t` appended last. If the
+enumeration of `S` dropped no candidate as a duplicate, and no new candidate below shares a
+key with a kept vertex, then the following equals the enumeration of `S'`, in order: take
+`S`'s list, keep the vertices clear of `t`, and insert each admissible candidate built from
+`t` at the end of its section.
+
+**Proof.** A candidate of `S'` is built from the walls, from corners, or from one or two
+stones. Its coordinates depend only on the stones that built it, so a candidate not
+involving `t` has the same coordinates under `S` and `S'`, and the arithmetic is unchanged
+because `t` is `second` in every pair, as it is in the full loop.
+
+*Admission.* A candidate is admissible when it is finite, in the inset, and clear of every
+stone it was not built on. Under `S'` that is the same test plus clearance from `t`, which
+is the comparison `extend` applies. A candidate rejected under `S` stays rejected.
+
+*Duplicates.* The enumeration keeps the first of any candidates sharing a key. With no drop
+under `S`, every admissible candidate of `S` is in its list, so the filtered list holds
+every admissible candidate of `S'` not involving `t`, with distinct keys. If no new one
+shares a key with those or with another new one, nothing is dropped under `S'` either.
+Otherwise `extend` declines and the full enumeration runs.
+
+*Order.* The enumeration visits corners, then walls by stone, then pairs by `first` and
+`second`. `t` has the highest index, so its wall candidates end the wall section, and each
+pair `(f, t)` ends the section for `f`. QED
+
 ## Floating-point lemmas
 
 ### N1. Length comparison

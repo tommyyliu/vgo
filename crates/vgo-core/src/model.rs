@@ -108,7 +108,11 @@ pub enum Phase {
 /// it plays no part in equality, and every constructor taking new stones starts
 /// from an empty cache.
 #[derive(Clone, Default)]
-struct LegalIndexCache(OnceLock<Arc<LegalSetIndex>>);
+struct LegalIndexCache {
+    own: OnceLock<Arc<LegalSetIndex>>,
+    /// Only valid while `stones` is the parent's stones plus one appended.
+    parent: Option<Arc<LegalSetIndex>>,
+}
 
 /// This position's Voronoi cells, and the parent's for building them from.
 ///
@@ -250,17 +254,25 @@ impl Position {
     pub(crate) fn adopt_legal_index(&self, other: &Self) {
         debug_assert_eq!(self.stones, other.stones);
         debug_assert!(self.radius.to_bits() == other.radius.to_bits());
-        if let Some(index) = other.legal_index.0.get() {
-            let _ = self.legal_index.0.set(Arc::clone(index));
+        if let Some(index) = other.legal_index.own.get() {
+            let _ = self.legal_index.own.set(Arc::clone(index));
         }
+    }
+
+    /// Records the index of the position this one extends by its last stone.
+    pub(crate) fn link_parent_index(&mut self, index: Arc<LegalSetIndex>) {
+        self.legal_index.parent = Some(index);
     }
 
     /// This position's legal-set index, shared by everything that needs it.
     #[must_use]
     pub fn legal_index(&self) -> &Arc<LegalSetIndex> {
-        self.legal_index
-            .0
-            .get_or_init(|| Arc::new(LegalSetIndex::build(self)))
+        self.legal_index.own.get_or_init(|| {
+            Arc::new(match &self.legal_index.parent {
+                Some(parent) => parent.extended(self),
+                None => LegalSetIndex::build(self),
+            })
+        })
     }
 
     /// The same position played under `ruleset`.

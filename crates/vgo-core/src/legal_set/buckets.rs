@@ -110,6 +110,21 @@ impl StoneBuckets {
         }
     }
 
+    /// Every stone before `end` that could pair with the point, in index order.
+    /// The same three cells of reach as [`Self::partners_into`], for the same reason.
+    pub(super) fn lower_partners_into(&self, x: f64, y: f64, end: usize, out: &mut Vec<usize>) {
+        let (column, row) = self.cell_of(x, y);
+        let columns = column.saturating_sub(3)..=(column + 3).min(self.columns - 1);
+        for r in row.saturating_sub(3)..=(row + 3).min(self.rows - 1) {
+            for &index in self.row_span(r, columns.clone()) {
+                if (index as usize) < end {
+                    out.push(index as usize);
+                }
+            }
+        }
+        out.sort_unstable();
+    }
+
     /// Every stone after `first` that could pair with the point, in index order.
     ///
     /// Three cells of reach, not two. The pair test admits a separation up to

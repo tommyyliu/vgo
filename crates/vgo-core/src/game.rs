@@ -100,6 +100,7 @@ pub fn place(position: &Position, x: f64, y: f64) -> Result<MoveResult, MoveErro
     stones.push(Stone::new(x, y, mover));
     let mut provisional = position.with_stones(stones);
     provisional.link_parent_cells(Arc::clone(position.shared_cells()));
+    provisional.link_parent_index(Arc::clone(position.legal_index()));
     if valid {
         provisional.mark_valid();
     }
@@ -853,6 +854,47 @@ mod validity {
         }
         assert!(moves > 500, "{moves} moves is too few to mean anything");
         assert!(captured > 0, "no capture was exercised in {moves} moves");
+    }
+
+    /// [E13]: extending the parent's index must give the full enumeration, in the
+    /// same order, through captures and on the tangent moves snapping produces.
+    #[test]
+    fn an_extended_legal_index_matches_a_full_build() {
+        for (radius, target) in [(1.0 / 12.0, 400), (1.0 / 18.0, 300), (1.0 / 38.0, 300)] {
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 11) as f64 / (1_u64 << 53) as f64
+            };
+            let empty = Position::new(radius, Vec::new(), Color::Black);
+            let mut position = empty.clone();
+            let (mut moves, mut misses) = (0, 0);
+            while moves < target {
+                let query = crate::Point::new(next(), next());
+                let snapped = legal_set::nearest(&position, query);
+                let Ok(result) = place(&position, snapped.point.x, snapped.point.y) else {
+                    misses += 1;
+                    if misses == 50 {
+                        (position, misses) = (empty.clone(), 0);
+                    }
+                    continue;
+                };
+                assert_eq!(
+                    result.position.legal_index().vertices(),
+                    legal_set::vertices(&result.position),
+                    "radius {radius}, move {moves}, {} stones",
+                    result.position.stones().len(),
+                );
+                moves += 1;
+                misses = 0;
+                position = result.position;
+                if position.phase() == Phase::Finished {
+                    position = empty.clone();
+                }
+            }
+        }
     }
 
     #[test]
