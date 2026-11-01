@@ -24,6 +24,10 @@ source scripts/env/ort.sh    # ORT_DYLIB_PATH and LD_LIBRARY_PATH from the venv
 
 The scripts below source it themselves.
 
+TensorRT is an optional extra. A venv created by a bare `uv sync` or `uv run`
+lacks it, and `--provider tensorrt` then fails on a missing `libnvinfer.so.10`.
+Restore it with `uv sync --frozen --extra tensorrt` in `training/`.
+
 What the machine needs: an NVIDIA **driver** (the wheels carry their own CUDA
 and TensorRT, including for Blackwell/sm_120), Rust via `rust-toolchain.toml`,
 `uv`, and a C compiler for `torch.compile`.

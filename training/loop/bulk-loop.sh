@@ -170,6 +170,7 @@ anchor_model="${VGO_ANCHOR_MODEL:-}"
 anchor_radius="${VGO_ANCHOR_RADIUS:-0.05555555555555555}"
 anchor_max_plies="${VGO_ANCHOR_MAX_PLIES:-70}"
 anchor_komi="${VGO_ANCHOR_KOMI:-0.09}"
+maximum_plies="${VGO_MAX_PLIES:-70}"
 seed_model="${VGO_SEED_MODEL:-}"
 [ -n "$seed_model" ] && seed_model="$(cd "$(dirname "$seed_model")" && pwd)/$(basename "$seed_model")"
 
@@ -268,7 +269,7 @@ start_generator () {
     --telemetry-seconds "$telemetry_seconds" \
     --resolution "$resolution" --policy-resolution 128 --raster-kind compact-radius \
     "${board_mix_flags[@]}" \
-    --max-plies 70 --radius 0.05555555555555555 \
+    --max-plies "$maximum_plies" --radius 0.05555555555555555 \
     --coarse-pool 16 --widening-coefficient 6.0 --maximum-candidates 321 \
     --komi-area-coefficient "$komi_area_coefficient" \
     --komi-low 0.017 --komi-high 0.137 \
