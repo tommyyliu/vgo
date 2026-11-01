@@ -33,21 +33,28 @@ card with 64 actors and 2 inference lanes:
 
 | Input | Positions/s | CPU threads busy |
 |---|---|---|
-| 128 | 19.5k | 4, rising to 6 by minute four |
+| 128 | 19.4k | 5 |
 | 192 | 7.6k | 4 |
 | 256 | 4.3k | 3 |
 
-The 128 row ran at 1000 simulations through whole games. The 192 and 256 rows ran under
-200 seconds and finished no games, so their threads are early-game figures, and the card is
-the limit at both.
+The 128 row ran at 1000 simulations through whole games on 8 physical cores. The 192 and 256
+rows ran under 200 seconds and finished no games, so their threads are early-game figures, and
+the card is the limit at both.
 
-Pinned to 8 physical cores at 128, 64 actors held 18.6k through 26 finished games, at 94% to
-98% GPU. 32 actors on the same cores managed 16.8k and fell to 87%: the broker needs a full
-batch waiting, and with fewer actors its queue runs dry. 8 physical cores are enough for a
-card of this speed, or about 4.5 per 10k positions/s on a faster one. Use 64 actors unless
-memory is short: they cost 7.7 GB of host memory against 5.2 GB at 32. Leave some headroom,
-because wake-up costs differ on rented machines. `vgo-bench --scaling 1,16,32` measures the
-CPU side on a new machine.
+Rented machines list vCPUs, which are usually hyperthreads, so the middle row below is what
+8 vCPU buys. Pinned at 128 through whole games:
+
+| CPUs | Positions/s | Late in games | GPU |
+|---|---|---|---|
+| 8 physical | 19.4k | 19.7k | 99% |
+| 4 physical, 8 threads | 18.1k | 17.2k | 95% |
+| 4 physical | 14.3k | 13.0k | 76% |
+
+That is about 5 vCPU per 10k positions/s to keep a card busy. This was only measured on this
+card, so check it on a faster one, and wake-up costs differ on rented machines. Use 64 actors
+unless memory is short: they cost 7.7 GB of host memory against 5.2 GB at 32, and at 32 the
+broker's queue runs dry on fewer cores. `vgo-bench --scaling 1,16,32` measures the CPU side
+on a new machine.
 
 Games store positions, not pictures, so a window played at 128 trains at any resolution.
 

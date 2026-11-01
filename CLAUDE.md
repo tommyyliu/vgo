@@ -36,6 +36,13 @@ performance/run.py                 # compare with history and record; needs a qu
   Sampled self time misled more than once: put timers around stages in a scratch copy first.
 - `vgo-bench --scaling 1,16,32` shows what sharing a machine costs. Check a real generator with
   `--profile-output` too, because a short run only reaches early-game positions.
+- Fixture searches run 200 simulations on a fixed policy. Real generation runs 1000, so its
+  shares differ: snapping was 9% of a fixture search and 20% of generation. Profile the generator
+  before choosing a target. `--profile-output` there writes a flamegraph SVG, and a frame named
+  after a closure may be the generic function that closure was passed to.
+- To compare generators, use the process's own CPU per position over a late window, from
+  `/proc/<pid>/task/*/stat`. Machine-wide busy cores include about a core of everything else, and
+  profile shares from runs of different lengths cover different stages of the game.
 - Never run timings alongside anything else, and bound every background job and wait.
 - Kill processes by exact PID. `pkill -f` and grep loops match their own shell.
 
@@ -45,15 +52,15 @@ Share of a fixture search with a fixed policy, so inference is absent.
 
 | Path | Big board | Small board |
 |---|---|---|
-| Move rules, mainly Voronoi | 36% | 15% |
-| Candidate snapping | 16% | 15% |
-| Distance transform | 13% | 24% |
-| Nearest-stone sweep and fold | 11% | 6% |
-| Cheap settled cases | 5% | 8% |
-| Exact settled test and vertex check | 2% | 6% |
+| Move rules, mainly Voronoi | 44% | 18% |
+| Distance transform | 16% | 29% |
+| Nearest-stone sweep and fold | 13% | 7% |
+| Cheap settled cases | 7% | 11% |
+| Candidate grid and sampling | 6% | 11% |
+| Exact settled test and vertex check | 2% | 7% |
 
-In real generation the GPU is the limit, not this table, from 8 physical cores up: see "Sizing
-a machine" in `docs/RUNNING.md`. Measure over whole games. Early-game runs read about half the
+In real generation the GPU is the limit, not this table, from about 8 vCPU on this card: see
+"Sizing a machine" in `docs/RUNNING.md`. Measure over whole games. Early-game runs read about half the
 CPU of later boards and overstated what three lanes and 8 cores could do. A run with 64 actors
 needs about 7 minutes before games finish.
 

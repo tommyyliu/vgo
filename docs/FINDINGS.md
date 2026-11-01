@@ -25,4 +25,5 @@ Don't reopen these without new evidence.
 | Random-candidate sampler | Target carried no board-dependent signal |
 | Three inference lanes | No gain over whole games: 18.5k positions/s against 18.6k at 128, 7.3k against 7.4k at 192. Hung at 256, 2 runs of 2 |
 | Maximum batch 64 | Slower: 16.8k positions/s against 18.8k at 32, two lanes at 128. The card runs near its compute limit at 32 |
+| Vectorized bounded transform in place of the envelope | Big boards flat, small boards 25% slower. A row's reach is set by its farthest pixel, which on a small board is 40 offsets or more |
 | Lower priority for actor threads | No gain pinned to 8 cores: lane wake delay went from 119 to 102 us, and the GPU did not rise. The stall was the broker round trip, now removed by the deck |
