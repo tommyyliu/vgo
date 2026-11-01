@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .model import RasterPolicyValueNet, build_model
+from .model import build_model
 
 
 REQUEST_MAGIC = b"VGOIFR01"
@@ -46,8 +46,7 @@ def load_model(checkpoint_path: Path) -> tuple[nn.Module, dict[str, object]]:
         width=int(checkpoint["model_width"]),
         blocks=int(checkpoint["blocks"]),
         policy_resolution=policy_resolution,
-        variance_scaled=bool(checkpoint.get("variance_scaled", False)),
-        norm_groups=checkpoint.get("norm_groups"),
+        norm_groups=int(checkpoint.get("norm_groups") or 8),
     )
     # The batch-normalized twin heads exist only while training; inference runs
     # the unnormalized heads, so their weights are absent from an exported model
