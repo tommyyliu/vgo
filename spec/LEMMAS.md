@@ -808,8 +808,8 @@ depend on what the thread rendered earlier.
 *Status: Proved.* Used by `squared_distance_transform_into` and `write_packed`.
 
 **Claim.** If a row of the transform's squared vertical distances equals the same row of an
-earlier transform on the same grid, the two rows of the field are equal. If a row's nearest
-and second-nearest squares equal an earlier raster's at the same radius, so do its ridges.
+earlier transform on the same grid, the two rows of the field are equal. If a pixel's nearest
+and second-nearest squares equal an earlier raster's at the same radius, so does its ridge.
 
 **Proof.** By [E3] a field row is `min over c of (x - c)^2 + row[c]`, which reads that row
 and nothing else, and it is an exact integer. `envelope_row`'s other arguments are buffers
@@ -820,14 +820,18 @@ is tested on the values themselves, so nothing is assumed about why they match. 
 ### E18. Far stones leave a cell's snap alone
 
 *Status: Conditional, like [E6], on every stone lying in the inset.* Used by `build_storage`
-and `SnapAnchor`.
+and `GridAnchor`.
 
 **Claim.** Let `U` and `S = U + F` be lists of stones in the same relative order, `q` a cell's
-centre, `rho` half the cell's diagonal, and `Q(S)` what the grid keeps for that cell: the
-snapped point if it is legal and inside the cell, and nothing otherwise. Write
-`m = SNAP_MARGIN`. If every `t` in `F` has `|t - q| >= rho + 2r + 100m`, then `Q(S) = Q(U)`.
+centre, `rho` half the cell's diagonal, and `Q(S)` the grid's verdict on that cell: playable at
+its centre, playable at a snapped point, or not playable. Write `m = SNAP_MARGIN`. If every
+`t` in `F` has `|t - q| >= rho + 2r + 100m`, then `Q(S) = Q(U)`.
 
-**Proof.** By [E6] it is enough to reason about the unbounded search, which takes the legal
+**Proof.** The verdict reads the cell's inset test, which ignores stones, and its squared
+distance to the nearest stone, which only tells distances below `2r` apart. No `t` is that
+close, so both tests agree in the two lists. What is left is the snap, when one is tried.
+
+By [E6] it is enough to reason about the unbounded search, which takes the legal
 candidate of least key, first of equals, and moves it by at most `M* < 17m`. Call a candidate
 *near* if it is within `rho + M*` of `q`. By [E6], anything else gives a point outside the
 cell, so it is rejected in both lists.
@@ -851,8 +855,8 @@ and its ties go to the lower index, an order `F` does not change. The final lega
 is the same by the step above. QED
 
 **Use.** As in [E16], writing `U` for the stones the anchor and a node share and `F` for
-those in one list only, `Q(node) = Q(U) = Q(anchor)` for any cell clear of `F`, so one node can
-save the answer and others read it. The anchor is keyed by its stones, grid and radius.
+those in one list only, `Q(node) = Q(U) = Q(anchor)` for any cell clear of `F`, so a node keeps
+the root's verdict on every such cell. The anchor is keyed by its stones, grid and radius.
 
 ### N1. Length comparison
 

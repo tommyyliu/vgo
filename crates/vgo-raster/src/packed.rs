@@ -529,6 +529,22 @@ fn ridge_row(nearest_squares: &[f64], second_squares: &[f64], radius: f64, out: 
     }
 }
 
+/// The columns from the first to the last that differ between two pairs of rows.
+fn moved_span(
+    (nearest, root_nearest): (&[f64], &[f64]),
+    (second, root_second): (&[f64], &[f64]),
+) -> std::ops::Range<usize> {
+    let differs = |column: usize| {
+        nearest[column] != root_nearest[column] || second[column] != root_second[column]
+    };
+    let width = nearest.len();
+    let Some(first) = (0..width).find(|&column| differs(column)) else {
+        return 0..0;
+    };
+    let last = (first..width).rev().find(|&column| differs(column));
+    first..last.map_or(first, |last| last + 1)
+}
+
 #[inline]
 fn set_bit(plane: &mut [u8], pixel: usize, value: bool) {
     // Branchless: the store happens either way, so a mispredicted branch costs
@@ -718,18 +734,29 @@ fn write_packed(
             }),
         );
 
-        // A ridge reads nothing but these two rows and the radius. Proof: [E17].
-        if reads_ridges
-            && nearest_row == &anchor.nearest_squares[base..base + width]
-            && second_row == &anchor.second_squares[base..base + width]
-        {
-            dense_plane[base..base + width].copy_from_slice(&anchor.ridges[base..base + width]);
+        // A pixel's ridge reads nothing but its two distances and the radius, so
+        // the pixels outside the span that moved keep the root's. Proof: [E17].
+        let dense_row = &mut dense_plane[base..base + width];
+        let span = if reads_ridges {
+            let root_ridges = &anchor.ridges[base..base + width];
+            dense_row.copy_from_slice(root_ridges);
+            moved_span(
+                (nearest_row, &anchor.nearest_squares[base..base + width]),
+                (second_row, &anchor.second_squares[base..base + width]),
+            )
         } else {
-            // On its own, not inside the bit packing below: there the loop's carried
-            // byte stops it vectorizing, and this is two square roots per pixel.
-            ridge_row(nearest_row, second_row, radius, ridges);
-            dense_plane[base..base + width].convert_from_f32_slice(ridges);
-        }
+            0..width
+        };
+        // On its own, not inside the bit packing below: there the loop's carried
+        // byte stops it vectorizing, and this is two square roots per pixel.
+        let ridges = &mut ridges[..span.len()];
+        ridge_row(
+            &nearest_row[span.clone()],
+            &second_row[span.clone()],
+            radius,
+            ridges,
+        );
+        dense_row[span].convert_from_f32_slice(ridges);
 
         // Groups of eight align with byte boundaries only because `width` is a
         // multiple of eight, which makes `row * width` one too. The general

@@ -70,8 +70,9 @@ breaks the prefix, so that leaf is swept.
 ### Reusing whole rows across a search
 
 A leaf differs from the root around a few stones, so most rows of its raster do not change.
-The distance transform and the ridge compare each row's input with the root's, and a row
-that matches copies the root's output. A fold skips rows the stone is too far from to reach.
+The distance transform compares each row's input with the root's, and a row that matches
+copies the root's output. The ridge does the same for the span of pixels that moved. A fold
+skips rows the stone is too far from to reach.
 
 - **Relies on:** E15, E17.
 - **Cost:** one comparison per row, plus the work on rows that differ.
@@ -126,15 +127,15 @@ boundary are snapped to a legal point inside the cell.
 - **Cost:** snapping looks only at nearby stones and vertices.
 - **Code:** `vgo-search/src/coarse_fine.rs`; `vgo-core/src/legal_set/nearest.rs`
 
-### Reusing snaps across a search
+### Reusing the root's grid across a search
 
-Every node's grid snaps the cells around every stone, and a stone farther than `2r` plus half
-a cell cannot change what a cell finds. Each thread saves the root's answers, and a node reads
-them for every cell clear of the stones it differs by.
+Every node's grid decides every cell, and a cell's verdict cannot depend on a stone farther
+than `2r` plus half a cell. A node copies the root's grid and decides again only the cells
+near the stones it differs by.
 
 - **Relies on:** E6, E16, E18.
-- **Cost:** a distance check per differing stone for each snapped cell, not the snap.
-- **Code:** `vgo-search/src/coarse_fine.rs`, `SnapAnchor`
+- **Cost:** a copy, plus the cells around each differing stone.
+- **Code:** `vgo-search/src/coarse_fine.rs`, `GridAnchor`
 
 ## Learning
 

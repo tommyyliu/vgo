@@ -33,36 +33,34 @@ pub struct CandidateSample {
 /// snap alone. Past the most a snap can move, and far below a cell. See [E18].
 const SNAP_REACH_MARGIN: f64 = 1.0e-4;
 
-/// What snapping found for a cell, on the stones of a [`SnapAnchor`].
-#[derive(Clone, Copy, Debug, Default)]
-enum SavedSnap {
-    #[default]
-    Unknown,
-    Rejected,
-    Kept(Point),
-}
-
-/// Snaps a search's grids can share.
+/// The root's grid, which the grids of its nodes start from.
 ///
-/// Every node's grid snaps the cells around every stone, and a node differs from the
-/// root by a few stones, so nearly all of that work was the same each time. This
-/// keeps the root's answers. A cell far enough from the stones a node differs by
-/// reads the saved one. Nothing here is needed for correctness: with no root
-/// announced, every grid snaps from nothing.
+/// Every node's grid decides every cell, and a node differs from the root by a few
+/// stones, so nearly all of that work was the same each time. A cell's verdict can
+/// only depend on stones near it, so a node copies the root's verdicts and decides
+/// again only the cells near the stones it differs by. Nothing here is needed for
+/// correctness: with no root announced, every grid decides every cell.
 #[derive(Debug, Default)]
-struct SnapAnchor {
+struct GridAnchor {
     width: usize,
     height: usize,
     radius_bits: u64,
     stones: StoneRun,
-    answers: Vec<SavedSnap>,
+    /// Whether `legal` and `overrides` hold the root's grid yet.
+    ready: bool,
+    legal: Vec<u64>,
+    overrides: Vec<(usize, Point)>,
+    /// Cells to decide again, as bits in the shape of `legal`.
+    stale: Vec<u64>,
     /// Set by [`next_grid_is_search_root`], and spent by the next grid.
     next_is_root: bool,
+    #[cfg(test)]
+    grids_copied: usize,
 }
 
-impl SnapAnchor {
+impl GridAnchor {
     /// Compares a grid with the anchor, moving the anchor to it if a root was
-    /// announced. Returns whether the grid can use the saved answers.
+    /// announced. Returns whether the grid can start from the root's.
     fn prepare(&mut self, position: &Position, width: usize, height: usize) -> bool {
         let same_board = self.width == width
             && self.height == height
@@ -76,28 +74,69 @@ impl SnapAnchor {
         if !std::mem::take(&mut self.next_is_root)
             || (fit == StoneFit::Extends && self.stones.differing().is_empty())
         {
-            return fit != StoneFit::Unrelated;
+            return fit != StoneFit::Unrelated && self.ready;
         }
         self.width = width;
         self.height = height;
         self.radius_bits = position.radius().to_bits();
         self.stones.set(position.stones());
-        self.answers.clear();
-        self.answers.resize(width * height, SavedSnap::Unknown);
-        true
+        self.ready = false;
+        false
+    }
+
+    /// Keeps a grid as the root's, if one was announced and this is it.
+    fn keep(&mut self, legal: &[u64], overrides: &[(usize, Point)], width: usize, radius: f64) {
+        if !self.ready
+            && self.width == width
+            && self.radius_bits == radius.to_bits()
+            && self.stones.differing().is_empty()
+        {
+            self.legal.clear();
+            self.legal.extend_from_slice(legal);
+            self.overrides.clear();
+            self.overrides.extend_from_slice(overrides);
+            self.ready = true;
+        }
+    }
+
+    /// Marks every cell whose centre is within `reach` of a differing stone: the
+    /// cells [`StoneRun::differing_beyond`] would not clear. Proof: [E18].
+    fn mark_stale(&mut self, xs: &[f64], ys: &[f64], reach: f64) {
+        let (width, height) = (xs.len(), ys.len());
+        self.stale.clear();
+        self.stale.resize(self.legal.len(), 0);
+        let reach_square = reach * reach;
+        let span = |centre: f64, size: usize| {
+            let low = ((centre - reach) * size as f64 - 1.5).floor().max(0.0) as usize;
+            let high = (((centre + reach) * size as f64 + 0.5).ceil() as usize).min(size);
+            low..high
+        };
+        for stone in self.stones.differing() {
+            for row in span(stone.y, height) {
+                let dy = stone.y - ys[row];
+                let dy_square = dy * dy;
+                for col in span(stone.x, width) {
+                    let dx = stone.x - xs[col];
+                    if dx * dx + dy_square < reach_square {
+                        let cell = row * width + col;
+                        self.stale[cell / 64] |= 1 << (cell % 64);
+                    }
+                }
+            }
+        }
     }
 }
 
 thread_local! {
     /// One grid per tree node, each needing this only while it is built.
     static NEAREST_SQUARES: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
-    static SNAP_ANCHOR: RefCell<SnapAnchor> = RefCell::default();
+    static GRID_ANCHOR: RefCell<GridAnchor> = RefCell::default();
 }
 
 /// Says the next grid on this thread is the root of a search, whose nodes' grids are
 /// the ones after it.
 pub(crate) fn next_grid_is_search_root() {
-    SNAP_ANCHOR.with_borrow_mut(|anchor| anchor.next_is_root = true);
+    GRID_ANCHOR.with_borrow_mut(|anchor| anchor.next_is_root = true);
 }
 
 /// A fine placement grid of logits over `[0,1]^2`, plus the legal mask, ready for
@@ -271,10 +310,8 @@ impl FineGrid {
         // stone reaches keep infinity, which satisfies both thresholds exactly
         // as an untouched cell should.
         let snap_reach = half_diagonal + exclusion + SNAP_REACH_MARGIN;
-        let snap_reach_square = snap_reach * snap_reach;
-        let mut borrowed_anchor = SNAP_ANCHOR.take();
-        let anchor = &mut borrowed_anchor;
-        let reads_answers = anchor.prepare(position, width, height);
+        let mut anchor = GRID_ANCHOR.take();
+        let copies_root = anchor.prepare(position, width, height) && shared.is_some();
         NEAREST_SQUARES.with_borrow_mut(|nearest_squared| {
             // Per axis, not per cell: the board's edges and each cell's centre are
             // products of one row and one column, so a grid per node need not
@@ -283,78 +320,93 @@ impl FineGrid {
             let xs: Vec<f64> = (0..width)
                 .map(|col| (col as f64 + 0.5) / width as f64)
                 .collect();
+            let ys: Vec<f64> = (0..height)
+                .map(|row| (row as f64 + 0.5) / height as f64)
+                .collect();
             nearest_stone_squares(position, &xs, height, exclusion, nearest_squared);
             let inset = |value: f64| {
                 value >= radius - COORDINATE_EPSILON && value <= 1.0 - radius + COORDINATE_EPSILON
             };
             let side_slack = |value: f64| (value - radius).min(1.0 - radius - value);
             let columns: Vec<(bool, f64)> = xs.iter().map(|&x| (inset(x), side_slack(x))).collect();
+            let rows: Vec<(bool, f64)> = ys.iter().map(|&y| (inset(y), side_slack(y))).collect();
             let threshold = exclusion - half_diagonal;
             let threshold_squared = threshold * threshold;
-            for row in 0..height {
-                let y = (row as f64 + 0.5) / height as f64;
-                let (row_inset, row_slack) = (inset(y), side_slack(y));
-                let base = row * width;
-                let cells = &nearest_squared[base..base + width];
-                for (col, (&nearest, &(column_inset, column_slack))) in
-                    cells.iter().zip(&columns).enumerate()
+            // Whether a cell is playable, and where if not at its centre.
+            let decide = |row: usize, col: usize| -> Option<Option<Point>> {
+                let nearest = nearest_squared[row * width + col];
+                let (row_inset, row_slack) = rows[row];
+                let (column_inset, column_slack) = columns[col];
+                if row_inset && column_inset && nearest >= minimum_squared {
+                    Some(None)
+                } else if column_slack.min(row_slack) >= -half_diagonal
+                    && (threshold <= 0.0 || nearest >= threshold_squared)
                 {
-                    let idx = base + col;
-                    let placement_override =
-                        if row_inset && column_inset && nearest >= minimum_squared {
-                            None
-                        } else if column_slack.min(row_slack) >= -half_diagonal
-                            && (threshold <= 0.0 || nearest >= threshold_squared)
-                        {
-                            // Only a point inside this cell is kept, and such a point
-                            // is within half a diagonal of its centre.
-                            let point = Point::new(xs[col], y);
-                            // Stones this far away cannot change what snapping
-                            // finds in this cell: [E18].
-                            let saved = (reads_answers
-                                && anchor.stones.differing_beyond(point, snap_reach_square))
-                            .then(|| &mut anchor.answers[idx]);
-                            let answer = saved.as_deref().copied().unwrap_or_default();
-                            let answer = if let SavedSnap::Unknown = answer {
-                                let snapped = nearest_legal_placement_indexed_within(
-                                    position,
-                                    point,
-                                    index,
-                                    half_diagonal,
-                                );
-                                let inside = snapped.legal
-                                    && (snapped.point.x - point.x).abs() <= half_x
-                                    && (snapped.point.y - point.y).abs() <= half_y;
-                                let answer = if inside {
-                                    SavedSnap::Kept(snapped.point)
-                                } else {
-                                    SavedSnap::Rejected
-                                };
-                                if let Some(saved) = saved {
-                                    *saved = answer;
-                                }
-                                answer
-                            } else {
-                                answer
-                            };
-                            match answer {
-                                SavedSnap::Kept(point) => Some(point),
-                                _ => continue,
+                    // Only a point inside this cell is kept, and such a point
+                    // is within half a diagonal of its centre.
+                    let point = Point::new(xs[col], ys[row]);
+                    let snapped = nearest_legal_placement_indexed_within(
+                        position,
+                        point,
+                        index,
+                        half_diagonal,
+                    );
+                    let inside = snapped.legal
+                        && (snapped.point.x - point.x).abs() <= half_x
+                        && (snapped.point.y - point.y).abs() <= half_y;
+                    inside.then_some(Some(snapped.point))
+                } else {
+                    None
+                }
+            };
+            if copies_root {
+                #[cfg(test)]
+                {
+                    anchor.grids_copied += 1;
+                }
+                // Cells clear of the differing stones keep the root's verdict: [E18].
+                legal.copy_from_slice(&anchor.legal);
+                anchor.mark_stale(&xs, &ys, snap_reach);
+                let mut root_overrides = anchor.overrides.iter().copied().peekable();
+                for (word, &bits) in anchor.stale.iter().enumerate() {
+                    let mut bits = bits;
+                    while bits != 0 {
+                        let idx = word * 64 + bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        while let Some(kept) = root_overrides.next_if(|&(cell, _)| cell < idx) {
+                            placement_overrides.push(kept);
+                        }
+                        root_overrides.next_if(|&(cell, _)| cell == idx);
+                        legal[idx / 64] &= !(1u64 << (idx % 64));
+                        if let Some(placement) = decide(idx / width, idx % width) {
+                            legal[idx / 64] |= 1u64 << (idx % 64);
+                            if let Some(point) = placement {
+                                placement_overrides.push((idx, point));
                             }
-                        } else {
-                            continue;
-                        };
-                    legal[idx / 64] |= 1u64 << (idx % 64);
-                    if shared.is_none() {
-                        logits[idx] = logit_at(row, col);
-                    }
-                    if let Some(point) = placement_override {
-                        placement_overrides.push((idx, point));
+                        }
                     }
                 }
+                placement_overrides.extend(root_overrides);
+            } else {
+                for row in 0..height {
+                    for col in 0..width {
+                        let idx = row * width + col;
+                        let Some(placement) = decide(row, col) else {
+                            continue;
+                        };
+                        legal[idx / 64] |= 1u64 << (idx % 64);
+                        if shared.is_none() {
+                            logits[idx] = logit_at(row, col);
+                        }
+                        if let Some(point) = placement {
+                            placement_overrides.push((idx, point));
+                        }
+                    }
+                }
+                anchor.keep(&legal, &placement_overrides, width, radius);
             }
         });
-        SNAP_ANCHOR.set(borrowed_anchor);
+        GRID_ANCHOR.set(anchor);
         // Scratch headroom is useful while snapping; it need not live in every
         // retained tree node. Empty grids also release the initial 6 KiB slab.
         placement_overrides.shrink_to_fit();
@@ -375,10 +427,11 @@ impl FineGrid {
         (self.width, self.height)
     }
 
-    /// Whether two points fall in the same fine cell of this grid.
+    /// The fine cell a point falls in, as a row-major index.
     #[must_use]
-    pub fn same_cell(&self, a: Point, b: Point) -> bool {
-        self.cell_of(a) == self.cell_of(b)
+    pub fn cell_index(&self, point: Point) -> u32 {
+        let (row, col) = self.cell_of(point);
+        (row * self.width + col) as u32
     }
 
     fn cell_of(&self, p: Point) -> (usize, usize) {
@@ -399,17 +452,39 @@ impl FineGrid {
     fn coarse_max(&self, crow: usize, ccol: usize) -> Option<f32> {
         let r0 = crow * self.coarse;
         let c0 = ccol * self.coarse;
-        let mut best: Option<f32> = None;
+        let columns = (c0 + self.coarse).min(self.width) - c0;
+        let mut best = f32::NEG_INFINITY;
+        let mut any = false;
         for row in r0..(r0 + self.coarse).min(self.height) {
-            for col in c0..(c0 + self.coarse).min(self.width) {
-                let idx = row * self.width + col;
-                if self.legal_at(idx) {
-                    let v = self.logits[idx];
-                    best = Some(best.map_or(v, |b| b.max(v)));
+            let first = row * self.width + c0;
+            let logits = &self.logits[first..first + columns];
+            // A coarse cell is rarely wider than a word, and two words always hold it.
+            for (chunk, logits) in logits.chunks(64).enumerate() {
+                let bits = self.legal_bits(first + 64 * chunk);
+                any |= bits & low_bits(logits.len()) != 0;
+                for (bit, &value) in logits.iter().enumerate() {
+                    // A comparison rather than `f32::max`, which pays to handle NaN:
+                    // a model's logits are checked finite before they reach a grid.
+                    let value = if bits >> bit & 1 != 0 {
+                        value
+                    } else {
+                        f32::NEG_INFINITY
+                    };
+                    best = if value > best { value } else { best };
                 }
             }
         }
-        best
+        any.then_some(best)
+    }
+
+    /// The legal bits of the 64 cells from `index` on, lowest cell first.
+    fn legal_bits(&self, index: usize) -> u64 {
+        let (word, shift) = (index / 64, index % 64);
+        let low = self.legal[word] >> shift;
+        match self.legal.get(word + 1) {
+            Some(&next) if shift != 0 => low | next << (64 - shift),
+            _ => low,
+        }
     }
 
     fn placement_at(&self, row: usize, col: usize) -> Point {
@@ -570,6 +645,15 @@ fn sample_candidates_with(
         });
     }
     out
+}
+
+/// A mask of the lowest `count` bits, for `count` up to 64.
+const fn low_bits(count: usize) -> u64 {
+    if count >= 64 {
+        u64::MAX
+    } else {
+        (1 << count) - 1
+    }
 }
 
 /// Whether a cell's illegal centre is close enough to the legal boundary that
@@ -826,9 +910,9 @@ mod tests {
     fn both_grids(position: &Position, size: usize) -> (FineGrid, FineGrid) {
         let logits = || Arc::new(vec![0.0_f32; size * size]);
         let anchored = FineGrid::from_shared_logits(position, size, size, 4, logits());
-        let kept = SNAP_ANCHOR.take();
+        let kept = GRID_ANCHOR.take();
         let fresh = FineGrid::from_shared_logits(position, size, size, 4, logits());
-        SNAP_ANCHOR.set(kept);
+        GRID_ANCHOR.set(kept);
         (anchored, fresh)
     }
 
@@ -850,6 +934,62 @@ mod tests {
         }
     }
 
+    /// The coarse scan reads legality a word at a time, so a cell can straddle two
+    /// words, which sizes like 128 and 16 never show.
+    #[test]
+    fn the_coarse_maximum_matches_a_scan_of_every_cell() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (width, height, coarse) in [
+            (70_usize, 9_usize, 7_usize),
+            (128, 4, 16),
+            (131, 5, 13),
+            (200, 3, 100),
+        ] {
+            for per_hundred in [0, 3, 40, 100] {
+                let logits: Vec<f32> = (0..width * height)
+                    .map(|_| (next() % 2000) as f32 / 100.0 - 10.0)
+                    .collect();
+                let mut legal = vec![0u64; (width * height).div_ceil(64)];
+                for cell in 0..width * height {
+                    if next() % 100 < per_hundred {
+                        legal[cell / 64] |= 1 << (cell % 64);
+                    }
+                }
+                let grid = FineGrid {
+                    width,
+                    height,
+                    coarse,
+                    logits: Arc::new(logits),
+                    legal,
+                    placement_overrides: Vec::new(),
+                    coarse_distribution: OnceLock::new(),
+                };
+                let (coarse_width, coarse_height) = grid.coarse_dims();
+                for crow in 0..coarse_height {
+                    for ccol in 0..coarse_width {
+                        let mut expected: Option<f32> = None;
+                        for row in crow * coarse..((crow + 1) * coarse).min(height) {
+                            for col in ccol * coarse..((ccol + 1) * coarse).min(width) {
+                                let cell = row * width + col;
+                                if grid.legal_at(cell) {
+                                    let value = grid.logits[cell];
+                                    expected = Some(expected.map_or(value, |b| b.max(value)));
+                                }
+                            }
+                        }
+                        assert_eq!(grid.coarse_max(crow, ccol), expected);
+                    }
+                }
+            }
+        }
+    }
+
     /// Every path through the anchor against a grid snapped from nothing: nodes
     /// branching off a root, captures from the middle of the list, a jump to another
     /// game, and a change of grid size on the same thread.
@@ -865,7 +1005,7 @@ mod tests {
             state ^= state << 17;
             (state % limit as u64) as usize
         };
-        let (mut overrides, mut saved) = (0usize, 0usize);
+        let mut overrides = 0usize;
         for game in 0..12 {
             let mut root: Vec<usize> = (0..points.len()).collect();
             for at in 0..root.len() {
@@ -892,18 +1032,12 @@ mod tests {
                 let (anchored, fresh) = both_grids(&position, size);
                 assert_same_grid(&anchored, &fresh, &format!("game {game} node {node}"));
                 overrides += fresh.placement_overrides.len();
-                saved += SNAP_ANCHOR.with_borrow(|anchor| {
-                    anchor
-                        .answers
-                        .iter()
-                        .filter(|answer| !matches!(answer, SavedSnap::Unknown))
-                        .count()
-                });
             }
         }
-        // A run with nothing to snap, or that never saved an answer, proved nothing.
+        // A run with nothing to snap, or that never copied a root, proved nothing.
         assert!(overrides > 1000, "{overrides} overrides");
-        assert!(saved > 1000, "saved {saved} answers");
+        let copied = GRID_ANCHOR.with_borrow(|anchor| anchor.grids_copied);
+        assert!(copied > 100, "copied {copied} grids");
     }
 
     /// An answer belongs to its radius and its grid as well as to its stones.

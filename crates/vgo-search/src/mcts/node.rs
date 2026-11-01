@@ -6,6 +6,9 @@ use crate::{
     FineGrid,
 };
 
+/// In [`Node::child_cells`], a child with no cell, which is what a pass is.
+const NO_CELL: u32 = u32::MAX;
+
 pub(super) struct Child {
     pub(super) candidate: Candidate,
     /// The rules refused this move, so it is not selectable.
@@ -53,6 +56,10 @@ pub(crate) struct Node {
     /// In-flight descents through this node; see `Child::virtual_visits`.
     pub(super) virtual_visits: u32,
     pub(super) children: Vec<Child>,
+    /// Each child's fine-grid cell, or [`NO_CELL`], in `children` order. Kept as
+    /// integers because a sampled move is checked against every child, on nodes
+    /// with hundreds of them, and comparing points cost 10% of all generation.
+    child_cells: Vec<u32>,
     /// The legacy sequence is comparatively expensive to construct because it
     /// enumerates legal vertices. Dense spatial policies never use it, so build
     /// it only if coarse-to-fine sampling is unavailable.
@@ -89,7 +96,8 @@ impl Node {
         fn visit(node: &Node, counter: &mut crate::memory::MemoryCounter) {
             counter.report.nodes += 1;
             counter.report.node_bytes += size_of::<Node>();
-            counter.report.edge_capacity_bytes += node.children.capacity() * size_of::<Child>();
+            counter.report.edge_capacity_bytes += node.children.capacity() * size_of::<Child>()
+                + node.child_cells.capacity() * size_of::<u32>();
             counter.report.position_bytes += std::mem::size_of_val(node.position.stones());
             if let Some(candidates) = &node.candidates {
                 counter.report.sampling_bytes +=
@@ -129,6 +137,7 @@ impl Node {
             visits: 0,
             virtual_visits: 0,
             children: Vec::new(),
+            child_cells: Vec::new(),
             candidates: None,
             candidates_exhausted: false,
             evaluation: Some(evaluation),
@@ -151,6 +160,7 @@ impl Node {
             visits: 0,
             virtual_visits: 0,
             children: Vec::new(),
+            child_cells: Vec::new(),
             candidates: None,
             candidates_exhausted: true,
             terminal_black_value: Some(black_value),
@@ -359,20 +369,25 @@ impl Node {
         let samples =
             crate::coarse_fine::sample_candidates_noisy(grid, draw_count, noise, &mut next);
         self.sample_rng = rng;
+        let known = self.child_cells.len();
+        self.child_cells
+            .extend(
+                self.children[known..]
+                    .iter()
+                    .map(|child| match child.candidate.action {
+                        Action::Place(point) => grid.cell_index(point),
+                        Action::Pass => NO_CELL,
+                    }),
+            );
         for sample in samples {
             self.proposal_draws += 1;
             let action = Action::Place(sample.point);
-            if let Some(existing) =
-                self.children
-                    .iter_mut()
-                    .find(|child| match child.candidate.action {
-                        Action::Place(existing) => grid.same_cell(existing, sample.point),
-                        Action::Pass => false,
-                    })
-            {
-                existing.proposal_count += 1;
+            let cell = grid.cell_index(sample.point);
+            if let Some(index) = self.child_cells.iter().position(|&known| known == cell) {
+                self.children[index].proposal_count += 1;
                 continue;
             }
+            self.child_cells.push(cell);
             let policy_logit = self
                 .evaluation
                 .as_ref()
