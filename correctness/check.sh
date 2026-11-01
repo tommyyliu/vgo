@@ -16,6 +16,7 @@ cargo fmt --all --check
 cargo clippy --release --workspace --exclude vgo-wasm --all-targets --quiet -- -D warnings
 cargo test --release -p vgo-core -p vgo-raster -p vgo-search -p vgo-inference -p vgo-selfplay -p vgo-bench -p vgo-wasm --quiet
 cargo check --release -p vgo-wasm --target wasm32-unknown-unknown --quiet
+cargo check --release -p vgo-selfplay -p vgo-bench --features profiling --all-targets --quiet
 (cd training && PYTHONPATH=. uv run --extra tensorrt --with pytest python -m pytest tests --quiet -p no:cacheprovider)
 
 (cd training && PYTHONPATH=.. uv run --extra tensorrt --with pytest python -m pytest ../dashboard/tests --quiet -p no:cacheprovider)

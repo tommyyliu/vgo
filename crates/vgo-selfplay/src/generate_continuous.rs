@@ -784,7 +784,9 @@ fn main() -> io::Result<()> {
             Err(error) => eprintln!("[cuda] blocking sync unavailable, continuing: {error}"),
         }
     }
-    start_profiler(config.profile_output.as_deref())?;
+    // A unit without the `profiling` feature, which is the point of the alias.
+    #[allow(clippy::let_unit_value)]
+    let profiler = start_profiler(config.profile_output.as_deref())?;
     let raster = RasterConfig::square_of(config.resolution, config.raster_kind);
     let policy_size = RasterConfig::square(config.policy_resolution).pixels() + 1;
     let root = config.output_root.join(&config.label);
@@ -834,7 +836,7 @@ fn main() -> io::Result<()> {
     let failure = join_actors(handles);
     reporter.finish()?;
     // Preserve the profile even when a genuine actor/backend failure occurred.
-    finish_profiler((), config.profile_output.as_deref())?;
+    finish_profiler(profiler, config.profile_output.as_deref())?;
     match failure {
         Some(error) => Err(error),
         None => print_summary(&config.label, &run),

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use vgo_core::{Color, Position, SettledRegion, legal_set_vertices};
+use vgo_core::{Color, Position, SettledRegion};
 
 mod edt;
 pub mod packed;
@@ -642,12 +642,13 @@ pub(crate) fn rasterize_into(position: &Position, config: RasterConfig, data: &m
 pub fn settled_mask(position: &Position, config: RasterConfig) -> Vec<bool> {
     let pixels = config.pixels();
     let stones = position.stones();
-    let known_vertices = legal_set_vertices(position);
+    let index = std::sync::Arc::clone(position.legal_index());
+    let known_vertices = index.vertices();
     let mut settled = vec![false; pixels];
     let mut contour = Vec::new();
     let mut crossings: Vec<f64> = Vec::with_capacity(16);
-    for index in 0..stones.len() {
-        let region = SettledRegion::new(position, index, &known_vertices);
+    for stone in 0..stones.len() {
+        let region = SettledRegion::new(position, stone, known_vertices);
         // One pixel: the contour is only used to classify pixel centres, and
         // finer chord detail cannot be represented by the output mask. This is
         // far cheaper than the 2e-5 the client needs for a zoomable vector.
