@@ -7,7 +7,7 @@
 
 ## Question
 
-Can legal play under [`reference/RULES.md`](../../reference/RULES.md) return to an earlier complete game position in
+Can legal play under [`spec/FORMAL.md`](../../spec/FORMAL.md) return to an earlier complete game position in
 a way that players would rationally repeat?
 
 A repeated position should initially mean the same radius, stone centers,

@@ -1,5 +1,7 @@
 # Project restart roadmap
 
+> Frozen on 2026-10-31. The current plan is [`DIRECTION.md`](../../DIRECTION.md).
+
 Updated: 2026-10-14. Status: items 1–5 have completed bounded measurements;
 item 6 has a measured arena prototype; item 7 has bounded failure
 handling and verification. Experiment defaults retained pending stronger strength evidence.
@@ -40,7 +42,7 @@ separation, batch fill, and unchanged replay targets. CPU smoke runs reconcile
 with published manifests. The fixed-position CPU baseline and a 120-second
 neural self-play profile on the RTX 5070 Ti cover opening, middle, and late
 stages and identify exact legal-space queries in raster classification as the
-first optimization target. See [restart measurements](../docs/research/RESTART_2026-10-13.md).
+first optimization target. See [restart measurements](RESTART_2026-10-13.md).
 
 - Report periodic plies/s, completed games/h, samples/h, inference encoding,
   queue and execution timings, observed batch sizes, and process memory.
@@ -71,7 +73,7 @@ sample counts. Two additional alternating neural benchmark pairs at 32 actors,
 gain and 12.9% less encoding time; the individual gains vary from 1.5% to 7.3%.
 These saved-position searches cover mature boards, but exclude publication and
 do not establish a sustained learning-rate improvement. Retain the equivalent
-pruning and prioritize model cost next. See [production results](../docs/research/RESTART_2026-10-14.md).
+pruning and prioritize model cost next. See [production results](RESTART_2026-10-14.md).
 
 - Investigate whichever dominates: board transitions and settlement, packed
   raster construction, or legal policy-grid construction. Prefer eliminating
@@ -86,11 +88,11 @@ pruning and prioritize model cost next. See [production results](../docs/researc
   improvement beyond timing noise in both the affected benchmark and a matched
   neural self-play run.
 
-Evidence: [benchmark history](../benchmarks/history.jsonl),
-[geometry lab](../docs/research/BOARD_ITERATION_LAB.md), and
-[support throughput](../docs/research/DENSE_SUPPORT_THROUGHPUT.md). The support
+Evidence: [benchmark history](../../benchmarks/history.jsonl),
+[geometry lab](BOARD_ITERATION_LAB.md), and
+[support throughput](DENSE_SUPPORT_THROUGHPUT.md). The support
 backend's large synthetic-grid wins did not reliably transfer to played
-positions. This work continues [ticket 007](007-geometry-performance.md).
+positions. This work continues [ticket 007](../../todo/007-geometry-performance.md).
 
 ### 3. Inexpensive model experiments
 
@@ -101,7 +103,7 @@ architecture, checkpoint compatibility and packed export pass their checks;
 same-corpus training is stable and serving is modestly faster. Four fresh arenas
 show mixed, inconclusive strength results. Retain two norms and the existing
 campaign settings; 128 is the leading candidate for a new efficiency-focused
-campaign, subject to a larger strength replication. See [results and recipes](../docs/research/RESTART_2026-10-14.md).
+campaign, subject to a larger strength replication. See [results and recipes](RESTART_2026-10-14.md).
 
 - First compare 128 and 256 input rasters at the same 128 policy resolution,
   using the same corpus and training recipe. Measure generation throughput,
@@ -114,8 +116,8 @@ campaign, subject to a larger strength replication. See [results and recipes](..
 - Acceptance: a recorded adopt/reject/inconclusive decision for each variant,
   with model artifacts and reproducible commands.
 
-Evidence: [resolution match](../artifacts/res-ab/arena-r38.json) and
-[normalization measurements](../docs/MODEL_ARCHITECTURE.md). One norm per block
+Evidence: [resolution match](../../artifacts/res-ab/arena-r38.json) and
+[normalization measurements](../MODEL_ARCHITECTURE.md). One norm per block
 has measured speed gains but no measured strength result.
 
 ### 4. Randomized search budgets and sample quality
@@ -134,7 +136,7 @@ generation-plus-training wall time by 0.6%. Randomized data scores 28–20 small
 and 26–22 big at equal thinking time, with both intervals including 50%.
 Adoption needs a larger-turnover, multiple-seed or multiple-update replication;
 the current controls stay opt-in. See
-[results, caveats and failed-attempt provenance](../docs/research/RESTART_2026-10-14.md).
+[results, caveats and failed-attempt provenance](RESTART_2026-10-14.md).
 
 - Mix occasional full searches with cheaper searches on other turns. Keep this
   separate from the existing reduction after soft resignation.
@@ -158,7 +160,7 @@ replay labels. Most tail boards change; actual soft-concession reversals were
 2/23 fixed and 14/49 randomized, so broad tail exclusion is unsupported. Keep
 soft continuation and current weights. Fixed the calibration sweep's missing
 minimum-ply floor and separated incompatible calibration histories. See
-[audit and follow-up](../docs/research/TREE_REUSE_2026-10-14.md).
+[audit and follow-up](TREE_REUSE_2026-10-14.md).
 
 **Established project context:** earlier investigations allowed bots to continue
 playing and found that they stalled even on completely settled boards. Soft

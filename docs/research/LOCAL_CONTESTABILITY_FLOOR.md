@@ -105,12 +105,12 @@ tangencies that a sampled picture could miss.
 
 ## Reproduce
 
-[The standalone certificate](../diagnostics/check_locality_floor.py) uses only
+[The standalone certificate](../scripts/check_locality_floor.py) uses only
 Python's standard library and `Fraction`; all decision comparisons are exact.
 Only the printed summaries are converted to floating point.
 
 ```sh
-python diagnostics/check_locality_floor.py
+python scripts/check_locality_floor.py
 cargo test -p vgo-core --features iteration-lab --lib iteration_lab::locality -- --nocapture
 ```
 

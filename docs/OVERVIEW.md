@@ -4,9 +4,9 @@ Start here. This is the map: what the system does, how the pieces fit, and why
 the load-bearing decisions are what they are. Each section ends with where to
 read more.
 
-For a deeper hierarchical explanation of the ideas and their dependencies, see
-[`PROJECT_OUTLINE.md`](PROJECT_OUTLINE.md). Current implementation work and its
-acceptance criteria are in the [`restart roadmap`](../todo/ROADMAP.md).
+The game and its mathematics are in [`spec/`](../spec/RULES.md), including
+[`the core algorithms`](../spec/ALGORITHMS.md). The current plan is
+[`DIRECTION.md`](../DIRECTION.md).
 
 ---
 
@@ -15,7 +15,7 @@ acceptance criteria are in the [`restart roadmap`](../todo/ROADMAP.md).
 An AlphaZero-style reinforcement learning system for **Voronoi Go**, a
 continuous-action variant of Go. A stone is placed at any real coordinate, not
 on a grid intersection; territory is decided by Voronoi cells. The rules are in
-[`reference/RULES.md`](../reference/RULES.md), with a JavaScript implementation
+[`spec/FORMAL.md`](../spec/FORMAL.md), with a JavaScript implementation
 in [`reference/`](../reference/README.md) that serves as the behavioural oracle.
 
 Continuous placement is the fact that drives most design decisions below. There

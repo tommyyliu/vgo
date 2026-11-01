@@ -1,36 +1,49 @@
 # Voronoi Go
 
-AlphaZero-style self-play for the continuous-action game defined in
-[`reference/RULES.md`](reference/RULES.md): stones go anywhere in the unit
+AlphaZero-style self-play for a continuous-action game: stones go anywhere in the unit
 square, and territory is decided by Voronoi cells.
 
-**New here? Read [`docs/OVERVIEW.md`](docs/OVERVIEW.md)**, then
-[`docs/RUNNING.md`](docs/RUNNING.md) for commands.
+| Read this | For |
+|---|---|
+| [`spec/RULES.md`](spec/RULES.md) | the game, in one page |
+| [`DIRECTION.md`](DIRECTION.md) | the goal, active bets and working rules |
+| [`docs/OVERVIEW.md`](docs/OVERVIEW.md) | how the system fits together |
+| [`spec/ALGORITHMS.md`](spec/ALGORITHMS.md) | the core ideas, separate from the code |
+| [`docs/RUNNING.md`](docs/RUNNING.md) | commands |
 
-For the ideas behind the whole system, read the hierarchical
-[`project outline`](docs/PROJECT_OUTLINE.md). The current work order is in the
-[`restart roadmap`](todo/ROADMAP.md).
-
-**Want the bot on a website?** [`client/`](client/README.md) is a self-contained
-browser opponent: the engine compiled to WebAssembly plus a small ES module, with
-no server and no GPU to operate.
+Run `scripts/check.sh` before merging.
 
 ## Layout
 
 | path | what it is |
 |---|---|
+| [`spec/`](spec/RULES.md) | rules, formal rules, lemmas with proofs, algorithms |
 | [`crates/vgo-core`](crates/vgo-core) | exact rules engine: legality, Voronoi geometry, captures, scoring |
 | [`crates/vgo-search`](crates/vgo-search) | progressive-widening MCTS with coarse-to-fine candidate sampling |
-| [`crates/vgo-raster`](crates/vgo-raster) | position -> model input tensor; `vgo-render-shard`/`vgo-pack-shard` for the Python loader |
-| [`crates/vgo-inference`](crates/vgo-inference) | ONNX Runtime / TensorRT sessions behind a batching broker |
-| [`crates/vgo-selfplay`](crates/vgo-selfplay) | `vgo-generate-continuous`, `vgo-arena`, `vgo-serve-move` |
+| [`crates/vgo-raster`](crates/vgo-raster) | position to model input; `vgo-render-shard`, `vgo-pack-shard` |
+| [`crates/vgo-inference`](crates/vgo-inference) | ONNX Runtime sessions behind a batching broker |
+| [`crates/vgo-selfplay`](crates/vgo-selfplay) | `vgo-generate-continuous`, `vgo-arena`, `vgo-serve-move`, `vgo-bench` |
 | [`crates/vgo-wasm`](crates/vgo-wasm) | the engine for the browser client |
 | [`training/`](training) | PyTorch model, learner, ONNX export |
-| [`scripts/`](scripts) | the loop (`bulk-loop.sh`) and its tools |
 | [`client/`](client/README.md) | the embeddable browser bot |
-| [`reference/`](reference/README.md) | JavaScript reference implementation, rules and proofs: the behavioural oracle |
-| [`docs/`](docs) | system docs; [`docs/research/`](docs/research) holds geometry and search research write-ups |
-| [`todo/`](todo/README.md) | backlog |
+| [`scripts/`](scripts) | the loop (`bulk-loop.sh`), checks and tools |
+| [`reference/`](reference/README.md) | JavaScript implementation, kept as a behavioural oracle |
+| [`docs/`](docs) | system docs; [`docs/research/`](docs/research/README.md) holds dated, frozen notes |
+| [`todo/`](todo/README.md) | backlog tickets |
+| `benchmarks/` | fixture positions, timing history, golden digests |
+| `artifacts/` | run output, not tracked. `artifacts/old/` is the archive |
+
+## Tech stack
+
+| Area | Part | Tools |
+|---|---|---|
+| Self-play | Rules, search, rasterization | Rust |
+| | Inference | Rust, ONNX Runtime through `ort` (CUDA, TensorRT) |
+| Training | Rasterization | Rust binaries called from Python, with a NumPy fallback |
+| | ML loop | Python, PyTorch, ONNX export, `uv`; driven by Bash |
+| Website | Browser bot | Rust compiled to WebAssembly, plain JS, `onnxruntime-web`; no server |
+| Evaluation | Arena and ratings | Rust `vgo-arena`, Python Bradley-Terry |
+| Reference | Oracle | JavaScript, tests run through PowerShell |
 
 Code for experiments that were concluded (the shard pipeline, Muon, the flat and
 U-Net nets, RGB rasters, tournament tooling and the rest) was removed on

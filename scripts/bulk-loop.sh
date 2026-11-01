@@ -3,7 +3,7 @@
 #
 # ## Why this exists
 #
-# `continuous-loop.sh` warm-starts one epoch on a moving window every 12k
+# The old continuous loop warm-started one epoch on a moving window every 12k
 # samples. Twenty-two such updates produced a model that a *from scratch* run on
 # the same corpus beat 41-7 -- +307 Elo, CI [+195, +527], 48 games at equal
 # simulations. A 26M-parameter model trained the same way scored +154 against

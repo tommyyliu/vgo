@@ -3,8 +3,8 @@
 This folder is the project backlog. Each ticket should describe one bounded
 problem, its current status, and observable acceptance criteria.
 
-Start with the [project restart roadmap](ROADMAP.md) for the current work order,
-experiment acceptance criteria, and the established context on endgame stalling.
+Start with [`DIRECTION.md`](../DIRECTION.md) for current priorities. Endgame stalling
+context is in the [frozen roadmap](../docs/research/ROADMAP_2026-10.md).
 
 Status values:
 

@@ -1,7 +1,7 @@
 # A universal locality bound of (2 + 4 sqrt(2))r
 
 2026-09-22. Exact Euclidean geometry, square territory board, square inset for
-legal centers, and the rules in `reference/RULES.md`. This improves the general
+legal centers, and the rules in `spec/FORMAL.md`. This improves the general
 8.828427r bound in [the earlier note](LOCAL_CONTESTABILITY.md).
 
 **Theorem.** Keep an owner stone s and every stone whose center is within

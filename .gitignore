@@ -1,14 +1,7 @@
 /target/
+# Run output. Old runs are under artifacts/old/, which keeps the Official and
+# control runs apart so they can't pool into another Elo scale.
 /artifacts
-# The official-rules runs live in their own root, not a subdirectory of
-# artifacts/. scripts/build-dense-curve.py globs `artifacts/*/records.jsonl` and
-# fits one Bradley-Terry scale over everything it finds, so a run under a
-# different ruleset sitting inside artifacts/ would be pooled into an Elo scale
-# with models it has never played and could not play.
-/artifacts-official/
-# Control runs: the official-rules config with one variable changed, so they
-# must not pool into either scale. Same reasoning as artifacts-official/.
-/artifacts-control/
 /.idea/
 .venv
 /.agents/
@@ -27,12 +20,3 @@ __pycache__/
 # Built by client/build.js from vendor/ and src/.
 /client/dist/
 
-# Sweep workspace: 1.4 GB of shards, arena records and checkpoints. Its own
-# scripts live alongside them and are not tracked either, because they are
-# scratch for one experiment rather than part of the pipeline.
-/experiments/
-
-# Rendered from ratings.json by scripts/build-dense-curve.py, which is tracked,
-# so following diagnostics/.gitignore: only the scripts are.
-/curve.html
-/nohup.out

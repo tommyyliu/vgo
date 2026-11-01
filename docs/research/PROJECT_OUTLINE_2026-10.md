@@ -1,9 +1,11 @@
 # Voronoi Go: project and idea outline
 
+> Frozen on 2026-10-31. For current material see [`spec/`](../../spec/LEMMAS.md), [`OVERVIEW.md`](../OVERVIEW.md) and [`DIRECTION.md`](../../DIRECTION.md).
+
 Current implementation reviewed on 2026-10-13. This is a conceptual map of the
 system and the reasoning needed to understand it. Commands live in
-[RUNNING.md](RUNNING.md); the next work lives in the
-[restart roadmap](../todo/ROADMAP.md). Historical research notes may describe
+[RUNNING.md](../RUNNING.md); the next work lives in the
+[restart roadmap](ROADMAP_2026-10.md). Historical research notes may describe
 drivers or options removed in the September prune.
 
 ## 1. The objective and the dependency chain
@@ -102,9 +104,9 @@ counts as a pass. The Vgo rules permit repetition. The alternate `Official`
 ruleset represents the website's different capture and self-capture behavior;
 experiments must identify their ruleset explicitly.
 
-Sources: [rules](../reference/RULES.md),
-[derived properties](../reference/AXIOMS.md),
-[official-rule differences](OFFICIAL_RULES.md).
+Sources: [rules](../../spec/FORMAL.md),
+[derived properties](../../spec/LEMMAS.md),
+[official-rule differences](../OFFICIAL_RULES.md).
 
 ## 3. The mathematical reduction that makes the engine possible
 
@@ -176,10 +178,10 @@ implementation. The faster distance-transform raster is another way to obtain
 the indicator at model pixels. Capture uses the cell-vertex criterion, so none
 of these drawing choices has rule authority.
 
-Sources: [A3–A6](../reference/AXIOMS.md),
-[numeric implementation](../crates/vgo-core/src/numeric.rs),
-[locality upper bound](research/LOCAL_CONTESTABILITY_SHARP_BOUND.md),
-[support certificates](research/SUPPORT_CERTIFICATES.md).
+Sources: [A3–A6](../../spec/LEMMAS.md),
+[numeric implementation](../../crates/vgo-core/src/numeric.rs),
+[locality upper bound](LOCAL_CONTESTABILITY_SHARP_BOUND.md),
+[support certificates](SUPPORT_CERTIFICATES.md).
 
 ## 4. The native engine and its cost
 
@@ -217,10 +219,10 @@ The experiments establish useful possibilities, with mixed evidence on real
 positions. Their synthetic speedups must not be treated as neural self-play
 speedups.
 
-Sources: [native simulator decision](adr/0001-native-simulator.md),
-[iteration lab](research/BOARD_ITERATION_LAB.md),
-[search memory](research/MCTS_MEMORY_LAB.md),
-[support integration](research/SUPPORT_SEARCH_INTEGRATION.md).
+Sources: [native simulator decision](../adr/0001-native-simulator.md),
+[iteration lab](BOARD_ITERATION_LAB.md),
+[search memory](MCTS_MEMORY_LAB.md),
+[support integration](SUPPORT_SEARCH_INTEGRATION.md).
 
 ## 5. Searching an action space that cannot be enumerated
 
@@ -276,9 +278,9 @@ batches therefore change exploration and can reduce strength.
 The stepped search driver exposes this process to the browser event loop. It
 shares result assembly with native search so move selection semantics agree.
 
-Sources: [search implementation](../crates/vgo-search/src/mcts.rs),
-[coarse-to-fine sampling](../crates/vgo-search/src/coarse_fine.rs),
-[stepped driver](../crates/vgo-search/src/stepped.rs).
+Sources: [search implementation](../../crates/vgo-search/src/mcts.rs),
+[coarse-to-fine sampling](../../crates/vgo-search/src/coarse_fine.rs),
+[stepped driver](../../crates/vgo-search/src/stepped.rs).
 
 ### 5.6 Keeping useful work across actual moves
 
@@ -298,7 +300,7 @@ without today's root noise, and inherited visits were collected under an older
 search root. Defining how those affect proposal probabilities and targets is
 necessary before enabling reuse in self-play. The current prototype therefore
 supports zero-noise arena searches; the browser and self-play retain their
-existing search behavior. See the [reuse investigation](research/TREE_REUSE_2026-10-14.md).
+existing search behavior. See the [reuse investigation](TREE_REUSE_2026-10-14.md).
 
 ## 6. Turning sampled search into learnable policy targets
 
@@ -331,7 +333,7 @@ The resulting target is a practical estimator for this schedule, not a proof
 of unbiased policy improvement. Storing the raw ingredients makes it possible
 to audit or change the estimator without regenerating every game.
 
-Source: [policy redesign and estimator assumptions](POLICY_REDESIGN.md).
+Source: [policy redesign and estimator assumptions](../POLICY_REDESIGN.md).
 
 ## 7. Representation and the model
 
@@ -387,9 +389,9 @@ Ownership is an auxiliary head and currently has zero loss weight in the bulk
 recipe. Final board and score records now provide material for further
 auxiliary-target experiments, but their learning benefit is unestablished.
 
-Sources: [raster contract](RASTER_REPRESENTATION.md),
-[model architecture](MODEL_ARCHITECTURE.md),
-[model code](../training/vgo_training/model.py).
+Sources: [raster contract](../RASTER_REPRESENTATION.md),
+[model architecture](../MODEL_ARCHITECTURE.md),
+[model code](../../training/vgo_training/model.py).
 
 ## 8. Games, outcomes, and replay
 
@@ -442,9 +444,9 @@ A high cap rate alone does not reopen this investigation. The useful remaining
 question is whether capped scoring or cheap-tail sample weighting causes a
 specific learning/evaluation problem.
 
-Sources: [self-play architecture](SELFPLAY_ARCHITECTURE.md),
-[position records](POSITION_SHARDS.md),
-[shared generation](../crates/vgo-selfplay/src/generation.rs).
+Sources: [self-play architecture](../SELFPLAY_ARCHITECTURE.md),
+[position records](../POSITION_SHARDS.md),
+[shared generation](../../crates/vgo-selfplay/src/generation.rs).
 
 ## 9. Learning and model replacement
 
@@ -483,9 +485,9 @@ Loss screens an experiment and exposes failures. Playing fresh games decides
 whether the resulting player improved. Compare both equal-search-budget
 strength and equal-time strength when an experiment changes execution speed.
 
-Sources: [bulk loop and defaults](../scripts/bulk-loop.sh),
-[learner](../training/vgo_training/learner.py),
-[supervision](../training/vgo_training/supervision.py).
+Sources: [bulk loop and defaults](../../scripts/bulk-loop.sh),
+[learner](../../training/vgo_training/learner.py),
+[supervision](../../training/vgo_training/supervision.py).
 
 ## 10. Inference and the resource budget
 
@@ -522,9 +524,9 @@ Queue durations are position-weighted; search and inference wall times overlap
 across actors and slots. Their sums can exceed elapsed time. GPU utilization
 alone cannot distinguish useful work from a stalled or spinning runtime.
 
-Sources: [inference contract](INFERENCE_PROTOCOL.md),
-[packed graph input](../training/vgo_training/packed_input.py),
-[RAM measurements](research/RAM_SCALING.md).
+Sources: [inference contract](../INFERENCE_PROTOCOL.md),
+[packed graph input](../../training/vgo_training/packed_input.py),
+[RAM measurements](RAM_SCALING.md).
 
 ## 11. Evaluation, verification, and evidence
 
@@ -560,9 +562,9 @@ when interpreting a result. Experimental code removed from the current tree
 can be recovered from `archive/pre-prune`; old reproduction commands may need
 that branch.
 
-Sources: [ratings fit](../training/vgo_training/bradley_terry.py),
-[benchmark runner](../scripts/bench.py), [research index](research/README.md),
-[rule regression backlog](../todo/004-rule-regression-suite.md).
+Sources: [ratings fit](../../training/vgo_training/bradley_terry.py),
+[benchmark runner](../../scripts/bench.py), [research index](README.md),
+[rule regression backlog](../../todo/004-rule-regression-suite.md).
 
 ## 12. Delivery, ownership, and the next frontier
 
@@ -607,5 +609,5 @@ or to self-play with well-defined training targets.
 
 The governing principle is to preserve reliable rule consequences while
 improving the decisions learned from a fixed amount of compute. The
-[roadmap](../todo/ROADMAP.md) turns these questions into bounded work with
+[roadmap](ROADMAP_2026-10.md) turns these questions into bounded work with
 acceptance criteria.

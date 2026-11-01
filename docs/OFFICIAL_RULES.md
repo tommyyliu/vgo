@@ -3,7 +3,7 @@
 This note documents `voronoigo.com`'s current behavior, exposed as
 `Ruleset::Official` in `crates/vgo-core`. Here, *Official* is a compatibility
 label: it means website-compatible, not canonical or preferred. This
-repository's rules remain the game defined in [`reference/RULES.md`](../reference/RULES.md).
+repository's rules remain the game defined in [`spec/FORMAL.md`](../spec/FORMAL.md).
 
 The purpose of this note is to record what differs, what our compatibility
 implementation does about it, and what is still weaker here than in the
@@ -127,7 +127,7 @@ non-convex, which is why `alive_groups_of` walks cells rather than group regions
 It does not need to do better: any point of the union lies in one of the cells,
 and that cell is where the argument above finds its corner.
 
-That also strengthens `AXIOMS.md`'s A16, which records each `R_s` as star-shaped
+That also strengthens `LEMMAS.md`'s A16, which records each `R_s` as star-shaped
 about `s`. True, but weaker than the fact: it is convex. The radial solve in
 `settled.rs` only needs star-shapedness, so nothing there is wrong -- but a
 future reader deriving bounds from A16 is leaving something on the table.

@@ -40,5 +40,5 @@ See [human/001-find-ko-scenario.md](human/001-find-ko-scenario.md).
   player to move, radius, and any other relevant state.
 - The policy explains its gameplay benefit rather than relying only on standard
   Go precedent.
-- [`reference/RULES.md`](../reference/RULES.md) and regression tests are updated
+- [`spec/FORMAL.md`](../spec/FORMAL.md) and regression tests are updated
   if a restriction is adopted.

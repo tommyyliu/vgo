@@ -27,7 +27,7 @@ without slowing ordinary positions unnecessarily.
 - Exact ties remain settled because they transfer no positive area.
 - Tests cover a definite escape, a definite capture, an exact tie, and cases on
   both sides of the previous `1e-7` deadband.
-- [`reference/AXIOMS.md`](../reference/AXIOMS.md) describes the implemented
+- [`spec/LEMMAS.md`](../spec/LEMMAS.md) describes the implemented
   numerical policy accurately.
 
 ## Resolution

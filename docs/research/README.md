@@ -15,8 +15,13 @@ Some reproduction commands here name drivers that the 2026-09-23 prune removed:
 `vgo-raster-bench` tools. They are on the `archive/pre-prune` branch. The
 measurements are still valid for the code they were taken on.
 
+Raw `diagnostics/` files these notes link to were never tracked and no longer exist.
+Their measurements are recorded in the notes themselves.
+
 | doc | question |
 |---|---|
+| [ROADMAP_2026-10.md](ROADMAP_2026-10.md), [PROJECT_OUTLINE_2026-10.md](PROJECT_OUTLINE_2026-10.md) | the plan and idea outline as of the restart, frozen |
+| [EXPERIMENT_BRANCHES_2026-08.md](EXPERIMENT_BRANCHES_2026-08.md) | why each experiment branch exists |
 | [TREE_REUSE_2026-10-14.md](TREE_REUSE_2026-10-14.md) | do existing tails need filtering, can MCTS retain useful work, and do native failures return within a deadline? |
 | [RESTART_2026-10-13.md](RESTART_2026-10-13.md) | what does the current GPU/CPU profile show, and does indexed radial enumeration help? |
 | [RESTART_2026-10-14.md](RESTART_2026-10-14.md) | production-scale pruning, matched model variants, and a randomized search-budget pilot |

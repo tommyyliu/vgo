@@ -24,7 +24,7 @@ Done:
 - A retained CPU smoke generated replay v3 from an ONNX incumbent, trained with
   corrected full-legal supervision, exported ONNX, and completed a two-game
   coarse-to-fine promotion arena. See
-  [`../benchmarks/results/2026-07-24-coarse-policy-smoke.json`](../benchmarks/results/2026-07-24-coarse-policy-smoke.json).
+  `../benchmarks/results/2026-07-24-coarse-policy-smoke.json`.
 
 ## The problem being fixed
 
