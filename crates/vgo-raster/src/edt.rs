@@ -19,6 +19,19 @@ impl EdtScratch {
     pub(crate) fn field(&self) -> &[f64] {
         &self.field
     }
+
+    /// The squared vertical distances each row of the last transform started from,
+    /// empty if its mask held no `true` cell.
+    pub(crate) fn heights(&self) -> &[u32] {
+        &self.gaps
+    }
+}
+
+/// An earlier transform on the same grid, which a row with the same input can copy.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EarlierTransform<'a> {
+    pub(crate) heights: &'a [u32],
+    pub(crate) field: &'a [f64],
 }
 
 /// Squared Euclidean distance, in pixels, from each cell to the nearest `true`
@@ -42,10 +55,12 @@ pub(crate) fn squared_distance_transform_into(
     width: usize,
     height: usize,
     scratch: &mut EdtScratch,
+    earlier: Option<EarlierTransform<'_>>,
 ) {
     scratch.field.resize(mask.len(), 0.0);
     if !mask.iter().any(|inside| *inside) {
         scratch.field.fill(ABSENT);
+        scratch.gaps.clear();
         return;
     }
     let none = (width + height + 1) as u32;
@@ -75,10 +90,20 @@ pub(crate) fn squared_distance_transform_into(
     scratch.parabolas.resize(width, 0);
     scratch.starts.resize(width, 0);
     scratch.start_heights.resize(width, 0);
-    for (row, out) in gaps
+    let earlier = earlier.filter(|earlier| earlier.heights.len() == mask.len());
+    for (index, (row, out)) in gaps
         .chunks_exact(width)
         .zip(scratch.field.chunks_exact_mut(width))
+        .enumerate()
     {
+        // A row's envelope reads nothing but that row, so one that matches needs no
+        // envelope. A new stone leaves most rows alone. Proof: [E17].
+        if let Some(EarlierTransform { heights, field }) = earlier
+            && heights[index * width..][..width] == *row
+        {
+            out.copy_from_slice(&field[index * width..][..width]);
+            continue;
+        }
         envelope_row(
             row,
             none * none,
@@ -166,7 +191,7 @@ mod tests {
 
     fn squared_distance_transform(mask: &[bool], width: usize, height: usize) -> Vec<f64> {
         let mut scratch = EdtScratch::default();
-        squared_distance_transform_into(mask, width, height, &mut scratch);
+        squared_distance_transform_into(mask, width, height, &mut scratch, None);
         scratch.field
     }
 
@@ -209,6 +234,69 @@ mod tests {
                         .map_or(ABSENT, |square| square as f64);
                     assert_eq!(*value, expected, "{width}x{height}, cell {cell}");
                 }
+            }
+        }
+    }
+
+    /// A mask with no true cell has no heights to offer. Keeping the last mask's
+    /// would pair them with a field of nothing but `ABSENT`.
+    #[test]
+    fn an_empty_mask_leaves_no_rows_to_copy() {
+        let (width, height) = (8, 8);
+        let mut mask = vec![false; width * height];
+        mask[27] = true;
+        let mut earlier = EdtScratch::default();
+        squared_distance_transform_into(&mask, width, height, &mut earlier, None);
+        let empty = vec![false; width * height];
+        squared_distance_transform_into(&empty, width, height, &mut earlier, None);
+
+        let mut copied = EdtScratch::default();
+        let rows = EarlierTransform {
+            heights: earlier.heights(),
+            field: earlier.field(),
+        };
+        squared_distance_transform_into(&mask, width, height, &mut copied, Some(rows));
+        assert_eq!(
+            copied.field,
+            squared_distance_transform(&mask, width, height)
+        );
+    }
+
+    /// Copying rows from another mask's transform has to change nothing, whether
+    /// the masks differ by a cell, by a lot, or in having any true cell at all.
+    #[test]
+    fn rows_copied_from_an_earlier_transform_match_a_fresh_one() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (width, height) = (32, 32);
+        for per_thousand in [0, 3, 20, 300, 1000] {
+            for flips in [0, 1, 5, 400] {
+                let before: Vec<bool> = (0..width * height)
+                    .map(|_| next() % 1000 < per_thousand)
+                    .collect();
+                let mut after = before.clone();
+                for _ in 0..flips {
+                    let cell = next() as usize % after.len();
+                    after[cell] = !after[cell];
+                }
+                let mut first = EdtScratch::default();
+                squared_distance_transform_into(&before, width, height, &mut first, None);
+                let mut copied = EdtScratch::default();
+                let earlier = EarlierTransform {
+                    heights: first.heights(),
+                    field: first.field(),
+                };
+                squared_distance_transform_into(&after, width, height, &mut copied, Some(earlier));
+                assert_eq!(
+                    copied.field,
+                    squared_distance_transform(&after, width, height),
+                    "{per_thousand} per thousand, {flips} flips"
+                );
             }
         }
     }

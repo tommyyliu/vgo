@@ -19,7 +19,7 @@ use vgo_core::{
 };
 
 use crate::RasterConfig;
-use crate::edt::{EdtScratch, squared_distance_transform_into};
+use crate::edt::{EarlierTransform, EdtScratch, squared_distance_transform_into};
 
 /// Pixel columns processed together by the nearest-stone search. The same
 /// chunking shape is used by the packed writer: it amortizes the grid-ring
@@ -382,12 +382,19 @@ pub(crate) fn prepare_settled_rows(
     config: RasterConfig,
     oversample: usize,
     scratch: &mut SettledScratch,
+    earlier: Option<EarlierTransform<'_>>,
 ) -> SettledRows {
     let scale = oversample.max(1) | 1;
     let (fine_width, fine_height) = (config.width * scale, config.height * scale);
     let index = Arc::clone(position.legal_index());
     sampled_legal_set_into(position, fine_width, fine_height, index.vertices(), scratch);
-    squared_distance_transform_into(&scratch.legal, fine_width, fine_height, &mut scratch.edt);
+    squared_distance_transform_into(
+        &scratch.legal,
+        fine_width,
+        fine_height,
+        &mut scratch.edt,
+        earlier,
+    );
     let spacing = 1.0 / fine_width as f64;
     // How far the sampled distance can overstate the true one. Half a cell
     // diagonal is the tempting answer and it is wrong: it assumes every point of
@@ -521,7 +528,7 @@ fn settled_by_bounded_distance_into(
     if stones.is_empty() {
         return 0;
     }
-    let mut rows = prepare_settled_rows(position, config, oversample, scratch);
+    let mut rows = prepare_settled_rows(position, config, oversample, scratch, None);
     let width = config.width;
     scratch.column_xs.clear();
     scratch

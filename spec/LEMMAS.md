@@ -744,6 +744,12 @@ stone contributes the same bits whichever path computes it. `A` being a prefix,
 compared by the exact bits of each coordinate, makes `A` plus `S - A` exactly the
 multiset of `S`. QED
 
+**Skipping a row.** A fold may skip a row with `dy^2 >= L`, where `dy` is the row's
+distance to the stone and `L` the largest second-smallest value in that row for `A`. The
+value `v` rounds an exact sum that is at least the representable `dy^2`, and rounding is
+monotonic, so `v >= dy^2`. Second-smallest values only fall as stones fold in, so
+`v >= m` at every pixel of the row, and the update above leaves `(n, m)` as it was.
+
 **Capture.** Removing a stone from the middle of the list ends the shared prefix there,
 so `A` is not a prefix of the new list and the fold does not apply. Nothing can be
 subtracted from a field. Such a position is swept instead, and by E1 a sweep gives these
@@ -796,6 +802,20 @@ grid and radius, so an answer never leaves the board it was computed for.
 This covers only the exact test. The two cheap cases run for every pixel of every leaf,
 so a pixel the unproved floor of [O1] decides is decided as it was, and the plane does not
 depend on what the thread rendered earlier.
+
+### E17. A row with the same input has the same output
+
+*Status: Proved.* Used by `squared_distance_transform_into` and `write_packed`.
+
+**Claim.** If a row of the transform's squared vertical distances equals the same row of an
+earlier transform on the same grid, the two rows of the field are equal. If a row's nearest
+and second-nearest squares equal an earlier raster's at the same radius, so do its ridges.
+
+**Proof.** By [E3] a field row is `min over c of (x - c)^2 + row[c]`, which reads that row
+and nothing else, and it is an exact integer. `envelope_row`'s other arguments are buffers
+it overwrites before reading. A ridge is computed pixel by pixel from the two squares and
+the radius alone, by one function, so equal inputs give equal bits. Equality of the inputs
+is tested on the values themselves, so nothing is assumed about why they match. QED
 
 ### N1. Length comparison
 

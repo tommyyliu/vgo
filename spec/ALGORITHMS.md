@@ -67,6 +67,16 @@ breaks the prefix, so that leaf is swept.
 - **Cost:** a copy plus one pass per stone past the root, instead of a sweep.
 - **Code:** `vgo-raster/src/packed.rs`, `nearest_field`
 
+### Reusing whole rows across a search
+
+A leaf differs from the root around a few stones, so most rows of its raster do not change.
+The distance transform and the ridge compare each row's input with the root's, and a row
+that matches copies the root's output. A fold skips rows the stone is too far from to reach.
+
+- **Relies on:** E15, E17.
+- **Cost:** one comparison per row, plus the work on rows that differ.
+- **Code:** `vgo-raster/src/edt.rs`, `packed.rs`, `write_packed`
+
 ### Stone planes by stamping
 
 A stone plane only asks whether a pixel is inside some disc, so each stone stamps its own

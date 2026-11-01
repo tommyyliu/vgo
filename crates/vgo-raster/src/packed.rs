@@ -21,6 +21,7 @@ use std::cell::RefCell;
 use half::{f16, slice::HalfFloatSliceExt};
 use vgo_core::{Color, Position};
 
+use crate::edt::EarlierTransform;
 use crate::settled_bounds::{ANSWER_UNKNOWN, KnownAnswers, SettledScratch, prepare_settled_rows};
 use crate::{RasterConfig, RasterKind, SETTLED_OVERSAMPLE};
 
@@ -327,6 +328,12 @@ struct SweepAnchor {
     stone_ys: Vec<f64>,
     nearest_squares: Vec<f64>,
     second_squares: Vec<f64>,
+    /// Each row's largest second-nearest square, past which a stone changes nothing.
+    row_limits: Vec<f64>,
+    /// The root's own transform and ridge, which rows that match it can copy.
+    transform_heights: Vec<u32>,
+    transform_field: Vec<f64>,
+    ridges: Vec<f16>,
     /// Filled in as leaves reach the exact test. See `KnownAnswers`.
     answers: Vec<u8>,
     /// Set by [`next_raster_is_search_root`], and spent by the next raster.
@@ -411,6 +418,23 @@ impl SweepAnchor {
             &mut self.nearest_squares,
             &mut self.second_squares,
         );
+        self.row_limits.clear();
+        self.row_limits.extend(
+            self.second_squares
+                .chunks_exact(self.width)
+                .map(|row| row.iter().copied().fold(0.0, f64::max)),
+        );
+        self.transform_heights.clear();
+        self.transform_field.clear();
+        self.ridges.clear();
+    }
+
+    /// The root's transform, once its own raster has made one.
+    fn earlier_transform(&self, width: usize) -> Option<EarlierTransform<'_>> {
+        (self.width == width && !self.transform_field.is_empty()).then_some(EarlierTransform {
+            heights: &self.transform_heights,
+            field: &self.transform_field,
+        })
     }
 }
 
@@ -470,6 +494,11 @@ fn nearest_field(
     let stones_past = anchor.differing_xs.iter().zip(&anchor.differing_ys);
     for (&x, &y) in stones_past {
         for (row, &pixel_y) in input.ys.iter().enumerate() {
+            // Every pixel of the row is at least this far from the stone. Proof: [E15].
+            let dy = pixel_y - y;
+            if dy * dy >= anchor.row_limits[row] {
+                continue;
+            }
             let base = row * width;
             fold_stone_into_row(
                 (x, y),
@@ -644,13 +673,8 @@ fn write_packed(
         return;
     }
 
-    // `settled` is classified row by row inside the sweep below, against the
-    // nearest-stone minimum that loop already computes for the ridge, rather than
-    // by a builder that sweeps every stone a second time. See `SettledRows`.
     settled.clear();
     settled.resize(pixels, false);
-    let mut settled_rows =
-        prepare_settled_rows(position, config, SETTLED_OVERSAMPLE, settled_scratch);
 
     let stride = bit_plane_bytes(pixels);
     let (current_plane, rest) = bits.split_at_mut(stride);
@@ -701,6 +725,27 @@ fn write_packed(
         second_squares,
     );
 
+    // `settled` is classified row by row below, against the nearest-stone minimum
+    // the ridge needs anyway, rather than by a builder that sweeps every stone a
+    // second time. See `SettledRows`.
+    let mut settled_rows = prepare_settled_rows(
+        position,
+        config,
+        SETTLED_OVERSAMPLE,
+        settled_scratch,
+        anchor.earlier_transform(width),
+    );
+    // The first raster after a rebuild is the root's own.
+    let is_root = fit == AnchorFit::Extends && anchor.transform_field.is_empty();
+    if is_root {
+        let transform = &settled_scratch.edt;
+        anchor
+            .transform_heights
+            .extend_from_slice(transform.heights());
+        anchor.transform_field.extend_from_slice(transform.field());
+    }
+    let reads_ridges = fit != AnchorFit::Unrelated && !anchor.ridges.is_empty();
+
     for (row, &y) in ys.iter().enumerate() {
         let base = row * width;
         let nearest_row = &nearest_squares[base..base + width];
@@ -721,10 +766,18 @@ fn write_packed(
             }),
         );
 
-        // On its own, not inside the bit packing below: there the loop's carried
-        // byte stops it vectorizing, and this is two square roots per pixel.
-        ridge_row(nearest_row, second_row, radius, ridges);
-        dense_plane[base..base + width].convert_from_f32_slice(ridges);
+        // A ridge reads nothing but these two rows and the radius. Proof: [E17].
+        if reads_ridges
+            && nearest_row == &anchor.nearest_squares[base..base + width]
+            && second_row == &anchor.second_squares[base..base + width]
+        {
+            dense_plane[base..base + width].copy_from_slice(&anchor.ridges[base..base + width]);
+        } else {
+            // On its own, not inside the bit packing below: there the loop's carried
+            // byte stops it vectorizing, and this is two square roots per pixel.
+            ridge_row(nearest_row, second_row, radius, ridges);
+            dense_plane[base..base + width].convert_from_f32_slice(ridges);
+        }
 
         // Groups of eight align with byte boundaries only because `width` is a
         // multiple of eight, which makes `row * width` one too. The general
@@ -746,6 +799,9 @@ fn write_packed(
                 set_bit(settled_plane, pixel, settled[pixel]);
             }
         }
+    }
+    if is_root {
+        anchor.ridges.extend_from_slice(dense_plane);
     }
 }
 
@@ -933,6 +989,7 @@ mod tests {
                 write_packed(&position, config, &mut anchored, &mut scratch);
                 write_packed(&position, config, &mut fresh, &mut PackedScratch::default());
                 assert_eq!(anchored.bits, fresh.bits);
+                assert_eq!(anchored.dense, fresh.dense);
             }
         }
     }
