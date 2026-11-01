@@ -581,11 +581,9 @@ mod tests {
         assert!(found, "fixture must contain a no-op placement");
     }
 
-    /// A move that takes enemy stones stays legal under the official rules even
-    /// when it kills friendlies too. The enemy is resolved first and dies first,
-    /// so "only its own" is a statement about the enemy count.
+    /// A plain capture is a move, not a pass, under the official rules.
     #[test]
-    fn the_official_rules_allow_a_capture_that_also_costs_the_mover() {
+    fn a_capture_is_a_real_move_under_the_official_rules() {
         use crate::Ruleset;
         // The even-trade fixture: black captures one white stone.
         let position = even_trade_position().with_ruleset(Ruleset::Official);
@@ -597,5 +595,186 @@ mod tests {
             0,
             "a capture is a move under either ruleset"
         );
+    }
+
+    fn position_of(radius: f64, to_move: Color, stones: &[(f64, f64, bool)]) -> Position {
+        let stones = stones
+            .iter()
+            .map(|&(x, y, black)| {
+                Stone::new(x, y, if black { Color::Black } else { Color::White })
+            })
+            .collect();
+        Position::new(radius, stones, to_move)
+    }
+
+    /// A move that takes enemy stones stays legal under the official rules even
+    /// when it kills friendlies too. The enemy is resolved first and dies first,
+    /// so "only its own" is a statement about the enemy count. Position found by
+    /// searching random games, since this needs both events in one move.
+    #[test]
+    fn the_official_rules_allow_a_capture_that_also_costs_the_mover() {
+        use crate::Ruleset;
+        let position = position_of(
+            0.12,
+            Color::White,
+            &[
+                (0.88, 0.12, false),
+                (0.17899673878581257, 0.879999, true),
+                (0.41899673878372923, 0.88, false),
+                (0.12, 0.647363265830379, true),
+                (0.12, 0.3600009999979167, false),
+                (0.88, 0.88, true),
+                (0.33385408652773085, 0.25106565368465705, false),
+                (0.35999999999791665, 0.6473642658303789, true),
+                (0.13280152804313414, 0.120001, false),
+                (0.88, 0.36, true),
+                (0.5909668250097583, 0.7125894583862411, false),
+                (0.5349058072968244, 0.12, true),
+            ],
+        )
+        .with_ruleset(Ruleset::Official);
+        let result = place(&position, 0.5296197406710788, 0.3899047283676407)
+            .expect("taking enemy stones keeps the move legal");
+        assert!(result.events.iter().any(|e| matches!(e, GameEvent::Capture { .. })));
+        assert!(result.events.iter().any(|e| matches!(e, GameEvent::SelfCapture { .. })));
+    }
+
+    /// Losing one friendly stone is only a no-op when that stone is the one just
+    /// placed. Here the new stone survives and a different one dies, so the board
+    /// changed and this is a real move.
+    #[test]
+    fn losing_a_different_stone_is_not_a_pass() {
+        let position = position_of(
+            0.12,
+            Color::White,
+            &[
+                (0.88, 0.88, true),
+                (0.7772349525661474, 0.44093289878863084, true),
+                (0.43658089623573126, 0.7258771754651037, true),
+                (0.6658467643291128, 0.22834607354532718, true),
+                (0.3528509246939351, 0.120001, true),
+                (0.88, 0.12, true),
+                (0.120001, 0.4128797269479796, true),
+                (0.4525276433011801, 0.33832312844256557, false),
+                (0.748533032104802, 0.6792104675227242, true),
+            ],
+        );
+        let (x, y) = (0.12, 0.6528797269458962);
+        let result = place(&position, x, y).expect("self-capture is legal here");
+        assert_eq!(result.captured, 1);
+        assert!(result.position.stones().iter().any(|s| s.x == x && s.y == y));
+        assert_ne!(result.position.stones(), position.stones());
+        assert_eq!(result.position.consecutive_passes(), 0);
+    }
+
+    #[test]
+    fn a_placement_resets_the_pass_count() {
+        let position = position_of(0.1, Color::Black, &[]).with_passes(1);
+        let result = place(&position, 0.5, 0.5).expect("an empty board accepts a stone");
+        assert_eq!(result.position.consecutive_passes(), 0);
+        assert_eq!(result.position.phase(), Phase::Playing);
+    }
+
+    /// Every ply of a seeded game, played mostly on legal-set vertices, where
+    /// stones touch and geometry is at its most degenerate.
+    fn seeded_game(seed: u64, radius: f64, ruleset: crate::Ruleset) -> Vec<(Position, Analysis)> {
+        use crate::{Point, legal_set_vertices, nearest_legal_placement};
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        let mut position = Position::new(radius, Vec::new(), Color::Black).with_ruleset(ruleset);
+        let mut plies = Vec::new();
+        for _ in 0..80 {
+            let vertices = legal_set_vertices(&position);
+            let query = if !vertices.is_empty() && next() < 0.8 {
+                vertices[(next() * vertices.len() as f64) as usize]
+            } else {
+                Point::new(next(), next())
+            };
+            let nearest = nearest_legal_placement(&position, query);
+            if !nearest.legal {
+                break;
+            }
+            let Ok(result) = place(&position, nearest.point.x, nearest.point.y) else {
+                continue;
+            };
+            position = result.position;
+            if position.phase() != Phase::Playing {
+                break;
+            }
+            plies.push((position.clone(), result.analysis));
+        }
+        plies
+    }
+
+    /// The rules define adjacency as a shared boundary, which is symmetric. Each
+    /// cell is clipped alone, so rounding can leave only one side recording it.
+    #[test]
+    fn adjacency_is_symmetric_across_real_games() {
+        for seed in 1..40 {
+            for (_, analysis) in seeded_game(seed, 0.06, crate::Ruleset::Vgo) {
+                let adjacency = &analysis.geometry.adjacency;
+                for (stone, neighbours) in adjacency.iter().enumerate() {
+                    for &other in neighbours {
+                        assert!(adjacency[other].contains(&stone), "{stone} and {other}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The official rule is `dist(cell, L) <= r`, tested against the definition.
+    ///
+    /// Sampling a cell's boundary only overestimates that distance, so a group
+    /// with a sample in reach is certainly alive. This direction is the one that
+    /// matters: a miss here would capture a live group.
+    ///
+    /// Committed positions have already lost their settled groups, so this looks
+    /// at the provisional board: one more stone added, before any removal.
+    #[test]
+    fn official_liveness_matches_the_definition_on_real_games() {
+        use crate::{Point, Ruleset, distance_to_legal_set};
+        let mut checked = 0;
+        for seed in 1..16 {
+            for (ply, (position, analysis)) in
+                seeded_game(seed, 0.09, Ruleset::Official).iter().enumerate()
+            {
+                for vertex in analysis.legal_vertices.iter().skip(ply % 3).step_by(3) {
+                    let mut stones = position.stones().to_vec();
+                    stones.push(Stone::new(vertex.x, vertex.y, position.to_move()));
+                    let provisional = position.with_stones(stones);
+                    let settled = Analysis::new(&provisional);
+                    let radius = provisional.radius();
+                    for (stone, cell) in settled.geometry.cells.iter().enumerate() {
+                        if settled.alive_groups.contains(&settled.geometry.groups[stone]) {
+                            continue;
+                        }
+                        for (index, &a) in cell.polygon.iter().enumerate() {
+                            let b = cell.polygon[(index + 1) % cell.polygon.len()];
+                            for step in 0..12 {
+                                let t = f64::from(step) / 12.0;
+                                let x = a.x + t * (b.x - a.x);
+                                let y = a.y + t * (b.y - a.y);
+                                let distance = distance_to_legal_set(
+                                    &provisional,
+                                    Point::new(x, y),
+                                    Some(&settled.legal_vertices),
+                                );
+                                assert!(
+                                    distance > radius * (1.0 - 1e-9),
+                                    "seed {seed}, ply {ply}: a settled cell is within reach"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000, "only {checked} samples of settled cells");
     }
 }

@@ -1147,7 +1147,8 @@ mod tests {
 
     use super::{
         ChildSummary, Descent, Node, SearchConfig, SearchResult, SearchStats, descend,
-        run_batched_simulations, sampled_child_indices, search, search_at_ply,
+        preferred_child_indices, run_batched_simulations, sampled_child_indices, search,
+        search_at_ply,
         search_with_evaluator, simulate,
     };
 
@@ -1781,6 +1782,81 @@ mod tests {
         let error = search_with_evaluator(&position, SearchConfig::canary(1), 5, &FailingEvaluator)
             .expect_err("failing evaluator must abort search");
         assert_eq!(error, EvaluationError::new("expected failure"));
+    }
+
+    /// Scores a stone by where it landed: the left half is good for whoever
+    /// placed it. That gives search a known right answer for either colour.
+    struct LeftHalfWins;
+
+    impl Evaluator for LeftHalfWins {
+        fn evaluate(&self, position: &Position) -> Result<Evaluation, EvaluationError> {
+            let placed_well = position.stones().last().is_some_and(|stone| stone.x < 0.5);
+            // The value is for the side to move, who is the placer's opponent.
+            let value = if placed_well { -0.9 } else { 0.9 };
+            Ok(Evaluation::new(value, Box::new(FlatPolicy)))
+        }
+    }
+
+    #[test]
+    fn search_plays_the_move_the_value_favours_for_either_colour() {
+        use vgo_core::Stone;
+        for colour in [Color::Black, Color::White] {
+            for seed in [1, 2, 3] {
+                let opponent = Stone::new(0.9, 0.9, colour.other());
+                let position = Position::new(0.05, vec![opponent], colour);
+                let config = SearchConfig { widening_coefficient: 4.0, ..SearchConfig::canary(128) };
+                let result = search_with_evaluator(&position, config, seed, &LeftHalfWins)
+                    .expect("scripted evaluator succeeds");
+                let Action::Place(point) = result.action else {
+                    panic!("{colour:?} passed, seed {seed}");
+                };
+                assert!(point.x < 0.5, "{colour:?} chose x = {}, seed {seed}", point.x);
+            }
+        }
+    }
+
+    #[test]
+    fn equal_visits_break_toward_the_movers_value() {
+        let summaries = [
+            ChildSummary { black_value: -0.5, ..child(place(0.2), 5) },
+            ChildSummary { black_value: 0.5, ..child(place(0.8), 5) },
+        ];
+        assert_eq!(preferred_child_indices(&summaries, Color::Black), vec![1, 0]);
+        assert_eq!(preferred_child_indices(&summaries, Color::White), vec![0, 1]);
+    }
+
+    #[test]
+    fn more_visits_outrank_value() {
+        let summaries = [
+            ChildSummary { black_value: 0.9, ..child(place(0.2), 2) },
+            ChildSummary { black_value: -0.9, ..child(place(0.8), 9) },
+        ];
+        assert_eq!(preferred_child_indices(&summaries, Color::Black), vec![1, 0]);
+    }
+
+    /// PUCT's exploration bonus scales with the square root of the parent's
+    /// visits. The numbers are chosen so `sqrt` keeps the proven child while a
+    /// linear bonus jumps to the unvisited one.
+    #[test]
+    fn exploration_grows_with_the_root_of_parent_visits() {
+        let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
+        let config = SearchConfig { exploration: 1.5, ..SearchConfig::canary(1) };
+        let mut root = Node::from_evaluation(
+            position.clone(),
+            ConstantEvaluator(0.0).evaluate(&position).unwrap(),
+            7,
+        );
+        root.widen(SearchConfig { widening_coefficient: 4.0, ..config }, &mut SearchStats::default());
+        assert!(root.children.len() >= 2);
+        root.children.iter_mut().skip(2).for_each(|child| child.refused = true);
+        root.visits = 100;
+        root.children[0].prior = 0.5;
+        root.children[0].visits = 100;
+        root.children[0].black_value_sum = 50.0;
+        root.children[1].prior = 0.02;
+        root.children[1].visits = 0;
+        root.children[1].black_value_sum = 0.0;
+        assert_eq!(root.select_child(config), 0);
     }
 
     /// A search under the official rules never returns a move those rules

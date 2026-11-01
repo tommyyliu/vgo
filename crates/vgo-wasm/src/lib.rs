@@ -490,3 +490,31 @@ fn parse_colour(name: &str) -> Result<Color, JsValue> {
         other => Err(JsValue::from_str(&format!("unknown colour {other}"))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Game;
+
+    #[test]
+    fn a_game_plays_through_two_passes_to_a_result() {
+        let mut game = Game::new(1.0 / 18.0, 0.1);
+        assert_eq!(game.to_move(), "black");
+        assert!(game.is_legal(0.5, 0.5));
+        assert!(game.place(0.5, 0.5));
+        assert_eq!(game.to_move(), "white");
+        assert_eq!(game.ply(), 1);
+        assert!(!game.is_legal(0.5, 0.5), "a stone blocks its own spot");
+        assert!(game.pass());
+        assert!(game.pass());
+        assert!(game.finished());
+        assert!(!game.place(0.2, 0.2), "a finished game takes no moves");
+    }
+
+    #[test]
+    fn an_illegal_placement_changes_nothing() {
+        let mut game = Game::new(1.0 / 18.0, 0.1);
+        assert!(!game.place(0.0, 0.0), "the corner is outside the inset");
+        assert_eq!(game.ply(), 0);
+        assert_eq!(game.to_move(), "black");
+    }
+}

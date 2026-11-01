@@ -979,28 +979,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "timing"]
-    fn measure_rasterize_cost() {
-        for stones in [8usize, 20, 35] {
-            let position = scattered_position(stones);
-            let config = RasterConfig::square(128);
-            let mut data = vec![0.0_f32; CHANNEL_COUNT * config.pixels()];
-            for _ in 0..3 {
-                rasterize_into(&position, config, &mut data);
-            }
-            let started = std::time::Instant::now();
-            let runs = 20;
-            for _ in 0..runs {
-                rasterize_into(&position, config, &mut data);
-            }
-            println!(
-                "  {stones:2} stones: {:.3} ms per 128x128 raster",
-                started.elapsed().as_secs_f64() / f64::from(runs) * 1000.0
-            );
-        }
-    }
-
     /// The komi channel states what the side to move must win by.
     ///
     /// The sign is silent if wrong -- a net simply learns the opposite of the

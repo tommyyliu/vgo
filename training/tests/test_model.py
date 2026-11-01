@@ -7,6 +7,7 @@ import unittest
 import torch
 
 from vgo_training.model import (
+    value_utility,
     DDRNetPolicyValueNet,
     build_model,
     load_model,
@@ -326,6 +327,17 @@ class DihedralAugmentationTests(unittest.TestCase):
         states, policies, masks = self._fixture()
         with self.assertRaises(ValueError):
             apply_dihedral(states, policies, masks, 1, 2, 8)
+
+
+
+class ValueUtilityTests(unittest.TestCase):
+    def test_a_winning_logit_is_positive_utility_for_the_mover(self) -> None:
+        winning = torch.tensor([[4.0, -4.0]])
+        self.assertGreater(value_utility(winning).item(), 0.9)
+        self.assertLess(value_utility(winning.flip(1)).item(), -0.9)
+
+    def test_even_logits_are_a_neutral_position(self) -> None:
+        self.assertEqual(value_utility(torch.zeros(1, 2)).item(), 0.0)
 
 
 if __name__ == "__main__":

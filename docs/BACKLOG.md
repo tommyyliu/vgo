@@ -27,6 +27,7 @@ Finished tickets were removed on 2026-10-31 and remain in git history.
 | Incremental legal vertices | Deferred | Reuse the parent's vertex list with identical output. Vertex order makes this delicate |
 | Repetition and ko policy | Needs human input | Decide between unrestricted repetition, simple ko and superko. Automated play reaches cycles, but it's unknown whether a strategically meaningful human cycle exists |
 | Sensible ko scenario | Needs human play | A concrete position that players would rationally repeat, or a list of failed attempts |
+| Official vertex reach test | Open | Find a position where the cell-vertex check in `official_cell_is_alive` alone decides a group, or prove the other two checks cover it. A bug there passes every test, and a search of up to 3,000 random games found no such position |
 | Lint and format | Open | `cargo fmt` applied and clippy clean, so `check.sh` enforces both |
 | Vgo learnings | Open | Results that exist only in `artifacts/old/` are written up. Required before that folder is deleted |
 
