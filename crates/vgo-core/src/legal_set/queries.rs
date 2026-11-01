@@ -132,8 +132,9 @@ pub fn none_closer_than_indexed(
     threshold: f64,
     index: &LegalSetIndex,
 ) -> bool {
-    let mut visit =
-        |candidate: Point| numeric::length_below(point.x - candidate.x, point.y - candidate.y, threshold);
+    let mut visit = |candidate: Point| {
+        numeric::length_below(point.x - candidate.x, point.y - candidate.y, threshold)
+    };
     !visit_candidates_within::<true>(
         position,
         point,
@@ -164,8 +165,9 @@ pub fn none_closer_than(
     threshold: f64,
     known_vertices: Option<&[Point]>,
 ) -> bool {
-    let mut visit =
-        |candidate: Point| numeric::length_below(point.x - candidate.x, point.y - candidate.y, threshold);
+    let mut visit = |candidate: Point| {
+        numeric::length_below(point.x - candidate.x, point.y - candidate.y, threshold)
+    };
     !visit_candidates_within::<true>(
         position,
         point,

@@ -107,7 +107,9 @@ fn hash_point(point: Point, hasher: &mut DefaultHasher) {
 fn hash_analysis(analysis: &Analysis, hasher: &mut DefaultHasher) {
     for cell in analysis.geometry.cells.iter() {
         cell.area.to_bits().hash(hasher);
-        cell.polygon.iter().for_each(|point| hash_point(*point, hasher));
+        cell.polygon
+            .iter()
+            .for_each(|point| hash_point(*point, hasher));
         for edge in &cell.edges {
             hash_point(edge.start, hasher);
             hash_point(edge.end, hasher);
@@ -116,7 +118,10 @@ fn hash_analysis(analysis: &Analysis, hasher: &mut DefaultHasher) {
     }
     analysis.geometry.adjacency.hash(hasher);
     analysis.geometry.groups.hash(hasher);
-    analysis.legal_vertices.iter().for_each(|point| hash_point(*point, hasher));
+    analysis
+        .legal_vertices
+        .iter()
+        .for_each(|point| hash_point(*point, hasher));
     for groups in [&analysis.alive_groups, &analysis.settled_groups] {
         let mut sorted: Vec<usize> = groups.iter().copied().collect();
         sorted.sort_unstable();
@@ -172,8 +177,7 @@ fn fuzz_game(seed: u64, radius: f64, ruleset: Ruleset, tangent: bool) -> (usize,
         let nearest = nearest_legal_placement(&position, query);
         hash_point(nearest.point, &mut hasher);
         let played = if nearest.legal && next() >= 0.01 {
-            place(&position, nearest.point.x, nearest.point.y)
-                .or_else(|_| pass(&position))
+            place(&position, nearest.point.x, nearest.point.y).or_else(|_| pass(&position))
         } else {
             pass(&position)
         };
@@ -185,8 +189,8 @@ fn fuzz_game(seed: u64, radius: f64, ruleset: Ruleset, tangent: bool) -> (usize,
         hash_rasters(&position, &mut hasher);
         plies += 1;
         if plies % 10 == 0 && position.phase() == Phase::Playing {
-            let result = search_with_evaluator(&position, search, seed, &evaluator)
-                .expect("fuzz search");
+            let result =
+                search_with_evaluator(&position, search, seed, &evaluator).expect("fuzz search");
             format!("{result:?}").hash(&mut hasher);
         }
     }

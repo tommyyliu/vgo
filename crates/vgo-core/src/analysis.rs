@@ -92,12 +92,10 @@ fn alive_groups_of(
         let stone = position.stones()[stone_index];
         let stone_point = Point::new(stone.x, stone.y);
         let alive = match position.ruleset() {
-            Ruleset::Vgo => {
-                cell.polygon.iter().any(|&vertex| {
-                    legal_set::escape_witness(position, vertex, stone_point, Some(legal_vertices))
-                        .is_some()
-                })
-            }
+            Ruleset::Vgo => cell.polygon.iter().any(|&vertex| {
+                legal_set::escape_witness(position, vertex, stone_point, Some(legal_vertices))
+                    .is_some()
+            }),
             Ruleset::Official => {
                 official_cell_is_alive(position, stone_index, cell, legal_vertices)
             }

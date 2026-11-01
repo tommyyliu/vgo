@@ -310,7 +310,12 @@ impl Node {
     /// `noise` is uniform mass mixed into the proposal; see
     /// [`SearchConfig::root_exploration_noise`]. Passed in rather than read
     /// from the config here because only the root takes it.
-    pub(super) fn widen_coarse_fine(&mut self, desired: usize, noise: f64, stats: &mut SearchStats) {
+    pub(super) fn widen_coarse_fine(
+        &mut self,
+        desired: usize,
+        noise: f64,
+        stats: &mut SearchStats,
+    ) {
         let FineGridCache::Ready(grid) = &self.fine_grid else {
             unreachable!("coarse-to-fine widening requires a cached grid");
         };

@@ -174,8 +174,8 @@ fn shares_a_boundary(position: &Position, a: Stone, b: Stone) -> bool {
         }
         // |x-a|^2 <= |x-other|^2  =>  2 x.(other-a) <= |other|^2 - |a|^2
         let (cx, cy) = (other.x - a.x, other.y - a.y);
-        let bound = square(other.x, other.y) - square(a.x, a.y)
-            - 2.0 * (midpoint.x * cx + midpoint.y * cy);
+        let bound =
+            square(other.x, other.y) - square(a.x, a.y) - 2.0 * (midpoint.x * cx + midpoint.y * cy);
         clip(&mut low, &mut high, 2.0 * (ux * cx + uy * cy), bound);
         if low >= high {
             return false;

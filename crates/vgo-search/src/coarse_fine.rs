@@ -706,8 +706,11 @@ mod tests {
                 let resolved = if is_legal_placement(position, point.x, point.y) {
                     Some(point)
                 } else if straddles_boundary(position, point, exclusion, half_diagonal) {
-                    let snapped =
-                        vgo_core::nearest_legal_placement_with(position, point, Some(&known_vertices));
+                    let snapped = vgo_core::nearest_legal_placement_with(
+                        position,
+                        point,
+                        Some(&known_vertices),
+                    );
                     let inside = snapped.legal
                         && (snapped.point.x - point.x).abs() <= half_x
                         && (snapped.point.y - point.y).abs() <= half_y;

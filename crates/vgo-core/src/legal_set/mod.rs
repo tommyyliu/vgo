@@ -11,8 +11,8 @@ use crate::{Position, numeric};
 use buckets::{StoneBuckets, clear_of_stones_pruned};
 
 pub use nearest::{Nearest, nearest, nearest_indexed, nearest_indexed_within, nearest_with};
-pub use queries::{distance, none_closer_than, none_closer_than_indexed};
 pub(crate) use queries::escape_witness;
+pub use queries::{distance, none_closer_than, none_closer_than_indexed};
 pub use vertices::{LegalSetIndex, vertices};
 
 #[must_use]

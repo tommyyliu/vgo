@@ -16,7 +16,6 @@
 //! `training/vgo_training/packed_input.py`, whose `compress` is the reference
 //! this has to agree with, and `bit_expansion_table` for the bit order.
 
-
 use half::{f16, slice::HalfFloatSliceExt};
 use vgo_core::{Color, Position};
 
@@ -182,7 +181,6 @@ impl PackedRaster {
         let stride = bit_plane_bytes(self.config.pixels());
         self.bits[slot * stride + pixel / 8] & (1 << (pixel % 8)) != 0
     }
-
 }
 
 /// Side of the smallest tile, in pixels. Measured best of 4, 8, 16 and 32.
@@ -219,7 +217,12 @@ fn sweep_tile(
     nearest_squares: &mut [f64],
     second_squares: &mut [f64],
 ) {
-    let SweepInput { stone_xs, stone_ys, xs, ys } = *input;
+    let SweepInput {
+        stone_xs,
+        stone_ys,
+        xs,
+        ys,
+    } = *input;
     let centre_x = 0.5 * (xs[columns.start] + xs[columns.end - 1]);
     let centre_y = 0.5 * (ys[rows.start] + ys[rows.end - 1]);
     let half_diagonal = (centre_x - xs[columns.start]).hypot(centre_y - ys[rows.start]);
@@ -278,8 +281,10 @@ fn sweep_tile(
                 let stone = stone as usize;
                 let (sx, dy) = (stone_xs[stone], y - stone_ys[stone]);
                 let dy_square = dy * dy;
-                for ((nearest, second), &x) in
-                    nearest_row.iter_mut().zip(second_row.iter_mut()).zip(tile_xs)
+                for ((nearest, second), &x) in nearest_row
+                    .iter_mut()
+                    .zip(second_row.iter_mut())
+                    .zip(tile_xs)
                 {
                     let dx = x - sx;
                     // `mul_add`, matching the dense writer and the nearest field
@@ -301,13 +306,7 @@ fn sweep_tile(
 /// A disc has few pixels, so this is far cheaper than keeping a per-colour
 /// minimum for every pixel in the sweep. The row and column ranges are padded by
 /// a pixel; the test itself is the dense writer's `square <= radius^2`. Proof: [E2].
-fn stamp_disc(
-    plane: &mut [u8],
-    (x, y): (f64, f64),
-    radius: f64,
-    xs: &[f64],
-    ys: &[f64],
-) {
+fn stamp_disc(plane: &mut [u8], (x, y): (f64, f64), radius: f64, xs: &[f64], ys: &[f64]) {
     let (width, height) = (xs.len(), ys.len());
     let radius_square = radius * radius;
     let span = |centre: f64, size: usize| {
@@ -450,7 +449,12 @@ pub(crate) fn rasterize_compact_radius_packed_into(
     let mut settled_rows = if let Some(scale) = settled_oversample(position, config) {
         settled.clear();
         settled.resize(pixels, false);
-        Some(prepare_settled_rows(position, config, scale, settled_scratch))
+        Some(prepare_settled_rows(
+            position,
+            config,
+            scale,
+            settled_scratch,
+        ))
     } else {
         settled_for_raster_into(position, config, settled_scratch, settled);
         None
@@ -499,7 +503,12 @@ pub(crate) fn rasterize_compact_radius_packed_into(
     candidates.clear();
     candidates.extend(0..stones.len() as u32);
     sweep_tile(
-        &SweepInput { stone_xs, stone_ys, xs, ys },
+        &SweepInput {
+            stone_xs,
+            stone_ys,
+            xs,
+            ys,
+        },
         0..width,
         0..height,
         0,

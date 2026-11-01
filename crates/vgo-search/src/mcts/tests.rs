@@ -9,8 +9,7 @@ use crate::{Action, Evaluation, EvaluationError, Evaluator, NaiveEvaluator, Poli
 
 use super::{
     ChildSummary, Descent, Node, SearchConfig, SearchResult, SearchStats, descend,
-    preferred_child_indices, run_batched_simulations, sampled_child_indices, search,
-    search_at_ply,
+    preferred_child_indices, run_batched_simulations, sampled_child_indices, search, search_at_ply,
     search_with_evaluator, simulate,
 };
 
@@ -206,8 +205,7 @@ fn virtual_loss_spreads_a_batch_across_children() {
     let mut config = SearchConfig::canary(16);
     config.leaf_batch = 8;
     let mut stats = SearchStats::default();
-    let mut root =
-        Node::new(position.clone(), None, 3, &NaiveEvaluator, &mut stats).expect("root");
+    let mut root = Node::new(position.clone(), None, 3, &NaiveEvaluator, &mut stats).expect("root");
     root.widen(config, &mut stats);
 
     // One round of descents without backing any of them up: every descent
@@ -366,10 +364,7 @@ impl Evaluator for BatchCountingEvaluator {
         Ok(Evaluation::new(0.0, Box::new(FlatPolicy)))
     }
 
-    fn evaluate_batch(
-        &self,
-        positions: &[Position],
-    ) -> Result<Vec<Evaluation>, EvaluationError> {
+    fn evaluate_batch(&self, positions: &[Position]) -> Result<Vec<Evaluation>, EvaluationError> {
         assert!(
             positions
                 .iter()
@@ -445,8 +440,7 @@ fn coarse_fine_progressive_widening_can_add_later_candidates() {
     let mut config = SearchConfig::canary(1);
     config.coarse_pool = 4;
     let mut stats = SearchStats::default();
-    let mut node =
-        Node::new(position, None, 11, &evaluator, &mut stats).expect("node evaluates");
+    let mut node = Node::new(position, None, 11, &evaluator, &mut stats).expect("node evaluates");
 
     node.widen(config, &mut stats);
     let initial_actions = node
@@ -666,13 +660,20 @@ fn search_plays_the_move_the_value_favours_for_either_colour() {
         for seed in [1, 2, 3] {
             let opponent = Stone::new(0.9, 0.9, colour.other());
             let position = Position::new(0.05, vec![opponent], colour);
-            let config = SearchConfig { widening_coefficient: 4.0, ..SearchConfig::canary(128) };
+            let config = SearchConfig {
+                widening_coefficient: 4.0,
+                ..SearchConfig::canary(128)
+            };
             let result = search_with_evaluator(&position, config, seed, &LeftHalfWins)
                 .expect("scripted evaluator succeeds");
             let Action::Place(point) = result.action else {
                 panic!("{colour:?} passed, seed {seed}");
             };
-            assert!(point.x < 0.5, "{colour:?} chose x = {}, seed {seed}", point.x);
+            assert!(
+                point.x < 0.5,
+                "{colour:?} chose x = {}, seed {seed}",
+                point.x
+            );
         }
     }
 }
@@ -680,20 +681,41 @@ fn search_plays_the_move_the_value_favours_for_either_colour() {
 #[test]
 fn equal_visits_break_toward_the_movers_value() {
     let summaries = [
-        ChildSummary { black_value: -0.5, ..child(place(0.2), 5) },
-        ChildSummary { black_value: 0.5, ..child(place(0.8), 5) },
+        ChildSummary {
+            black_value: -0.5,
+            ..child(place(0.2), 5)
+        },
+        ChildSummary {
+            black_value: 0.5,
+            ..child(place(0.8), 5)
+        },
     ];
-    assert_eq!(preferred_child_indices(&summaries, Color::Black), vec![1, 0]);
-    assert_eq!(preferred_child_indices(&summaries, Color::White), vec![0, 1]);
+    assert_eq!(
+        preferred_child_indices(&summaries, Color::Black),
+        vec![1, 0]
+    );
+    assert_eq!(
+        preferred_child_indices(&summaries, Color::White),
+        vec![0, 1]
+    );
 }
 
 #[test]
 fn more_visits_outrank_value() {
     let summaries = [
-        ChildSummary { black_value: 0.9, ..child(place(0.2), 2) },
-        ChildSummary { black_value: -0.9, ..child(place(0.8), 9) },
+        ChildSummary {
+            black_value: 0.9,
+            ..child(place(0.2), 2)
+        },
+        ChildSummary {
+            black_value: -0.9,
+            ..child(place(0.8), 9)
+        },
     ];
-    assert_eq!(preferred_child_indices(&summaries, Color::Black), vec![1, 0]);
+    assert_eq!(
+        preferred_child_indices(&summaries, Color::Black),
+        vec![1, 0]
+    );
 }
 
 /// PUCT's exploration bonus scales with the square root of the parent's
@@ -702,15 +724,27 @@ fn more_visits_outrank_value() {
 #[test]
 fn exploration_grows_with_the_root_of_parent_visits() {
     let position = Position::new(1.0 / 6.0, Vec::new(), Color::Black);
-    let config = SearchConfig { exploration: 1.5, ..SearchConfig::canary(1) };
+    let config = SearchConfig {
+        exploration: 1.5,
+        ..SearchConfig::canary(1)
+    };
     let mut root = Node::from_evaluation(
         position.clone(),
         ConstantEvaluator(0.0).evaluate(&position).unwrap(),
         7,
     );
-    root.widen(SearchConfig { widening_coefficient: 4.0, ..config }, &mut SearchStats::default());
+    root.widen(
+        SearchConfig {
+            widening_coefficient: 4.0,
+            ..config
+        },
+        &mut SearchStats::default(),
+    );
     assert!(root.children.len() >= 2);
-    root.children.iter_mut().skip(2).for_each(|child| child.refused = true);
+    root.children
+        .iter_mut()
+        .skip(2)
+        .for_each(|child| child.refused = true);
     root.visits = 100;
     root.children[0].prior = 0.5;
     root.children[0].visits = 100;
@@ -765,9 +799,8 @@ fn an_official_search_never_plays_a_refused_move() {
             let mut config = SearchConfig::canary(64);
             config.temperature = 0.0;
             config.leaf_batch = leaf_batch;
-            let result =
-                crate::search_at_ply(&position, config, seed, &crate::NaiveEvaluator, 0)
-                    .expect("search");
+            let result = crate::search_at_ply(&position, config, seed, &crate::NaiveEvaluator, 0)
+                .expect("search");
 
             // Whatever it chose, the rules must accept it.
             if let Action::Place(point) = result.action {

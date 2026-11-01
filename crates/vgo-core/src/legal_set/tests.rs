@@ -1,8 +1,8 @@
-use super::vertices::vertices_with;
 use super::StoneBuckets;
 use super::none_closer_than;
-use crate::{Color, Point, Position, Stone};
+use super::vertices::vertices_with;
 use super::{contains, distance, nearest, nearest_with, vertices};
+use crate::{Color, Point, Position, Stone};
 
 /// The bucketed enumeration against the quadratic one it replaced.
 ///
@@ -205,8 +205,6 @@ fn indexed_threshold_queries_match_exhaustive_near_boundaries() {
     }
 }
 
-
-
 #[test]
 fn closed_boundaries_are_legal() {
     let position = Position::new(0.1, vec![Stone::new(0.5, 0.5, Color::Black)], Color::White);
@@ -234,7 +232,11 @@ fn covered_legal_set_has_no_vertices_or_finite_distance() {
 
 #[test]
 fn indexed_nearest_matches_the_unindexed_scan() {
-    for (count, radius, seed) in [(40, 1.0 / 38.0, 3), (90, 1.0 / 38.0, 5), (200, 1.0 / 38.0, 7)] {
+    for (count, radius, seed) in [
+        (40, 1.0 / 38.0, 3),
+        (90, 1.0 / 38.0, 5),
+        (200, 1.0 / 38.0, 7),
+    ] {
         let position = scattered(count, radius, seed);
         let index = super::LegalSetIndex::build(&position);
         for row in 0..64 {
@@ -243,8 +245,18 @@ fn indexed_nearest_matches_the_unindexed_scan() {
                 let plain = nearest_with(&position, query, Some(index.vertices()));
                 let fast = super::nearest_indexed(&position, query, &index);
                 assert_eq!(
-                    (plain.legal, plain.snapped, plain.point.x.to_bits(), plain.point.y.to_bits()),
-                    (fast.legal, fast.snapped, fast.point.x.to_bits(), fast.point.y.to_bits()),
+                    (
+                        plain.legal,
+                        plain.snapped,
+                        plain.point.x.to_bits(),
+                        plain.point.y.to_bits()
+                    ),
+                    (
+                        fast.legal,
+                        fast.snapped,
+                        fast.point.x.to_bits(),
+                        fast.point.y.to_bits()
+                    ),
                 );
             }
         }
@@ -253,18 +265,27 @@ fn indexed_nearest_matches_the_unindexed_scan() {
 
 #[test]
 fn a_bounded_nearest_matches_the_full_one_within_its_reach() {
-    for (count, radius, seed) in [(40, 1.0 / 38.0, 3), (90, 1.0 / 38.0, 5), (60, 1.0 / 18.0, 7)] {
+    for (count, radius, seed) in [
+        (40, 1.0 / 38.0, 3),
+        (90, 1.0 / 38.0, 5),
+        (60, 1.0 / 18.0, 7),
+    ] {
         let position = scattered(count, radius, seed);
         let index = super::LegalSetIndex::build(&position);
         for reach in [0.002, 0.01, 0.05] {
             for row in 0..128 {
                 for column in 0..128 {
-                    let query = Point::new((column as f64 + 0.5) / 128.0, (row as f64 + 0.5) / 128.0);
+                    let query =
+                        Point::new((column as f64 + 0.5) / 128.0, (row as f64 + 0.5) / 128.0);
                     let full = super::nearest_indexed(&position, query, &index);
                     let bounded = super::nearest_indexed_within(&position, query, &index, reach);
                     if full.legal && full.point.distance(query) <= reach {
                         assert_eq!(
-                            (bounded.legal, bounded.point.x.to_bits(), bounded.point.y.to_bits()),
+                            (
+                                bounded.legal,
+                                bounded.point.x.to_bits(),
+                                bounded.point.y.to_bits()
+                            ),
                             (true, full.point.x.to_bits(), full.point.y.to_bits()),
                         );
                     } else if bounded.legal {
@@ -389,11 +410,7 @@ fn lazy_nearest_matches_the_exhaustive_scan() {
 
 /// The pre-optimization scan: build every candidate, test all of them,
 /// keep a strict running minimum. Mirrors `nearest_with` exactly.
-fn exhaustive_nearest(
-    position: &Position,
-    point: Point,
-    known: &[Point],
-) -> (bool, Point, bool) {
+fn exhaustive_nearest(position: &Position, point: Point, known: &[Point]) -> (bool, Point, bool) {
     if contains(position, point.x, point.y) {
         return (true, point, false);
     }
@@ -439,7 +456,11 @@ fn exhaustive_nearest(
     }
     match best {
         None => (false, point, false),
-        Some((_, found)) => (true, super::nearest::clear_by_margin(position, found, None), true),
+        Some((_, found)) => (
+            true,
+            super::nearest::clear_by_margin(position, found, None),
+            true,
+        ),
     }
 }
 

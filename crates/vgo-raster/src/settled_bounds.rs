@@ -300,7 +300,12 @@ impl VertexGrid {
             points[*slot as usize] = *mark;
             *slot += 1;
         }
-        Self { cell, side, starts: counts, points }
+        Self {
+            cell,
+            side,
+            starts: counts,
+            points,
+        }
     }
 
     /// Whether a vertex lies strictly closer than `distance` to `point`. Errs
@@ -315,7 +320,8 @@ impl VertexGrid {
         }
         let reach_squared = reach * reach;
         let low = |v: f64| (((v - reach) / self.cell).floor().max(0.0) as usize).min(self.side - 1);
-        let high = |v: f64| (((v + reach) / self.cell).floor().max(0.0) as usize).min(self.side - 1);
+        let high =
+            |v: f64| (((v + reach) / self.cell).floor().max(0.0) as usize).min(self.side - 1);
         for row in low(point.y)..=high(point.y) {
             let base = row * self.side;
             let (first, last) = (
@@ -376,7 +382,8 @@ pub fn settled_mask_by_bounded_distance(
 ) -> (Vec<bool>, usize) {
     let mut scratch = SettledScratch::default();
     let mut mask = Vec::new();
-    let tests = settled_by_bounded_distance_into(position, config, oversample, &mut scratch, &mut mask);
+    let tests =
+        settled_by_bounded_distance_into(position, config, oversample, &mut scratch, &mut mask);
     (mask, tests)
 }
 
@@ -478,7 +485,10 @@ impl SettledRows {
                 true
             } else if nearest_square > upper * upper {
                 false
-            } else if self.vertices.any_closer(Point::new(x, y), nearest_square.sqrt()) {
+            } else if self
+                .vertices
+                .any_closer(Point::new(x, y), nearest_square.sqrt())
+            {
                 false
             } else {
                 self.exact_tests += 1;
@@ -512,7 +522,9 @@ fn settled_by_bounded_distance_into(
     let mut rows = prepare_settled_rows(position, config, oversample, scratch);
     let width = config.width;
     scratch.column_xs.clear();
-    scratch.column_xs.extend((0..width).map(|column| (column as f64 + 0.5) / width as f64));
+    scratch
+        .column_xs
+        .extend((0..width).map(|column| (column as f64 + 0.5) / width as f64));
     scratch.nearest_squares.resize(width, f64::INFINITY);
     let nearest_grid = (stones.len() >= NEAREST_SEARCH_MINIMUM_STONES).then(|| {
         let cell = (2.0 * position.radius()).max(1.0 / (stones.len() as f64).sqrt());
@@ -521,7 +533,13 @@ fn settled_by_bounded_distance_into(
     for (row, out) in mask.chunks_exact_mut(width).enumerate() {
         let y = (row as f64 + 0.5) / config.height as f64;
         if let Some(grid) = nearest_grid.as_ref() {
-            nearest_row_chunked(position, grid, y, &scratch.column_xs, &mut scratch.nearest_squares);
+            nearest_row_chunked(
+                position,
+                grid,
+                y,
+                &scratch.column_xs,
+                &mut scratch.nearest_squares,
+            );
         } else {
             scratch.nearest_squares.fill(f64::INFINITY);
             for stone in stones {
@@ -606,13 +624,21 @@ mod tests {
                     ((s.x - x).powi(2) + (s.y - y).powi(2)).sqrt() > 2.0 * radius * 1.0001
                 });
                 if clear {
-                    let colour = if stones.len() % 2 == 0 { Color::Black } else { Color::White };
+                    let colour = if stones.len() % 2 == 0 {
+                        Color::Black
+                    } else {
+                        Color::White
+                    };
                     stones.push(Stone::new(x, y, colour));
                 }
             }
             Position::new(radius, stones, Color::Black)
         }
-        for (size, radius, target) in [(128usize, 1.0 / 38.0, 250usize), (128, 1.0 / 38.0, 400), (96, 1.0 / 18.0, 90)] {
+        for (size, radius, target) in [
+            (128usize, 1.0 / 38.0, 250usize),
+            (128, 1.0 / 38.0, 400),
+            (96, 1.0 / 18.0, 90),
+        ] {
             let config = RasterConfig::square_of(size, RasterKind::CompactRadius);
             let position = packing(radius, target, target as u64);
             let scale = crate::settled_oversample(&position, config).expect("distance path");
@@ -633,7 +659,10 @@ mod tests {
                     wrong += 1;
                 }
             }
-            assert_eq!(wrong, 0, "{size}px, {target} stones: {wrong} pixels disagree");
+            assert_eq!(
+                wrong, 0,
+                "{size}px, {target} stones: {wrong} pixels disagree"
+            );
         }
     }
 
@@ -667,7 +696,10 @@ mod tests {
                     wrong += 1;
                 }
             }
-            assert_eq!(wrong, 0, "{count} stones: {wrong} pixels disagree with the definition");
+            assert_eq!(
+                wrong, 0,
+                "{count} stones: {wrong} pixels disagree with the definition"
+            );
         }
     }
 
@@ -778,7 +810,6 @@ mod tests {
         assert!(mask.iter().all(|settled| !settled));
         assert_eq!(settled_mask(&position, config), mask);
     }
-
 }
 
 #[cfg(test)]

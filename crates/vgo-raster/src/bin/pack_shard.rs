@@ -36,14 +36,24 @@ const OUT_HEADER: usize = 8 + 4 * 7;
 const OUT_MAGIC: &[u8; 8] = b"VGOPACK1";
 
 const fn header_size(version: u32) -> usize {
-    if version >= 8 { HEADER_V8 } else if version >= 7 { HEADER_V7 } else { HEADER_V6 }
+    if version >= 8 {
+        HEADER_V8
+    } else if version >= 7 {
+        HEADER_V7
+    } else {
+        HEADER_V6
+    }
 }
 const STONE: usize = 8 + 8 + 1;
 const STONE_CAPACITY: usize = 128;
 const POLICY_CAPACITY_V4: usize = 64;
 const POLICY_CAPACITY_V6: usize = 128;
 const fn policy_capacity(version: u32) -> usize {
-    if version >= 6 { POLICY_CAPACITY_V6 } else { POLICY_CAPACITY_V4 }
+    if version >= 6 {
+        POLICY_CAPACITY_V6
+    } else {
+        POLICY_CAPACITY_V4
+    }
 }
 const fn cell_bytes(version: u32) -> usize {
     if version >= 7 { 12 } else { 20 }
@@ -69,9 +79,21 @@ struct Layout {
 
 fn layout_for(channels: usize) -> Option<Layout> {
     match channels {
-        5 => Some(Layout { binary: &[0, 1, 3], scalar: &[4], continuous: &[2] }),
-        6 => Some(Layout { binary: &[0, 1, 3], scalar: &[4, 5], continuous: &[2] }),
-        7 => Some(Layout { binary: &[0, 1, 3], scalar: &[4, 5, 6], continuous: &[2] }),
+        5 => Some(Layout {
+            binary: &[0, 1, 3],
+            scalar: &[4],
+            continuous: &[2],
+        }),
+        6 => Some(Layout {
+            binary: &[0, 1, 3],
+            scalar: &[4, 5],
+            continuous: &[2],
+        }),
+        7 => Some(Layout {
+            binary: &[0, 1, 3],
+            scalar: &[4, 5, 6],
+            continuous: &[2],
+        }),
         9 => Some(Layout {
             binary: &[0, 1, 3, 4, 5, 6],
             scalar: &[7, 8],
@@ -96,7 +118,11 @@ struct Records {
 fn position_at(blob: &[u8], records: &Records, index: usize) -> Position {
     let base = records.header + index * records.stride;
     let radius = read_f64(blob, base);
-    let komi = if records.version >= 5 { read_f64(blob, base + 8) } else { 0.0 };
+    let komi = if records.version >= 5 {
+        read_f64(blob, base + 8)
+    } else {
+        0.0
+    };
     let to_move = if blob[base + 8 + records.komi_bytes] == 0 {
         Color::Black
     } else {
@@ -107,8 +133,16 @@ fn position_at(blob: &[u8], records: &Records, index: usize) -> Position {
     let mut stones = Vec::with_capacity(count);
     for stone in 0..count {
         let at = base + records.stones_at + stone * STONE;
-        let colour = if blob[at + 16] == 0 { Color::Black } else { Color::White };
-        stones.push(Stone::new(read_f64(blob, at), read_f64(blob, at + 8), colour));
+        let colour = if blob[at + 16] == 0 {
+            Color::Black
+        } else {
+            Color::White
+        };
+        stones.push(Stone::new(
+            read_f64(blob, at),
+            read_f64(blob, at + 8),
+            colour,
+        ));
     }
     Position::new(radius, stones, to_move)
         .with_komi(komi)
@@ -147,11 +181,8 @@ fn main() {
         STONE_CAPACITY
     };
     let stride = (blob.len() - header) / samples;
-    let expected = stones_at
-        + stone_capacity * STONE
-        + 4
-        + capacity * cell_bytes(version)
-        + 4 + 4 + 8 + 4 + 8;
+    let expected =
+        stones_at + stone_capacity * STONE + 4 + capacity * cell_bytes(version) + 4 + 4 + 8 + 4 + 8;
     assert_eq!(
         stride, expected,
         "record stride {stride} does not match the expected {expected} for \
@@ -161,8 +192,8 @@ fn main() {
     let config = RasterConfig::square_of(resolution, kind);
     let channels = config.channels();
     let pixels = config.pixels();
-    let layout = layout_for(channels)
-        .unwrap_or_else(|| panic!("no packing layout for {channels} channels"));
+    let layout =
+        layout_for(channels).unwrap_or_else(|| panic!("no packing layout for {channels} channels"));
     let bit_bytes = pixels.div_ceil(8);
 
     let bits_per_sample = layout.binary.len() * bit_bytes;
@@ -173,7 +204,14 @@ fn main() {
     let mut continuous = vec![0_u8; samples * cont_per_sample];
     let mut scalars = vec![0_u8; samples * scalars_per_sample];
 
-    let records = Records { header, stride, version, komi_bytes, stones_at, count_at };
+    let records = Records {
+        header,
+        stride,
+        version,
+        komi_bytes,
+        stones_at,
+        count_at,
+    };
     let workers = std::thread::available_parallelism()
         .map_or(1, std::num::NonZeroUsize::get)
         .min(samples.max(1));
@@ -216,8 +254,7 @@ fn main() {
                         let at = local * cont_per_sample + slot * pixels * 2;
                         for (pixel, &value) in plane.iter().enumerate() {
                             let half = f16::from_f32(value).to_le_bytes();
-                            cont_chunk[at + pixel * 2..at + pixel * 2 + 2]
-                                .copy_from_slice(&half);
+                            cont_chunk[at + pixel * 2..at + pixel * 2 + 2].copy_from_slice(&half);
                         }
                     }
                     // One value per plane. The packer takes pixel zero and
@@ -240,9 +277,7 @@ fn main() {
         }
     });
 
-    let mut out = Vec::with_capacity(
-        OUT_HEADER + bits.len() + continuous.len() + scalars.len(),
-    );
+    let mut out = Vec::with_capacity(OUT_HEADER + bits.len() + continuous.len() + scalars.len());
     out.extend_from_slice(OUT_MAGIC);
     for value in [
         samples as u32,

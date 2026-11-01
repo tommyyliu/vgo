@@ -194,9 +194,7 @@ impl Game {
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let parsed = views
             .iter()
-            .map(|view| {
-                Ok(Stone::new(view.x, view.y, parse_colour(&view.color)?))
-            })
+            .map(|view| Ok(Stone::new(view.x, view.y, parse_colour(&view.color)?)))
             .collect::<Result<Vec<_>, JsValue>>()?;
         let position = Position::new(self.position.radius(), parsed, parse_colour(to_move)?)
             .with_komi(self.position.komi())
@@ -359,7 +357,11 @@ impl Search {
         self.outstanding = batch.len();
         let mut data = vec![0.0_f32; batch.len() * stride];
         for (index, position) in batch.iter().enumerate() {
-            rasterize_any_into(position, config, &mut data[index * stride..(index + 1) * stride]);
+            rasterize_any_into(
+                position,
+                config,
+                &mut data[index * stride..(index + 1) * stride],
+            );
         }
         Ok(data)
     }
@@ -456,8 +458,7 @@ impl Search {
                 }
             })
             .collect();
-        serde_wasm_bindgen::to_value(&views)
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+        serde_wasm_bindgen::to_value(&views).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// The chosen move as `[x, y]`, or an empty array for a pass.

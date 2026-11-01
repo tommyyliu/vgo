@@ -89,7 +89,6 @@ impl<'a> SettledRegion<'a> {
             entry.1 /= 2.0;
         }
 
-
         Self {
             position,
             origin,
@@ -162,7 +161,12 @@ impl<'a> SettledRegion<'a> {
             let vertical = side < 2;
             let line = if side % 2 == 1 { 1.0 - radius } else { radius };
             let component = if vertical { ux } else { uy };
-            let offset = line - if vertical { self.origin.x } else { self.origin.y };
+            let offset = line
+                - if vertical {
+                    self.origin.x
+                } else {
+                    self.origin.y
+                };
             for branch in 0..2 {
                 let denominator = if branch == 1 {
                     component - 1.0
@@ -292,9 +296,8 @@ impl<'a> SettledRegion<'a> {
             let cap = self.exit_distance(ux, uy) + 0.02;
             (ux, uy, self.radius_along(ux, uy, cap))
         };
-        let at = |t: f64, ux: f64, uy: f64| {
-            Point::new(self.origin.x + t * ux, self.origin.y + t * uy)
-        };
+        let at =
+            |t: f64, ux: f64, uy: f64| Point::new(self.origin.x + t * ux, self.origin.y + t * uy);
 
         #[allow(clippy::too_many_arguments)]
         fn flatten(
@@ -321,10 +324,8 @@ impl<'a> SettledRegion<'a> {
             let uy = sum_y * inverse_length;
             let cap = region.exit_distance(ux, uy) + 0.02;
             let tm = region.radius_along(ux, uy, cap);
-            let chord_x = 0.5
-                * ((region.origin.x + ta * ax) + (region.origin.x + tb * bx));
-            let chord_y = 0.5
-                * ((region.origin.y + ta * ay) + (region.origin.y + tb * by));
+            let chord_x = 0.5 * ((region.origin.x + ta * ax) + (region.origin.x + tb * bx));
+            let chord_y = 0.5 * ((region.origin.y + ta * ay) + (region.origin.y + tb * by));
             let deviation = numeric::length(
                 region.origin.x + tm * ux - chord_x,
                 region.origin.y + tm * uy - chord_y,
@@ -341,12 +342,30 @@ impl<'a> SettledRegion<'a> {
                 return;
             }
             flatten(
-                region, loop_points, ta, ax, ay, tm, ux, uy, depth + 1,
-                tolerance, max_depth,
+                region,
+                loop_points,
+                ta,
+                ax,
+                ay,
+                tm,
+                ux,
+                uy,
+                depth + 1,
+                tolerance,
+                max_depth,
             );
             flatten(
-                region, loop_points, tm, ux, uy, tb, bx, by, depth + 1,
-                tolerance, max_depth,
+                region,
+                loop_points,
+                tm,
+                ux,
+                uy,
+                tb,
+                bx,
+                by,
+                depth + 1,
+                tolerance,
+                max_depth,
             );
         }
 
@@ -452,7 +471,8 @@ mod tests {
                 }
             }
             assert_eq!(
-                disagreements, 0,
+                disagreements,
+                0,
                 "{count} stones: radial solve disagreed with the definition at \
                  {disagreements} of {} sample points",
                 grid * grid

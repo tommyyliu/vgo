@@ -2,7 +2,6 @@
 
 use vgo_core::{Color, Position, SettledRegion, legal_set_vertices};
 
-
 mod edt;
 pub mod packed;
 mod policy;
@@ -29,7 +28,6 @@ pub(crate) fn settled_oversample(position: &Position, _config: RasterConfig) -> 
 }
 
 pub const CHANNEL_COUNT: usize = 12;
-
 
 /// Indices into [`CHANNELS`] that [`RasterKind::Compact`] keeps.
 pub(crate) const COMPACT_CHANNELS: [usize; 5] = [
@@ -282,7 +280,6 @@ impl SemanticRaster {
     pub fn at(&self, channel: usize, row: usize, column: usize) -> f32 {
         self.channel(channel)[row * self.config.width + column]
     }
-
 }
 
 /// Rasterize a position into whichever layout `config.kind` names.
@@ -373,7 +370,9 @@ pub(crate) fn settled_for_raster_into(
     output: &mut Vec<bool>,
 ) {
     if let Some(scale) = settled_oversample(position, config) {
-        settled_bounds::settled_mask_by_bounded_distance_into(position, config, scale, scratch, output);
+        settled_bounds::settled_mask_by_bounded_distance_into(
+            position, config, scale, scratch, output,
+        );
     } else {
         output.clear();
         output.extend_from_slice(&settled_for_raster(position, config));
@@ -1101,14 +1100,16 @@ mod tests {
         assert_eq!(data, expected.data());
     }
 
-
     /// The pass plane is the pass count, not a lossy summary of it: two passes
     /// end the game, so a live position is only ever at zero or one.
     #[test]
     fn the_pass_plane_carries_the_whole_pass_state() {
         let position = Position::new(
             0.1,
-            vec![Stone::new(0.3, 0.3, Color::Black), Stone::new(0.7, 0.7, Color::White)],
+            vec![
+                Stone::new(0.3, 0.3, Color::Black),
+                Stone::new(0.7, 0.7, Color::White),
+            ],
             Color::Black,
         );
         let config = RasterConfig::square_of(16, RasterKind::CompactRadius);
@@ -1120,12 +1121,13 @@ mod tests {
             let mut data = vec![f32::NAN; config.channels() * pixels];
             super::rasterize_any_into(&position, config, &mut data);
             assert!(
-                data[slot..slot + pixels].iter().all(|value| *value == expected),
+                data[slot..slot + pixels]
+                    .iter()
+                    .all(|value| *value == expected),
                 "{passes} passes should paint the plane {expected}"
             );
         }
     }
-
 
     /// The whole reason the layout exists: two board sizes must not render
     /// identically. An empty board is the case that matters, because it is
@@ -1151,10 +1153,12 @@ mod tests {
         // rasterizer writes at index 8.
         let pixels = config.pixels();
         let plane = &standard[6 * pixels..7 * pixels];
-        assert!(plane.iter().all(|&v| (v - (2.0 / 38.0) as f32).abs() < 1e-6));
+        assert!(
+            plane
+                .iter()
+                .all(|&v| (v - (2.0 / 38.0) as f32).abs() < 1e-6)
+        );
     }
-
-
 
     #[test]
     fn raster_has_stable_shape_and_ranges() {
@@ -1178,4 +1182,3 @@ mod tests {
         }
     }
 }
-

@@ -157,11 +157,8 @@ fn main() {
         STONE_CAPACITY
     };
     let stride = (blob.len() - header) / samples;
-    let expected = stones_at
-        + stone_capacity * STONE
-        + 4
-        + capacity * cell_bytes(version)
-        + 4 + 4 + 8 + 4 + 8;
+    let expected =
+        stones_at + stone_capacity * STONE + 4 + capacity * cell_bytes(version) + 4 + 4 + 8 + 4 + 8;
     assert_eq!(
         stride, expected,
         "record stride {stride} does not match the expected {expected} for \
@@ -173,7 +170,14 @@ fn main() {
     let pixels = config.pixels();
     let record_bytes = channels * pixels * 4;
 
-    let layout = Layout { header, stride, version, komi_bytes, stones_at, count_at };
+    let layout = Layout {
+        header,
+        stride,
+        version,
+        komi_bytes,
+        stones_at,
+        count_at,
+    };
     let mut out = vec![0_u8; samples * record_bytes];
 
     // One thread per core, each taking a contiguous run of samples. Chunking

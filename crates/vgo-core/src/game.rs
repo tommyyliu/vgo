@@ -237,8 +237,11 @@ mod tests {
                 .map(point_bits)
                 .collect::<Vec<_>>()
         );
-        for (actual_cell, expected_cell) in
-            actual.geometry.cells.iter().zip(expected.geometry.cells.iter())
+        for (actual_cell, expected_cell) in actual
+            .geometry
+            .cells
+            .iter()
+            .zip(expected.geometry.cells.iter())
         {
             assert_eq!(actual_cell.area.to_bits(), expected_cell.area.to_bits());
             assert_eq!(
@@ -600,9 +603,7 @@ mod tests {
     fn position_of(radius: f64, to_move: Color, stones: &[(f64, f64, bool)]) -> Position {
         let stones = stones
             .iter()
-            .map(|&(x, y, black)| {
-                Stone::new(x, y, if black { Color::Black } else { Color::White })
-            })
+            .map(|&(x, y, black)| Stone::new(x, y, if black { Color::Black } else { Color::White }))
             .collect();
         Position::new(radius, stones, to_move)
     }
@@ -635,8 +636,18 @@ mod tests {
         .with_ruleset(Ruleset::Official);
         let result = place(&position, 0.5296197406710788, 0.3899047283676407)
             .expect("taking enemy stones keeps the move legal");
-        assert!(result.events.iter().any(|e| matches!(e, GameEvent::Capture { .. })));
-        assert!(result.events.iter().any(|e| matches!(e, GameEvent::SelfCapture { .. })));
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| matches!(e, GameEvent::Capture { .. }))
+        );
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| matches!(e, GameEvent::SelfCapture { .. }))
+        );
     }
 
     /// Losing one friendly stone is only a no-op when that stone is the one just
@@ -662,7 +673,13 @@ mod tests {
         let (x, y) = (0.12, 0.6528797269458962);
         let result = place(&position, x, y).expect("self-capture is legal here");
         assert_eq!(result.captured, 1);
-        assert!(result.position.stones().iter().any(|s| s.x == x && s.y == y));
+        assert!(
+            result
+                .position
+                .stones()
+                .iter()
+                .any(|s| s.x == x && s.y == y)
+        );
         assert_ne!(result.position.stones(), position.stones());
         assert_eq!(result.position.consecutive_passes(), 0);
     }
@@ -740,8 +757,9 @@ mod tests {
         use crate::{Point, Ruleset, distance_to_legal_set};
         let mut checked = 0;
         for seed in 1..16 {
-            for (ply, (position, analysis)) in
-                seeded_game(seed, 0.09, Ruleset::Official).iter().enumerate()
+            for (ply, (position, analysis)) in seeded_game(seed, 0.09, Ruleset::Official)
+                .iter()
+                .enumerate()
             {
                 for vertex in analysis.legal_vertices.iter().skip(ply % 3).step_by(3) {
                     let mut stones = position.stones().to_vec();
@@ -750,7 +768,10 @@ mod tests {
                     let settled = Analysis::new(&provisional);
                     let radius = provisional.radius();
                     for (stone, cell) in settled.geometry.cells.iter().enumerate() {
-                        if settled.alive_groups.contains(&settled.geometry.groups[stone]) {
+                        if settled
+                            .alive_groups
+                            .contains(&settled.geometry.groups[stone])
+                        {
                             continue;
                         }
                         for (index, &a) in cell.polygon.iter().enumerate() {

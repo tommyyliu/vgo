@@ -267,10 +267,23 @@ mod tests {
                 check(dx, dy, near);
             }
         }
-        for threshold in [0.0, -0.0, -1.0, 1e-300, 1e-141, 1e300, f64::INFINITY, f64::NAN] {
+        for threshold in [
+            0.0,
+            -0.0,
+            -1.0,
+            1e-300,
+            1e-141,
+            1e300,
+            f64::INFINITY,
+            f64::NAN,
+        ] {
             for (dx, dy) in [
-                (0.0, 0.0), (1.0, 0.0), (1e-160, 0.0), (1e200, 1e200),
-                (f64::NAN, 0.0), (f64::INFINITY, 1.0),
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (1e-160, 0.0),
+                (1e200, 1e200),
+                (f64::NAN, 0.0),
+                (f64::INFINITY, 1.0),
             ] {
                 check(dx, dy, threshold);
             }

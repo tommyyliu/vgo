@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod generation;
 /// The replay record format, shared by every generator.
 ///
 /// Lived inside `generate_demo` when there was one generator. A second one that
@@ -7,7 +8,6 @@
 /// and the readers -- the Python loader and `render_shard` -- already have to
 /// agree with this file exactly.
 pub mod replay_stream;
-pub mod generation;
 pub mod telemetry;
 
 use vgo_core::{Analysis, Color, GameEvent, Outcome, Phase, Position};
@@ -172,7 +172,13 @@ pub fn play_game<E>(
     search: impl FnMut(&Position, u32) -> Result<SearchResult, E>,
     observe: impl FnMut(PlayoutStep<'_>),
 ) -> Result<PlayoutReport, E> {
-    play_game_with_resignation(initial, maximum_plies, ResignRule::disabled(), search, observe)
+    play_game_with_resignation(
+        initial,
+        maximum_plies,
+        ResignRule::disabled(),
+        search,
+        observe,
+    )
 }
 
 /// [`play_game`], with the option to concede a decided game.
@@ -310,7 +316,6 @@ pub fn play_game_with_resignation<E>(
     })
 }
 
-
 pub(crate) fn accumulate_search_stats(total: &mut SearchStats, next: SearchStats) {
     total.simulations += next.simulations;
     total.evaluations += next.evaluations;
@@ -341,7 +346,6 @@ mod tests {
         assert!(report.stats.plies <= 4);
         assert_eq!(report.stats.search.simulations, report.stats.plies * 2);
     }
-
 
     /// A search result whose root value is fixed, for driving the resign rule.
     fn fixed_value(position: &vgo_core::Position, black_value: f64) -> vgo_search::SearchResult {
@@ -407,7 +411,13 @@ mod tests {
     fn a_single_bad_evaluation_does_not_end_a_game() {
         // The window exists because one ply's root value is noisy. A lone
         // hopeless evaluation surrounded by even ones must not concede.
-        let rule = ResignRule { threshold: 0.9, window: 5, disable_fraction: 0.0, minimum_ply: 0, soft_simulations: 0 };
+        let rule = ResignRule {
+            threshold: 0.9,
+            window: 5,
+            disable_fraction: 0.0,
+            minimum_ply: 0,
+            soft_simulations: 0,
+        };
         let mut ply = 0;
         let report = play_game_with_resignation(
             Position::new(1.0 / 6.0, Vec::new(), Color::Black),
@@ -433,7 +443,13 @@ mod tests {
         // Window 1 so the rule fires before the fixture's repeated Pass ends
         // the game by double-pass; the window's behaviour is covered by
         // `a_single_bad_evaluation_does_not_end_a_game`.
-        let rule = ResignRule { threshold: 0.9, window: 1, disable_fraction: 0.0, minimum_ply: 0, soft_simulations: 0 };
+        let rule = ResignRule {
+            threshold: 0.9,
+            window: 1,
+            disable_fraction: 0.0,
+            minimum_ply: 0,
+            soft_simulations: 0,
+        };
         let report = play_game_with_resignation(
             Position::new(1.0 / 6.0, Vec::new(), Color::Black),
             40,
@@ -445,7 +461,11 @@ mod tests {
         assert!(report.resigned);
         let outcome = report.outcome.expect("a resigned game still has a winner");
         assert_eq!(outcome.winner, Some(Color::White));
-        assert!(report.stats.plies <= 2, "should concede promptly, got {}", report.stats.plies);
+        assert!(
+            report.stats.plies <= 2,
+            "should concede promptly, got {}",
+            report.stats.plies
+        );
     }
 
     #[test]
@@ -462,14 +482,18 @@ mod tests {
         // the one setting where the bug is invisible.
         // Placing rather than passing: two passes finish the game at ply 2,
         // before Black reaches a third turn.
-        let rule = ResignRule { threshold: 0.9, window: 3, disable_fraction: 0.0, minimum_ply: 0, soft_simulations: 0 };
+        let rule = ResignRule {
+            threshold: 0.9,
+            window: 3,
+            disable_fraction: 0.0,
+            minimum_ply: 0,
+            soft_simulations: 0,
+        };
         let report = play_game_with_resignation(
             Position::new(1.0 / 6.0, Vec::new(), Color::Black),
             40,
             rule,
-            |position, ply| {
-                Ok::<_, Infallible>(placing_value(position, ply, -1.0))
-            },
+            |position, ply| Ok::<_, Infallible>(placing_value(position, ply, -1.0)),
             |_| {},
         )
         .unwrap();
@@ -582,7 +606,13 @@ mod tests {
         // The root value is Black-relative. A strongly positive value means
         // Black is winning, so Black must never concede on it however long it
         // persists -- only the side actually losing may resign.
-        let rule = ResignRule { threshold: 0.9, window: 3, disable_fraction: 0.0, minimum_ply: 0, soft_simulations: 0 };
+        let rule = ResignRule {
+            threshold: 0.9,
+            window: 3,
+            disable_fraction: 0.0,
+            minimum_ply: 0,
+            soft_simulations: 0,
+        };
         let report = play_game_with_resignation(
             Position::new(1.0 / 6.0, Vec::new(), Color::Black),
             8,

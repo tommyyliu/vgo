@@ -450,7 +450,6 @@ impl Validation {
         self.issues.is_empty()
     }
 
-
     #[must_use]
     pub fn issues(&self) -> &[ValidationIssue] {
         &self.issues
@@ -466,7 +465,8 @@ mod tests {
         let stone = |x, color| Stone::new(x, 0.5, color);
         let parent = Position::new(0.05, vec![stone(0.2, Color::Black)], Color::White);
         let cells = Arc::clone(parent.shared_cells());
-        let mut child = parent.with_stones(vec![stone(0.2, Color::Black), stone(0.7, Color::White)]);
+        let mut child =
+            parent.with_stones(vec![stone(0.2, Color::Black), stone(0.7, Color::White)]);
         child.link_parent_cells(cells);
         assert!(child.clone().parent_cells().is_some());
         // Same stone count as the linked child, so only the reset can catch this.
@@ -483,7 +483,10 @@ mod tests {
         let position = Position::new(0.05, vec![first], Color::White);
         let before = position.legal_index().vertices().to_vec();
         let moved = position.with_stones(vec![Stone::new(0.94, 0.94, Color::Black)]);
-        assert_eq!(moved.legal_index().vertices(), crate::legal_set::vertices(&moved));
+        assert_eq!(
+            moved.legal_index().vertices(),
+            crate::legal_set::vertices(&moved)
+        );
         assert_ne!(moved.legal_index().vertices(), before);
         // A clone shares the built index.
         let clone = position.clone();

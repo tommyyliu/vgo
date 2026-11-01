@@ -62,7 +62,13 @@ pub fn nearest_with(
 /// [`nearest_with`], against a prebuilt index.
 #[must_use]
 pub fn nearest_indexed(position: &Position, point: Point, index: &LegalSetIndex) -> Nearest {
-    nearest_from(position, point, Some(&index.vertices), index.buckets.as_ref(), None)
+    nearest_from(
+        position,
+        point,
+        Some(&index.vertices),
+        index.buckets.as_ref(),
+        None,
+    )
 }
 
 /// [`nearest_indexed`] for a caller that only accepts answers within `reach` of
@@ -78,7 +84,13 @@ pub fn nearest_indexed_within(
     index: &LegalSetIndex,
     reach: f64,
 ) -> Nearest {
-    nearest_from(position, point, Some(&index.vertices), index.buckets.as_ref(), Some(reach))
+    nearest_from(
+        position,
+        point,
+        Some(&index.vertices),
+        index.buckets.as_ref(),
+        Some(reach),
+    )
 }
 
 /// The geometry of snapping: how far candidates sit off the constraints that
@@ -105,7 +117,10 @@ impl Snap {
     }
 
     fn clamp(&self, value: f64) -> f64 {
-        value.clamp(self.inset.min(1.0 - self.inset), self.inset.max(1.0 - self.inset))
+        value.clamp(
+            self.inset.min(1.0 - self.inset),
+            self.inset.max(1.0 - self.inset),
+        )
     }
 
     fn clamped_query(&self, point: Point) -> Point {
@@ -159,7 +174,11 @@ fn snapped(
         },
         // No legal point exists anywhere: the board is full, and the caller must
         // treat the move as unplayable rather than substituting one.
-        None => Nearest { point, legal: false, snapped: false },
+        None => Nearest {
+            point,
+            legal: false,
+            snapped: false,
+        },
     }
 }
 
@@ -217,7 +236,8 @@ fn nearest_from(
     }
     let snap = Snap::new(position.radius());
     if let (Some(reach), Some(buckets)) = (within, buckets)
-        && let Some(answer) = nearest_bounded(position, point, reach, buckets, known_vertices, &snap)
+        && let Some(answer) =
+            nearest_bounded(position, point, reach, buckets, known_vertices, &snap)
     {
         return answer;
     }
@@ -290,7 +310,11 @@ fn nearest_from(
 ///
 /// Nudging the winner rather than the candidates keeps the two uses separate:
 /// the geometry stays exact, and only the point that becomes a move is moved.
-pub(super) fn clear_by_margin(position: &Position, point: Point, buckets: Option<&StoneBuckets>) -> Point {
+pub(super) fn clear_by_margin(
+    position: &Position,
+    point: Point,
+    buckets: Option<&StoneBuckets>,
+) -> Point {
     let radius = position.radius();
     let target = 2.0 * radius + numeric::SNAP_MARGIN;
     let mut moved = point;

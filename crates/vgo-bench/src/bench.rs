@@ -111,7 +111,9 @@ fn write_profile(guard: Option<pprof::ProfilerGuard<'static>>, output: Option<&s
             .rev()
             .flat_map(|inlined| inlined.iter().rev().map(|symbol| symbol.name()))
             .collect();
-        names.iter_mut().for_each(|name| *name = name.replace(';', ":"));
+        names
+            .iter_mut()
+            .for_each(|name| *name = name.replace(';', ":"));
         writeln!(file, "{} {count}", names.join(";")).expect("write profile");
     }
 }

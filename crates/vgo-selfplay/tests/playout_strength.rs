@@ -55,7 +55,11 @@ fn duel<E: Evaluator>(
                 continue;
             };
             completed += 1;
-            let high_color = if high_is_black { Color::Black } else { Color::White };
+            let high_color = if high_is_black {
+                Color::Black
+            } else {
+                Color::White
+            };
             high_points += match outcome.winner {
                 Some(w) if w == high_color => 1.0,
                 Some(_) => 0.0,

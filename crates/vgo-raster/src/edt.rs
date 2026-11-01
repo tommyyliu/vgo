@@ -105,8 +105,8 @@ fn envelope_row(row: &[u32], parabolas: &mut [u32], starts: &mut [u32], out: &mu
         // First pixel where `column` is strictly below the parabola on top.
         let left = i64::from(parabolas[top]);
         let right = i64::from(column);
-        let numerator =
-            right * right - left * left + i64::from(row[right as usize]) - i64::from(row[left as usize]);
+        let numerator = right * right - left * left + i64::from(row[right as usize])
+            - i64::from(row[left as usize]);
         let crossing = numerator.div_euclid(2 * (right - left)) + 1;
         if crossing < width {
             top += 1;
@@ -142,8 +142,16 @@ mod tests {
             state
         };
         for (width, height, per_thousand) in [
-            (1, 1, 500), (1, 9, 300), (9, 1, 300), (17, 5, 2), (5, 17, 2),
-            (32, 32, 1), (32, 32, 20), (32, 32, 300), (31, 47, 950), (64, 64, 3),
+            (1, 1, 500),
+            (1, 9, 300),
+            (9, 1, 300),
+            (17, 5, 2),
+            (5, 17, 2),
+            (32, 32, 1),
+            (32, 32, 20),
+            (32, 32, 300),
+            (31, 47, 950),
+            (64, 64, 3),
         ] {
             for _ in 0..40 {
                 let mask: Vec<bool> = (0..width * height)

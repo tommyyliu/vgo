@@ -41,8 +41,7 @@ pub struct Edge {
     pub source: Option<EdgeSource>,
 }
 
-impl Edge {
-}
+impl Edge {}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Cell {
@@ -131,10 +130,9 @@ fn normalize_polygon(points: &mut Vec<Vertex>, scratch: &mut Scratch) {
     let deduped = &mut scratch.deduped;
     deduped.clear();
     for vertex in points.iter().copied() {
-        if deduped
-            .last()
-            .is_none_or(|last| distance_squared(vertex.point, last.point) > numeric::EDGE_EPSILON.powi(2))
-        {
+        if deduped.last().is_none_or(|last| {
+            distance_squared(vertex.point, last.point) > numeric::EDGE_EPSILON.powi(2)
+        }) {
             deduped.push(vertex);
         } else if let Some(last) = deduped.last_mut() {
             last.outgoing = vertex.outgoing;
@@ -239,7 +237,10 @@ fn clip_half_plane(polygon: &mut Vec<Vertex>, constraint: Constraint, scratch: &
                     // from here to `b` is still that edge.
                     a.outgoing
                 };
-                output.push(Vertex { point: crossing, outgoing });
+                output.push(Vertex {
+                    point: crossing,
+                    outgoing,
+                });
             }
         }
     }
@@ -388,7 +389,10 @@ struct CellBuffers {
 /// One stone's cell, clipped from the board square.
 fn compute_cell(position: &Position, stone: usize, buffers: &mut CellBuffers) -> Cell {
     let count = position.stones().len();
-    let CellBuffers { order, clip: scratch } = buffers;
+    let CellBuffers {
+        order,
+        clip: scratch,
+    } = buffers;
     // The starting square's sides are board edges, each vertex owning the
     // side that leaves it: (0,0) to (1,0) is the top, and so on round.
     let mut polygon = vec![
@@ -419,7 +423,10 @@ fn compute_cell(position: &Position, stone: usize, buffers: &mut CellBuffers) ->
             continue;
         }
         let o = position.stones()[other];
-        order.push(order_key(numeric::length(o.x - site.x, o.y - site.y), other));
+        order.push(order_key(
+            numeric::length(o.x - site.x, o.y - site.y),
+            other,
+        ));
     }
     // `total_cmp` so a NaN coordinate cannot make the comparator
     // inconsistent; ties break by index, which keeps the clip sequence a
@@ -515,7 +522,9 @@ fn compute_cell(position: &Position, stone: usize, buffers: &mut CellBuffers) ->
 #[must_use]
 pub fn compute(position: &Position) -> Geometry {
     let count = position.stones().len();
-    let parent = position.parent_cells().filter(|cells| cells.len() + 1 == count);
+    let parent = position
+        .parent_cells()
+        .filter(|cells| cells.len() + 1 == count);
     let mut cells = Vec::with_capacity(count);
     let mut adjacency = vec![Vec::new(); count];
     let mut diagnostics = GeometryDiagnostics::default();
@@ -600,7 +609,11 @@ mod tests {
         let mut out = Vec::new();
         for cell in geometry.cells.iter() {
             out.push(cell.area.to_bits());
-            out.extend(cell.polygon.iter().flat_map(|p| [p.x.to_bits(), p.y.to_bits()]));
+            out.extend(
+                cell.polygon
+                    .iter()
+                    .flat_map(|p| [p.x.to_bits(), p.y.to_bits()]),
+            );
             for edge in &cell.edges {
                 out.extend([edge.start.x.to_bits(), edge.start.y.to_bits()]);
                 out.extend([edge.end.x.to_bits(), edge.end.y.to_bits()]);
@@ -627,10 +640,17 @@ mod tests {
             for _ in 0..6000 {
                 let x = radius + next() * (1.0 - 2.0 * radius);
                 let y = radius + next() * (1.0 - 2.0 * radius);
-                if stones.iter().any(|s| (s.x - x).hypot(s.y - y) < 2.0 * radius) {
+                if stones
+                    .iter()
+                    .any(|s| (s.x - x).hypot(s.y - y) < 2.0 * radius)
+                {
                     continue;
                 }
-                let color = if stones.len() % 2 == 0 { Color::Black } else { Color::White };
+                let color = if stones.len() % 2 == 0 {
+                    Color::Black
+                } else {
+                    Color::White
+                };
                 let parent = Position::new(radius, stones.clone(), Color::Black);
                 let shared = compute(&parent).cells;
                 stones.push(Stone::new(x, y, color));
@@ -665,10 +685,22 @@ mod tests {
         let mut scratch = super::Scratch::default();
         for stone in 0..count {
             let mut polygon = vec![
-                super::Vertex { point: Point::new(0.0, 0.0), outgoing: None },
-                super::Vertex { point: Point::new(1.0, 0.0), outgoing: None },
-                super::Vertex { point: Point::new(1.0, 1.0), outgoing: None },
-                super::Vertex { point: Point::new(0.0, 1.0), outgoing: None },
+                super::Vertex {
+                    point: Point::new(0.0, 0.0),
+                    outgoing: None,
+                },
+                super::Vertex {
+                    point: Point::new(1.0, 0.0),
+                    outgoing: None,
+                },
+                super::Vertex {
+                    point: Point::new(1.0, 1.0),
+                    outgoing: None,
+                },
+                super::Vertex {
+                    point: Point::new(0.0, 1.0),
+                    outgoing: None,
+                },
             ];
             // Same order the cutoff visits in, so only the stopping differs.
             let site = {
@@ -729,14 +761,28 @@ mod tests {
     #[test]
     fn order_keys_sort_like_total_cmp_and_round_trip() {
         let values = [
-            f64::NEG_INFINITY, -2.5, -1e-300, -0.0, 0.0, 1e-320, 1e-300, 0.5, 2.5,
-            f64::MAX, f64::INFINITY, f64::NAN, -f64::NAN,
+            f64::NEG_INFINITY,
+            -2.5,
+            -1e-300,
+            -0.0,
+            0.0,
+            1e-320,
+            1e-300,
+            0.5,
+            2.5,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NAN,
+            -f64::NAN,
         ];
         for &a in &values {
             for &b in &values {
                 for (i, j) in [(1usize, 2usize), (2, 1), (1, 1)] {
                     let expected = a.total_cmp(&b).then(i.cmp(&j));
-                    assert_eq!(super::order_key(a, i).cmp(&super::order_key(b, j)), expected);
+                    assert_eq!(
+                        super::order_key(a, i).cmp(&super::order_key(b, j)),
+                        expected
+                    );
                 }
             }
             let (decoded, index) = super::decode_order_key(super::order_key(a, 7));
@@ -773,9 +819,15 @@ mod tests {
                 let (x, y) = if tangent && !stones.is_empty() && next() < 0.7 {
                     let s = stones[(next() * stones.len() as f64) as usize % stones.len()];
                     let angle = next() * std::f64::consts::TAU;
-                    (s.x + 2.0 * radius * angle.cos(), s.y + 2.0 * radius * angle.sin())
+                    (
+                        s.x + 2.0 * radius * angle.cos(),
+                        s.y + 2.0 * radius * angle.sin(),
+                    )
                 } else {
-                    (radius + next() * (1.0 - 2.0 * radius), radius + next() * (1.0 - 2.0 * radius))
+                    (
+                        radius + next() * (1.0 - 2.0 * radius),
+                        radius + next() * (1.0 - 2.0 * radius),
+                    )
                 };
                 if x < radius || x > 1.0 - radius || y < radius || y > 1.0 - radius {
                     continue;
@@ -783,7 +835,11 @@ mod tests {
                 if stones.iter().all(|s: &Stone| {
                     super::numeric::length(s.x - x, s.y - y) >= 2.0 * radius - 1.0e-12
                 }) {
-                    let colour = if stones.len() % 2 == 0 { Color::Black } else { Color::White };
+                    let colour = if stones.len() % 2 == 0 {
+                        Color::Black
+                    } else {
+                        Color::White
+                    };
                     stones.push(Stone::new(x, y, colour));
                 }
             }
@@ -853,9 +909,10 @@ mod tests {
                 tries += 1;
                 let x = radius + next() * (1.0 - 2.0 * radius);
                 let y = radius + next() * (1.0 - 2.0 * radius);
-                if stones.iter().all(|s: &Stone| {
-                    ((s.x - x).powi(2) + (s.y - y).powi(2)).sqrt() >= 2.0 * radius
-                }) {
+                if stones
+                    .iter()
+                    .all(|s: &Stone| ((s.x - x).powi(2) + (s.y - y).powi(2)).sqrt() >= 2.0 * radius)
+                {
                     let colour = if stones.len() % 2 == 0 {
                         Color::Black
                     } else {

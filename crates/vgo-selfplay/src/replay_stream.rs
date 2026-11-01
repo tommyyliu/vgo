@@ -179,8 +179,7 @@ impl ReplayStream {
         // The header must describe the raster it will actually receive: an RGB
         // shard carries three planes, not the semantic ten, and validate_sample
         // compares each sample's config against this one.
-        let channels_u32 =
-            u32::try_from(raster.channels()).expect("channel count fits in u32");
+        let channels_u32 = u32::try_from(raster.channels()).expect("channel count fits in u32");
         let height_u32 = u32::try_from(raster.height).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -592,8 +591,8 @@ mod tests {
     use vgo_raster::RasterConfig;
 
     use super::{
-        LabeledSample, REPLAY_MAGIC, REPLAY_VERSION, ReplayStream, V7_CELL_BYTES,
-        STONE_CAPACITY, temporary_path,
+        LabeledSample, REPLAY_MAGIC, REPLAY_VERSION, ReplayStream, STONE_CAPACITY, V7_CELL_BYTES,
+        temporary_path,
     };
 
     /// Policy slots the test shards pad to. Arbitrary and small: the point is
@@ -644,8 +643,16 @@ mod tests {
         let path = directory.0.join("dataset.vgo");
         let raster = RasterConfig::square(2);
         let policy_size = raster.pixels() + 1;
-        let mut stream =
-            ReplayStream::create(&path, 3, raster, policy_size, 2, TEST_CAPACITY, STONE_CAPACITY).expect("create replay");
+        let mut stream = ReplayStream::create(
+            &path,
+            3,
+            raster,
+            policy_size,
+            2,
+            TEST_CAPACITY,
+            STONE_CAPACITY,
+        )
+        .expect("create replay");
 
         assert_eq!(
             stream
@@ -693,8 +700,16 @@ mod tests {
         let path = directory.0.join("dataset.vgo");
         let raster = RasterConfig::square(2);
         let policy_size = raster.pixels() + 1;
-        let mut stream =
-            ReplayStream::create(&path, 2, raster, policy_size, 0, TEST_CAPACITY, STONE_CAPACITY).expect("create replay");
+        let mut stream = ReplayStream::create(
+            &path,
+            2,
+            raster,
+            policy_size,
+            0,
+            TEST_CAPACITY,
+            STONE_CAPACITY,
+        )
+        .expect("create replay");
         stream
             .write_game(vec![sample(1, 0)])
             .expect("write partial replay");
@@ -709,7 +724,15 @@ mod tests {
         assert!(!temporary_path(&path).exists());
 
         File::create(&path).expect("reserve published path");
-        let error = match ReplayStream::create(&path, 1, raster, policy_size, 0, TEST_CAPACITY, STONE_CAPACITY) {
+        let error = match ReplayStream::create(
+            &path,
+            1,
+            raster,
+            policy_size,
+            0,
+            TEST_CAPACITY,
+            STONE_CAPACITY,
+        ) {
             Ok(_) => panic!("published path cannot be overwritten"),
             Err(error) => error,
         };
@@ -722,8 +745,16 @@ mod tests {
         let path = directory.0.join("dataset.vgo");
         let raster = RasterConfig::square(2);
         let policy_size = raster.pixels() + 1;
-        let mut stream =
-            ReplayStream::create(&path, 1, raster, policy_size, 0, TEST_CAPACITY, STONE_CAPACITY).expect("create replay");
+        let mut stream = ReplayStream::create(
+            &path,
+            1,
+            raster,
+            policy_size,
+            0,
+            TEST_CAPACITY,
+            STONE_CAPACITY,
+        )
+        .expect("create replay");
         stream.write_game(vec![sample(4, 0)]).expect("write replay");
         let published = stream.publish().expect("publish replay");
 
