@@ -42,9 +42,9 @@ document.getElementById('app').addEventListener('load', function () {
     const before = doc.getElementById('sgf').value;
     doc.getElementById('sgf').value = before.replace(/RA\[[^\]]+\]/, 'RA[0.07143]');
     doc.getElementById('load').click();
-    assert(doc.getElementById('radLbl').textContent === '50px', 'loaded radius did not reach the control');
+    assert(doc.getElementById('rad').value === '50', 'loaded radius did not reach the control');
     doc.getElementById('undo').click();
-    assert(doc.getElementById('radLbl').textContent === '39px', 'undo did not restore the prior radius');
+    assert(doc.getElementById('rad').value === '39', 'undo did not restore the prior radius');
   });
 
   test('invalid imported diagrams remain visible but unplayable', function () {
