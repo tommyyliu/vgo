@@ -245,12 +245,13 @@ fn sampled_legal_set_into(
                 continue;
             }
             let base = row * fine_width;
-            for column in low_column..=high_column {
-                let x = scratch.fine_column_xs[column];
+            for (legal, &x) in scratch.legal[base + low_column..=base + high_column]
+                .iter_mut()
+                .zip(&scratch.fine_column_xs[low_column..=high_column])
+            {
                 let dx = x - stone.x;
-                if dx.mul_add(dx, dy_squared) < exclusion_squared {
-                    scratch.legal[base + column] = false;
-                }
+                // A store either way, so this vectorizes.
+                *legal &= dx.mul_add(dx, dy_squared) >= exclusion_squared;
             }
         }
     }

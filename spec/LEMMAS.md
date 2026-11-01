@@ -466,6 +466,13 @@ values below `2^28`, so nothing overflows. Conversion to `f64` is exact. QED
 
 Since the values are exact integers, any correct transform produces the same bits.
 
+`envelope_row` skips columns holding `m^2`, which is what the first half shows they cannot
+supply the minimum. Some column in every row holds a smaller value, because a true cell
+exists and its column's distance is below `m` in every row, so a skipped first column is
+beaten when that one arrives. The stack keeps each parabola's value at its own start
+instead of recomputing it, and the output writes each interval as a run: neither changes
+what is computed.
+
 ### E4. Voronoi cutoff
 
 *Status: Proved in exact arithmetic.* Used by `compute_cell`. The argument with

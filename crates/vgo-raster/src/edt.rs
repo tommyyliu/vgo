@@ -11,6 +11,7 @@ pub(crate) struct EdtScratch {
     gaps: Vec<u32>,
     parabolas: Vec<u32>,
     starts: Vec<u32>,
+    start_heights: Vec<i32>,
 }
 
 impl EdtScratch {
@@ -73,11 +74,19 @@ pub(crate) fn squared_distance_transform_into(
 
     scratch.parabolas.resize(width, 0);
     scratch.starts.resize(width, 0);
+    scratch.start_heights.resize(width, 0);
     for (row, out) in gaps
         .chunks_exact(width)
         .zip(scratch.field.chunks_exact_mut(width))
     {
-        envelope_row(row, &mut scratch.parabolas, &mut scratch.starts, out);
+        envelope_row(
+            row,
+            none * none,
+            &mut scratch.parabolas,
+            &mut scratch.starts,
+            &mut scratch.start_heights,
+            out,
+        );
     }
 }
 
@@ -85,49 +94,69 @@ pub(crate) fn squared_distance_transform_into(
 ///
 /// In `i32`, which [E3] shows holds every value here. The narrower divide is the
 /// point: 64-bit division costs several times the 32-bit one on many server CPUs.
-fn envelope_row(row: &[u32], parabolas: &mut [u32], starts: &mut [u32], out: &mut [f64]) {
-    let parabolas = &mut parabolas[..row.len()];
-    let starts = &mut starts[..row.len()];
-    let height_at = |at: i32, of: u32| {
-        let offset = at - of as i32;
-        offset * offset + row[of as usize] as i32
-    };
-    let width = row.len() as i32;
+fn envelope_row(
+    row: &[u32],
+    absent: u32,
+    parabolas: &mut [u32],
+    starts: &mut [u32],
+    start_heights: &mut [i32],
+    out: &mut [f64],
+) {
+    let size = row.len();
+    let parabolas = &mut parabolas[..size];
+    let starts = &mut starts[..size];
+    let start_heights = &mut start_heights[..size];
+    let out = &mut out[..size];
+    let width = size as i32;
+    let square = |value: i32| value * value;
     let mut top = 0usize;
     parabolas[0] = 0;
     starts[0] = 0;
-    for column in 1..row.len() as u32 {
-        let beaten = loop {
+    start_heights[0] = row[0] as i32;
+    for (column, &height) in row.iter().enumerate().skip(1) {
+        // A column holding no legal cell cannot win while any column holds one,
+        // which [E3] makes the caller's condition.
+        if height >= absent {
+            continue;
+        }
+        let (right, height) = (column as i32, height as i32);
+        let at_start = loop {
             let start = starts[top] as i32;
-            if height_at(start, parabolas[top]) <= height_at(start, column) {
-                break false;
+            let candidate = square(start - right) + height;
+            if start_heights[top] <= candidate {
+                break None;
             }
             if top == 0 {
-                break true;
+                break Some(candidate);
             }
             top -= 1;
         };
-        if beaten {
-            parabolas[0] = column;
+        if let Some(candidate) = at_start {
+            parabolas[0] = column as u32;
+            start_heights[0] = candidate;
             continue;
         }
         // First pixel where `column` is strictly below the parabola on top.
         let left = parabolas[top] as i32;
-        let right = column as i32;
-        let numerator =
-            right * right - left * left + row[right as usize] as i32 - row[left as usize] as i32;
+        let numerator = right * right - left * left + height - row[left as usize] as i32;
         let crossing = numerator.div_euclid(2 * (right - left)) + 1;
         if crossing < width {
             top += 1;
-            parabolas[top] = column;
+            parabolas[top] = column as u32;
             starts[top] = crossing as u32;
+            start_heights[top] = square(crossing - right) + height;
         }
     }
-    for at in (0..row.len()).rev() {
-        out[at] = f64::from(height_at(at as i32, parabolas[top]));
-        if at as u32 == starts[top] && top > 0 {
-            top -= 1;
+    // One run per parabola, so the arithmetic is a flat loop over contiguous pixels.
+    let mut end = size;
+    for index in (0..=top).rev() {
+        let (centre, start) = (parabolas[index] as i32, starts[index] as usize);
+        let height = row[parabolas[index] as usize] as i32;
+        for (at, value) in out[start..end].iter_mut().enumerate() {
+            let offset = (start + at) as i32 - centre;
+            *value = f64::from(offset * offset + height);
         }
+        end = start;
     }
 }
 
