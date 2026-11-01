@@ -23,7 +23,7 @@
     "bucket": "Extract",
     "effort": "M",
     "title": "Train the ownership head",
-    "why": "Weight 0 in the bulk loop since 219d67a, with no recorded arena result. sigmago measured +194 \u00b1 28 with ownership and score heads together, but -96 \u00b1 49 on a smaller run.",
+    "why": "Weight 0 in the bulk loop since 219d67a, with no recorded arena result. sigmago measured +194 ± 28 with ownership and score heads together, but -96 ± 49 on a smaller run.",
     "test": "Train on one frozen corpus at weights 0, 0.5 and 1.5, then arena at equal sims on both boards."
   },
   {
@@ -104,8 +104,17 @@
     "bucket": "Speed",
     "effort": "S",
     "title": "Settle one norm per block",
-    "why": "Measured about 4-9% faster search, with mixed, inconclusive arenas.",
+    "why": "Measured about 4-9% faster search, with mixed, inconclusive arenas. The GPU is now the limit on throughput, and this is the one measured way left to lift it.",
     "test": "Only worth a larger arena if 128 input is adopted first."
+  },
+  {
+    "id": "snap-reuse",
+    "status": "Later",
+    "bucket": "Speed",
+    "effort": "M",
+    "title": "Reuse candidate snapping across a search",
+    "why": "Snapping is about 15% of a search on big boards, and a far stone cannot change a cell's answer. CPU is no longer the limit, so this only saves cores. Stones sit on cell centres, so exact ties between candidates are possible and the proof has to cover visit order.",
+    "test": "Prove the answer is independent of bucket order under ties, then compare whole searches and digests."
   },
   {
     "id": "tree-reuse",
@@ -121,8 +130,8 @@
     "title": "Measure self-play on rented hardware",
     "bucket": "Speed",
     "status": "Later",
-    "why": "The engine work may have moved the limit from CPU to GPU.",
-    "test": "Record generation throughput and GPU use on the rented box.",
+    "why": "One card now holds about 19k positions/s at 128 on 8 cores here, up from 12k late in games. Rented hardware has different wake-up costs and memory, so the core count needs checking on the real box.",
+    "test": "Run 64 actors at 128 for 7 minutes pinned to half the cores, so games finish, and record positions/s, GPU use and busy cores.",
     "effort": "S"
   },
   {

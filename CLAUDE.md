@@ -52,8 +52,13 @@ Share of a fixture search with a fixed policy, so inference is absent.
 | Vertex check | 6% | 6% |
 | Candidate snapping | 8% | 9% |
 
-In real generation the GPU is the limit, not this table, as long as the host has enough cores:
-see "Sizing a machine" in `docs/RUNNING.md`. Measure over whole games. Early-game runs read
-about half the CPU of later boards and overstated what three lanes and 8 cores could do.
+In real generation the GPU is the limit, not this table, from 8 physical cores up: see "Sizing
+a machine" in `docs/RUNNING.md`. Measure over whole games. Early-game runs read about half the
+CPU of later boards and overstated what three lanes and 8 cores could do. A run with 64 actors
+needs about 7 minutes before games finish.
+
+`nvidia-smi` utilization and busy cores can both sit below 100% with work queued, which means a
+hand-off is stalling, not that a resource is short. Broker telemetry shows which: look for
+`completion_wait_seconds` near 1 with positions in the channel and the lanes not busy.
 
 Bigger nets are closed in `docs/FINDINGS.md`. Tree reuse is parked in `dashboard/ideas.json`.

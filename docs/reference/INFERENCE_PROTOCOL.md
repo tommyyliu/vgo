@@ -58,13 +58,20 @@ The implementation exposes three independent contracts:
 
 Each `BatchService` remains synchronous, but generation can run multiple
 session-owned execution slots with `--inference-slots` (default `2`). One
-broker builds batches from the shared actor queue, then assigns each complete
-batch to a free slot; requests are no longer partitioned before batching. Each
+broker builds batches from the shared actor queue, then gives each batch to the
+slot holding the fewest; requests are no longer partitioned before batching. Each
 slot retains its own session, execution context, and reusable input storage, so
 tune the slot count against device memory and end-to-end throughput. The
 executor also permits a future backend to use multiple
 pinned-memory/stream slots inside one session without changing actors,
 encoding, batching, or response routing.
+
+A slot holds the batch it is running and one on deck, which it starts the moment
+it finishes, so a slot never waits for the broker to wake, deliver results and
+build a batch. On a loaded host that round trip outlasted the other slot's batch and
+left the GPU idle with full batches queued. Once every slot is running, only a full
+batch goes on deck, so short batches do not take positions from full ones. Only
+one batch per slot ever runs, so the device sees the same concurrency.
 
 Metrics count submitted request positions (the compatibility `requests`
 counter), executed batches and positions, maximum batch occupancy, and

@@ -97,13 +97,23 @@ impl Drop for ServiceWorker {
     }
 }
 
+/// Batches one slot can hold: the one running, and one on deck.
+///
+/// A slot that finishes takes the batch on deck at once. Without one it has to wake
+/// the broker, which delivers results and builds a batch and wakes the slot back up,
+/// and on a loaded host that round trip outlasted the other slot's batch and left
+/// the GPU idle with full batches queued. Only one batch per slot ever runs, so the
+/// GPU sees the same concurrency as before.
+const SLOT_DEPTH: usize = 2;
+
 /// A set of independent synchronous services exposed as one asynchronous
-/// executor. Batches are assigned only to idle slots and completions share one
-/// receiver, so a slower slot cannot head-of-line block a faster one.
+/// executor. A batch goes to the slot holding the fewest, and completions share
+/// one receiver, so a slower slot cannot head-of-line block a faster one.
 pub struct ThreadedBatchExecutorPool<S: BatchService + 'static> {
     workers: Vec<ServiceWorker>,
     completion_receiver: Receiver<Result<CompletedBatch, EvaluationError>>,
-    available: Vec<usize>,
+    /// Batches each slot holds, running or on deck.
+    loads: Vec<usize>,
     in_flight: usize,
     service: PhantomData<S>,
     timeout: Duration,
@@ -174,11 +184,11 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
             });
         }
         drop(completion_sender);
-        let available = (0..workers.len()).rev().collect();
+        let loads = vec![0; workers.len()];
         Ok(Self {
             workers,
             completion_receiver,
-            available,
+            loads,
             in_flight: 0,
             service: PhantomData,
             timeout,
@@ -188,8 +198,14 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
 }
 
 impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
-    pub fn capacity(&self) -> usize {
+    /// How many batches can run at once.
+    pub fn slots(&self) -> usize {
         self.workers.len()
+    }
+
+    /// How many batches can be held at once, counting those on deck.
+    pub fn capacity(&self) -> usize {
+        self.workers.len() * SLOT_DEPTH
     }
 
     pub fn in_flight(&self) -> usize {
@@ -197,9 +213,10 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
     }
 
     pub fn submit(&mut self, batch: InferenceBatch) -> Result<usize, EvaluationError> {
-        let Some(slot) = self.available.pop() else {
-            return Err(EvaluationError::new("batch executor has no available slot"));
-        };
+        let slot = (0..self.loads.len())
+            .min_by_key(|&slot| self.loads[slot])
+            .filter(|&slot| self.loads[slot] < SLOT_DEPTH)
+            .ok_or_else(|| EvaluationError::new("batch executor has no available slot"))?;
         let pending = (
             slot,
             Instant::now(),
@@ -213,10 +230,8 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
             .expect("sender exists while executor pool is alive")
             .send(batch)
             .map_err(|_| EvaluationError::new(format!("inference executor {slot} has stopped")));
-        if let Err(error) = result {
-            self.available.push(slot);
-            return Err(error);
-        }
+        result?;
+        self.loads[slot] += 1;
         self.in_flight += 1;
         self.pending.insert(sequence, pending);
         Ok(slot)
@@ -252,7 +267,7 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
                     worker.join.take();
                 }
                 self.pending.clear();
-                self.available.clear();
+                self.loads.fill(SLOT_DEPTH);
                 self.in_flight = 0;
                 return Err(match error {
                     Ok(Err(error)) => error,
@@ -268,7 +283,7 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
         };
         self.in_flight -= 1;
         self.pending.remove(&completion.sequence);
-        self.available.push(completion.slot);
+        self.loads[completion.slot] -= 1;
         Ok(completion)
     }
 }
@@ -391,12 +406,15 @@ mod tests {
     fn executor_tracks_capacity_and_sequence() {
         let mut executor = ThreadedBatchExecutorPool::spawn(vec![EchoService]).unwrap();
         assert_eq!(executor.submit(batch(7, 11)).unwrap(), 0);
-        assert_eq!(executor.in_flight(), 1);
-        assert!(executor.submit(batch(8, 12)).is_err());
+        assert_eq!(executor.submit(batch(8, 12)).unwrap(), 0);
+        assert_eq!(executor.in_flight(), 2);
+        assert!(executor.submit(batch(9, 13)).is_err());
         let completed = executor.receive().unwrap();
         assert_eq!(completed.sequence(), 7);
         assert_eq!(completed.slot(), 0);
         assert_eq!(completed.outputs()[0].id(), 11);
+        assert_eq!(executor.in_flight(), 1);
+        assert_eq!(executor.receive().unwrap().sequence(), 8);
         assert_eq!(executor.in_flight(), 0);
     }
 
@@ -407,7 +425,8 @@ mod tests {
         let first = executor.submit(batch(7, 11)).unwrap();
         let second = executor.submit(batch(8, 12)).unwrap();
         assert_ne!(first, second);
-        assert_eq!(executor.capacity(), 2);
+        assert_eq!(executor.slots(), 2);
+        assert_eq!(executor.capacity(), 4);
         assert_eq!(executor.in_flight(), 2);
 
         let mut completed = [executor.receive().unwrap(), executor.receive().unwrap()];

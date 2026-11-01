@@ -237,6 +237,95 @@ fn broker_config() -> BrokerConfig {
     }
 }
 
+/// A short batch must not go on deck: it would take positions a full batch was about
+/// to use, for a slot that has no need of it yet.
+#[test]
+fn a_deck_takes_only_a_full_batch() {
+    struct Recording {
+        gate: Option<mpsc::Receiver<()>>,
+        sizes: Arc<Mutex<Vec<usize>>>,
+    }
+    impl BatchService for Recording {
+        fn contract(&self) -> BatchContract {
+            test_contract(4)
+        }
+        fn infer(
+            &mut self,
+            inputs: &[InferenceInput],
+        ) -> Result<Vec<InferenceOutput>, EvaluationError> {
+            self.sizes.lock().unwrap().push(inputs.len());
+            if let Some(gate) = self.gate.take() {
+                let _ = gate.recv();
+            }
+            ConstantService { wrong_id: false }.infer(inputs)
+        }
+    }
+    let (release, gate) = mpsc::channel();
+    let sizes = Arc::new(Mutex::new(Vec::new()));
+    let service = Recording {
+        gate: Some(gate),
+        sizes: Arc::clone(&sizes),
+    };
+    let contract = service.contract();
+    let executor = ThreadedBatchExecutorPool::spawn(vec![service]).unwrap();
+    let (sender, receiver) = mpsc::sync_channel(8);
+    let broker = Broker::new(
+        BrokerConfig {
+            maximum_delay: Duration::from_millis(1),
+            queue_capacity: 8,
+        },
+        contract,
+        executor,
+        receiver,
+        Arc::new(AtomicMetrics::default()),
+        vec![Arc::new(AtomicMetrics::default())],
+    );
+    let serving = thread::spawn(move || broker.run());
+
+    let position = Position::new(0.1, Vec::new(), Color::Black);
+    let mut next_id = 0;
+    let mut send = |count: usize| {
+        let inputs = (0..count)
+            .map(|_| {
+                next_id += 1;
+                encode_request(next_id, &position, contract)
+            })
+            .collect();
+        let (response, completion) = mpsc::sync_channel(1);
+        sender
+            .send(Request {
+                inputs,
+                encoding_nanoseconds: 0,
+                queued_at: Instant::now(),
+                response,
+            })
+            .unwrap();
+        completion
+    };
+
+    // A full batch to hold the slot, then fewer than a batch behind it, with far
+    // longer than the batching delay to go on deck if it were going to.
+    let mut completions = vec![send(4)];
+    while sizes.lock().unwrap().is_empty() {
+        thread::sleep(Duration::from_millis(1));
+    }
+    completions.extend([send(1), send(1), send(1)]);
+    thread::sleep(Duration::from_millis(50));
+    completions.push(send(1));
+    release.send(()).unwrap();
+    for completion in completions {
+        assert!(
+            completion
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_ok()
+        );
+    }
+    drop(sender);
+    serving.join().unwrap();
+    assert_eq!(*sizes.lock().unwrap(), [4, 4]);
+}
+
 #[test]
 fn batched_evaluator_adapts_a_batch_service() {
     let evaluator =

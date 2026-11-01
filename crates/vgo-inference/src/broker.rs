@@ -78,6 +78,8 @@ pub(crate) struct Broker<S: BatchService + 'static> {
     metrics: Arc<AtomicMetrics>,
     lane_metrics: Vec<Arc<AtomicMetrics>>,
     queued: VecDeque<Queued>,
+    /// Positions in `queued` that no batch has taken yet.
+    queued_positions: usize,
     responses: HashMap<u64, PendingResponse>,
     in_flight: HashMap<u64, InFlight>,
     next_request: u64,
@@ -102,6 +104,7 @@ impl<S: BatchService + 'static> Broker<S> {
             metrics,
             lane_metrics,
             queued: VecDeque::new(),
+            queued_positions: 0,
             responses: HashMap::new(),
             in_flight: HashMap::new(),
             next_request: 0,
@@ -136,6 +139,12 @@ impl<S: BatchService + 'static> Broker<S> {
 
     fn fill_free_slots(&mut self) -> Result<(), EvaluationError> {
         while self.executor.in_flight() < self.executor.capacity() {
+            // A deck is for a batch that is ready. With every slot running, a short
+            // one would take positions a full batch was about to use, and nothing is
+            // waiting for it to start.
+            if self.executor.in_flight() >= self.executor.slots() && !self.full_batch_ready() {
+                break;
+            }
             if self.queued.is_empty() && !self.disconnected && !self.wait_for_request() {
                 break;
             }
@@ -146,6 +155,17 @@ impl<S: BatchService + 'static> Broker<S> {
             self.dispatch(batch)?;
         }
         Ok(())
+    }
+
+    /// Whether a full batch is queued, taking whatever has already arrived.
+    fn full_batch_ready(&mut self) -> bool {
+        while self.queued_positions < self.contract.maximum_batch {
+            match self.receiver.try_recv() {
+                Ok(request) => self.enqueue(request),
+                Err(_) => return false,
+            }
+        }
+        true
     }
 
     /// Block until a request arrives. With work in flight, only wait the batching
@@ -190,6 +210,7 @@ impl<S: BatchService + 'static> Broker<S> {
         self.next_request = key.wrapping_add(1);
         let count = request.inputs.len();
         debug_assert!(count > 0, "evaluators do not submit empty requests");
+        self.queued_positions += count;
         self.responses.insert(
             key,
             PendingResponse {
@@ -249,6 +270,7 @@ impl<S: BatchService + 'static> Broker<S> {
             let count = remaining.min(self.contract.maximum_batch - inputs.len());
             let offset = current.next_offset;
             inputs.extend(current.inputs.by_ref().take(count));
+            self.queued_positions -= count;
             current.next_offset += count;
             // A split request charges its encoding time pro rata.
             let encoded = if count == remaining {

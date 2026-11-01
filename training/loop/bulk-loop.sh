@@ -79,7 +79,7 @@ read -r -a board_mix <<< "${VGO_BOARD_MIX:-50:38 25:18 25:18-38}"
 turnover="${VGO_TURNOVER:-0.15}"
 epochs="${VGO_EPOCHS:-8}"
 updates="${VGO_UPDATES:-200}"
-actors="${VGO_ACTORS:-32}"
+actors="${VGO_ACTORS:-64}"
 telemetry_seconds="${VGO_TELEMETRY_SECONDS:-30}"
 simulations="${VGO_SIMULATIONS:-1000}"
 full_search_fraction="${VGO_FULL_SEARCH_FRACTION:-1.0}"
@@ -209,6 +209,9 @@ print(total)
 PY
 }
 
+# 64 actors keep a full batch waiting, so each slot's deck stays filled. At 32 the
+# queue runs dry on a machine with fewer cores: see "Sizing a machine" in RUNNING.md.
+#
 # `--inference-slots 2` and `--maximum-batch 32` are the known-good pair. Do not
 # raise them. Three gain nothing over whole games and hang at 256 within a minute;
 # at 4 the inference threads livelock, spinning at 100% CPU while every actor

@@ -193,6 +193,8 @@ impl OnnxBatchService {
                 //
                 // All within noise. Batch is already at its optimum: single-session
                 // inference saturates by batch 16-32, and batch 48 and 64 are slower.
+                // With two lanes at 128, batch 64 gave 16.8k positions/s against
+                // 18.8k at 32 (2026-11-01).
                 // Lanes, measured 2026-11-01 over whole games: two and three both
                 // gave 18.5k positions/s at 128 and 7.4k at 192, and one gave 13.4k
                 // early in games. Three hung at 256 both times it ran, after about

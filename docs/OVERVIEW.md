@@ -163,9 +163,10 @@ throughput (1.72k -> 3.7k positions/s) with bit-identical outputs.
 
 Rust loads the graph through ONNX Runtime's TensorRT provider (fp16) and serves
 it behind a batching broker. Two inference slots overlap host staging with GPU
-execution. `--inference-slots 2 --maximum-batch 32 --leaf-batch 4` is the
-known-good combination: 3 slots gain nothing over whole games and hang at 256, and at 4
-the inference threads livelock.
+execution, and each keeps a full batch on deck to start the moment it finishes.
+`--inference-slots 2 --maximum-batch 32 --leaf-batch 4` is the known-good combination:
+3 slots gain nothing over whole games and hang at 256, at 4 the inference threads
+livelock, and batch 64 is slower.
 
 The generator asks CUDA to block rather than spin while waiting on the GPU,
 which frees two cores that were otherwise pinned at 100%.
