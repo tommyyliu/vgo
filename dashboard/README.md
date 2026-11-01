@@ -11,4 +11,5 @@ Run it from the repository root. It needs only Python.
 
 Metrics are read from `artifacts/`, `performance/history.jsonl` and `spec/LEMMAS.md`, and
 refresh every 5 minutes. The loop panels use `artifacts/vgo-bulk` when it exists, and the
-archived run otherwise. Ideas are stored in `ideas.json`.
+archived run otherwise. The work list, both experiments and engineering, is `ideas.json`,
+which the Research tab edits.

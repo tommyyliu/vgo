@@ -1,6 +1,6 @@
 # Voronoi Go: project and idea outline
 
-> Frozen on 2026-10-31. For current material see [`spec/`](../../spec/LEMMAS.md), [`OVERVIEW.md`](../OVERVIEW.md) and [`BACKLOG.md`](../BACKLOG.md).
+> Frozen on 2026-10-31. For current material see [`spec/`](../../spec/LEMMAS.md), [`OVERVIEW.md`](../OVERVIEW.md) and the [dashboard](../../dashboard/README.md).
 
 Current implementation reviewed on 2026-10-13. This is a conceptual map of the
 system and the reasoning needed to understand it. Commands live in

@@ -115,5 +115,104 @@
     "title": "Tree reuse in self-play",
     "why": "Arena prototype scored 24-24 and 23-25, and inherited only 9-12 visits per hit.",
     "test": "No next step unless search budgets rise a lot."
+  },
+  {
+    "id": "e0bf7471",
+    "title": "Measure self-play on rented hardware",
+    "bucket": "Speed",
+    "status": "Later",
+    "why": "The engine work may have moved the limit from CPU to GPU.",
+    "test": "Record generation throughput and GPU use on the rented box.",
+    "effort": "S"
+  },
+  {
+    "id": "40ec030a",
+    "title": "Rule regression fixtures",
+    "bucket": "Engineering",
+    "status": "Later",
+    "why": "Capture cases have no reproducible shared positions.",
+    "test": "Fixtures for nonlocal capture through pocket closure, disconnected self-capture, opponent removal reviving a group, and simultaneous captures run from one command and are shared with Rust.",
+    "effort": "M"
+  },
+  {
+    "id": "c779f7c5",
+    "title": "Browser tests in check.sh",
+    "bucket": "Engineering",
+    "status": "Later",
+    "why": "A stale UI test went unnoticed because nothing runs these automatically.",
+    "test": "js-app/tests run headless on Linux. Today they need PowerShell and Windows Chrome.",
+    "effort": "M"
+  },
+  {
+    "id": "2aa29f48",
+    "title": "Game-grouped validation",
+    "bucket": "Engineering",
+    "status": "Later",
+    "why": "Adjacent positions from one game can land on both sides of the split, which makes validation loss optimistic.",
+    "test": "All positions from one game land in one split, deterministically, tested with overlapping game IDs across shards.",
+    "effort": "S"
+  },
+  {
+    "id": "56317eb8",
+    "title": "Deterministic parallel arena",
+    "bucket": "Engineering",
+    "status": "Later",
+    "why": "fp16 inference can reorder near-ties as batch shapes change.",
+    "test": "Decide between bitwise repeatability and bounded stability, then show identical results across repeated fixed-seed runs.",
+    "effort": "M"
+  },
+  {
+    "id": "1498b8e6",
+    "title": "Incremental legal vertices",
+    "bucket": "Speed",
+    "status": "Later",
+    "why": "About 9% of big-board search rebuilds a list that barely changes.",
+    "test": "Reuse the parent's vertex list with identical output. Vertex order makes this delicate.",
+    "effort": "L"
+  },
+  {
+    "id": "a254b512",
+    "title": "Official vertex reach test",
+    "bucket": "Engineering",
+    "status": "Later",
+    "why": "A bug in this check passes every test. A search of up to 3,000 random games found no position where it alone decides a group.",
+    "test": "Find such a position, or prove the other two checks cover it.",
+    "effort": "M"
+  },
+  {
+    "id": "5b4efdee",
+    "title": "Repetition and ko policy",
+    "bucket": "Measurement",
+    "status": "Parked",
+    "why": "Automated play reaches cycles, but it's unknown whether a strategically meaningful human cycle exists. Rule variants are in docs/history/GAMEPLAY_VARIANTS.md.",
+    "test": "Find a position players would rationally repeat, then choose between unrestricted repetition, simple ko and superko.",
+    "effort": "M"
+  },
+  {
+    "id": "3257466f",
+    "title": "Lint and format",
+    "bucket": "Engineering",
+    "status": "Later",
+    "why": "check.sh can't enforce either until the repo is clean.",
+    "test": "Apply cargo fmt and clear clippy warnings in their own commit.",
+    "effort": "S"
+  },
+  {
+    "id": "f59494cb",
+    "title": "Vgo learnings",
+    "bucket": "Measurement",
+    "status": "Later",
+    "why": "Most runs in artifacts/old/ are in no note. Required before that folder is deleted.",
+    "test": "Write one line per run in docs/FINDINGS.md: question, result, verdict, trust.",
+    "effort": "M"
+  },
+  {
+    "id": "6cf9c874",
+    "title": "Decide the NumPy rasterizer",
+    "bucket": "Engineering",
+    "status": "Later",
+    "why": "A hand-kept second rasterizer is a correctness risk if Rust covers every case.",
+    "test": "Delete it unless something still needs the fallback.",
+    "effort": "S"
   }
 ]

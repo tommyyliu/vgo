@@ -6,7 +6,7 @@ square, and territory is decided by Voronoi cells.
 | Read this | For |
 |---|---|
 | [`spec/RULES.md`](spec/RULES.md) | the game, in one page |
-| [`docs/BACKLOG.md`](docs/BACKLOG.md) | the goal and what is next |
+| [`dashboard/`](dashboard/README.md) | metrics, proof status and the list of what to try next |
 | [`docs/FINDINGS.md`](docs/FINDINGS.md) | what we have learned and how results are decided |
 | [`docs/OVERVIEW.md`](docs/OVERVIEW.md) | how the system fits together |
 | [`spec/ALGORITHMS.md`](spec/ALGORITHMS.md) | the core ideas, separate from the code |
@@ -34,7 +34,7 @@ Run `correctness/check.sh` before merging.
 | [`docs/`](docs) | overview, commands, backlog, [`reference/`](docs/reference) for interfaces, [`history/`](docs/history/README.md) for dated records |
 | [`performance/`](performance/README.md) | timing runner, fixture positions and history |
 | [`correctness/`](correctness) | `check.sh`, spec and link checks, golden digests |
-| [`dashboard/`](dashboard/README.md) | performance and research dashboards: `python3 -m dashboard` |
+| [`dashboard/`](dashboard/README.md) | performance and research dashboards, and the work list: `python3 -m dashboard` |
 | `artifacts/` | run output, not tracked. `artifacts/old/` is the archive |
 
 ## Tech stack

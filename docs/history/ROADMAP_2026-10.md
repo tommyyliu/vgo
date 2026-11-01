@@ -1,6 +1,6 @@
 # Project restart roadmap
 
-> Frozen on 2026-10-31. The current plan is [`BACKLOG.md`](../BACKLOG.md).
+> Frozen on 2026-10-31. The current plan is the [dashboard](../../dashboard/README.md).
 
 Updated: 2026-10-14. Status: items 1–5 have completed bounded measurements;
 item 6 has a measured arena prototype; item 7 has bounded failure

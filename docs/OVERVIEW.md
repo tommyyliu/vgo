@@ -5,8 +5,8 @@ the load-bearing decisions are what they are. Each section ends with where to
 read more.
 
 The game and its mathematics are in [`spec/`](../spec/RULES.md), including
-[`the core algorithms`](../spec/ALGORITHMS.md). The plan is in
-[`BACKLOG.md`](BACKLOG.md), and results are in [`FINDINGS.md`](FINDINGS.md).
+[`the core algorithms`](../spec/ALGORITHMS.md). Results are in [`FINDINGS.md`](FINDINGS.md), and the work list is on the
+[dashboard](../dashboard/README.md).
 
 ---
 
