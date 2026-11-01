@@ -209,7 +209,7 @@ fn fuzz(games: u64) {
                     break;
                 }
                 let radius = RADII[(game % 5) as usize];
-                let ruleset = if game / 5 % 2 == 0 { Ruleset::Vgo } else { Ruleset::Official };
+                let ruleset = if (game / 5).is_multiple_of(2) { Ruleset::Vgo } else { Ruleset::Official };
                 let tangent = game / 10 % 2 == 1;
                 let (plies, captured, digest) = fuzz_game(game + 1, radius, ruleset, tangent);
                 lines.lock().unwrap().push((game, format!(

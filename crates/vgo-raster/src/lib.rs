@@ -698,10 +698,10 @@ pub fn settled_mask(position: &Position, config: RasterConfig) -> Vec<bool> {
     settled
 }
 
-pub(crate) fn relative_stones(
-    position: &Position,
-    to_move: Color,
-) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+/// Stone coordinates for the side to move, then for its opponent.
+type RelativeStones = (Vec<(f64, f64)>, Vec<(f64, f64)>);
+
+pub(crate) fn relative_stones(position: &Position, to_move: Color) -> RelativeStones {
     let stones = position.stones();
     let mut current = Vec::with_capacity(stones.len());
     let mut opponent = Vec::with_capacity(stones.len());
@@ -898,7 +898,7 @@ mod tests {
             attempts += 1;
             let x = radius + (1.0 - 2.0 * radius) * next();
             let y = radius + (1.0 - 2.0 * radius) * next();
-            let color = if placed.len() % 2 == 0 {
+            let color = if placed.len().is_multiple_of(2) {
                 Color::Black
             } else {
                 Color::White

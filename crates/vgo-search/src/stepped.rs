@@ -151,6 +151,7 @@ impl ReusableSearch {
     /// changes. Configuration and seed changes also invalidate cached work.
     /// Root exploration noise is unsupported: old proposals have different beta
     /// probabilities from a freshly noised root. Use deterministic play here.
+    #[allow(clippy::too_many_arguments)]
     pub fn search(
         &mut self,
         position: &Position,

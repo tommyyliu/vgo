@@ -101,7 +101,7 @@ fn scattered(count: usize, radius: f64, seed: u64) -> crate::Position {
         stones.push(crate::Stone {
             x,
             y,
-            color: if stones.len() % 2 == 0 {
+            color: if stones.len().is_multiple_of(2) {
                 crate::Color::Black
             } else {
                 crate::Color::White

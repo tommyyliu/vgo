@@ -310,6 +310,7 @@ pub(crate) fn action_index(action: Action, config: RasterConfig) -> u32 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn search_config(
     simulations: u32,
     coarse_pool: usize,
@@ -864,6 +865,29 @@ fn calibration_trials(
         .collect()
 }
 
+/// Whether a game is exempt from resignation, decided from its seed.
+///
+/// Hashing the seed rather than counting games keeps the exempt set stable
+/// across reruns and independent of actor scheduling, which matters because
+/// these games are the calibration sample: they have to be a fair draw, not
+/// whichever games happened to land on a particular worker.
+pub(crate) fn resign_exempt(game_seed: u64, fraction: f64) -> bool {
+    if fraction <= 0.0 {
+        return false;
+    }
+    if fraction >= 1.0 {
+        return true;
+    }
+    // SplitMix64 finalizer: cheap, and well distributed for consecutive seeds.
+    let mut value = game_seed ^ 0x9e37_79b9_7f4a_7c15;
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    (value >> 11) as f64 / (1_u64 << 53) as f64 <= fraction
+}
+
 #[cfg(test)]
 mod calibration_tests {
     use super::*;
@@ -902,27 +926,4 @@ mod calibration_tests {
         let won_by_white = calibration_trials(&observations, 20, -1.0);
         assert!(won_by_white.iter().all(|trial| !trial.wrong));
     }
-}
-
-/// Whether a game is exempt from resignation, decided from its seed.
-///
-/// Hashing the seed rather than counting games keeps the exempt set stable
-/// across reruns and independent of actor scheduling, which matters because
-/// these games are the calibration sample: they have to be a fair draw, not
-/// whichever games happened to land on a particular worker.
-pub(crate) fn resign_exempt(game_seed: u64, fraction: f64) -> bool {
-    if fraction <= 0.0 {
-        return false;
-    }
-    if fraction >= 1.0 {
-        return true;
-    }
-    // SplitMix64 finalizer: cheap, and well distributed for consecutive seeds.
-    let mut value = game_seed ^ 0x9e37_79b9_7f4a_7c15;
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^= value >> 31;
-    (value >> 11) as f64 / (1_u64 << 53) as f64 <= fraction
 }

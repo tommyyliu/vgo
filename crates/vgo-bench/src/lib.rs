@@ -48,6 +48,12 @@ pub struct FixedEvaluator {
     pub logits: Arc<Vec<f32>>,
 }
 
+impl Default for FixedEvaluator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FixedEvaluator {
     #[must_use]
     pub fn new() -> Self {

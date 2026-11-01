@@ -646,7 +646,7 @@ mod tests {
                 {
                     continue;
                 }
-                let color = if stones.len() % 2 == 0 {
+                let color = if stones.len().is_multiple_of(2) {
                     Color::Black
                 } else {
                     Color::White
@@ -835,7 +835,7 @@ mod tests {
                 if stones.iter().all(|s: &Stone| {
                     super::numeric::length(s.x - x, s.y - y) >= 2.0 * radius - 1.0e-12
                 }) {
-                    let colour = if stones.len() % 2 == 0 {
+                    let colour = if stones.len().is_multiple_of(2) {
                         Color::Black
                     } else {
                         Color::White
@@ -913,7 +913,7 @@ mod tests {
                     .iter()
                     .all(|s: &Stone| ((s.x - x).powi(2) + (s.y - y).powi(2)).sqrt() >= 2.0 * radius)
                 {
-                    let colour = if stones.len() % 2 == 0 {
+                    let colour = if stones.len().is_multiple_of(2) {
                         Color::Black
                     } else {
                         Color::White

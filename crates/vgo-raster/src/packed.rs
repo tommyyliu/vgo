@@ -345,7 +345,9 @@ fn ridge_at(nearest_square: f64, second_square: f64, radius: f64) -> f32 {
     // other operand. Every game starts from an empty board, so the NaN version
     // reached the model on the first position of the first game and the run
     // died with "invalid inference value".
-    (1.0 - (second - nearest) / radius).max(0.0).min(1.0) as f32
+    #[allow(clippy::manual_clamp)]
+    let ridge = (1.0 - (second - nearest) / radius).max(0.0).min(1.0);
+    ridge as f32
 }
 
 /// `ridge_at` over a row, as a flat loop over contiguous slices.
@@ -517,8 +519,7 @@ pub(crate) fn rasterize_compact_radius_packed_into(
         second_squares,
     );
 
-    for row in 0..height {
-        let y = ys[row];
+    for (row, &y) in ys.iter().enumerate() {
         let base = row * width;
         let nearest_row = &nearest_squares[base..base + width];
         let second_row = &second_squares[base..base + width];
@@ -543,7 +544,7 @@ pub(crate) fn rasterize_compact_radius_packed_into(
         // Groups of eight align with byte boundaries only because `width` is a
         // multiple of eight, which makes `row * width` one too. The general
         // path below sets each bit on its own.
-        if width % 8 == 0 {
+        if width.is_multiple_of(8) {
             for (bytes, flags) in settled_plane[base / 8..(base + width) / 8]
                 .iter_mut()
                 .zip(settled[base..base + width].chunks_exact(8))

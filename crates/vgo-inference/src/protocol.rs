@@ -22,6 +22,8 @@ const PROTOCOL_VERSION: u32 = 1;
 /// The two are a choice made once, by the model, not per request -- a batch
 /// mixing them cannot be gathered into one tensor, which `OnnxBatchService`
 /// rejects rather than silently splits.
+// Boxing would add an indirection per position on the hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum RasterPayload {
     Dense(SemanticRaster),

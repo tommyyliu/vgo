@@ -230,6 +230,22 @@ pub(crate) fn strictly_closer(
     }
 }
 
+/// Distance from `point` to the segment `a`-`b`.
+///
+/// Clamped projection: a degenerate segment collapses to the distance to `a`,
+/// which is what the callers below want rather than a NaN.
+#[must_use]
+pub fn distance_to_segment(point: Point, a: Point, b: Point) -> f64 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let square = dx.mul_add(dx, dy * dy);
+    let t = if square <= 0.0 {
+        0.0
+    } else {
+        (((point.x - a.x) * dx + (point.y - a.y) * dy) / square).clamp(0.0, 1.0)
+    };
+    length(point.x - (a.x + t * dx), point.y - (a.y + t * dy))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -380,20 +396,4 @@ mod tests {
         assert_eq!(comparison.signed_margin, 0.0);
         assert!(comparison.error_bound > 0.0);
     }
-}
-
-/// Distance from `point` to the segment `a`-`b`.
-///
-/// Clamped projection: a degenerate segment collapses to the distance to `a`,
-/// which is what the callers below want rather than a NaN.
-#[must_use]
-pub fn distance_to_segment(point: Point, a: Point, b: Point) -> f64 {
-    let (dx, dy) = (b.x - a.x, b.y - a.y);
-    let square = dx.mul_add(dx, dy * dy);
-    let t = if square <= 0.0 {
-        0.0
-    } else {
-        (((point.x - a.x) * dx + (point.y - a.y) * dy) / square).clamp(0.0, 1.0)
-    };
-    length(point.x - (a.x + t * dx), point.y - (a.y + t * dy))
 }

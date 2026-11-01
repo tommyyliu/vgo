@@ -459,6 +459,7 @@ impl SettledRows {
     /// never from settled straight to unsettled, because `slack > 0` keeps the
     /// cases disjoint and ordered. A pixel in the band gets the exact test, which
     /// agrees with either cheap case, so only `exact_tests` can change.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn classify_row(
         &mut self,
         position: &Position,
@@ -483,11 +484,10 @@ impl SettledRows {
                 && nearest_square <= sampled_minus_slack * sampled_minus_slack
             {
                 true
-            } else if nearest_square > upper * upper {
-                false
-            } else if self
-                .vertices
-                .any_closer(Point::new(x, y), nearest_square.sqrt())
+            } else if nearest_square > upper * upper
+                || self
+                    .vertices
+                    .any_closer(Point::new(x, y), nearest_square.sqrt())
             {
                 false
             } else {
@@ -568,6 +568,7 @@ fn settled_by_bounded_distance_into(
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use vgo_core::{Color, Stone, distance_to_legal_set, legal_set_vertices};
 
@@ -624,7 +625,7 @@ mod tests {
                     ((s.x - x).powi(2) + (s.y - y).powi(2)).sqrt() > 2.0 * radius * 1.0001
                 });
                 if clear {
-                    let colour = if stones.len() % 2 == 0 {
+                    let colour = if stones.len().is_multiple_of(2) {
                         Color::Black
                     } else {
                         Color::White
@@ -848,7 +849,7 @@ mod dispatch_parity {
                         stones.push(Stone::new(
                             x,
                             y,
-                            if placed % 2 == 0 {
+                            if placed.is_multiple_of(2) {
                                 Color::Black
                             } else {
                                 Color::White

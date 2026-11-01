@@ -6,6 +6,8 @@ mod game;
 mod legal_set;
 mod model;
 mod numeric;
+// `!(t > 0.0)` is deliberate: a NaN root must take the rejecting branch.
+#[allow(clippy::neg_cmp_op_on_partial_ord, clippy::needless_range_loop)]
 mod settled;
 mod voronoi;
 

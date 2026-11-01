@@ -142,9 +142,7 @@ fn field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     let start = body.find(&needle)? + needle.len();
     let rest = body[start..].trim_start();
     let rest = rest.strip_prefix(':')?.trim_start();
-    let end = rest
-        .find(|c: char| c == ',' || c == '}' || c == ']')
-        .unwrap_or(rest.len());
+    let end = rest.find([',', '}', ']']).unwrap_or(rest.len());
     Some(rest[..end].trim())
 }
 

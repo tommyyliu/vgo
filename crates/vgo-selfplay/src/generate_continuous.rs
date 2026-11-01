@@ -571,7 +571,7 @@ fn main() -> io::Result<()> {
             Err(error) => eprintln!("[cuda] blocking sync unavailable, continuing: {error}"),
         }
     }
-    let profiler = start_profiler(config.profile_output.as_deref())?;
+    start_profiler(config.profile_output.as_deref())?;
     if config.actors == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -760,7 +760,7 @@ fn main() -> io::Result<()> {
     }
     reporter.finish()?;
     // Preserve the profile even when a genuine actor/backend failure occurred.
-    finish_profiler(profiler, config.profile_output.as_deref())?;
+    finish_profiler((), config.profile_output.as_deref())?;
 
     if let Some(error) = failure {
         return Err(error);

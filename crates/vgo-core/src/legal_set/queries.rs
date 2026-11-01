@@ -14,6 +14,8 @@ fn visit_candidates(
 
 /// Whether a candidate is legal and accepted, in the order the caller can afford.
 #[inline]
+// Same tests, different cost: the order is the point.
+#[allow(clippy::if_same_then_else)]
 fn admit<const VISIT_FIRST: bool>(
     position: &Position,
     buckets: Option<&StoneBuckets>,

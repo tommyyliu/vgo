@@ -427,7 +427,7 @@ mod tests {
                 .iter()
                 .all(|s| (s.x - x).hypot(s.y - y) >= 2.0 * radius)
             {
-                let colour = if placed.len() % 2 == 0 {
+                let colour = if placed.len().is_multiple_of(2) {
                     Color::Black
                 } else {
                     Color::White

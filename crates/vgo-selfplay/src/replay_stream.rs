@@ -74,8 +74,8 @@ pub fn stone_capacity_for_radius(radius: f64) -> usize {
     ((bound * 1.15).ceil() as usize).max(STONE_CAPACITY)
 }
 
-/// Policy cells a v4 record can hold. Progressive widening surfaces a few dozen
-/// candidates from a 512-simulation search; 47 was the observed maximum.
+// Policy cells a v4 record can hold. Progressive widening surfaces a few dozen
+// candidates from a 512-simulation search; 47 was the observed maximum.
 // v6 widened this from 64. Search at 1600 simulations touches more distinct
 // cells per position than 64 -- measured 81 before the writer rejected the
 // record -- and each record pads to a fixed capacity, so deeper search needs

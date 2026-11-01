@@ -189,15 +189,6 @@
     "effort": "M"
   },
   {
-    "id": "3257466f",
-    "title": "Lint and format",
-    "bucket": "Engineering",
-    "status": "Later",
-    "why": "check.sh can't enforce either until the repo is clean.",
-    "test": "Apply cargo fmt and clear clippy warnings in their own commit.",
-    "effort": "S"
-  },
-  {
     "id": "f59494cb",
     "title": "Vgo learnings",
     "bucket": "Measurement",

@@ -23,7 +23,7 @@ continuous set is searched through a finite candidate list.
 
 - **Relies on:** A6, E7, N1.
 - **Cost:** buckets keep each legality test near constant.
-- **Code:** `vgo-core/src/legal_set.rs`
+- **Code:** `vgo-core/src/legal_set/`
 
 ### Voronoi cells by sorted clipping
 
@@ -82,7 +82,7 @@ A node's action set is grown as about a coefficient times the square root of its
 so search can work in a continuous action space. The coefficient is a tuned strength
 parameter with no lemma behind it.
 
-- **Code:** `vgo-search/src/mcts.rs`
+- **Code:** `vgo-search/src/mcts/`
 
 ### Coarse-to-fine proposals
 
@@ -92,7 +92,7 @@ boundary are snapped to a legal point inside the cell.
 
 - **Relies on:** A6, E6.
 - **Cost:** snapping looks only at nearby stones and vertices.
-- **Code:** `vgo-search/src/coarse_fine.rs`; `vgo-core/src/legal_set.rs`, `nearest_bounded`
+- **Code:** `vgo-search/src/coarse_fine.rs`; `vgo-core/src/legal_set/nearest.rs`
 
 ## Learning
 

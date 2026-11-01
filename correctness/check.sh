@@ -12,7 +12,8 @@ cd "$root"
 mode="${1:-}"
 
 python3 correctness/check-spec.py
-cargo clippy --release --workspace --exclude vgo-wasm --quiet
+cargo fmt --all --check
+cargo clippy --release --workspace --exclude vgo-wasm --all-targets --quiet -- -D warnings
 cargo test --release -p vgo-core -p vgo-raster -p vgo-search -p vgo-selfplay -p vgo-bench -p vgo-wasm --quiet
 cargo check --release -p vgo-wasm --target wasm32-unknown-unknown --quiet
 (cd training && PYTHONPATH=. uv run --with pytest python -m pytest tests --quiet -p no:cacheprovider)
