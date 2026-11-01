@@ -15,7 +15,9 @@
 
 use std::cell::RefCell;
 use std::sync::{Arc, OnceLock};
-use vgo_core::{COORDINATE_EPSILON, Point, Position, nearest_legal_placement_indexed_within};
+use vgo_core::{
+    COORDINATE_EPSILON, Point, Position, StoneFit, StoneRun, nearest_legal_placement_indexed_within,
+};
 
 /// A sampled placement candidate and the probability it was drawn with.
 #[derive(Clone, Copy, Debug)]
@@ -27,9 +29,75 @@ pub struct CandidateSample {
     pub beta: f64,
 }
 
+/// How much farther than `2r` plus half a cell a stone must be to leave a cell's
+/// snap alone. Past the most a snap can move, and far below a cell. See [E18].
+const SNAP_REACH_MARGIN: f64 = 1.0e-4;
+
+/// What snapping found for a cell, on the stones of a [`SnapAnchor`].
+#[derive(Clone, Copy, Debug, Default)]
+enum SavedSnap {
+    #[default]
+    Unknown,
+    Rejected,
+    Kept(Point),
+}
+
+/// Snaps a search's grids can share.
+///
+/// Every node's grid snaps the cells around every stone, and a node differs from the
+/// root by a few stones, so nearly all of that work was the same each time. This
+/// keeps the root's answers. A cell far enough from the stones a node differs by
+/// reads the saved one. Nothing here is needed for correctness: with no root
+/// announced, every grid snaps from nothing.
+#[derive(Debug, Default)]
+struct SnapAnchor {
+    width: usize,
+    height: usize,
+    radius_bits: u64,
+    stones: StoneRun,
+    answers: Vec<SavedSnap>,
+    /// Set by [`next_grid_is_search_root`], and spent by the next grid.
+    next_is_root: bool,
+}
+
+impl SnapAnchor {
+    /// Compares a grid with the anchor, moving the anchor to it if a root was
+    /// announced. Returns whether the grid can use the saved answers.
+    fn prepare(&mut self, position: &Position, width: usize, height: usize) -> bool {
+        let same_board = self.width == width
+            && self.height == height
+            && self.radius_bits == position.radius().to_bits();
+        let fit = if same_board {
+            self.stones.fit(position.stones())
+        } else {
+            self.stones.clear_differing();
+            StoneFit::Unrelated
+        };
+        if !std::mem::take(&mut self.next_is_root)
+            || (fit == StoneFit::Extends && self.stones.differing().is_empty())
+        {
+            return fit != StoneFit::Unrelated;
+        }
+        self.width = width;
+        self.height = height;
+        self.radius_bits = position.radius().to_bits();
+        self.stones.set(position.stones());
+        self.answers.clear();
+        self.answers.resize(width * height, SavedSnap::Unknown);
+        true
+    }
+}
+
 thread_local! {
     /// One grid per tree node, each needing this only while it is built.
     static NEAREST_SQUARES: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+    static SNAP_ANCHOR: RefCell<SnapAnchor> = RefCell::default();
+}
+
+/// Says the next grid on this thread is the root of a search, whose nodes' grids are
+/// the ones after it.
+pub(crate) fn next_grid_is_search_root() {
+    SNAP_ANCHOR.with_borrow_mut(|anchor| anchor.next_is_root = true);
 }
 
 /// A fine placement grid of logits over `[0,1]^2`, plus the legal mask, ready for
@@ -202,6 +270,11 @@ impl FineGrid {
         // product is constant: O(cells), whatever the board size. Cells no
         // stone reaches keep infinity, which satisfies both thresholds exactly
         // as an untouched cell should.
+        let snap_reach = half_diagonal + exclusion + SNAP_REACH_MARGIN;
+        let snap_reach_square = snap_reach * snap_reach;
+        let mut borrowed_anchor = SNAP_ANCHOR.take();
+        let anchor = &mut borrowed_anchor;
+        let reads_answers = anchor.prepare(position, width, height);
         NEAREST_SQUARES.with_borrow_mut(|nearest_squared| {
             // Per axis, not per cell: the board's edges and each cell's centre are
             // products of one row and one column, so a grid per node need not
@@ -236,19 +309,38 @@ impl FineGrid {
                             // Only a point inside this cell is kept, and such a point
                             // is within half a diagonal of its centre.
                             let point = Point::new(xs[col], y);
-                            let snapped = nearest_legal_placement_indexed_within(
-                                position,
-                                point,
-                                index,
-                                half_diagonal,
-                            );
-                            let inside = snapped.legal
-                                && (snapped.point.x - point.x).abs() <= half_x
-                                && (snapped.point.y - point.y).abs() <= half_y;
-                            if !inside {
-                                continue;
+                            // Stones this far away cannot change what snapping
+                            // finds in this cell: [E18].
+                            let saved = (reads_answers
+                                && anchor.stones.differing_beyond(point, snap_reach_square))
+                            .then(|| &mut anchor.answers[idx]);
+                            let answer = saved.as_deref().copied().unwrap_or_default();
+                            let answer = if let SavedSnap::Unknown = answer {
+                                let snapped = nearest_legal_placement_indexed_within(
+                                    position,
+                                    point,
+                                    index,
+                                    half_diagonal,
+                                );
+                                let inside = snapped.legal
+                                    && (snapped.point.x - point.x).abs() <= half_x
+                                    && (snapped.point.y - point.y).abs() <= half_y;
+                                let answer = if inside {
+                                    SavedSnap::Kept(snapped.point)
+                                } else {
+                                    SavedSnap::Rejected
+                                };
+                                if let Some(saved) = saved {
+                                    *saved = answer;
+                                }
+                                answer
+                            } else {
+                                answer
+                            };
+                            match answer {
+                                SavedSnap::Kept(point) => Some(point),
+                                _ => continue,
                             }
-                            Some(snapped.point)
                         } else {
                             continue;
                         };
@@ -262,6 +354,7 @@ impl FineGrid {
                 }
             }
         });
+        SNAP_ANCHOR.set(borrowed_anchor);
         // Scratch headroom is useful while snapping; it need not live in every
         // retained tree node. Empty grids also release the initial 6 KiB slab.
         placement_overrides.shrink_to_fit();
@@ -700,6 +793,142 @@ mod tests {
 
     fn empty_board() -> Position {
         Position::new(1.0 / 6.0, Vec::new(), Color::Black)
+    }
+
+    fn lattice(radius: f64) -> Vec<(f64, f64)> {
+        let step = 2.3 * radius;
+        let mut points = Vec::new();
+        let mut y = 2.0 * radius;
+        while y < 1.0 - 2.0 * radius {
+            let mut x = 2.0 * radius;
+            while x < 1.0 - 2.0 * radius {
+                points.push((x, y));
+                x += step;
+            }
+            y += step;
+        }
+        points
+    }
+
+    fn position_of(radius: f64, points: &[(f64, f64)], picks: &[usize]) -> Position {
+        let stones = picks.iter().enumerate().map(|(turn, &pick)| {
+            let color = if turn % 2 == 0 {
+                Color::Black
+            } else {
+                Color::White
+            };
+            Stone::new(points[pick].0, points[pick].1, color)
+        });
+        Position::new(radius, stones.collect(), Color::Black)
+    }
+
+    /// A grid built on the shared anchor, and one with none.
+    fn both_grids(position: &Position, size: usize) -> (FineGrid, FineGrid) {
+        let logits = || Arc::new(vec![0.0_f32; size * size]);
+        let anchored = FineGrid::from_shared_logits(position, size, size, 4, logits());
+        let kept = SNAP_ANCHOR.take();
+        let fresh = FineGrid::from_shared_logits(position, size, size, 4, logits());
+        SNAP_ANCHOR.set(kept);
+        (anchored, fresh)
+    }
+
+    fn assert_same_grid(anchored: &FineGrid, fresh: &FineGrid, context: &str) {
+        assert_eq!(anchored.legal, fresh.legal, "{context}");
+        assert_eq!(
+            anchored.placement_overrides.len(),
+            fresh.placement_overrides.len(),
+            "{context}"
+        );
+        for (a, b) in anchored
+            .placement_overrides
+            .iter()
+            .zip(&fresh.placement_overrides)
+        {
+            assert_eq!(a.0, b.0, "{context}");
+            assert_eq!(a.1.x.to_bits(), b.1.x.to_bits(), "{context}");
+            assert_eq!(a.1.y.to_bits(), b.1.y.to_bits(), "{context}");
+        }
+    }
+
+    /// Every path through the anchor against a grid snapped from nothing: nodes
+    /// branching off a root, captures from the middle of the list, a jump to another
+    /// game, and a change of grid size on the same thread.
+    #[test]
+    fn grids_on_the_anchor_match_grids_from_nothing() {
+        let radius = 1.0 / 38.0;
+        let points = lattice(radius);
+        assert!(points.len() > 120);
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |limit: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % limit as u64) as usize
+        };
+        let (mut overrides, mut saved) = (0usize, 0usize);
+        for game in 0..12 {
+            let mut root: Vec<usize> = (0..points.len()).collect();
+            for at in 0..root.len() {
+                root.swap(at, at + next(points.len() - at));
+            }
+            let mut pool = root.split_off(30 + game * 6);
+            for node in 0..40 {
+                let mut picks = root.clone();
+                let depth = next(9);
+                picks.extend(pool.iter().skip(next(20)).take(depth));
+                if node % 7 == 3 {
+                    picks.remove(next(picks.len()));
+                }
+                if node % 13 == 12 {
+                    let by = 1 + next(20);
+                    root.extend(pool.drain(..by));
+                }
+                if node % 13 == 1 {
+                    next_grid_is_search_root();
+                }
+                let size = [128, 128, 128, 64][game % 4];
+                let position = position_of(radius, &points, &picks);
+                assert!(position.validate().is_playable());
+                let (anchored, fresh) = both_grids(&position, size);
+                assert_same_grid(&anchored, &fresh, &format!("game {game} node {node}"));
+                overrides += fresh.placement_overrides.len();
+                saved += SNAP_ANCHOR.with_borrow(|anchor| {
+                    anchor
+                        .answers
+                        .iter()
+                        .filter(|answer| !matches!(answer, SavedSnap::Unknown))
+                        .count()
+                });
+            }
+        }
+        // A run with nothing to snap, or that never saved an answer, proved nothing.
+        assert!(overrides > 1000, "{overrides} overrides");
+        assert!(saved > 1000, "saved {saved} answers");
+    }
+
+    /// An answer belongs to its radius and its grid as well as to its stones.
+    #[test]
+    fn the_anchor_keeps_to_its_board() {
+        let wide = 1.0 / 38.0;
+        let points = lattice(wide);
+        let picks: Vec<usize> = (0..90).map(|index| index * 2).collect();
+        // The close pair puts both radii's rings on the same cells.
+        for (radius, size) in [
+            (wide, 128),
+            (0.8 * wide, 128),
+            (wide, 64),
+            (wide, 128),
+            (0.999 * wide, 128),
+        ] {
+            let position = position_of(radius, &points, &picks);
+            for announced in [false, true, false] {
+                if announced {
+                    next_grid_is_search_root();
+                }
+                let (anchored, fresh) = both_grids(&position, size);
+                assert_same_grid(&anchored, &fresh, &format!("radius {radius} size {size}"));
+            }
+        }
     }
 
     fn narrow_sliver_position() -> Position {

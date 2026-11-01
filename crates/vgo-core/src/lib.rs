@@ -6,6 +6,7 @@ mod game;
 mod legal_set;
 mod model;
 mod numeric;
+mod stone_run;
 mod voronoi;
 
 pub use analysis::{Analysis, Outcome, Score, Settlement};
@@ -24,4 +25,5 @@ pub use legal_set::{
 };
 pub use model::{Color, Phase, Position, Ruleset, Stone, Validation, ValidationIssue};
 pub use numeric::{COORDINATE_EPSILON, distance_to_segment, length as planar_length, length_below};
+pub use stone_run::{StoneFit, StoneRun};
 pub use voronoi::{Cell, Edge, EdgeSource, Geometry, Point};

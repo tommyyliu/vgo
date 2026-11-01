@@ -126,6 +126,16 @@ boundary are snapped to a legal point inside the cell.
 - **Cost:** snapping looks only at nearby stones and vertices.
 - **Code:** `vgo-search/src/coarse_fine.rs`; `vgo-core/src/legal_set/nearest.rs`
 
+### Reusing snaps across a search
+
+Every node's grid snaps the cells around every stone, and a stone farther than `2r` plus half
+a cell cannot change what a cell finds. Each thread saves the root's answers, and a node reads
+them for every cell clear of the stones it differs by.
+
+- **Relies on:** E6, E16, E18.
+- **Cost:** a distance check per differing stone for each snapped cell, not the snap.
+- **Code:** `vgo-search/src/coarse_fine.rs`, `SnapAnchor`
+
 ## Learning
 
 These are empirical choices, judged by arena play. Evidence is in

@@ -19,7 +19,7 @@
 use std::cell::RefCell;
 
 use half::{f16, slice::HalfFloatSliceExt};
-use vgo_core::{Color, Position};
+use vgo_core::{Color, Position, Stone, StoneFit, StoneRun};
 
 use crate::edt::EarlierTransform;
 use crate::settled_bounds::{ANSWER_UNKNOWN, KnownAnswers, SettledScratch, prepare_settled_rows};
@@ -305,10 +305,6 @@ fn fold_stone_into_row(
     }
 }
 
-/// Most stones a position can differ from the anchor by and still read its answers.
-/// Past this the position is not really a leaf of the anchor.
-const MOST_DIFFERING_STONES: usize = 32;
-
 /// What this thread's leaves can share about a search's root.
 ///
 /// Every leaf of a search is the root's stones plus the few on its path, so
@@ -324,8 +320,7 @@ struct SweepAnchor {
     width: usize,
     height: usize,
     radius_bits: u64,
-    stone_xs: Vec<f64>,
-    stone_ys: Vec<f64>,
+    stones: StoneRun,
     nearest_squares: Vec<f64>,
     second_squares: Vec<f64>,
     /// Each row's largest second-nearest square, past which a stone changes nothing.
@@ -338,80 +333,37 @@ struct SweepAnchor {
     answers: Vec<u8>,
     /// Set by [`next_raster_is_search_root`], and spent by the next raster.
     next_is_root: bool,
-    /// The anchor's stones the position lost, then the position's stones past
-    /// the anchor. Between them these are everything that differs.
-    differing_xs: Vec<f64>,
-    differing_ys: Vec<f64>,
-}
-
-/// How a position relates to the anchor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AnchorFit {
-    /// The anchor's stones are a prefix of the position's.
-    Extends,
-    /// It lost stones too, as a capture does, so only the answers carry over.
-    Differs,
-    /// Nothing carries over.
-    Unrelated,
 }
 
 impl SweepAnchor {
-    /// Lists the stones this position differs from the anchor by.
-    ///
-    /// A stone keeps its place in the list until it is captured, so walking both
-    /// lists together splits them into the stones they share, the anchor's stones
-    /// the position lost, and the position's stones past the last one shared.
-    fn fit(&mut self, input: &SweepInput<'_>, radius: f64) -> AnchorFit {
-        self.differing_xs.clear();
-        self.differing_ys.clear();
-        if self.width != input.xs.len()
-            || self.height != input.ys.len()
-            || self.radius_bits != radius.to_bits()
+    /// How `stones` relate to the anchor on this grid and radius.
+    fn fit(&mut self, stones: &[Stone], input: &SweepInput<'_>, radius: f64) -> StoneFit {
+        if self.width == input.xs.len()
+            && self.height == input.ys.len()
+            && self.radius_bits == radius.to_bits()
         {
-            return AnchorFit::Unrelated;
-        }
-        let (stone_xs, stone_ys) = (input.stone_xs, input.stone_ys);
-        let mut shared = 0;
-        for (&x, &y) in self.stone_xs.iter().zip(&self.stone_ys) {
-            if shared < stone_xs.len()
-                && x.to_bits() == stone_xs[shared].to_bits()
-                && y.to_bits() == stone_ys[shared].to_bits()
-            {
-                shared += 1;
-            } else {
-                self.differing_xs.push(x);
-                self.differing_ys.push(y);
-                if self.differing_xs.len() > MOST_DIFFERING_STONES {
-                    return AnchorFit::Unrelated;
-                }
-            }
-        }
-        let lost = self.differing_xs.len();
-        self.differing_xs.extend_from_slice(&stone_xs[shared..]);
-        self.differing_ys.extend_from_slice(&stone_ys[shared..]);
-        if self.differing_xs.len() > MOST_DIFFERING_STONES {
-            AnchorFit::Unrelated
-        } else if lost == 0 {
-            AnchorFit::Extends
+            self.stones.fit(stones)
         } else {
-            AnchorFit::Differs
+            self.stones.clear_differing();
+            StoneFit::Unrelated
         }
     }
 
-    /// Makes this the anchor for all of `input`'s stones.
-    fn rebuild(&mut self, input: &SweepInput<'_>, radius: f64, candidates: &mut Vec<u32>) {
+    /// Makes this the anchor for all of `stones`, which `input` was built from.
+    fn rebuild(
+        &mut self,
+        stones: &[Stone],
+        input: &SweepInput<'_>,
+        radius: f64,
+        candidates: &mut Vec<u32>,
+    ) {
         self.width = input.xs.len();
         self.height = input.ys.len();
         self.radius_bits = radius.to_bits();
         self.answers.clear();
         self.answers
             .resize(self.width * self.height, ANSWER_UNKNOWN);
-        self.stone_xs.clear();
-        self.stone_xs.extend_from_slice(input.stone_xs);
-        self.stone_ys.clear();
-        self.stone_ys.extend_from_slice(input.stone_ys);
-        self.differing_xs.clear();
-        self.differing_ys.clear();
+        self.stones.set(stones);
         sweep_stones(
             input,
             candidates,
@@ -467,21 +419,22 @@ fn sweep_stones(
 /// the anchor into its field where this position extends the anchor, and by a
 /// sweep where it does not. Returns how the position fits the anchor. Proof: [E15].
 fn nearest_field(
+    stones: &[Stone],
     input: &SweepInput<'_>,
     radius: f64,
     anchor: &mut SweepAnchor,
     candidates: &mut Vec<u32>,
     nearest_squares: &mut Vec<f64>,
     second_squares: &mut Vec<f64>,
-) -> AnchorFit {
-    let mut fit = anchor.fit(input, radius);
+) -> StoneFit {
+    let mut fit = anchor.fit(stones, input, radius);
     if std::mem::take(&mut anchor.next_is_root)
-        && (fit != AnchorFit::Extends || !anchor.differing_xs.is_empty())
+        && (fit != StoneFit::Extends || !anchor.stones.differing().is_empty())
     {
-        anchor.rebuild(input, radius, candidates);
-        fit = AnchorFit::Extends;
+        anchor.rebuild(stones, input, radius, candidates);
+        fit = StoneFit::Extends;
     }
-    if fit != AnchorFit::Extends {
+    if fit != StoneFit::Extends {
         sweep_stones(input, candidates, nearest_squares, second_squares);
         return fit;
     }
@@ -491,17 +444,16 @@ fn nearest_field(
     second_squares.clear();
     second_squares.extend_from_slice(&anchor.second_squares);
     let width = input.xs.len();
-    let stones_past = anchor.differing_xs.iter().zip(&anchor.differing_ys);
-    for (&x, &y) in stones_past {
+    for stone in anchor.stones.differing() {
         for (row, &pixel_y) in input.ys.iter().enumerate() {
             // Every pixel of the row is at least this far from the stone. Proof: [E15].
-            let dy = pixel_y - y;
+            let dy = pixel_y - stone.y;
             if dy * dy >= anchor.row_limits[row] {
                 continue;
             }
             let base = row * width;
             fold_stone_into_row(
-                (x, y),
+                (stone.x, stone.y),
                 pixel_y,
                 input.xs,
                 &mut nearest_squares[base..base + width],
@@ -712,6 +664,7 @@ fn write_packed(
     }
 
     let fit = nearest_field(
+        stones,
         &SweepInput {
             stone_xs,
             stone_ys,
@@ -736,7 +689,7 @@ fn write_packed(
         anchor.earlier_transform(width),
     );
     // The first raster after a rebuild is the root's own.
-    let is_root = fit == AnchorFit::Extends && anchor.transform_field.is_empty();
+    let is_root = fit == StoneFit::Extends && anchor.transform_field.is_empty();
     if is_root {
         let transform = &settled_scratch.edt;
         anchor
@@ -744,7 +697,7 @@ fn write_packed(
             .extend_from_slice(transform.heights());
         anchor.transform_field.extend_from_slice(transform.field());
     }
-    let reads_ridges = fit != AnchorFit::Unrelated && !anchor.ridges.is_empty();
+    let reads_ridges = fit != StoneFit::Unrelated && !anchor.ridges.is_empty();
 
     for (row, &y) in ys.iter().enumerate() {
         let base = row * width;
@@ -759,9 +712,8 @@ fn write_packed(
             nearest_row,
             settled_scratch.edt.field(),
             &mut settled[base..base + width],
-            (fit != AnchorFit::Unrelated).then(|| KnownAnswers {
-                stone_xs: &anchor.differing_xs,
-                stone_ys: &anchor.differing_ys,
+            (fit != StoneFit::Unrelated).then(|| KnownAnswers {
+                stones: &anchor.stones,
                 row: &mut anchor.answers[base..base + width],
             }),
         );
@@ -907,23 +859,20 @@ mod tests {
                 let announced = leaf % 13 == 1;
                 scratch.anchor.next_is_root = announced;
 
-                let stones = position.stones();
-                let stone_xs: Vec<f64> = stones.iter().map(|stone| stone.x).collect();
-                let stone_ys: Vec<f64> = stones.iter().map(|stone| stone.y).collect();
                 let grid: Vec<f64> = (0..resolution)
                     .map(|index| (index as f64 + 0.5) / resolution as f64)
                     .collect();
                 let input = SweepInput {
-                    stone_xs: &stone_xs,
-                    stone_ys: &stone_ys,
+                    stone_xs: &[],
+                    stone_ys: &[],
                     xs: &grid,
                     ys: &grid,
                 };
                 if !announced {
-                    fits[match scratch.anchor.fit(&input, radius) {
-                        AnchorFit::Extends => 0,
-                        AnchorFit::Differs => 1,
-                        AnchorFit::Unrelated => 2,
+                    fits[match scratch.anchor.fit(position.stones(), &input, radius) {
+                        StoneFit::Extends => 0,
+                        StoneFit::Differs => 1,
+                        StoneFit::Unrelated => 2,
                     }] += 1;
                 }
 

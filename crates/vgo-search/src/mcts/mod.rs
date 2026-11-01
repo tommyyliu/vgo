@@ -341,6 +341,7 @@ pub fn search_at_ply(
     );
     let mut stats = SearchStats::default();
     evaluator.begin_search(position);
+    crate::coarse_fine::next_grid_is_search_root();
     let mut root = Node::new(position.clone(), None, match_seed, evaluator, &mut stats)?;
     root.mark_root();
     if config.leaf_batch > 1 {

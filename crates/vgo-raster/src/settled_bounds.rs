@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use vgo_core::{
-    COORDINATE_EPSILON, LegalSetIndex, Point, Position, none_closer_than_except_vertices,
+    COORDINATE_EPSILON, LegalSetIndex, Point, Position, StoneRun, none_closer_than_except_vertices,
 };
 
 use crate::RasterConfig;
@@ -351,17 +351,16 @@ pub(crate) const ANSWER_UNKNOWN: u8 = 0;
 const ANSWER_NOT_SETTLED: u8 = 1;
 const ANSWER_SETTLED: u8 = 2;
 
-/// Exact answers saved for a run of stones this position extends, one row's worth,
-/// and the position's stones past that run.
+/// Exact answers saved for a run of stones, one row's worth, and that run, which
+/// holds the stones this position differs from it by.
 pub(crate) struct KnownAnswers<'a> {
-    pub(crate) stone_xs: &'a [f64],
-    pub(crate) stone_ys: &'a [f64],
+    pub(crate) stones: &'a StoneRun,
     pub(crate) row: &'a mut [u8],
 }
 
 impl KnownAnswers<'_> {
-    /// The column's saved answer, if every stone past the run is outside
-    /// `reach_square` of `point` and so has no say in it.
+    /// The column's saved answer, if every differing stone is outside `reach_square`
+    /// of `point` and so has no say in it.
     #[inline]
     fn slot_beyond_stones_past(
         &mut self,
@@ -369,11 +368,9 @@ impl KnownAnswers<'_> {
         point: Point,
         reach_square: f64,
     ) -> Option<&mut u8> {
-        let beyond = self.stone_xs.iter().zip(self.stone_ys).all(|(&x, &y)| {
-            let (dx, dy) = (x - point.x, y - point.y);
-            dx * dx + dy * dy >= reach_square
-        });
-        beyond.then(|| &mut self.row[column])
+        self.stones
+            .differing_beyond(point, reach_square)
+            .then(|| &mut self.row[column])
     }
 }
 

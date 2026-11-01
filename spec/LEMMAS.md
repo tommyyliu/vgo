@@ -817,6 +817,43 @@ it overwrites before reading. A ridge is computed pixel by pixel from the two sq
 the radius alone, by one function, so equal inputs give equal bits. Equality of the inputs
 is tested on the values themselves, so nothing is assumed about why they match. QED
 
+### E18. Far stones leave a cell's snap alone
+
+*Status: Conditional, like [E6], on every stone lying in the inset.* Used by `build_storage`
+and `SnapAnchor`.
+
+**Claim.** Let `U` and `S = U + F` be lists of stones in the same relative order, `q` a cell's
+centre, `rho` half the cell's diagonal, and `Q(S)` what the grid keeps for that cell: the
+snapped point if it is legal and inside the cell, and nothing otherwise. Write
+`m = SNAP_MARGIN`. If every `t` in `F` has `|t - q| >= rho + 2r + 100m`, then `Q(S) = Q(U)`.
+
+**Proof.** By [E6] it is enough to reason about the unbounded search, which takes the legal
+candidate of least key, first of equals, and moves it by at most `M* < 17m`. Call a candidate
+*near* if it is within `rho + M*` of `q`. By [E6], anything else gives a point outside the
+cell, so it is rejected in both lists.
+
+*Far stones add no near candidate.* A candidate only `S` has comes from some `t`: a point
+within `w + 2m` of `t`, where `w = 2r + m`, or a vertex on `t`'s circle. Either way it is at
+least `rho + 100m - 3m` from `q`, which is not near.
+
+*Near candidates keep their legality.* A near `c` has `|c - t| >= 2r + 100m - M* > 2r`, so `t`
+does not exclude it, and a vertex of `U` near `q` is still enumerated with the same bits, as in
+[E16]. The clamped query and the side projections read only `q` and the radius.
+
+*The same one wins.* The near candidates and their legality agree, so their keys do. Ties go
+to the first in list order, which is the query, then stones by index, then sides, then vertices.
+`F` changes indices but not the relative order of `U`'s stones or vertices, so the first of
+equals is the same candidate. The bounded search falls back to this scan on any exact tie.
+
+*It moves the same way.* `clear_by_margin` reads stones within `2r + m` of the moving point,
+which stays within `rho + M*` of `q`. Each `t` is farther away than that, so it is never read,
+and its ties go to the lower index, an order `F` does not change. The final legality check
+is the same by the step above. QED
+
+**Use.** As in [E16], writing `U` for the stones the anchor and a node share and `F` for
+those in one list only, `Q(node) = Q(U) = Q(anchor)` for any cell clear of `F`, so one node can
+save the answer and others read it. The anchor is keyed by its stones, grid and radius.
+
 ### N1. Length comparison
 
 *Status: Proved for `t < 2^511`.* Used by `length_below`. Outside that range the shortcut
