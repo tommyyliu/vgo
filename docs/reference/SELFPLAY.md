@@ -35,7 +35,7 @@ actor game
 ```
 
 MCTS submits a leaf round through `Evaluator::evaluate_batch`. Simple
-evaluators inherit a sequential default; `BatchedEvaluator` sends a grouped
+evaluators inherit a sequential default; `BatchedEvaluatorPool` sends a grouped
 request directly to the model broker. This avoids creating scoped operating
 system threads and one response channel per leaf.
 

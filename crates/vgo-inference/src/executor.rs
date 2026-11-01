@@ -81,156 +81,6 @@ impl CompletedBatch {
     }
 }
 
-/// Owns one or more inference execution slots.
-///
-/// `submit` transfers batch ownership and returns once a slot accepts it.
-/// `receive` may return completed batches out of submission order, keyed by
-/// `sequence`. Actors therefore do not need to know whether an executor uses
-/// threads, processes, pinned buffers, CUDA streams, or remote workers.
-pub trait BatchExecutor: Send {
-    fn capacity(&self) -> usize;
-    fn in_flight(&self) -> usize;
-    /// Submit to an available execution slot and return that slot's index.
-    fn submit(&mut self, batch: InferenceBatch) -> Result<usize, EvaluationError>;
-    fn receive(&mut self) -> Result<CompletedBatch, EvaluationError>;
-}
-
-pub struct ThreadedBatchExecutor<S: BatchService + 'static> {
-    sender: Option<SyncSender<InferenceBatch>>,
-    receiver: Receiver<Result<CompletedBatch, EvaluationError>>,
-    in_flight: usize,
-    join: Option<JoinHandle<()>>,
-    service: PhantomData<S>,
-    timeout: Duration,
-    pending: Option<(u64, Instant, u64, u64)>,
-    description: String,
-    fatal_native_failure: bool,
-}
-
-impl<S: BatchService + 'static> ThreadedBatchExecutor<S> {
-    pub fn spawn(service: S) -> Result<Self, EvaluationError> {
-        Self::spawn_with_timeout(
-            service,
-            crate::deadline_from_env("VGO_INFERENCE_TIMEOUT_SECONDS", 120)?,
-        )
-    }
-
-    pub fn spawn_with_timeout(mut service: S, timeout: Duration) -> Result<Self, EvaluationError> {
-        if timeout.is_zero() {
-            return Err(EvaluationError::new("inference timeout must be positive"));
-        }
-        let description = service.description();
-        let fatal_native_failure = service.fatal_native_failure();
-        let worker_description = description.clone();
-        let (batch_sender, batch_receiver) = mpsc::sync_channel::<InferenceBatch>(1);
-        let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
-        let join = thread::Builder::new()
-            .name(String::from("vgo-inference-executor"))
-            .spawn(move || {
-                while let Ok(batch) = batch_receiver.recv() {
-                    let sequence = batch.sequence;
-                    let started = Instant::now();
-                    let result = service.infer(&batch.inputs).map_err(|error| {
-                        EvaluationError::new(format!(
-                            "{worker_description} slot 0 batch {sequence}: {error}"
-                        ))
-                    });
-                    let stages = service.last_inference_stages();
-                    let completion = result.map(|outputs| CompletedBatch {
-                        sequence,
-                        slot: 0,
-                        elapsed: started.elapsed(),
-                        stages,
-                        outputs,
-                    });
-                    let failed = completion.is_err();
-                    if completion_sender.send(completion).is_err() || failed {
-                        break;
-                    }
-                }
-            })
-            .map_err(|error| EvaluationError::new(format!("start batch executor: {error}")))?;
-        Ok(Self {
-            sender: Some(batch_sender),
-            receiver: completion_receiver,
-            in_flight: 0,
-            join: Some(join),
-            service: PhantomData,
-            timeout,
-            pending: None,
-            description,
-            fatal_native_failure,
-        })
-    }
-}
-
-impl<S: BatchService + 'static> BatchExecutor for ThreadedBatchExecutor<S> {
-    fn capacity(&self) -> usize {
-        1
-    }
-
-    fn in_flight(&self) -> usize {
-        self.in_flight
-    }
-
-    fn submit(&mut self, batch: InferenceBatch) -> Result<usize, EvaluationError> {
-        if self.in_flight >= self.capacity() {
-            return Err(EvaluationError::new("batch executor has no available slot"));
-        }
-        let pending = (
-            batch.sequence(),
-            Instant::now(),
-            batch.inputs()[0].id(),
-            batch.inputs().last().unwrap().id(),
-        );
-        self.sender
-            .as_ref()
-            .ok_or_else(|| EvaluationError::new("inference executor stopped after a fatal error"))?
-            .send(batch)
-            .map_err(|_| EvaluationError::new("batch executor has stopped"))?;
-        self.in_flight += 1;
-        self.pending = Some(pending);
-        Ok(0)
-    }
-
-    fn receive(&mut self) -> Result<CompletedBatch, EvaluationError> {
-        if self.in_flight == 0 {
-            return Err(EvaluationError::new("batch executor has no in-flight work"));
-        }
-        let (sequence, started, first, last) = self.pending.expect("in-flight batch metadata");
-        let completion = match self
-            .receiver
-            .recv_timeout(self.timeout.saturating_sub(started.elapsed()))
-        {
-            Ok(completion) => completion,
-            Err(error) => {
-                if self.fatal_native_failure {
-                    crate::deadline::arm_fatal_watchdog();
-                }
-                // A native call cannot be interrupted safely. Disconnect and
-                // detach it so callers and process shutdown can finish. Fatal:
-                // the owner must exit rather than reopen GPU sessions here.
-                self.sender.take();
-                self.join.take();
-                self.pending = None;
-                self.in_flight = 0;
-                return Err(EvaluationError::new(format!(
-                    "{} slot 0 batch {sequence}, request IDs {first}..{last}, elapsed {:.3}s (limit {:.3}s): {error}",
-                    self.description,
-                    started.elapsed().as_secs_f64(),
-                    self.timeout.as_secs_f64()
-                )));
-            }
-        };
-        self.in_flight -= 1;
-        self.pending = None;
-        if completion.is_err() && self.fatal_native_failure {
-            crate::deadline::arm_fatal_watchdog();
-        }
-        completion
-    }
-}
-
 struct ServiceWorker {
     sender: Option<SyncSender<InferenceBatch>>,
     join: Option<JoinHandle<()>>,
@@ -337,16 +187,16 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
     }
 }
 
-impl<S: BatchService + 'static> BatchExecutor for ThreadedBatchExecutorPool<S> {
-    fn capacity(&self) -> usize {
+impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
+    pub fn capacity(&self) -> usize {
         self.workers.len()
     }
 
-    fn in_flight(&self) -> usize {
+    pub fn in_flight(&self) -> usize {
         self.in_flight
     }
 
-    fn submit(&mut self, batch: InferenceBatch) -> Result<usize, EvaluationError> {
+    pub fn submit(&mut self, batch: InferenceBatch) -> Result<usize, EvaluationError> {
         let Some(slot) = self.available.pop() else {
             return Err(EvaluationError::new("batch executor has no available slot"));
         };
@@ -372,7 +222,7 @@ impl<S: BatchService + 'static> BatchExecutor for ThreadedBatchExecutorPool<S> {
         Ok(slot)
     }
 
-    fn receive(&mut self) -> Result<CompletedBatch, EvaluationError> {
+    pub fn receive(&mut self) -> Result<CompletedBatch, EvaluationError> {
         if self.in_flight == 0 {
             return Err(EvaluationError::new("batch executor has no in-flight work"));
         }
@@ -436,15 +286,6 @@ impl<S: BatchService + 'static> Drop for ThreadedBatchExecutorPool<S> {
     }
 }
 
-impl<S: BatchService + 'static> Drop for ThreadedBatchExecutor<S> {
-    fn drop(&mut self) {
-        self.sender.take();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -454,10 +295,7 @@ mod tests {
     use vgo_core::{Color, Position};
     use vgo_raster::{RasterConfig, rasterize};
 
-    use super::{
-        BatchExecutor, CompletedBatch, InferenceBatch, ThreadedBatchExecutor,
-        ThreadedBatchExecutorPool,
-    };
+    use super::{CompletedBatch, InferenceBatch, ThreadedBatchExecutorPool};
     use crate::{BatchContract, BatchService, InferenceInput, InferenceOutput, InputLayout};
     use vgo_search::EvaluationError;
 
@@ -485,8 +323,8 @@ mod tests {
     #[test]
     fn single_slot_timeout_and_drop_do_not_wait_for_a_stalled_native_call() {
         let (release, gate) = mpsc::channel();
-        let mut executor = ThreadedBatchExecutor::spawn_with_timeout(
-            GatedService(Some(gate)),
+        let mut executor = ThreadedBatchExecutorPool::spawn_with_timeout(
+            vec![GatedService(Some(gate))],
             Duration::from_millis(30),
         )
         .unwrap();
@@ -551,7 +389,7 @@ mod tests {
 
     #[test]
     fn executor_tracks_capacity_and_sequence() {
-        let mut executor = ThreadedBatchExecutor::spawn(EchoService).unwrap();
+        let mut executor = ThreadedBatchExecutorPool::spawn(vec![EchoService]).unwrap();
         assert_eq!(executor.submit(batch(7, 11)).unwrap(), 0);
         assert_eq!(executor.in_flight(), 1);
         assert!(executor.submit(batch(8, 12)).is_err());

@@ -41,7 +41,7 @@ use std::{
 use clap::{ArgAction, Parser};
 use vgo_core::{Color, Phase, Position, Stone};
 use vgo_inference::{
-    BatchedEvaluator, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
+    BatchedEvaluatorPool, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
 };
 use vgo_raster::{RasterConfig, RasterKind};
 use vgo_search::{Action, SearchConfig, search_with_evaluator};
@@ -339,12 +339,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fp16: arguments.fp16,
         cache_directory: arguments.cache_directory.clone(),
     })?;
-    let evaluator = BatchedEvaluator::spawn(
+    let evaluator = BatchedEvaluatorPool::spawn(
         BrokerConfig {
             maximum_delay: Duration::from_millis(1),
             queue_capacity: arguments.leaf_batch.max(2) * 2,
         },
-        service,
+        vec![service],
     )?;
 
     let mut config = SearchConfig::canary(arguments.simulations);

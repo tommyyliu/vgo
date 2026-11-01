@@ -14,7 +14,7 @@ use std::{
 use clap::{ArgAction, Parser};
 use vgo_core::{Color, Outcome, Point, Position, Ruleset};
 use vgo_inference::{
-    BatchedEvaluator, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
+    BatchedEvaluatorPool, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
 };
 use vgo_raster::{RasterConfig, RasterKind};
 use vgo_search::{
@@ -246,7 +246,7 @@ fn load_model(
     kind: RasterKind,
     resolution: usize,
     arguments: &Arguments,
-) -> Result<BatchedEvaluator, EvaluationError> {
+) -> Result<BatchedEvaluatorPool, EvaluationError> {
     let service = OnnxBatchService::load(&OnnxServiceConfig {
         model,
         raster: RasterConfig::square_of(resolution, kind),
@@ -257,12 +257,12 @@ fn load_model(
         fp16: arguments.fp16,
         cache_directory: arguments.cache_directory.clone(),
     })?;
-    BatchedEvaluator::spawn(
+    BatchedEvaluatorPool::spawn(
         BrokerConfig {
             maximum_delay: Duration::from_millis(arguments.delay_ms),
             queue_capacity: (arguments.threads * 4).max(arguments.maximum_batch * 2),
         },
-        service,
+        vec![service],
     )
 }
 
@@ -372,8 +372,8 @@ fn game_sgf(result: &GameResult, radius: f64, komi: f64) -> String {
 }
 
 fn play_game(
-    candidate: &BatchedEvaluator,
-    opponent: Option<&BatchedEvaluator>,
+    candidate: &BatchedEvaluatorPool,
+    opponent: Option<&BatchedEvaluatorPool>,
     candidate_color: Color,
     seed: u64,
     arguments: &Arguments,
@@ -664,8 +664,8 @@ impl Tally {
 
 fn run_match(
     arguments: &Arc<Arguments>,
-    candidate: &BatchedEvaluator,
-    opponent: Option<&BatchedEvaluator>,
+    candidate: &BatchedEvaluatorPool,
+    opponent: Option<&BatchedEvaluatorPool>,
     opponent_path: Option<&std::path::Path>,
     seed_base: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {

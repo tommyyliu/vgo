@@ -53,7 +53,7 @@ The implementation exposes three independent contracts:
 
 - `InferenceInput` and `InferenceOutput` are the encoded request boundary;
 - `BatchService` synchronously evaluates an already-encoded batch;
-- `BatchExecutor` separates batch submission from completion, declares its slot
+- `ThreadedBatchExecutorPool` separates batch submission from completion, declares its slot
   capacity, and permits out-of-order completion by sequence number.
 
 Each `BatchService` remains synchronous, but generation can run multiple
@@ -62,7 +62,7 @@ broker builds batches from the shared actor queue, then assigns each complete
 batch to a free slot; requests are no longer partitioned before batching. Each
 slot retains its own session, execution context, and reusable input storage, so
 tune the slot count against device memory and end-to-end throughput. The
-`BatchExecutor` contract also permits a future backend to use multiple
+executor also permits a future backend to use multiple
 pinned-memory/stream slots inside one session without changing actors,
 encoding, batching, or response routing.
 

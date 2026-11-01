@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use vgo_core::{Color, Position};
 use vgo_inference::{
-    BatchedEvaluator, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
+    BatchedEvaluatorPool, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
 };
 use vgo_raster::RasterConfig;
 use vgo_search::{Evaluator, NaiveEvaluator, SearchConfig, search_with_evaluator};
@@ -118,12 +118,12 @@ fn more_playouts_beat_fewer_coarse_fine() {
         cache_directory: std::env::temp_dir(),
     })
     .expect("onnx model loads");
-    let evaluator = BatchedEvaluator::spawn(
+    let evaluator = BatchedEvaluatorPool::spawn(
         BrokerConfig {
             maximum_delay: Duration::from_millis(1),
             queue_capacity: 64,
         },
-        service,
+        vec![service],
     )
     .expect("evaluator spawns");
 
