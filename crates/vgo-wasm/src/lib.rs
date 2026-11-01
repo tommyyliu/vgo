@@ -209,11 +209,6 @@ impl Game {
 
     /// The model input for the current position: `channels * size * size`
     /// floats, channel-major, exactly what self-play feeds the network.
-    ///
-    /// Built with the distance-transform `settled` channel, which differs from
-    /// the training-time rasterizer on at most a pixel or two of 16384 — far
-    /// below what fp16 inference rounds away, and measured *closer* to the
-    /// definition than the implementation the model was trained against.
     pub fn raster(&self, size: usize) -> Result<Vec<f32>, JsValue> {
         if size == 0 {
             return Err(JsValue::from_str("raster size must be positive"));

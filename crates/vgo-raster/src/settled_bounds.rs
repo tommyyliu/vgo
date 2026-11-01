@@ -292,9 +292,7 @@ fn sampled_legal_set_into(
 /// since every legal cell centre really is a point of the set.
 ///
 /// In practice that costs at most one pixel of 16384 at the densest fixture
-/// tested, against two for the shipping implementation, which walks a contour
-/// at 1/128 tolerance and is not exact either. Oversampling to 3 removed it
-/// entirely on every fixture.
+/// tested. Oversampling to 3 removed it entirely on every fixture.
 ///
 /// Returns the mask and how many pixels needed the exact test, so callers can
 /// see whether the band is staying small.
@@ -309,16 +307,6 @@ pub fn settled_mask_by_bounded_distance(
     let tests =
         settled_by_bounded_distance_into(position, config, oversample, &mut scratch, &mut mask);
     (mask, tests)
-}
-
-pub(crate) fn settled_mask_by_bounded_distance_into(
-    position: &Position,
-    config: RasterConfig,
-    oversample: usize,
-    scratch: &mut SettledScratch,
-    mask: &mut Vec<bool>,
-) {
-    settled_by_bounded_distance_into(position, config, oversample, scratch, mask);
 }
 
 /// The row-independent half of the `settled` test, so the packed writer can supply
@@ -530,7 +518,7 @@ mod tests {
     use vgo_core::{Color, Stone, distance_to_legal_set, legal_set_vertices};
 
     use super::*;
-    use crate::{RasterKind, settled_mask};
+    use crate::{RasterKind, SETTLED_OVERSAMPLE};
 
     fn fixture(count: usize, radius: f64) -> Position {
         let spacing = 2.0 * radius * 1.08;
@@ -599,9 +587,8 @@ mod tests {
         ] {
             let config = RasterConfig::square_of(size, RasterKind::CompactRadius);
             let position = packing(radius, target, target as u64);
-            let scale = crate::settled_oversample(&position, config).expect("distance path");
             let vertices = legal_set_vertices(&position);
-            let (mask, _) = settled_mask_by_bounded_distance(&position, config, scale);
+            let (mask, _) = settled_mask_by_bounded_distance(&position, config, SETTLED_OVERSAMPLE);
             let mut wrong = 0usize;
             for pixel in 0..config.pixels() {
                 let x = ((pixel % size) as f64 + 0.5) / size as f64;
@@ -635,10 +622,8 @@ mod tests {
         for count in [28usize, 120, 240] {
             let position = fixture(count, radius);
             assert!(position.validate().is_playable());
-            let scale = crate::settled_oversample(&position, config)
-                .expect("a coarse raster must take the distance path");
             let vertices = legal_set_vertices(&position);
-            let (mask, _) = settled_mask_by_bounded_distance(&position, config, scale);
+            let (mask, _) = settled_mask_by_bounded_distance(&position, config, SETTLED_OVERSAMPLE);
             let mut wrong = 0usize;
             for pixel in 0..config.pixels() {
                 let x = ((pixel % config.width) as f64 + 0.5) / config.width as f64;
@@ -704,7 +689,7 @@ mod tests {
     fn bounded_distance_agrees_with_the_definition() {
         let radius = 0.055_714_285_714_285_716;
         let config = RasterConfig::square_of(128, RasterKind::Compact);
-        for count in [8usize, 28, 52] {
+        for count in [1usize, 2, 4, 8, 14, 19, 28, 52] {
             let position = fixture(count, radius);
             if !position.validate().is_playable() || position.stones().is_empty() {
                 continue;
@@ -802,7 +787,6 @@ mod tests {
         let position = Position::new(0.05, Vec::new(), Color::Black);
         let (mask, _) = settled_mask_by_bounded_distance(&position, config, 1);
         assert!(mask.iter().all(|settled| !settled));
-        assert_eq!(settled_mask(&position, config), mask);
     }
 }
 

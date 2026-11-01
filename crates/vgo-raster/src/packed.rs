@@ -22,7 +22,7 @@ use half::{f16, slice::HalfFloatSliceExt};
 use vgo_core::{Color, Position};
 
 use crate::settled_bounds::{SettledScratch, prepare_settled_rows};
-use crate::{RasterConfig, RasterKind, settled_for_raster_into, settled_oversample};
+use crate::{RasterConfig, RasterKind, SETTLED_OVERSAMPLE};
 
 /// Which planes of a layout are binary, continuous, and constant.
 ///
@@ -441,26 +441,13 @@ fn write_packed(
         return;
     }
 
-    // On the dispatch that dominates production, `settled` is classified row by
-    // row inside the sweep below, against the nearest-stone minimum that loop
-    // already computes for the ridge -- rather than by a builder that sweeps
-    // every stone a second time to recompute it. See `SettledRows`. The other
-    // branch is the small-board O(stones^2) solve, which has no such field to
-    // share, so it still builds the whole mask up front.
-    let mut settled_rows = if let Some(scale) = settled_oversample(position, config) {
-        settled.clear();
-        settled.resize(pixels, false);
-        Some(prepare_settled_rows(
-            position,
-            config,
-            scale,
-            settled_scratch,
-        ))
-    } else {
-        settled_for_raster_into(position, config, settled_scratch, settled);
-        None
-    };
-    assert_eq!(settled.len(), pixels);
+    // `settled` is classified row by row inside the sweep below, against the
+    // nearest-stone minimum that loop already computes for the ridge, rather than
+    // by a builder that sweeps every stone a second time. See `SettledRows`.
+    settled.clear();
+    settled.resize(pixels, false);
+    let mut settled_rows =
+        prepare_settled_rows(position, config, SETTLED_OVERSAMPLE, settled_scratch);
 
     let stride = bit_plane_bytes(pixels);
     let (current_plane, rest) = bits.split_at_mut(stride);
@@ -523,17 +510,15 @@ fn write_packed(
         let nearest_row = &nearest_squares[base..base + width];
         let second_row = &second_squares[base..base + width];
 
-        if let Some(rows) = settled_rows.as_mut() {
-            rows.classify_row(
-                position,
-                row,
-                y,
-                xs,
-                nearest_row,
-                settled_scratch.edt.field(),
-                &mut settled[base..base + width],
-            );
-        }
+        settled_rows.classify_row(
+            position,
+            row,
+            y,
+            xs,
+            nearest_row,
+            settled_scratch.edt.field(),
+            &mut settled[base..base + width],
+        );
 
         // On its own, not inside the bit packing below: there the loop's carried
         // byte stops it vectorizing, and this is two square roots per pixel.
@@ -732,9 +717,6 @@ mod tests {
     /// two must agree on every pixel, and unlike the ridge there is no f16
     /// quantisation here to hide a last-ulp disagreement -- which is why both
     /// sides compute squared distances by `mul_add`.
-    ///
-    /// Stone counts straddle `DISTANCE_SETTLED_MINIMUM_STONES`, so this covers
-    /// the dispatch in both directions.
     #[test]
     fn fused_settled_matches_the_reference_builder() {
         // Both sizes sample the legal set at the output resolution.

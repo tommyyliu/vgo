@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use vgo_core::{Color, Position, SettledRegion};
+use vgo_core::{Color, Position};
 
 mod edt;
 pub mod packed;
@@ -9,12 +9,7 @@ mod settled_bounds;
 pub use policy::DensePolicy;
 pub use settled_bounds::settled_mask_by_bounded_distance;
 
-/// Stone count above which the distance-transform settled mask is worth its
-/// fixed cost. Measured crossover sits between 14 and 28 stones.
-const DISTANCE_SETTLED_MINIMUM_STONES: usize = 20;
-
-/// Whether `settled` takes the distance-transform path, and at what oversample,
-/// or `None` for the per-stone solve.
+/// Legal-set samples per output pixel along each axis when classifying `settled`.
 ///
 /// The transform samples the legal set at the output resolution. It used to need
 /// six cells per stone radius -- below that, legal slivers fell between samples
@@ -23,9 +18,7 @@ const DISTANCE_SETTLED_MINIMUM_STONES: usize = 20;
 /// (see `sampled_legal_set_into`) catches every sliver at any resolution: on 103
 /// real 1/38 positions at 128, 1x and 3x both disagreed with the definition on 4
 /// of 1.56M pixels, and 1x rasterizes 17% faster.
-pub(crate) fn settled_oversample(position: &Position, _config: RasterConfig) -> Option<usize> {
-    (position.stones().len() >= DISTANCE_SETTLED_MINIMUM_STONES).then_some(1)
-}
+pub(crate) const SETTLED_OVERSAMPLE: usize = 1;
 
 pub const CHANNEL_COUNT: usize = 12;
 
@@ -328,55 +321,14 @@ pub fn rasterize_compact_radius_into(position: &Position, config: RasterConfig, 
 /// This shares the semantic raster's geometry helpers but writes only the five
 /// requested planes. In particular, it does not allocate, render, and copy a
 /// twelve-plane temporary for every inference position.
-/// The `settled` channel, from whichever implementation is configured.
+/// The `settled` channel.
 ///
 /// Every writer goes through here so the compact and semantic rasters cannot
-/// disagree on it — which is exactly what broke when only the compact writer
+/// disagree on it -- which is exactly what broke when only the compact writer
 /// was switched: `compact_is_a_subset_of_the_semantic_raster` failed, correctly.
 #[must_use]
 pub fn settled_for_raster(position: &Position, config: RasterConfig) -> Vec<bool> {
-    // Dispatch on stone count. The distance-transform form pays a fixed
-    // O(pixels) cost and wins only once the per-stone solve's O(n^2) exceeds it:
-    // measured 0.5x at 14 stones, 2.8x at 28, 7.2x at 52. Real shards are not
-    // all late-game -- the corpus this was tuned against runs min 0, mean 26.2
-    // stones -- so always taking it gave back a third of the gain on early
-    // positions.
-    //
-    // This used to sit behind a `distance-settled` feature, off by default,
-    // "pending an A/B on real shards". The A/B never happened and the flag
-    // never moved, so every run since paid the quadratic path. Two things
-    // settle it without one:
-    //
-    //   * The distance-transform form is *closer* to the definition, not
-    //     merely faster. `bounded_distance_agrees_with_the_definition` pins it
-    //     at zero wrong pixels; the per-stone solve walks a contour at 1/128
-    //     tolerance and is wrong on one or two of 16384.
-    //   * A build-time flag that changes a network input is worse than a
-    //     config field, because nothing records it. A resumed run could render
-    //     different inputs than it trained on and the identity check would see
-    //     nothing.
-    //
-    // So the fast path is simply the path now, and there is no flag to forget.
-    match settled_oversample(position, config) {
-        Some(scale) => settled_mask_by_bounded_distance(position, config, scale).0,
-        None => settled_mask(position, config),
-    }
-}
-
-pub(crate) fn settled_for_raster_into(
-    position: &Position,
-    config: RasterConfig,
-    scratch: &mut settled_bounds::SettledScratch,
-    output: &mut Vec<bool>,
-) {
-    if let Some(scale) = settled_oversample(position, config) {
-        settled_bounds::settled_mask_by_bounded_distance_into(
-            position, config, scale, scratch, output,
-        );
-    } else {
-        output.clear();
-        output.extend_from_slice(&settled_for_raster(position, config));
-    }
+    settled_mask_by_bounded_distance(position, config, SETTLED_OVERSAMPLE).0
 }
 
 pub(crate) fn rasterize_compact_into(position: &Position, config: RasterConfig, data: &mut [f32]) {
@@ -398,7 +350,7 @@ pub(crate) fn rasterize_compact_into(position: &Position, config: RasterConfig, 
 /// name one or the other put it in the same slot deliberately.
 ///
 /// The mask must be `config.pixels()` long and indexed row-major, exactly as
-/// [`settled_mask`] returns it.
+/// [`settled_for_raster`] returns it.
 pub(crate) fn rasterize_compact_with_predicate_into(
     position: &Position,
     config: RasterConfig,
@@ -630,73 +582,6 @@ pub(crate) fn rasterize_into(position: &Position, config: RasterConfig, data: &m
             );
         }
     }
-}
-
-/// The `settled` channel as a mask, for callers that render the other channels
-/// themselves.
-///
-/// Public because the GPU path needs it: `compact.wgsl` computes the four
-/// per-pixel channels from the stone list, but this one is per-stone contour
-/// geometry scanline-filled, which is not pixel-shader work. The host computes
-/// it and uploads 64 KB rather than the 327 KB whole tensor.
-pub fn settled_mask(position: &Position, config: RasterConfig) -> Vec<bool> {
-    let pixels = config.pixels();
-    let stones = position.stones();
-    let index = std::sync::Arc::clone(position.legal_index());
-    let known_vertices = index.vertices();
-    let mut settled = vec![false; pixels];
-    let mut contour = Vec::new();
-    let mut crossings: Vec<f64> = Vec::with_capacity(16);
-    for stone in 0..stones.len() {
-        let region = SettledRegion::new(position, stone, known_vertices);
-        // One pixel: the contour is only used to classify pixel centres, and
-        // finer chord detail cannot be represented by the output mask. This is
-        // far cheaper than the 2e-5 the client needs for a zoomable vector.
-        region.contour_within_into(1.0 / config.width.max(config.height) as f64, &mut contour);
-        if contour.len() < 3 {
-            continue;
-        }
-        // Only the rows the contour spans need testing.
-        let (mut low_y, mut high_y) = (f64::INFINITY, f64::NEG_INFINITY);
-        for point in &contour {
-            low_y = low_y.min(point.y);
-            high_y = high_y.max(point.y);
-        }
-        let first_row = ((low_y * config.height as f64 - 0.5).floor().max(0.0)) as usize;
-        let last_row =
-            ((high_y * config.height as f64 - 0.5).ceil() as usize).min(config.height - 1);
-        // Scanline fill computes a row's crossings once instead of once per
-        // pixel. The same buffer is reused for every row and every stone.
-        for row in first_row..=last_row {
-            let y = (row as f64 + 0.5) / config.height as f64;
-            crossings.clear();
-            let mut previous = contour[contour.len() - 1];
-            for &current in &contour {
-                if (current.y > y) != (previous.y > y) {
-                    let t = (y - current.y) / (previous.y - current.y);
-                    crossings.push(current.x + t * (previous.x - current.x));
-                }
-                previous = current;
-            }
-            if crossings.is_empty() {
-                continue;
-            }
-            crossings.sort_by(f64::total_cmp);
-            // Star-shaped loops are simple, so spans pair up in order.
-            for span in crossings.chunks_exact(2) {
-                let from = ((span[0] * config.width as f64 - 0.5).ceil()).max(0.0) as usize;
-                let to = ((span[1] * config.width as f64 - 0.5).floor()).max(-1.0);
-                if to < 0.0 {
-                    continue;
-                }
-                let to = (to as usize).min(config.width - 1);
-                for column in from..=to {
-                    settled[row * config.width + column] = true;
-                }
-            }
-        }
-    }
-    settled
 }
 
 /// Stone coordinates for the side to move, then for its opponent.
