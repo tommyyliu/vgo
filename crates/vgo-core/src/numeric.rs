@@ -46,7 +46,7 @@ pub fn length(dx: f64, dy: f64) -> f64 {
 ///
 /// Answers from the squares when they are clearly apart, and takes the root only
 /// inside a few ulps of the boundary, where rounding could change the answer. It
-/// therefore agrees with the direct comparison on every input, including NaN.
+/// therefore agrees with the direct comparison, including on NaN. Proof: [N1].
 #[inline]
 #[must_use]
 pub fn length_below(dx: f64, dy: f64, threshold: f64) -> bool {

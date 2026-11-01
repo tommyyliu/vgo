@@ -52,7 +52,7 @@ identified as board constraints and shared edges as stone bisectors. A
 zero-length contact is discarded before adjacency is formed, so cells meeting
 at only a vertex never connect groups.
 
-Capture uses the finite cell-vertex criterion proved in `AXIOMS.md`. It does
+Capture uses the finite cell-vertex criterion proved in [`LEMMAS.md`](../spec/LEMMAS.md). It does
 not use the settled contour.
 
 ## Transactions

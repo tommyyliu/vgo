@@ -75,6 +75,8 @@ fn admit<const VISIT_FIRST: bool>(
 /// `threshold`, and skipping it also skips the O(stones) legality check that
 /// would have screened it -- which is what makes the whole call quadratic.
 ///
+/// Proof: [E7].
+///
 /// Only sound for a caller asking whether *anything* is within `threshold`.
 /// [`distance`] passes `None` because it needs the true minimum, which any
 /// skipped stone could hold.
@@ -605,8 +607,8 @@ pub fn nearest_indexed_within(
 /// Stones lie inside the inset and clamping to that box never increases a
 /// distance, so a stone's clamped candidate stays within `diameter` of the stone.
 /// A stone further than `reach + diameter` from `point` therefore has no
-/// candidate within `reach`. Clearing the margin moves the winner by a few
-/// `SNAP_MARGIN`s at most, so a winner beyond the padded disc stays beyond `reach`.
+/// candidate within `reach`. The padding covers the movement of
+/// [`clear_by_margin`], which can reach 17 `SNAP_MARGIN`s. Proof: [E6].
 fn nearest_bounded(
     position: &Position,
     point: Point,
@@ -617,7 +619,7 @@ fn nearest_bounded(
     inset: f64,
 ) -> Option<Nearest> {
     let clamp = |value: f64| value.clamp(inset.min(1.0 - inset), inset.max(1.0 - inset));
-    let padded = reach + 16.0 * numeric::SNAP_MARGIN;
+    let padded = reach + 64.0 * numeric::SNAP_MARGIN;
     let limit = padded * padded;
     let mut near: Vec<(i64, Point)> = Vec::with_capacity(16);
     let mut consider = |candidate: Point| {

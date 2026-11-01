@@ -361,7 +361,7 @@ fn sort_next_prefix(order: &mut [u128], sorted: usize) -> usize {
     sorted + block
 }
 
-/// A distance and stone index as one integer whose order is `f64::total_cmp` on
+/// [N3] A distance and stone index as one integer whose order is `f64::total_cmp` on
 /// the distance, then the index, so sorting needs no float comparator.
 #[inline]
 fn order_key(distance: f64, index: usize) -> u128 {
@@ -445,7 +445,7 @@ fn compute_cell(position: &Position, stone: usize, buffers: &mut CellBuffers) ->
         if polygon.is_empty() {
             break;
         }
-        // Claim 1: |p - s| <= R for every p in the polygon, so a site
+        // [E4] Claim 1: |p - s| <= R for every p in the polygon, so a site
         // further than 2R has |p - o| >= |o - s| - |p - s| > R >= |p - s|
         // and its bisector cannot cut. Claim 2: R is non-increasing and
         // `distance` non-decreasing, so this holds for every later
@@ -511,7 +511,7 @@ fn compute_cell(position: &Position, stone: usize, buffers: &mut CellBuffers) ->
 /// if the new stone lies strictly beyond the cell's `reach`. Not cutting the
 /// final polygon would not be enough: a stone can cut an intermediate polygon
 /// and be clipped away later, which leaves the same shape with different
-/// rounding. Beyond `reach` it never enters the clip sequence at all.
+/// rounding. Beyond `reach` it never enters the clip sequence at all. Proof: [E5].
 #[must_use]
 pub fn compute(position: &Position) -> Geometry {
     let count = position.stones().len();

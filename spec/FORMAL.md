@@ -1,7 +1,7 @@
-# Voronoi Go Rules
+# Voronoi Go: formal rules
 
-This document defines the game. Mathematical consequences and implementation
-lemmas belong in `AXIOMS.md`, not here.
+This is the normative definition of the game. [`RULES.md`](RULES.md) is the same
+game in plain words. Consequences belong in [`LEMMAS.md`](LEMMAS.md), not here.
 
 ## 1. Board and stones
 

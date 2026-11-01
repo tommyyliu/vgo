@@ -192,7 +192,7 @@ impl Position {
         }
     }
 
-    /// This position's Voronoi cells, shared with its children.
+    /// This position's Voronoi cells, shared with its children. See [E8].
     pub(crate) fn shared_cells(&self) -> &SharedCells {
         self.geometry
             .own

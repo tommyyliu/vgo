@@ -209,6 +209,7 @@ struct SweepInput<'a> {
 /// The bound only chooses candidates. Every stored distance is still the exact
 /// `mul_add` the dense writer computes, and the two-smallest update does not
 /// depend on visit order. The slack on the limit covers rounding in the bound.
+/// Proofs: [E1], [N2].
 fn sweep_tile(
     input: &SweepInput<'_>,
     columns: std::ops::Range<usize>,
@@ -299,7 +300,7 @@ fn sweep_tile(
 ///
 /// A disc has few pixels, so this is far cheaper than keeping a per-colour
 /// minimum for every pixel in the sweep. The row and column ranges are padded by
-/// a pixel; the test itself is the dense writer's `square <= radius^2`.
+/// a pixel; the test itself is the dense writer's `square <= radius^2`. Proof: [E2].
 fn stamp_disc(
     plane: &mut [u8],
     (x, y): (f64, f64),

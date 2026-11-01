@@ -1,5 +1,0 @@
-# Rendered output is reproducible from the scripts; only the scripts are tracked.
-rasters/
-arena-sgf/
-resignation-review/
-resignation-review.tar.gz

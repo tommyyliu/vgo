@@ -84,6 +84,7 @@ pub(crate) fn squared_distance_transform(mask: &[bool], width: usize, height: us
 /// cell, or [`ABSENT`] everywhere if no cell is `true`.
 ///
 /// Each result is an exact integer, so any correct method gives identical bits.
+/// Proof: [E3].
 /// This one suits a binary mask (Meijster, Roerdink and Hesselink's transform):
 ///
 ///   1. Each cell's vertical distance to a `true` cell comes from one forward
@@ -605,6 +606,8 @@ pub(crate) fn settled_mask_by_bounded_distance_into(
 /// different pixel.
 ///
 /// `oversample` is chosen by `settled_oversample`, the same as the reference.
+///
+/// Not proved exact on every position: see [O1].
 pub(crate) struct SettledRows {
     scale: usize,
     fine_width: usize,

@@ -1,12 +1,10 @@
 # JavaScript Reference
 
-This directory is a self-contained behavioral reference for Voronoi Go. It is
-kept intentionally independent from the future training implementation.
+A self-contained JavaScript implementation of Voronoi Go, used as a behavioural
+oracle. The rules and lemmas it implements are in [`spec/`](../spec/RULES.md).
 
 ## Contents
 
-- [`RULES.md`](RULES.md): normative game rules.
-- [`AXIOMS.md`](AXIOMS.md): proved consequences used by implementations.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md): design of the JavaScript reference.
 - [`src/`](src/): pure geometry and game modules.
 - [`js-reference/voronoi_go.html`](js-reference/voronoi_go.html): interactive
