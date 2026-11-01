@@ -34,6 +34,7 @@ Run `correctness/check.sh` before merging.
 | [`docs/`](docs) | overview, commands, backlog, [`reference/`](docs/reference) for interfaces, [`history/`](docs/history/README.md) for dated records |
 | [`performance/`](performance/README.md) | timing runner, fixture positions and history |
 | [`correctness/`](correctness) | `check.sh`, spec and link checks, golden digests |
+| [`dashboard/`](dashboard/README.md) | performance and research dashboards: `python3 -m dashboard` |
 | `artifacts/` | run output, not tracked. `artifacts/old/` is the archive |
 
 ## Tech stack

@@ -1,0 +1,119 @@
+[
+  {
+    "id": "info-metric",
+    "status": "Next",
+    "bucket": "Measurement",
+    "effort": "S",
+    "title": "Measure information per search directly",
+    "why": "Nothing measures how much a search teaches. KL(search policy || prior) and value change per search would give a real signal-per-compute number.",
+    "test": "Log both per position in a short run, and check they separate full searches from cheap ones."
+  },
+  {
+    "id": "connect-ratings",
+    "status": "Next",
+    "bucket": "Measurement",
+    "effort": "S",
+    "title": "Connect updates 33 and 36 to the rating graph",
+    "why": "Both swept the baseline 48-0, so they're only lower bounds. Whether the loop kept improving after them is unknown.",
+    "test": "Play both against update 45 and update 42. About 40 games each is enough for a large gap."
+  },
+  {
+    "id": "ownership-loss",
+    "status": "Next",
+    "bucket": "Extract",
+    "effort": "M",
+    "title": "Train the ownership head",
+    "why": "Weight 0 in the bulk loop since 219d67a, with no recorded arena result. sigmago measured +194 ± 28 with ownership and score heads together, but -96 ± 49 on a smaller run.",
+    "test": "Train on one frozen corpus at weights 0, 0.5 and 1.5, then arena at equal sims on both boards."
+  },
+  {
+    "id": "window-size",
+    "status": "Next",
+    "bucket": "Replay",
+    "effort": "S",
+    "title": "Retest a larger training window",
+    "why": "750k beat 250k 51-29 on the small board, while the big board was inconclusive. The loop runs 200k. This is the most direct evidence on getting more from existing data.",
+    "test": "Replicate with a second seed at 500k and 750k, and weigh strength against training time."
+  },
+  {
+    "id": "input-128",
+    "status": "Next",
+    "bucket": "Speed",
+    "effort": "M",
+    "title": "Confirm 128 input as the efficient default",
+    "why": "128 searches 2-3.6x faster and scored 30-18 at equal time on the big board. Equal-sim arenas are inconclusive and need replication.",
+    "test": "Run a larger equal-time arena on both boards before starting a new campaign."
+  },
+  {
+    "id": "score-head",
+    "status": "Later",
+    "bucket": "Extract",
+    "effort": "M",
+    "title": "Add a score head",
+    "why": "Final scores have been recorded since 2026-09-24. Margin is richer than win or loss for each game.",
+    "test": "Add after the ownership test, so the two effects can be told apart."
+  },
+  {
+    "id": "contested-branching",
+    "status": "Later",
+    "bucket": "Generate",
+    "effort": "M",
+    "title": "Branch from contested positions",
+    "why": "sigmago's branch mining was never a fair test: 94% of roots were already decided, because it selected late positions.",
+    "test": "Offline first: run several continuations from positions with values near even. Stop if they rarely disagree."
+  },
+  {
+    "id": "randomized-budgets",
+    "status": "Later",
+    "bucket": "Generate",
+    "effort": "M",
+    "title": "Revisit randomized search budgets",
+    "why": "Gave 2.8x the games per hour, but 32 games were discarded and the pilot recipe was rejected. That doesn't rule out the idea.",
+    "test": "Retry with a recipe that keeps a healthy policy target, judged at equal elapsed compute."
+  },
+  {
+    "id": "aux-heads",
+    "status": "Later",
+    "bucket": "Extract",
+    "effort": "S",
+    "title": "Add short-horizon value and opponent-move heads",
+    "why": "Both can be labelled from existing games, adding more per-position signal.",
+    "test": "Add one at a time, after ownership."
+  },
+  {
+    "id": "per-stage-eval",
+    "status": "Later",
+    "bucket": "Measurement",
+    "effort": "M",
+    "title": "Rate models by game stage and board size",
+    "why": "One rating hides regressions in the opening or endgame.",
+    "test": "Extend arena records, and fit a rating per bucket."
+  },
+  {
+    "id": "settled-plane",
+    "status": "Later",
+    "bucket": "Speed",
+    "effort": "M",
+    "title": "Ablate the settled input plane",
+    "why": "It's 92-96% of raster cost, and its strength benefit has never been measured.",
+    "test": "Train with and without it on one corpus, then arena at equal time."
+  },
+  {
+    "id": "one-norm",
+    "status": "Later",
+    "bucket": "Speed",
+    "effort": "S",
+    "title": "Settle one norm per block",
+    "why": "Measured about 4-9% faster search, with mixed, inconclusive arenas.",
+    "test": "Only worth a larger arena if 128 input is adopted first."
+  },
+  {
+    "id": "tree-reuse",
+    "status": "Parked",
+    "bucket": "Speed",
+    "effort": "L",
+    "title": "Tree reuse in self-play",
+    "why": "Arena prototype scored 24-24 and 23-25, and inherited only 9-12 visits per hit.",
+    "test": "No next step unless search budgets rise a lot."
+  }
+]

@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project dashboard</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f0efec;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #6f6d68;
+  --line: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,.10);
+  --series: #2a78d6; --band: rgba(42,120,214,.16); --accent-ink: #1c5cab;
+  --good: #006300; --critical: #a82a2a; --warning-bg: #fdf3dc;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #2c2c2a;
+    --ink: #f0efec; --ink-2: #c3c2b7; --muted: #9b9a92;
+    --line: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,.10);
+    --series: #3987e5; --band: rgba(57,135,229,.22); --accent-ink: #86b6ef;
+    --good: #0ca30c; --critical: #f08a8a; --warning-bg: #33290f;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1120px; margin: 0 auto; padding: 24px 24px 64px; }
+a { color: var(--accent-ink); }
+.back { font-size: 13px; text-decoration: none; }
+.back:hover { text-decoration: underline; }
+header { margin: 6px 0 14px; }
+h1 { font-size: 24px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
+#summary, #updated { color: var(--ink-2); margin: 2px 0 0; }
+#updated { color: var(--muted); font-size: 13px; }
+nav { position: sticky; top: 0; z-index: 5; display: flex; gap: 16px; flex-wrap: wrap;
+  padding: 8px 0; background: var(--page); border-bottom: 1px solid var(--line); margin-bottom: 8px; }
+nav a { text-decoration: none; color: var(--ink-2); font-size: 13.5px; }
+nav a:hover { color: var(--ink); }
+section { scroll-margin-top: 44px; padding-top: 22px; }
+h2 { font-size: 18px; margin: 0; font-weight: 650; }
+.question { color: var(--ink-2); margin: 1px 0 12px; }
+h3 { font-size: 14px; margin: 0; font-weight: 600; }
+.caption { color: var(--muted); font-size: 13px; margin: 1px 0 8px; }
+.block { margin-bottom: 14px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
+.stat { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 15px; }
+.stat .label { color: var(--ink-2); font-size: 13px; }
+.stat .value { font-size: 26px; font-weight: 650; line-height: 1.25; letter-spacing: -.02em; }
+.stat .sub { color: var(--muted); font-size: 12.5px; }
+
+.note { background: var(--warning-bg); border-radius: 8px; padding: 9px 13px; color: var(--ink); }
+.note::before { content: "▲ "; color: var(--critical); font-size: 11px; }
+
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; font-weight: 500; font-size: 12.5px; color: var(--muted);
+  padding: 5px 10px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 6px 10px; border-top: 1px solid var(--line); vertical-align: top; }
+tbody tr:first-child td { border-top: 0; }
+.right { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.muted { color: var(--muted); font-size: 13px; }
+.better { color: var(--good); font-weight: 600; }
+.worse { color: var(--critical); font-weight: 600; }
+.better::before { content: "▲ "; font-size: 9px; }
+.worse::before { content: "▼ "; font-size: 9px; }
+.nowrap { white-space: nowrap; }
+
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; height: auto; }
+.chart text { fill: var(--muted); font-size: 12px; }
+.grid { stroke: var(--line); stroke-width: 1; }
+.baseline { stroke: var(--axis); stroke-width: 1; }
+.line { fill: none; stroke: var(--series); stroke-width: 2; stroke-linejoin: round; }
+.band { fill: var(--band); }
+.dot { fill: var(--series); stroke: var(--surface); stroke-width: 2; }
+.whisker { stroke: var(--series); stroke-width: 1.5; opacity: .55; }
+.cross { stroke: var(--axis); stroke-width: 1; display: none; }
+.hit { fill: transparent; }
+#tip { position: fixed; z-index: 20; pointer-events: none; display: none; max-width: 280px;
+  background: var(--ink); color: var(--page); font-size: 12.5px; padding: 4px 8px; border-radius: 5px; }
+
+.idea-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+button, select, input, textarea { font: inherit; color: inherit; }
+button { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button:hover { background: var(--surface-2); }
+:focus-visible { outline: 2px solid var(--series); outline-offset: 1px; }
+select, input, textarea { background: var(--page); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; }
+.board { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; align-items: start; }
+.column h3 { margin-bottom: 7px; color: var(--ink-2); }
+.idea { background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 9px 12px; margin-bottom: 8px; }
+.idea summary { cursor: pointer; font-weight: 600; list-style-position: outside; }
+.idea .meta { color: var(--muted); font-size: 12.5px; margin: 1px 0 3px; }
+.idea p { margin: 3px 0; color: var(--ink-2); }
+.idea .result { color: var(--ink); }
+.form { margin-top: 8px; display: grid; gap: 7px; }
+.form label { color: var(--ink-2); font-size: 13px; display: block; }
+.form input, .form textarea, .form select { display: block; width: 100%; margin-top: 2px; }
+.form textarea { min-height: 62px; resize: vertical; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.row-actions { display: flex; gap: 8px; align-items: center; }
+.flash { color: var(--muted); font-size: 13px; }
+.done-list { margin-top: 12px; color: var(--muted); }
+.error { color: var(--critical); padding: 20px 0; }
+@media (max-width: 820px) {
+  .board { grid-template-columns: 1fr; }
+}
+@media (max-width: 680px) {
+  main { padding: 16px 16px 48px; }
+}
+</style>
+</head>
+<body>
+<main>
+  <a class="back" href="http://127.0.0.1:8765/">← All projects</a>
+  <header>
+    <h1 id="title"></h1>
+    <p id="summary"></p>
+    <p id="updated"></p>
+  </header>
+  <nav id="nav" aria-label="Dashboards"></nav>
+  <div id="sections"></div>
+</main>
+<div id="tip" role="status"></div>
+<script>
+"use strict";
+const TABS = { performance: "Performance", research: "Research" };
+const COLUMNS = ["Next", "Running", "Later"];
+const CLOSED = ["Done", "Rejected", "Parked"];
+const STATUSES = [...COLUMNS, ...CLOSED];
+const BUCKETS = ["Generate", "Extract", "Replay", "Loop", "Speed", "Measurement"];
+const EFFORT = { S: "Small", M: "Medium", L: "Large" };
+const state = { ideas: [] };
+const $ = id => document.getElementById(id);
+
+/* Everything from disk goes through textContent, never innerHTML. */
+function el(tag, props = {}, ...kids) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props)) {
+    if (key === "class") node.className = value;
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else if (key in node) node[key] = value;
+    else node.setAttribute(key, value);
+  }
+  node.append(...kids.filter(k => k !== null && k !== undefined));
+  return node;
+}
+
+function svg(tag, attributes = {}, ...kids) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, value);
+  node.append(...kids);
+  return node;
+}
+
+function number(value) {
+  if (value === null || value === undefined) return "–";
+  const size = Math.abs(value);
+  return value.toLocaleString(undefined, { maximumFractionDigits: size < 10 ? 2 : size < 100 ? 1 : 0 });
+}
+
+function compact(value) {
+  const size = Math.abs(value);
+  if (size >= 1e6) return `${number(value / 1e6)}M`;
+  if (size >= 1e3) return `${number(value / 1e3)}k`;
+  return number(value);
+}
+
+function stats(block) {
+  return el("div", { class: "stats" }, ...block.items.map(item => el("div", { class: "stat" },
+    el("div", { class: "label", textContent: item.label }),
+    el("div", { class: "value", textContent: item.value }),
+    el("div", { class: "sub", textContent: item.sub }))));
+}
+
+const note = block => el("div", { class: "note", textContent: block.text });
+
+function heading(block) {
+  return [
+    block.title ? el("h3", { textContent: block.title }) : null,
+    block.caption ? el("p", { class: "caption", textContent: block.caption }) : null,
+  ];
+}
+
+function cell(row, column) {
+  const value = row[column.key];
+  const right = column.align === "right" ? "right" : "";
+  switch (column.format) {
+    case "code": return el("td", { class: right }, el("code", { textContent: value }));
+    case "muted": return el("td", { class: "muted", textContent: value ?? "" });
+    case "number": return el("td", { class: right, textContent: number(value) });
+    case "share": return el("td", { class: right, textContent: value == null ? "–" : `${Math.round(value * 100)}%` });
+    case "percent": {
+      /* Hot-path timings: lower is better. Under 5% is treated as noise. */
+      const kind = value <= -5 ? "better" : value >= 5 ? "worse" : "";
+      return el("td", { class: right }, el("span", { class: kind,
+        textContent: `${value > 0 ? "+" : ""}${number(value)}%` }));
+    }
+    case "interval":
+      return el("td", { class: right, textContent: `${Math.round(row.low * 100)}–${Math.round(row.high * 100)}%` });
+    case "verdict": {
+      const kind = value === "Candidate better" ? "better" : value === "Candidate worse" ? "worse" : "muted";
+      return el("td", { class: "nowrap" }, el("span", { class: kind, textContent: value }));
+    }
+    default: return el("td", { class: right, textContent: value ?? "" });
+  }
+}
+
+function table(block) {
+  return el("div", { class: "card" }, ...heading(block), el("div", { class: "scroll" }, el("table", {},
+    el("thead", {}, el("tr", {}, ...block.columns.map(c =>
+      el("th", { class: c.align === "right" ? "right" : "", textContent: c.label })))),
+    el("tbody", {}, ...block.rows.map(row => el("tr", {}, ...block.columns.map(c => cell(row, c))))))));
+}
+
+function ticks(low, high, count) {
+  const span = high - low || 1;
+  const rough = span / count;
+  const power = 10 ** Math.floor(Math.log10(rough));
+  const step = [1, 2, 5, 10].map(m => m * power).find(s => s >= rough);
+  const values = [];
+  for (let v = Math.ceil(low / step) * step; v <= high + step / 1e6; v += step) values.push(v);
+  return values;
+}
+
+function line(block) {
+  const [W, H] = [1000, 300];
+  const pad = { top: 14, right: 18, bottom: 40, left: 62 };
+  const points = block.series[0].points;
+  const lows = points.map(p => p.low ?? p.y), highs = points.map(p => p.high ?? p.y);
+  let yMin = Math.min(...lows), yMax = Math.max(...highs);
+  if (yMin > 0 && yMin < yMax * 0.5) yMin = 0;
+  const margin = (yMax - yMin || 1) * 0.06;
+  yMin -= yMin === 0 ? 0 : margin; yMax += margin;
+  const xs = points.map(p => p.x);
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const X = v => pad.left + (v - xMin) / (xMax - xMin || 1) * (W - pad.left - pad.right);
+  const Y = v => H - pad.bottom - (v - yMin) / (yMax - yMin || 1) * (H - pad.top - pad.bottom);
+  const xText = block.xFormat === "millions" ? compact : number;
+  const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": block.title });
+
+  for (const v of ticks(yMin, yMax, 5)) {
+    root.append(svg("line", { class: "grid", x1: pad.left, x2: W - pad.right, y1: Y(v), y2: Y(v) }));
+    root.append(svg("text", { x: pad.left - 8, y: Y(v) + 4, "text-anchor": "end" }, compact(v)));
+  }
+  for (const v of ticks(xMin, xMax, 7)) {
+    root.append(svg("text", { x: X(v), y: H - pad.bottom + 18, "text-anchor": "middle" }, xText(v)));
+  }
+  root.append(svg("line", { class: "baseline", x1: pad.left, x2: W - pad.right, y1: H - pad.bottom, y2: H - pad.bottom }));
+  root.append(svg("text", { x: (pad.left + W - pad.right) / 2, y: H - 5, "text-anchor": "middle" }, block.xLabel));
+  root.append(svg("text", { x: 14, y: H / 2 - pad.bottom / 2, "text-anchor": "middle",
+    transform: `rotate(-90 14 ${H / 2 - pad.bottom / 2})` }, block.yLabel));
+
+  const banded = points.some(p => p.low !== undefined);
+  if (banded) {
+    for (const p of points) root.append(svg("line", { class: "whisker", x1: X(p.x), x2: X(p.x), y1: Y(p.low), y2: Y(p.high) }));
+  }
+  root.append(svg("path", { class: "line", d: points.map((p, i) => `${i ? "L" : "M"}${X(p.x)} ${Y(p.y)}`).join("") }));
+  if (points.length <= 24) {
+    for (const p of points) root.append(svg("circle", { class: "dot", cx: X(p.x), cy: Y(p.y), r: 4.5 }));
+  }
+
+  const cross = svg("line", { class: "cross", y1: pad.top, y2: H - pad.bottom });
+  root.append(cross);
+  const tip = $("tip");
+  const hit = svg("rect", { class: "hit", x: pad.left, y: pad.top, width: W - pad.left - pad.right, height: H - pad.top - pad.bottom });
+  hit.addEventListener("mousemove", event => {
+    const box = root.getBoundingClientRect();
+    const x = (event.clientX - box.left) / box.width * W;
+    const nearest = points.reduce((a, b) => Math.abs(X(b.x) - x) < Math.abs(X(a.x) - x) ? b : a);
+    cross.setAttribute("x1", X(nearest.x)); cross.setAttribute("x2", X(nearest.x));
+    cross.style.display = "block";
+    const range = nearest.low !== undefined ? ` (${compact(nearest.low)} to ${compact(nearest.high)})` : "";
+    tip.textContent = `${nearest.label || `${block.xLabel} ${xText(nearest.x)}`}: ${compact(nearest.y)}${range}`;
+    tip.style.display = "block";
+    const own = tip.getBoundingClientRect();
+    tip.style.left = `${Math.min(innerWidth - own.width - 8, Math.max(8, event.clientX - own.width / 2))}px`;
+    tip.style.top = `${event.clientY - own.height - 12}px`;
+  });
+  hit.addEventListener("mouseleave", () => { cross.style.display = "none"; tip.style.display = "none"; });
+  root.append(hit);
+  return el("div", { class: "card" }, ...heading(block), el("div", { class: "chart" }, root));
+}
+
+async function saveIdea(body) {
+  const res = await fetch("/api/ideas", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  state.ideas = data.ideas;
+}
+
+function ideaForm(idea, onDone) {
+  const flash = el("span", { class: "flash" });
+  const input = (name, props = {}) => el("input", { name, type: "text", value: idea[name] || "", ...props });
+  const area = name => el("textarea", { name, value: idea[name] || "" });
+  const select = (name, options, current) => el("select", { name },
+    ...options.map(([value, label]) => el("option", { value, textContent: label, selected: value === current })));
+  const form = el("form", { class: "form", onsubmit: async event => {
+    event.preventDefault();
+    const fields = Object.fromEntries(new FormData(form));
+    if (!fields.title?.trim()) { flash.textContent = "Add a title first."; return; }
+    try {
+      await saveIdea({ id: idea.id, fields });
+      onDone();
+    } catch (e) { flash.textContent = `Not saved: ${e.message}`; }
+  } },
+    el("label", {}, "Idea", input("title", { required: true })),
+    el("div", { class: "pair" },
+      el("label", {}, "Status", select("status", STATUSES.map(s => [s, s]), idea.status || "Next")),
+      el("label", {}, "Bucket", select("bucket", BUCKETS.map(s => [s, s]), idea.bucket || "Generate"))),
+    el("label", {}, "Effort", select("effort", Object.entries(EFFORT), idea.effort || "M")),
+    el("label", {}, "Why", area("why")),
+    el("label", {}, "How to test it", area("test")),
+    el("label", {}, "Result", area("result")),
+    el("div", { class: "row-actions" },
+      el("button", { type: "submit", textContent: "Save" }),
+      idea.id ? el("button", { type: "button", textContent: "Delete", onclick: async () => {
+        if (!confirm(`Delete "${idea.title}"?`)) return;
+        await saveIdea({ id: idea.id, delete: true });
+        onDone();
+      } }) : null,
+      flash));
+  return form;
+}
+
+function ideaCard(idea, redraw) {
+  const body = el("div", {});
+  const details = el("details", { class: "idea" },
+    el("summary", { textContent: idea.title }),
+    el("div", { class: "meta", textContent: `${idea.bucket || "Unsorted"} · ${EFFORT[idea.effort] || "Medium"} effort` }),
+    idea.why ? el("p", { textContent: idea.why }) : null,
+    idea.test ? el("p", {}, el("strong", { textContent: "Test: " }), idea.test) : null,
+    idea.result ? el("p", { class: "result" }, el("strong", { textContent: "Result: " }), idea.result) : null,
+    body,
+    el("button", { textContent: "Edit", onclick: event => {
+      event.target.remove();
+      body.append(ideaForm(idea, redraw));
+    } }));
+  return details;
+}
+
+function ideas() {
+  const root = el("div", {});
+  const redraw = () => root.replaceChildren(...board(redraw));
+  redraw();
+  return root;
+}
+
+function board(redraw) {
+  const add = el("div", {});
+  const bar = el("div", { class: "idea-bar" },
+    el("button", { textContent: "Add idea", onclick: () => add.replaceChildren(
+      el("div", { class: "idea" }, ideaForm({ status: "Next" }, redraw))) }));
+  const columns = el("div", { class: "board" }, ...COLUMNS.map(status => {
+    const cards = state.ideas.filter(i => i.status === status);
+    return el("div", { class: "column" },
+      el("h3", { textContent: `${status} (${cards.length})` }),
+      ...cards.map(i => ideaCard(i, redraw)));
+  }));
+  const closed = state.ideas.filter(i => CLOSED.includes(i.status));
+  const rest = closed.length ? el("div", { class: "done-list" },
+    el("h3", { textContent: `Closed (${closed.length})`, style: "margin-bottom:7px" }),
+    el("div", { class: "board" }, ...closed.map(i => ideaCard(i, redraw)))) : null;
+  return [bar, add, columns, rest].filter(Boolean);
+}
+
+const RENDER = { stats, note, table, line, ideas };
+
+function render(data) {
+  document.title = `${data.title} dashboard`;
+  $("title").textContent = data.title;
+  $("summary").textContent = data.summary;
+  $("updated").textContent = `Read from the project's files ${new Date(data.collected_at * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}`;
+  state.ideas = data.ideas;
+  state.data = data;
+  showTab();
+}
+
+function showTab() {
+  const data = state.data;
+  if (!data) return;
+  const tab = TABS[location.hash.slice(1)] ? location.hash.slice(1) : "performance";
+  $("nav").replaceChildren(...Object.entries(TABS).map(([id, label]) => el("a", {
+    href: `#${id}`, textContent: label, "aria-current": id === tab ? "page" : "false",
+    style: id === tab ? "color: var(--ink); font-weight: 600" : "" })));
+  $("sections").replaceChildren(...data.sections.filter(s => s.tab === tab).map(s => el("section", { id: s.id },
+    el("h2", { textContent: s.title }),
+    el("p", { class: "question", textContent: s.question }),
+    ...s.blocks.map(b => el("div", { class: "block" }, RENDER[b.type](b))))));
+}
+
+window.addEventListener("hashchange", showTab);
+
+fetch("/api/data")
+  .then(async res => {
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error);
+    render(data);
+  })
+  .catch(e => { $("sections").append(el("p", { class: "error", textContent: `Could not load this dashboard: ${e.message}` })); });
+</script>
+</body>
+</html>

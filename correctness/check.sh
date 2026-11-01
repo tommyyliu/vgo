@@ -17,6 +17,8 @@ cargo test --release -p vgo-core -p vgo-raster -p vgo-search -p vgo-selfplay -p 
 cargo check --release -p vgo-wasm --target wasm32-unknown-unknown --quiet
 (cd training && PYTHONPATH=. uv run --with pytest python -m pytest tests --quiet -p no:cacheprovider)
 
+(cd training && PYTHONPATH=.. uv run --with pytest python -m pytest ../dashboard/tests --quiet -p no:cacheprovider)
+
 [[ "$mode" == --quick ]] && exit 0
 
 cargo build --release -p vgo-bench --bin vgo-verify --quiet
