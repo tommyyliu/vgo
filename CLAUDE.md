@@ -5,14 +5,18 @@ Start with `README.md`, then `docs/OVERVIEW.md`. The work list is `dashboard/ide
 ## Rules for changes
 
 - Run `correctness/check.sh` before calling work done. It takes about a minute.
-- Engine output must not change unless that is the point of the change. A golden mismatch
-  needs an explanation in the commit before `check.sh --update-golden`.
+- Engine and game output must not change unless that is the point of the change. A golden
+  mismatch needs an explanation in the commit before `check.sh --update-golden`.
+  `vgo-verify` covers the engine; `correctness/game-digest.sh` covers self-play and arena.
 - Every engine shortcut needs a written lemma in `spec/LEMMAS.md` and a `[ID]` citation in the
   code. Tests and game comparisons can refute a lemma. They never prove one, so don't call work
   solid on their evidence. A shortcut that can't be proved is listed there as open.
 - When claiming a test protects something, inject the bug and watch the test fail. Harnesses must
   pass on clean code first, and must distinguish a failed test from a tool that didn't run.
-- The repo is public. Scan before pushing. Commit and push only when asked.
+- Commit as you go, on a branch rather than `main`. Push only when asked: the repo is public,
+  so scan first.
+- Verify with tests and tiny runs, one stage at a time. Full RL runs are expensive and prove
+  little here, so start one only when asked.
 - `artifacts/` holds run data and is not in git. `artifacts/old/` is an archive that needs a
   write-up of its results in `docs/FINDINGS.md` before it is deleted.
 
