@@ -5,7 +5,7 @@ import pytest
 
 from dashboard import collect as vo
 from dashboard import ratings as rt
-from dashboard.server import State
+from dashboard.server import State, report_file
 
 
 def match(a, b, a_wins, b_wins):
@@ -95,7 +95,7 @@ def test_sample_rate_skips_gaps_between_updates():
 
 def test_collect_tolerates_an_empty_project(tmp_path):
     result = vo.collect(tmp_path)
-    assert [s["id"] for s in result["sections"]] == ["speed", "signal", "model", "spec", "next"]
+    assert [s["id"] for s in result["sections"]] == ["speed", "signal", "model", "spec", "next", "reports"]
 
 
 def shape(name, group="Single change", kl=1.9, card_gain=0, generator=None):
@@ -133,9 +133,19 @@ def test_shape_deltas_are_against_the_mean_of_the_controls():
     assert spread == pytest.approx(0.1414, abs=1e-3)
 
 
+def test_every_listed_report_exists():
+    for report in vo.REPORTS:
+        assert report_file(report["slug"]) is not None
+
+
+@pytest.mark.parametrize("name", ["../server.py", "..", "", "missing", "report.css/../../server.py"])
+def test_only_files_in_the_reports_folder_are_served(name):
+    assert report_file(name) is None
+
+
 def test_the_recorded_screen_builds_a_page():
     sections = vo.shape_sections(Path(__file__).resolve().parents[2])
-    assert [s["tab"] for s in sections] == ["shapes"] * 4
+    assert [s["tab"] for s in sections] == ["shapes"] * 5
     types = {b["type"] for s in sections for b in s["blocks"]}
     assert types <= {"stats", "table", "note", "line", "scatter"}
 

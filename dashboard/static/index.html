@@ -57,6 +57,14 @@ h3 { font-size: 14px; margin: 0; font-weight: 600; }
 .note { background: var(--warning-bg); border-radius: 8px; padding: 9px 13px; color: var(--ink); }
 .note::before { content: "▲ "; color: var(--critical); font-size: 11px; }
 
+.reports { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.report { display: grid; gap: 4px; align-content: start; padding: 15px 17px; text-decoration: none; color: var(--ink);
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+.report:hover { border-color: var(--series); }
+.report .meta { color: var(--muted); font-size: 12.5px; }
+.report strong { font-size: 17px; font-weight: 650; }
+.report .summary { color: var(--ink-2); }
+
 .scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
 th { text-align: left; font-weight: 500; font-size: 12.5px; color: var(--muted);
@@ -139,7 +147,7 @@ select, input, textarea { background: var(--page); border: 1px solid var(--borde
 <div id="tip" role="status"></div>
 <script>
 "use strict";
-const TABS = { performance: "Performance", research: "Research", shapes: "Net shapes" };
+const TABS = { performance: "Performance", research: "Research", shapes: "Net shapes", reports: "Reports" };
 const COLUMNS = ["Next", "Running", "Later"];
 const CLOSED = ["Done", "Rejected", "Parked"];
 const STATUSES = [...COLUMNS, ...CLOSED];
@@ -189,6 +197,12 @@ function stats(block) {
 }
 
 const note = block => el("div", { class: "note", textContent: block.text });
+
+const links = block => el("div", { class: "reports" }, ...block.items.map(item =>
+  el("a", { class: "report", href: `/reports/${item.slug}` },
+    el("span", { class: "meta", textContent: `${item.kind} · ${item.date}` }),
+    el("strong", { textContent: item.title }),
+    el("span", { class: "summary", textContent: item.summary }))));
 
 function heading(block) {
   return [
@@ -463,7 +477,7 @@ function board(redraw) {
   return [bar, add, columns, rest].filter(Boolean);
 }
 
-const RENDER = { stats, note, table, line, scatter, ideas };
+const RENDER = { stats, note, table, line, scatter, links, ideas };
 
 function render(data) {
   document.title = `${data.title} dashboard`;

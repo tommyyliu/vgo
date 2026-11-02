@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Soft resignation plan</title>
+<link rel="stylesheet" href="report.css">
+</head>
+<body>
+<div class="frame">
+<nav class="contents" aria-label="Contents">
+  <a class="back" href="/#reports">← Dashboard</a>
+  <ol>
+    <li><a href="#today">What's wrong today</a></li>
+    <li><a href="#principles">Principles</a></li>
+    <li><a href="#flow">The new flow</a></li>
+    <li><a href="#table">The comeback table</a></li>
+    <li><a href="#work">The work, in order</a></li>
+    <li><a href="#cost">What it costs and buys</a></li>
+    <li><a href="#tests">How we'll test it</a></li>
+    <li><a href="#risks">Risks and open questions</a></li>
+    <li><a href="#scope">Left out on purpose</a></li>
+  </ol>
+  <p class="other"><a href="search-budget">Where should search go?</a></p>
+</nav>
+
+<main>
+<header>
+  <div class="eyebrow"><span class="pill">Plan</span><span>Proposed, 2 Nov 2026</span></div>
+  <h1>Soft resignation</h1>
+  <p class="lede">Soft resignation saves about 29% of search. It also fills half the training window with cheap positions, and its calibration almost never changes anything. This plan keeps a real saving and fixes both problems.</p>
+</header>
+
+<div class="tiles">
+  <div class="tile"><b>48%</b><span>of plies come after the rule fires</span><small>r128-s2000, threshold 0.99</small></div>
+  <div class="tile"><b>23 of 24</b><span>threshold picks held the fallback</span><small>across three runs</small></div>
+  <div class="tile"><b>18%</b><span>of 38-board concessions were wrong</span><small>128 input, threshold 0.99</small></div>
+  <div class="tile"><b>29%</b><span>of search saved today</span><small>1000 simulations, 400 in the tail</small></div>
+</div>
+
+<div class="brief">
+  <h2>The plan in brief</h2>
+  <ul>
+    <li>Save every ply's root value, so any rule can be tested on games already played.</li>
+    <li>Make the cheap tail reversible, and play it without noise.</li>
+    <li>Keep every ply on disk, and thin tail plies when training loads them.</li>
+    <li>Decide from measured comeback rates by board and game stage, and leave the rule off where evidence is thin.</li>
+  </ul>
+</div>
+
+<h2 id="today">What's wrong today</h2>
+
+<h3>Calibration changes almost nothing</h3>
+<p>The picker looks for the lowest threshold with under 3% false positives. On mixed boards that almost never happens, so it holds the 0.99 fallback and the rule keeps firing above its own target.</p>
+<p>This is a regression. Commit <code>4799b3f</code> switched the rule off in this case on Aug 2 and called the fallback backwards. Commit <code>8001051</code> brought the fallback back on Aug 30, when the loop stopped using the old pipeline.</p>
+
+<div class="scroll"><table>
+  <thead><tr><th>Games from</th><th>Input</th><th class="num">All boards</th><th class="num">18</th><th class="num">19–37</th><th class="num">38</th></tr></thead>
+  <tbody>
+    <tr><td>Aug 30</td><td>256</td><td class="num">4.7%</td><td class="num">0.0%</td><td class="num">2.7%</td><td class="num">7.2%</td></tr>
+    <tr><td>Aug 31</td><td>256</td><td class="num">7.5%</td><td class="num">0.6%</td><td class="num">4.8%</td><td class="num">11.2%</td></tr>
+    <tr><td>Sep 1</td><td>256</td><td class="num">4.9%</td><td class="num">1.6%</td><td class="num">2.3%</td><td class="num">7.6%</td></tr>
+    <tr><td>Sep 23</td><td>128</td><td class="num">11.2%</td><td class="num">2.4%</td><td class="num">6.9%</td><td class="num">17.8%</td></tr>
+  </tbody>
+</table></div>
+<p class="tablenote">Share of concessions where the conceding side went on to win or tie, at threshold 0.99 and window 5. The 3% target was not met on all boards in any of these runs.</p>
+<p>The 18 board has improved: older notes in the code, from what look like small-board runs, record 4.8–9%. The jump on September 23 is unexplained. That run moved to 128 input and doubled the full budget while the tail stayed at 400, so either could be responsible.</p>
+
+<h3>Half the window is cheap tail</h3>
+<p>About 48% of plies come after the rule fires. They are searched at 400 simulations and trained at full weight, which works against the 0.99 threshold's stated purpose of keeping that share down. A 32-game run with real tail records measured 59%, so this was already known.</p>
+
+<h3>Stage matters more than threshold</h3>
+<p>This table splits false positives by threshold and by how far through the game the rule first fired. Darker cells are worse. Small numbers are how many games the rule fired on.</p>
+<div class="scroll"><table>
+  <thead><tr><th>Board</th><th>Threshold</th><th class="num">First 15%</th><th class="num">15–30%</th><th class="num">30–50%</th><th class="num">Past 50%</th></tr></thead>
+  <tbody>
+    <tr class="first-of-board"><td rowspan="3">38</td><td>0.90</td><td class="heat" style="--h:57%">23.6%<small>483</small></td><td class="heat" style="--h:32%">13.3%<small>98</small></td><td class="heat" style="--h:49%">20.3%<small>69</small></td><td class="heat" style="--h:15%">6.3%<small>127</small></td></tr>
+    <tr><td>0.99</td><td class="heat" style="--h:56%">23.2%<small>358</small></td><td class="heat" style="--h:37%">15.3%<small>98</small></td><td class="heat" style="--h:47%">19.4%<small>67</small></td><td class="heat" style="--h:4%">1.8%<small>109</small></td></tr>
+    <tr><td>0.999</td><td class="heat" style="--h:53%">22.1%<small>267</small></td><td class="heat" style="--h:47%">19.4%<small>103</small></td><td class="heat" style="--h:28%">11.5%<small>87</small></td><td class="heat" style="--h:18%">7.5%<small>80</small></td></tr>
+    <tr class="first-of-board"><td rowspan="3">19–37</td><td>0.90</td><td class="heat" style="--h:24%">10.0%<small>201</small></td><td class="heat" style="--h:13%">5.6%<small>71</small></td><td class="heat" style="--h:30%">12.5%<small>32</small></td><td class="heat" style="--h:5%">2.1%<small>48</small></td></tr>
+    <tr><td>0.99</td><td class="heat" style="--h:25%">10.6%<small>151</small></td><td class="heat" style="--h:9%">3.7%<small>81</small></td><td class="heat" style="--h:16%">6.5%<small>31</small></td><td class="heat">0.0%<small>43</small></td></tr>
+    <tr><td>0.999</td><td class="heat" style="--h:20%">8.5%<small>106</small></td><td class="heat" style="--h:18%">7.5%<small>107</small></td><td class="heat" style="--h:13%">5.6%<small>36</small></td><td class="heat">0.0%<small>34</small></td></tr>
+    <tr class="first-of-board"><td rowspan="3">18</td><td>0.90</td><td class="num">none</td><td class="heat" style="--h:8%">3.5%<small>115</small></td><td class="heat" style="--h:16%">6.5%<small>155</small></td><td class="heat" style="--h:11%">4.5%<small>132</small></td></tr>
+    <tr><td>0.99</td><td class="num">none</td><td class="heat">0.0%<small>44</small></td><td class="heat" style="--h:6%">2.3%<small>173</small></td><td class="heat" style="--h:8%">3.4%<small>119</small></td></tr>
+    <tr><td>0.999</td><td class="num">none</td><td class="heat">0.0%<small>20</small></td><td class="heat" style="--h:3%">1.3%<small>152</small></td><td class="heat" style="--h:4%">1.8%<small>114</small></td></tr>
+  </tbody>
+</table></div>
+<p class="tablenote">Window 5, 128 input. Stage is the first firing as a share of the board's ply cap.</p>
+<ul>
+  <li><strong>A higher threshold helps on the 18 board.</strong> From 0.90 to 0.999, errors fall by more than two thirds.</li>
+  <li><strong>On bigger boards, stage matters more.</strong> On the 38 board at 0.99, errors fall from 23.2% in the first 15% of the cap to 1.8% past the halfway point.</li>
+  <li><strong>Doomed early games exist, but value alone can't pick them out.</strong> About 78% of the earliest 38-board calls were right, yet 0.999 is still wrong 22% of the time.</li>
+</ul>
+<div class="callout"><p>These games all had cheap tails, and an early concession means a longer one. Some of the early errors may be weak tail play, not bad judgement. The stored results can't separate the two.</p></div>
+
+<h3>A concession is permanent, and the tail is noisy</h3>
+<p>Once the rule fires, the game stays cheap to the end even if value recovers (<code>lib.rs:226</code>). The tail also keeps root noise and temperature, which fast turns already switch off (<code>generation.rs:564</code>).</p>
+
+<h2 id="principles">Principles</h2>
+<ul>
+  <li><strong>Results come from play.</strong> Every game plays to a real end, so the rule never sets a label directly.</li>
+  <li><strong>This is a budget decision.</strong> The rule moves search away from games that look decided. It makes no claim about who won.</li>
+  <li><strong>No evidence, no discount.</strong> Where the data is thin, games get full search.</li>
+  <li><strong>One definition of each rule.</strong> Playing a game and replaying it offline must agree, and a test holds them together.</li>
+</ul>
+
+<h2 id="flow">The new flow</h2>
+<figure>
+  <div class="scroll">
+  <svg viewBox="0 0 980 214" role="img" aria-label="Today, games save fixed rule outcomes that set one pooled threshold, which starts a permanent tail, and every ply trains at full weight. In the plan, games save per-ply values that build a comeback table, which drives a reversible tail, and tail plies are thinned at training time.">
+    <defs><marker id="head" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="currentColor"/></marker></defs>
+    <text class="head" x="185" y="18" text-anchor="middle">Saved after each game</text>
+    <text class="head" x="415" y="18" text-anchor="middle">Chosen before each generator</text>
+    <text class="head" x="645" y="18" text-anchor="middle">During play</text>
+    <text class="head" x="875" y="18" text-anchor="middle">In training</text>
+
+    <text class="strong" x="0" y="72">Today</text>
+    <rect class="box" x="90" y="34" width="190" height="72" rx="8"/>
+    <text class="strong" x="185" y="64" text-anchor="middle">36 fixed outcomes</text><text class="small" x="185" y="83" text-anchor="middle">threshold by window</text>
+    <rect class="box" x="320" y="34" width="190" height="72" rx="8"/>
+    <text class="strong" x="415" y="64" text-anchor="middle">One threshold</text><text class="small" x="415" y="83" text-anchor="middle">pooled over all boards</text>
+    <rect class="box" x="550" y="34" width="190" height="72" rx="8"/>
+    <text class="strong" x="645" y="64" text-anchor="middle">Permanent tail</text><text class="small" x="645" y="83" text-anchor="middle">noise stays on</text>
+    <rect class="box" x="780" y="34" width="190" height="72" rx="8"/>
+    <text class="strong" x="875" y="64" text-anchor="middle">All plies</text><text class="small" x="875" y="83" text-anchor="middle">at full weight</text>
+    <line class="arrow" x1="282" y1="70" x2="318" y2="70" marker-end="url(#head)"/>
+    <text class="small" x="300" y="61" text-anchor="middle">picks</text>
+    <line class="arrow" x1="512" y1="70" x2="548" y2="70" marker-end="url(#head)"/>
+    <text class="small" x="530" y="61" text-anchor="middle">sets</text>
+    <line class="arrow" x1="742" y1="70" x2="778" y2="70" marker-end="url(#head)"/>
+    <text class="small" x="760" y="61" text-anchor="middle">feeds</text>
+
+    <text class="strong" x="0" y="168">Planned</text>
+    <rect class="box new" x="90" y="130" width="190" height="72" rx="8"/>
+    <text class="strong" x="185" y="160" text-anchor="middle">Per-ply values</text><text class="small" x="185" y="179" text-anchor="middle">any rule can be replayed</text>
+    <rect class="box new" x="320" y="130" width="190" height="72" rx="8"/>
+    <text class="strong" x="415" y="160" text-anchor="middle">Comeback table</text><text class="small" x="415" y="179" text-anchor="middle">by board, stage and value</text>
+    <rect class="box new" x="550" y="130" width="190" height="72" rx="8"/>
+    <text class="strong" x="645" y="160" text-anchor="middle">Reversible tail</text><text class="small" x="645" y="179" text-anchor="middle">played without noise</text>
+    <rect class="box new" x="780" y="130" width="190" height="72" rx="8"/>
+    <text class="strong" x="875" y="160" text-anchor="middle">Tail thinned</text><text class="small" x="875" y="179" text-anchor="middle">at load, 1 ply in 4</text>
+    <line class="arrow" x1="282" y1="166" x2="318" y2="166" marker-end="url(#head)"/>
+    <text class="small" x="300" y="157" text-anchor="middle">builds</text>
+    <line class="arrow" x1="512" y1="166" x2="548" y2="166" marker-end="url(#head)"/>
+    <text class="small" x="530" y="157" text-anchor="middle">opens</text>
+    <line class="arrow" x1="742" y1="166" x2="778" y2="166" marker-end="url(#head)"/>
+    <text class="small" x="760" y="157" text-anchor="middle">feeds</text>
+  </svg>
+  </div>
+  <figcaption>Each step changes: what's saved, how the rule is chosen, what the tail does, and how training uses it.</figcaption>
+</figure>
+
+<p>During play, a game moves between two states. A game can now leave the tail, and it can enter again later.</p>
+<figure>
+  <div class="scroll">
+  <svg viewBox="0 0 800 196" role="img" aria-label="A game moves from full search to the cheap tail after five own turns in open table cells, and back to full search when value recovers past 0.90 for two own turns.">
+    <defs><marker id="head2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="currentColor"/></marker></defs>
+    <rect class="box" x="10" y="54" width="220" height="88" rx="10"/>
+    <text class="strong" x="120" y="88" text-anchor="middle">Full search</text>
+    <text class="small" x="120" y="108" text-anchor="middle">1000 simulations, noise on</text>
+    <text class="small" x="120" y="125" text-anchor="middle">every ply trained</text>
+    <rect class="box new" x="570" y="54" width="220" height="88" rx="10"/>
+    <text class="strong" x="680" y="88" text-anchor="middle">Cheap tail</text>
+    <text class="small" x="680" y="108" text-anchor="middle">400 simulations, no noise</text>
+    <text class="small" x="680" y="125" text-anchor="middle">1 ply in 4 trained</text>
+    <path class="arrow" d="M230 78 C 330 34, 470 34, 568 78" marker-end="url(#head2)"/>
+    <text x="400" y="30" text-anchor="middle">5 own turns in open table cells</text>
+    <path class="arrow" d="M570 120 C 470 164, 330 164, 232 120" marker-end="url(#head2)"/>
+    <text x="400" y="176" text-anchor="middle">value back past 0.90 for 2 own turns</text>
+  </svg>
+  </div>
+  <figcaption>Both directions use the conceding seat's own turns. The two thresholds differ so a game doesn't flip back and forth.</figcaption>
+</figure>
+
+<h2 id="table">The comeback table</h2>
+<p>This replaces the threshold. It asks one question: when a game looked like this, how often did the trailing side come back?</p>
+<ul>
+  <li><strong>Cells.</strong> Each cell is a board band (18, 19–37, 38), a stage (the four columns above), and a value band (0.95, 0.99, 0.999). That's 36 cells.</li>
+  <li><strong>Counting.</strong> A game counts once per cell, the first time it reaches that cell, because plies within a game aren't independent.</li>
+  <li><strong>Open cells.</strong> A cell opens when the 95% upper bound on its comeback rate is below the target. A cell with few games has a wide bound, so it stays closed.</li>
+  <li><strong>Entering the tail.</strong> A seat must sit in open cells for 5 of its own turns in a row.</li>
+  <li><strong>Refreshing.</strong> Before each generator starts, the table is rebuilt from the last 1,000 games.</li>
+</ul>
+<p>This also handles games that are doomed early. If a cell for an early position with extreme value has few comebacks, it opens by itself, with no floor holding it back. If the data says value can't tell early, it stays closed.</p>
+<p>The target is a plain setting, with a default of 5%. No principled number exists for it. 5% is simply AlphaGo Zero's convention, and a reversible tail makes a wrong call cheaper, so we can move it freely.</p>
+<p>A fresh run starts with an empty table, so every cell is closed and every game gets full search. Those early games are also the clean ones, because no tail has touched them. We expect that to take about an hour of generation, or longer if early nets don't reach the target.</p>
+
+<h2 id="work">The work, in order</h2>
+<ol class="steps">
+  <li><div>
+    <h3>Save per-ply search data</h3>
+    <p>Add <code>root_values</code>, <code>search_kl</code> and <code>top_gap</code> to <code>games.jsonl</code>, at a few KB per game. The last two serve the <a href="search-budget">search budget work</a>. Fix the manifest's <code>radius</code>, which records the flag and not the game's board, and add <code>tail_samples</code>.</p>
+    <p class="where"><code>generation.rs</code>, <code>generate_continuous.rs</code></p>
+  </div></li>
+  <li><div>
+    <h3>Write one tail rule</h3>
+    <p>A small <code>TailRule</code> state machine replaces <code>ResignRule</code> and the two near-duplicate branches in the play loop. It takes each ply's root value and says whether the next ply is in the tail. Hard resignation goes too: all 10,580 games in r128-s2000 read <code>resigned: false</code>.</p>
+    <p class="where"><code>lib.rs</code>, <code>generation.rs</code>. Removes <code>--resign-disable-fraction</code>, <code>resign_exempt</code> and <code>resigned</code>.</p>
+  </div></li>
+  <li><div>
+    <h3>Play the tail clean</h3>
+    <p>Tail plies drop root noise and temperature, matching fast turns.</p>
+    <p class="where"><code>ply_search_config</code> in <code>generation.rs</code></p>
+  </div></li>
+  <li><div>
+    <h3>Thin at load</h3>
+    <p>Every ply stays on disk. A new <code>--tail-keep</code> setting, default 0.25, drops tail rows before rendering, seeded by game and ply, so it saves memory and can change without regenerating. Window selection counts kept samples, so a 150k window stays 150k.</p>
+    <p class="where"><code>dataset.py</code>, <code>learner.py</code>, <code>train-once.py</code>, <code>count_samples</code> in <code>bulk-loop.sh</code></p>
+  </div></li>
+  <li><div>
+    <h3>Replace calibration</h3>
+    <p>A new <code>tail-calibration.py</code> replays recent games, builds the table and writes <code>tail-table.json</code>, which the generator reads with <code>--tail-table</code>.</p>
+    <p class="where">Removes <code>resign-calibration.py</code>, <code>ResignTrial</code>, <code>calibration_trials</code>, <code>CALIBRATION_*</code>, <code>write_calibration</code>, the per-game calibration file, and the <code>bc</code> calls in the loop.</p>
+  </div></li>
+  <li><div>
+    <h3>Report what it did</h3>
+    <p>At each generator start, log one line per board: games, open cells, tail share and comeback rate. A failed build stops the loop with a clear message. Add the same numbers to <code>events.jsonl</code> and a dashboard panel.</p>
+    <p class="where"><code>bulk-loop.sh</code>, <code>dashboard/collect.py</code></p>
+  </div></li>
+</ol>
+
+<h2 id="cost">What it costs and buys</h2>
+<p>Thinning alone keeps today's saving and changes what training sees. If the table also holds the rule back until about halfway through big-board games, the saving shrinks and the data gets cleaner.</p>
+<div class="scroll"><table>
+  <thead><tr><th></th><th class="num">Today</th><th class="num">Thinned</th><th class="num">Thinned, firing from 50% of cap</th></tr></thead>
+  <tbody>
+    <tr><td>Tail share of plies played</td><td class="num">48%</td><td class="num">48%</td><td class="num">25%</td></tr>
+    <tr><td>Search saved</td><td class="num">29%</td><td class="num">29%</td><td class="num">15%</td></tr>
+    <tr><td>Tail share of the training window</td><td class="num">48%</td><td class="num">19%</td><td class="num">8%</td></tr>
+    <tr><td>Games in a window of the same size</td><td class="num">1×</td><td class="num">1.6×</td><td class="num">1.2×</td></tr>
+  </tbody>
+</table></div>
+<p class="tablenote">At 1000 simulations with a 400-simulation tail. The last column is an estimate, because tail length with a later start is an upper bound.</p>
+<div class="bars" role="img" aria-label="Training window share of tail plies: 48% today, 19% when thinned, and 8% when thinned with later firing.">
+  <div class="bar-row"><span>Today</span><div class="bar"><span class="kept" style="flex:52">52%</span><span class="tail" style="flex:48">48%</span></div></div>
+  <div class="bar-row"><span>Thinned</span><div class="bar"><span class="kept" style="flex:81">81%</span><span class="tail" style="flex:19">19%</span></div></div>
+  <div class="bar-row"><span>Thinned, firing later</span><div class="bar"><span class="kept" style="flex:92">92%</span><span class="tail" style="flex:8">8%</span></div></div>
+  <div class="legend"><span><i style="background:var(--tint)"></i>Full search plies</span><span><i style="background:var(--series)"></i>Tail plies</span></div>
+</div>
+<p>More games in the same window matters because every net memorizes game outcomes: value error is about 0.05 on training games and 0.56 on held-out ones.</p>
+
+<h2 id="tests">How we'll test it</h2>
+<ul>
+  <li><strong>Shared fixture.</strong> One file of value sequences and expected enter and exit plies, read by a Rust test and a Python test, so the live rule and the offline replay can't drift apart.</li>
+  <li><strong>Reversal.</strong> A game that recovers leaves the tail, returns to full budget, and can enter again.</li>
+  <li><strong>Thinning.</strong> It's repeatable, keeps every full-search ply, and the window counts kept samples.</li>
+  <li><strong>Bug injection.</strong> Each protection gets a deliberate bug, and we watch the test fail.</li>
+  <li><strong>Game digests.</strong> Tail play changes, so these change on purpose, with the reason in the commit.</li>
+  <li><strong>Small runs.</strong> A short generator run, then a tiny training run, one stage at a time.</li>
+</ul>
+
+<h2 id="risks">Risks and open questions</h2>
+<ul>
+  <li><strong>Cold start works against early speed.</strong> The rule stays off while nets are weakest, which gives up to 29% of search in the phase where speed matters most. Weak value heads make poor calls anyway, so we accept this for the first run and will watch how long it lasts.</li>
+  <li><strong>The table lags the model.</strong> 1,000 games span a few models. A stale table is mildly conservative as nets improve, which is the safe direction.</li>
+  <li><strong>Cells may stay thin.</strong> If 36 cells take too long to fill, merge bands before relaxing the bound.</li>
+  <li><strong>Thinning could hurt late-game play.</strong> Compare <code>--tail-keep</code> 1.0 and 0.25 on one window, then play the two nets against each other.</li>
+  <li><strong>The tail may flip back and forth.</strong> Exit settings are a first guess. Per-ply data will show how often it happens.</li>
+  <li><strong>Validation mix.</strong> Thinning before the train and validation split keeps both on the same mix, but makes runs at different keep rates harder to compare. Those comparisons should read full-search plies only.</li>
+</ul>
+
+<h2 id="scope">Left out on purpose</h2>
+<ul>
+  <li><strong>A standing 10% of exempt games.</strong> The cold start gives clean games for free. It can come back if the table looks wrong.</li>
+  <li><strong>Changing the ply cap.</strong> High cap rates are known behaviour, and the roadmap says not to reopen that without new evidence.</li>
+  <li><strong>A smooth budget.</strong> That's a larger idea, covered in <a href="search-budget">Where should search go?</a></li>
+  <li><strong>Using the settled plane as proof a game is decided.</strong> Captures can shrink settled regions (lemma A8), so that would need its own proof.</li>
+</ul>
+</main>
+</div>
+</body>
+</html>

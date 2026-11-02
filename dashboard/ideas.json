@@ -9,6 +9,15 @@
     "test": "Log both per position in a short run, and check they separate full searches from cheap ones."
   },
   {
+    "id": "search-value",
+    "status": "Next",
+    "bucket": "Generate",
+    "effort": "L",
+    "title": "Spend search where it can change the result",
+    "why": "Soft resignation is one narrow case of a general budget question: where does more search change the outcome, and where is it wasted? Framed that way, a yes-or-no concession becomes a search budget that follows how result-affecting the next moves are. There is no direct metric for this yet.",
+    "test": "Record per-ply root value, KL(search policy || prior) and the value gap between the top two moves in a fresh run. See which of them predicts the result changing, then try a budget that follows it. info-metric is the first step. The dashboard's Reports tab has the ideas report."
+  },
+  {
     "id": "connect-ratings",
     "status": "Next",
     "bucket": "Measurement",
@@ -50,8 +59,8 @@
     "bucket": "Speed",
     "effort": "M",
     "title": "Train the faster net shapes",
-    "why": "Fewer detail blocks, no attention and one norm take the card's ceiling at 128 from 21k positions/s to 34-41k, and the generator to 33-39k with three lanes. At 61 Elo a doubling that is worth 40-60 Elo if a shape keeps its strength. In a loss screen `blocks8` (+48% on the card) showed no policy penalty and `c_d222_short_n1` (+64% in the generator) showed +0.013 KL, against a seed spread of 0.003. Early in a run generation speed matters more than play, and any net's games train any shape, so a fast shape could generate first and the run could retrain to a stronger one later. Strength is unmeasured, and these rates need 15 to 20 vCPU per card: on 8 vCPU a net 63% faster on the card led by 10% after two minutes and was still falling.",
-    "test": "Arena `blocks8` and `c_d222_short_n1` against the current net at equal time on both boards, about 500 games each. Check a trained one over whole games on 8 vCPU. Checkpoints are in `artifacts/shape-screen/runs/`, and the dashboard's Net shapes tab shows the screen."
+    "why": "Fewer blocks, no attention and one norm take the card's ceiling at 128 from 21k positions/s to as much as 62k, but the generator stops gaining near 40k here. Trained nets read 30k for `blocks8` (no policy penalty in a loss screen), 35k for `c_d222_short_n1` (+0.013 KL) and 37k for `m_d111_c22` (+0.022 KL), against a seed spread of 0.003. Early in a run generation speed matters more than play, and any net's games train any shape, so a fast shape could generate first and the run could retrain to a stronger one later. Strength is unmeasured, and these rates need 15 to 20 vCPU per card: on 8 threads of 4 cores `blocks8` lost its whole gain within three minutes.",
+    "test": "Arena `blocks8`, `c_d222_short_n1` and `m_d111_c22` against the current net at equal time on both boards, about 500 games each. Check a trained one over whole games on 8 vCPU. Checkpoints are in `artifacts/shape-screen/runs/`, and the dashboard's Net shapes tab shows the screen."
   },
   {
     "id": "score-head",

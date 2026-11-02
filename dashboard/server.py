@@ -18,9 +18,17 @@ HOME = Path(__file__).resolve().parent
 ROOT = HOME.parent
 PAGE = HOME / "static" / "index.html"
 IDEAS = HOME / "ideas.json"
+REPORTS = HOME / "reports"
+CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8"}
 TTL = 300
 IDEA_FIELDS = {"title", "bucket", "status", "why", "test", "effort", "result"}
 MAX_FIELD = 4000
+
+
+def report_file(name: str) -> Path | None:
+    """A report by exact name in the folder's listing, so a path can't climb out of it."""
+    wanted = name if "." in name else f"{name}.html"
+    return next((path for path in REPORTS.iterdir() if path.name == wanted), None)
 
 
 def write_json(path: Path, value) -> None:
@@ -106,6 +114,8 @@ def make_handler(state: State, port: int):
                     traceback.print_exc()
                     self.send_json({"error": "Collecting failed; see the server's terminal output."},
                                    HTTPStatus.INTERNAL_SERVER_ERROR)
+            elif self.path.startswith("/reports/") and (path := report_file(self.path.removeprefix("/reports/"))):
+                self.send_body(path.read_bytes(), CONTENT_TYPES[path.suffix])
             else:
                 self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 

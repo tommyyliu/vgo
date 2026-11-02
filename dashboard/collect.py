@@ -1,4 +1,4 @@
-"""Dashboard data: speed, signal per compute, strength, lemmas, net shapes and what's next."""
+"""Dashboard data: speed, signal per compute, strength, lemmas, net shapes, reports and what's next."""
 
 from __future__ import annotations
 
@@ -23,7 +23,15 @@ MIN_LEDGER_GAMES = 40
 SHAPE_SCREEN = "performance/shape-screen.json"
 ELO_PER_DOUBLING = 61  # Closed ideas in docs/FINDINGS.md.
 VCPU_PER_10K = 5  # "Sizing a machine" in docs/RUNNING.md.
-SHORTLIST = {"blocks8", "c_d222_short_n1"}
+SHORTLIST = {"blocks8", "c_d222_short_n1", "m_d111_c22"}
+REPORTS = [
+    {"slug": "soft-resignation", "kind": "Plan", "title": "Soft resignation",
+     "summary": "How to keep the compute saving while stopping the cheap tail from filling half the training window.",
+     "date": "2 Nov 2026"},
+    {"slug": "search-budget", "kind": "Ideas", "title": "Where should search go?",
+     "summary": "What we know about spending search where it matters, what to record now, and what to think about when we come back to it.",
+     "date": "2 Nov 2026"},
+]
 TELEMETRY_RUNS = {
     "Fixed budget, 1000 sims, 128 input": "artifacts/old/main/experiments-2026-10-14/budget-games/fixed",
     "Randomized budget, 128 input": "artifacts/old/main/experiments-2026-10-14/budget-games/randomized",
@@ -475,10 +483,10 @@ def shape_sections(root: Path) -> list[dict]:
     delta, spread = shape_deltas(shapes)
     window = screen["window"]
     limit = {s["name"]: s["points"] for s in screen["cpu_limit"]}
-    fast, slow = limit["Fast net, 8 threads of 4 cores"][-1], limit["Current net, 8 threads of 4 cores"][-1]
+    fast, slow = limit["m_d111_c22, 8 threads of 4 cores"][-1], limit["Current net, 8 threads of 4 cores"][-1]
     fastest = max((s for s in shapes if s["generator"]), key=lambda s: s["generator"])
-    early, swift = named["c_d222_short_n1"], named["c_w32_ctx96_bt_a0_n1"]
-    early_speed, swift_speed = shape_speed(early, screen), shape_speed(swift, screen)
+    early, gentler = named["m_d111_c22"], named["c_d222_short_n1"]
+    early_speed = shape_speed(early, screen)
     tested = [s for s in shapes if s["group"] not in ("Control", "Closed")]
 
     which = {"id": "shapes-which", "title": "Which net when",
@@ -501,11 +509,11 @@ def shape_sections(root: Path) -> list[dict]:
             {"stage": "Early", "cares": "Games per hour", "use": early["name"],
              "why": f"{early_speed['generator_gain']:+.0f}% in the generator, so the same games take "
                     f"{1 - early_speed['time']:.0%} less time, at {delta[early['name']]:+.3f} KL. "
-                    f"{swift['name']} is only {percent_change(early['generator'], swift['generator']):.0f}% faster "
-                    f"again for {delta[swift['name']] / delta[early['name']]:.0f} times the KL cost."},
+                    f"{gentler['name']} costs less KL ({delta[gentler['name']]:+.3f}) and is "
+                    f"{-percent_change(early['generator'], gentler['generator']):.0f}% slower."},
             {"stage": "Middle", "cares": "Both", "use": "blocks8",
-             "why": f"{named['blocks8']['card_gain']:+d}% on the card with no policy penalty, and it needs no new "
-                    "code. Not yet run in the generator."},
+             "why": f"{shape_speed(named['blocks8'], screen)['generator_gain']:+.0f}% in the generator with no policy "
+                    "penalty, and it needs no new code."},
             {"stage": "Late", "cares": "Modeling ability", "use": "control",
              "why": "Eight epochs can't show capacity, so nothing here argues for leaving the current net. "
                     "Bigger nets are closed at this compute, so a late move to one needs new evidence."},
@@ -513,6 +521,20 @@ def shape_sections(root: Path) -> list[dict]:
         {"type": "note", "text": "These are loss curves from one 8-epoch run each, not strength. A shape that "
                                  "looks free here can still fall behind in a long run, and adoption needs a "
                                  "matched-compute arena."},
+    ]}
+
+    budget = screen["time_budget"]
+    total_time = sum(row["microseconds"] for row in budget)
+    time = {"id": "shapes-time", "title": "Where the time goes",
+            "question": "What does the current net spend its time on?", "blocks": [
+        {"type": "table", "title": "Time per position on the card",
+         "caption": "A net stripped to its floor, with one part added back at a time, timed against a repeated "
+                    "baseline. Norms and attention come from removing them from the full net. The floor alone "
+                    "reads about 100k positions/s, so it is not the limit.",
+         "columns": [{"key": "part", "label": "Part"},
+                     {"key": "microseconds", "label": "µs per position", "format": "number", "align": "right"},
+                     {"key": "share", "label": "Share", "format": "share", "align": "right"}],
+         "rows": [{**row, "share": row["microseconds"] / total_time} for row in budget]},
     ]}
 
     what = {"id": "shapes-what", "title": "What each shape is",
@@ -537,8 +559,9 @@ def shape_sections(root: Path) -> list[dict]:
              "now": "One output per cell, resized bilinearly"},
          ]},
         {"type": "table", "title": "The shapes",
-         "caption": "Names: c_ a stack, d222 detail blocks, short context 3/3, c22 context 2/2, w32 detail width, "
-                    "ctx96 context width, bt bottleneck tail, a0 no attention, n1 one norm, ps PixelShuffle. "
+         "caption": "Names: c_ a stack, m_ a minimal net, d222 detail blocks, c22 context blocks, short context 3/3, "
+                    "w32 detail width, ctx96 context width, bt bottleneck tail, a0 no attention, n1 one norm, "
+                    "ps PixelShuffle. "
                     "Parameters are the exported net's. Arithmetic is relative to the current net.",
          "columns": [{"key": "name", "label": "Shape", "format": "code"}, {"key": "group", "label": "Kind", "format": "nowrap"},
                      {"key": "change", "label": "What changes"},
@@ -555,7 +578,8 @@ def shape_sections(root: Path) -> list[dict]:
         {"type": "table", "title": "Speed against the current net",
          "caption": f"Card: the ceiling at 128, batch 32, two lanes, against {screen['card_baseline'] / 1000:.1f}k "
                     f"positions/s. Generator: 75 s early in games on all 32 threads with three lanes, against "
-                    f"{screen['generator_baseline'] / 1000:.1f}k, using random weights for the stacks. A dash means "
+                    f"{screen['generator_baseline'] / 1000:.1f}k, on trained weights except the two random-weight stacks "
+                    "c_d222_c22_n1 and c_w32_ctx96_bt_a0_n1. A dash means "
                     "not run. The last three columns use the generator where it ran and the card otherwise, which "
                     f"is an upper bound. Elo is {ELO_PER_DOUBLING} a doubling, if the shape keeps its strength. "
                     f"vCPU is about {VCPU_PER_10K} per 10k positions/s. Meaningful means at least a quarter of "
@@ -568,19 +592,20 @@ def shape_sections(root: Path) -> list[dict]:
                      {"key": "vcpu", "label": "vCPU per card", "format": "whole", "align": "right"},
                      {"key": "worth", "label": "Meaningful", "align": "right"}],
          "rows": speed_rows},
-        {"type": "note", "text": "A faster net only pays where the CPU can feed it. On 8 vCPU the current net is "
-                                 "already close to the CPU's limit, so these gains need about 15 to 20 vCPU per card."},
+        {"type": "note", "text": "A faster net only pays where the CPU can feed it. The generator stops gaining near "
+                                 "40k positions/s here: 54k and 62k on the card read 37k and 40k. On 8 vCPU the current net "
+                                 "is already close to the CPU's limit, and blocks8 lost its whole gain within three minutes."},
         {"type": "line", "title": "Generator rate as CPU runs short",
-         "caption": "c_d222_bt_a0_n1, 63% faster on the card, early in games with two lanes. With fewer CPUs it "
-                    "starts fast and falls toward the current net as boards fill. Later boards cost more CPU "
-                    "than these two minutes reach.",
+         "caption": "Trained nets early in games, with three lanes on 32 threads and two lanes on 8. With fewer CPUs "
+                    "a fast net starts ahead and falls toward the current net as boards fill. Later boards cost more "
+                    "CPU than these minutes reach.",
          "xLabel": "Seconds", "yLabel": "Positions/s", "series": screen["cpu_limit"]},
     ]}
 
     def kind(shape: dict) -> str:
         return "closed" if shape["group"] == "Closed" else "pick" if shape["name"] in SHORTLIST else "other"
 
-    plotted = [s for s in shapes if s["name"] not in ("control_seed2", "control_seed3")]
+    plotted = [s for s in shapes if s["name"] not in ("control_seed2", "control_seed3", "floor")]
     means = [statistics.mean(c) for c in zip(*(s["kl"] for s in shapes if s["group"] == "Control"))]
     epochs = range(1, len(means) + 1)
     seeds = [delta[s["name"]] for s in shapes if s["group"] == "Control"]
@@ -591,7 +616,8 @@ def shape_sections(root: Path) -> list[dict]:
     learning = {"id": "shapes-learning", "title": "What the speed costs",
                 "question": "How well did each shape learn on held-out games?", "blocks": [
         {"type": "scatter", "title": "Speed against policy loss",
-         "caption": "Lower right is best: faster, with no loss. The band is the three control seeds.",
+         "caption": "Lower right is best: faster, with no loss. The band is the three control seeds. floor is left "
+                    f"off the chart, at {named['floor']['card_gain']:+d}% and {delta['floor']:+.3f} KL.",
          "xLabel": "Card speed gain, %", "yLabel": "Validation policy KL vs control",
          "band": [min(seeds), max(seeds)],
          "legend": {"pick": "Shortlisted", "other": "Tested", "closed": "PixelShuffle, closed"},
@@ -624,7 +650,7 @@ def shape_sections(root: Path) -> list[dict]:
          "rows": sorted(({"name": s["name"], "delta": delta[s["name"]], **s["final"]} for s in shapes),
                         key=lambda r: r["policy_kl"])},
     ]}
-    return [{**section, "tab": "shapes"} for section in (which, what, speed, learning)]
+    return [{**section, "tab": "shapes"} for section in (which, time, what, speed, learning)]
 
 
 def collect(path: Path) -> dict:
@@ -645,5 +671,8 @@ def collect(path: Path) -> dict:
             {"id": "next", "tab": "research", "title": "What to try next",
              "question": "What's most worth testing?", "blocks": [{"type": "ideas"}]},
             *shape_sections(root),
+            {"id": "reports", "tab": "reports", "title": "Reports",
+             "question": "What have we written up?",
+             "blocks": [{"type": "links", "items": REPORTS}]},
         ],
     }
