@@ -2,7 +2,7 @@
 # Hash whole self-play and arena games, run through the real binaries on CPU.
 #
 # `vgo-verify` hashes the engine. This hashes what sits above it: generation,
-# resignation, replay writing, the broker and arena play, none of which it sees.
+# the search tail, replay writing, the broker and arena play, none of which it sees.
 # An untrained model is enough, because the digest compares builds and says
 # nothing about strength. Output is independent of actor count, so a broker or
 # scheduling change that alters a game shows up as a mismatch.
@@ -27,15 +27,14 @@ generate () {
     "$@" --ruleset "$ruleset" \
     --coarse-pool 16 --widening-coefficient 6.0 --maximum-candidates 321 \
     --temperature 1.0 --temperature-plies 10 --root-exploration-noise 0.1 \
-    --resign-threshold "$RESIGN" --resign-window 3 --resign-minimum-ply 4 \
-    --resign-soft-simulations 8 --resign-disable-fraction 0.25 \
+    --tail-schedule "$work/tail.json" --tail-window 3 --tail-simulations 8 \
+    --tail-exit-value 0.2 \
     --resolution 64 --policy-resolution 64 --telemetry-seconds 0 --seed 7 \
     >"$output.log" 2>&1 || { cat "$output.log" >&2; return 1; }
   # The first eight only: a stopping generator may finish extra games in flight.
   for index in 0 1 2 3 4 5 6 7; do
     local game="$output/digest/game-00000000$index"
-    cat "$game/dataset.vgo" "$game/games.jsonl" "$game/manifest.json" \
-      "$game/resign-calibration.jsonl"
+    cat "$game/dataset.vgo" "$game/games.jsonl" "$game/manifest.json"
   done | sha256sum | cut -d' ' -f1
 }
 
@@ -56,7 +55,10 @@ arena () {
     | sha256sum | cut -d' ' -f1
 }
 
-RESIGN="${RESIGN:-0.3}"
+# Low enough that an untrained model's games reach the tail.
+cat > "$work/tail.json" <<'JSON'
+{"stages": [0.1], "boards": [{"up_to_units": null, "thresholds": [0.3]}]}
+JSON
 # `echo "$(...)"` would hide a failed run behind echo's exit status.
 report () {
   local name="$1" value

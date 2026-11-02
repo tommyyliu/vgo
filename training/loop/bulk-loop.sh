@@ -38,9 +38,10 @@
 # The window cancels out of the cost: training duty is `epochs * 0.0125 /
 # turnover` regardless of how wide it is, so those two knobs alone set how much
 # of the GPU goes to training rather than to the generation that feeds it. At 8
-# epochs and 50% turnover that is ~20%, a retrain every ~5.3h of generation.
-# Generation never stops -- the generator holds the incumbent model throughout --
-# so this is contention on a GPU already at 78%, not downtime.
+# epochs and 15% turnover that is about two thirds of generation time on paper, on
+# figures from a slower recipe, so check the lifecycle logs. Generation never stops
+# -- the generator holds the incumbent model throughout -- so this is contention
+# for the GPU, not downtime.
 #
 # Note the window cancels: a narrower one retrains sooner but each retrain is
 # proportionally cheaper. Widen it for diversity, not to train less often.
@@ -68,8 +69,16 @@ models="$output/models"
 window="${VGO_WINDOW_SAMPLES:-150000}"
 # Input raster, square. The policy grid stays at 128 either way, so this changes
 # what the network sees, not which moves it can propose: boundary cells whose
-# centre is illegal still snap to the nearest legal point inside them.
-resolution="${VGO_RESOLUTION:-256}"
+# centre is illegal still snap to the nearest legal point inside them. 128 searches
+# 2-3.6x faster than 256 and scored 30-18 at equal time on the big board.
+resolution="${VGO_RESOLUTION:-128}"
+# The net's shape. Early in a run generation speed matters more than play, so the
+# default is the lighter net from the loss screen: 37k positions/s in the generator
+# against 21k. Any net's games train any shape, so a later stage can restart with
+# VGO_SHAPE="" VGO_CONTEXT_ATTENTION_BLOCKS=1 VGO_NORMS_PER_BLOCK=2 for the full
+# net, at the cost of one retrain. See the Net shapes tab of the dashboard.
+shape="${VGO_SHAPE-{\"detail_blocks\":[1,1,1],\"context_blocks\":[2,2],\"tail\":\"conv\"\}}"
+context_attention_blocks="${VGO_CONTEXT_ATTENTION_BLOCKS:-0}"
 # Board sizes, as space-separated `WEIGHT:UNITS` or `WEIGHT:LOW-HIGH` bands in
 # stone diameters across. Komi and the ply cap follow from each game's size.
 read -r -a board_mix <<< "${VGO_BOARD_MIX:-50:38 25:18 25:18-38}"
@@ -80,26 +89,19 @@ turnover="${VGO_TURNOVER:-0.15}"
 epochs="${VGO_EPOCHS:-8}"
 updates="${VGO_UPDATES:-200}"
 actors="${VGO_ACTORS:-64}"
+inference_slots="${VGO_INFERENCE_SLOTS:-3}"
 telemetry_seconds="${VGO_TELEMETRY_SECONDS:-30}"
 simulations="${VGO_SIMULATIONS:-1000}"
 full_search_fraction="${VGO_FULL_SEARCH_FRACTION:-1.0}"
 fast_simulations="${VGO_FAST_SIMULATIONS:-200}"
-norms_per_block="${VGO_NORMS_PER_BLOCK:-2}"
+norms_per_block="${VGO_NORMS_PER_BLOCK:-1}"
+# Training only, and absent from the exported graph. Unlike the value label, it
+# varies within a game, so it can't be memorized by trajectory.
+ownership_weight="${VGO_OWNERSHIP_WEIGHT:-1.5}"
 # The naive evaluator's value is a heuristic, so deep search on it buys little,
 # and with no model the whole generator runs on CPU while the GPU idles. A
 # from-scratch run spends its first generation here, so keep it cheap.
 naive_simulations="${VGO_NAIVE_SIMULATIONS:-200}"
-# Soft resign. `resign_threshold` at 0.0 is what disables the whole rule, so
-# setting it is what turns this on.
-#
-# Past a soft concession the game keeps playing -- it is a discount on the tail,
-# not a skip -- at `resign_soft_simulations`. That default is 2400, which is
-# above the normal budget here, so leaving it alone would make conceded games
-# *more* expensive than ordinary ones. 400 against 1000 is the discount.
-#
-# 0.99 rather than the 0.98 tried before: at 0.98 two fifths of recorded samples
-# came from the cheap tail, and every ply is recorded, so all of them are
-# trained on. A higher bar fires later and keeps that share down.
 # Komi, as a fixed number of points on every board -- the same convention as
 # Go, where 7 points is roughly right from 9x9 to 19x19.
 #
@@ -113,32 +115,18 @@ naive_simulations="${VGO_NAIVE_SIMULATIONS:-200}"
 # it wants less komi, not more. 1/38 sits at 53% and moves a point the wrong way,
 # which is the smaller of the two errors.
 komi_area_coefficient="${VGO_KOMI_AREA_COEFFICIENT:-28.0}"
-# `resign_threshold` is the fallback, used until calibration says otherwise.
+# The search tail. Games that look decided play on at a cheaper budget, so search
+# moves to positions where it matters and every game still reaches a real result.
+# A schedule from recent games says how far behind a side must be, by board and
+# stage, and it is rebuilt before each generator. See crates/vgo-selfplay/src/tail.rs.
 #
-# The real value is chosen per generation from measured false positives. Every
-# game writes `resign-calibration.jsonl`: for each candidate (threshold, window),
-# whether the rule would have conceded, and whether that concession would have
-# been wrong. Under soft resignation the game plays on to a real terminal state,
-# so every game calibrates rather than only a sampled exemption.
-#
-# Re-picked before each generator rather than once per run, because calibration
-# describes the model that produced it and a model still learning invalidates its
-# own history -- one recorded run fired on 15 of 1625 games over fifteen shards
-# and 440 of 1686 over the next sixteen. The old shard pipeline did this per
-# shard; the bulk loop first dropped it by accident.
-#
-# Set the target to 0 to pin the threshold and switch adaptation off.
-resign_threshold="${VGO_RESIGN_THRESHOLD:-0.99}"
-resign_target_false_positive="${VGO_RESIGN_TARGET_FP:-0.03}"
-# Games pooled when picking. Wider is steadier but reaches back to weaker models.
-resign_calibration_games="${VGO_RESIGN_CALIBRATION_GAMES:-400}"
-resign_soft_simulations="${VGO_RESIGN_SOFT_SIMULATIONS:-400}"
-resign_window="${VGO_RESIGN_WINDOW:-5}"
-resign_minimum_ply="${VGO_RESIGN_MINIMUM_PLY:-20}"
-# Zero is right under soft resign: the disable fraction exists to sample games
-# that ignore the rule so false positives can be counted, and a soft concession
-# plays on to a real terminal state, so there is nothing to falsify.
-resign_disable_fraction="${VGO_RESIGN_DISABLE_FRACTION:-0.0}"
+# A stage without enough evidence stays closed, so a new run starts with full search.
+tail_target="${VGO_TAIL_TARGET:-0.05}"
+tail_games="${VGO_TAIL_GAMES:-1000}"
+tail_simulations="${VGO_TAIL_SIMULATIONS:-400}"
+tail_window="${VGO_TAIL_WINDOW:-5}"
+# Share of tail plies to train on. All of them stay on disk.
+tail_keep="${VGO_TAIL_KEEP:-0.25}"
 packed_input="${VGO_PACKED_INPUT:-1}"
 root_noise="${VGO_ROOT_NOISE:-0.10}"
 # Measurement against a fixed anchor, every N rounds. Both seats always get the
@@ -190,31 +178,18 @@ with open(sys.argv[1], "a", encoding="utf-8") as stream:
 PY
 }
 
-# Samples currently on disk, from manifests rather than by loading anything.
+# Samples training would keep, from manifests rather than by loading anything.
 count_samples () {
-  "$python" - "$games" <<'PY'
-import json, sys
-from pathlib import Path
-total = 0
-for generation in sorted(p for p in Path(sys.argv[1]).iterdir() if p.is_dir()):
-    for game in sorted(p for p in generation.iterdir() if p.is_dir()):
-        manifest = game / "manifest.json"
-        if not manifest.is_file() or not (game / "dataset.vgo").is_file():
-            continue
-        try:
-            total += int(json.loads(manifest.read_text())["samples"])
-        except (ValueError, KeyError, OSError):
-            continue
-print(total)
-PY
+  ( cd "$root/training" && "$python" -m vgo_training.window "$games" --tail-keep "$tail_keep" )
 }
 
 # 64 actors keep a full batch waiting, so each slot's deck stays filled. At 32 the
 # queue runs dry on a machine with fewer cores: see "Sizing a machine" in RUNNING.md.
 #
-# `--inference-slots 2` and `--maximum-batch 32` are the known-good pair. Do not
-# raise them. Three gain nothing over whole games and hang at 256 within a minute;
-# at 4 the inference threads livelock, spinning at 100% CPU while every actor
+# `--maximum-batch 32` stays. Three lanes pay for a net this fast at 128, where two
+# leave the card idle between batches. On the full net three gain nothing over
+# whole games, and they hang at 256 within a minute, so use VGO_INFERENCE_SLOTS=2
+# there. At 4 the inference threads livelock, spinning at 100% CPU while every actor
 # blocks on a result that never arrives. `nvidia-smi` reports 100% utilization
 # either way, so the tell is power draw, which sits near idle (~60 W) instead of
 # the 200 W+ of real load.
@@ -227,39 +202,27 @@ PY
 # backslash joins the next line, so a `#` on it comments out every remaining
 # argument and the binary starts with a silently truncated command line -- no
 # `--model` reads as a naive generator, which still runs and still writes games.
-# Lowest threshold whose measured false-positive rate clears the target, or the
-# configured fallback when nothing has enough evidence yet. Self-protecting: with
-# no calibration it changes nothing, so it is safe to leave on while the value
-# head is still learning and the rule would be worthless.
-pick_resign_threshold () {
-  local chosen
-  if [ "$(echo "$resign_target_false_positive > 0" | bc -l 2>/dev/null)" != "1" ]; then
-    echo "$resign_threshold"; return
-  fi
-  chosen=$("$python" "$root/training/loop/resign-calibration.py" "$games" --pick \
-    --games "$resign_calibration_games" --window "$resign_window" \
-    --minimum-ply "$resign_minimum_ply" \
-    --target "$resign_target_false_positive" --fallback "$resign_threshold" 2>/dev/null)
-  [ -z "$chosen" ] && chosen="$resign_threshold"
-  echo "$chosen"
+# Before each generator, because a schedule describes the games behind it and the
+# models that played them. A failure here stops the run rather than hiding: losing
+# the tail quietly costs search with nothing else looking wrong.
+build_tail_schedule () {
+  local path="$1"
+  "$python" "$root/training/loop/tail-calibration.py" "$games" --output "$path" \
+    --games "$tail_games" --target "$tail_target" --window "$tail_window"
 }
 
 start_generator () {
   local label="$1" model="$2" first_game="$3"
   local budget="$simulations"
   [ -z "$model" ] && budget="$naive_simulations"
-  # A conceded game's tail must stay cheaper than a normal move.
-  local soft="$resign_soft_simulations"
-  [ "$soft" -gt "$budget" ] && soft="$budget"
+  # A tail must stay cheaper than a normal move.
+  local tail_budget="$tail_simulations"
+  [ "$tail_budget" -gt "$budget" ] && tail_budget="$budget"
   local stop_file="$games/$label.stop"
   rm -f "$stop_file"
-  local threshold
-  threshold=$(pick_resign_threshold)
-  if [ "$threshold" = "$resign_threshold" ]; then
-    echo "[resign] $label: no threshold met $(echo "100*$resign_target_false_positive" | bc -l | cut -c1-4)% false positives; holding the $resign_threshold fallback" >&2
-  else
-    echo "[resign] $label: threshold $threshold chosen from calibration (target $(echo "100*$resign_target_false_positive" | bc -l | cut -c1-4)%)" >&2
-  fi
+  local schedule="$output/tail-schedules/$label.json"
+  build_tail_schedule "$schedule" || { echo "[loop] could not build $schedule" >&2; return 1; }
+  record_event tail_schedule "label=$label" "schedule=$schedule"
   local model_flag=()
   local search_fraction=1.0
   [ -n "$model" ] && model_flag=(--model "$model")
@@ -276,14 +239,10 @@ start_generator () {
     --coarse-pool 16 --widening-coefficient 6.0 --maximum-candidates 321 \
     --komi-area-coefficient "$komi_area_coefficient" \
     --komi-low 0.017 --komi-high 0.137 \
-    --resign-threshold "$threshold" \
-    --resign-soft-simulations "$soft" \
-    --resign-window "$resign_window" \
-    --resign-minimum-ply "$resign_minimum_ply" \
-    --resign-disable-fraction "$resign_disable_fraction" \
+    --tail-schedule "$schedule" --tail-simulations "$tail_budget" --tail-window "$tail_window" \
     --temperature 1.0 --temperature-plies 30 \
     --root-exploration-noise "$root_noise" \
-    --leaf-batch 4 --maximum-batch 32 --delay-ms 1 --inference-slots 2 \
+    --leaf-batch 4 --maximum-batch 32 --delay-ms 1 --inference-slots "$inference_slots" \
     --provider tensorrt --fp16 true \
     --cache-directory "$root/artifacts/onnx-cache" \
     --seed $((70000 + first_game)) \
@@ -297,6 +256,13 @@ start_generator () {
 
 board_mix_flags=()
 for band in "${board_mix[@]}"; do board_mix_flags+=(--board-mix "$band"); done
+shape_flags=()
+[ -n "$shape" ] && shape_flags=(--shape "$shape")
+
+# Anything that ends this script ends the generator it started, which would
+# otherwise keep filling the disk. `label` is whichever generator is current.
+label=""
+trap '[ -n "$label" ] && touch "$games/$label.stop"' EXIT
 
 model="$seed_model"
 # With no seed and no named anchor, the run's first trained model becomes the
@@ -333,7 +299,7 @@ next_game=$(( 1000000 + first_update * 1000000 ))
 # for anything that reads them.
 run_tag="$(date '+%m%d%H%M')"
 label="gen-$(printf '%06d' "$generation")-$run_tag-seed"
-generator=$(start_generator "$label" "$model" "$next_game")
+generator=$(start_generator "$label" "$model" "$next_game") || exit 1
 echo "[loop] generation $generation started (pid $generator, model ${model:-none})"
 
 baseline=$(count_samples)
@@ -365,10 +331,12 @@ for ((update = first_update; update < first_update + updates; update++)); do
       --games-root "$games" --window-samples "$window" \
       --output "$checkpoint" \
       --raster-kind compact-radius --resolution "$resolution" \
-      --model-width 64 --blocks 16 --context-attention-blocks 1 \
+      --model-width 64 --blocks 16 --context-attention-blocks "$context_attention_blocks" \
+      "${shape_flags[@]}" \
       --attention-heads 8 --norm-groups 8 --norms-per-block "$norms_per_block" --precision bfloat16 \
       --epochs "$epochs" --batch-size 64 --learning-rate 0.0005 \
-      --value-weight 2.0 --ownership-weight 0.0 --validation-fraction 0.1 \
+      --value-weight 2.0 --ownership-weight "$ownership_weight" --validation-fraction 0.1 \
+      --tail-keep "$tail_keep" \
       --schedule wsd --warmup-epochs 0 --compile \
       --seed $((90000 + update)) --report-every 1 \
   ) >> "$output/train.log" 2>&1 || { record_event training_failed "update=$update"; echo "[loop] training failed" >&2; exit 1; }
@@ -393,7 +361,7 @@ print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$onnx")
   previous_label="$label"
   previous_generator="$generator"
   label="gen-$(printf '%06d' "$generation")-$run_tag-$sha"
-  generator=$(start_generator "$label" "$onnx" "$next_game")
+  generator=$(start_generator "$label" "$onnx" "$next_game") || { label="$previous_label"; exit 1; }
   touch "$games/$previous_label.stop"
   record_event generator_draining "label=$previous_label" "pid=$previous_generator"
   model="$onnx"
@@ -430,22 +398,10 @@ print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$onnx")
     # holding the zero. Deduplicated because `seed_model` is usually also the
     # newest entry in `models/`, and drawing it twice would spend a third of the
     # match on a repeat.
-    # One fixed reference every round, not left to the draw.
-    #
-    # Sampling purely from recent models makes them play each other and never the
-    # references, which splits the rating graph: the recent cluster has no edge
-    # to the anchor, so Bradley-Terry fits it against its own prior and reports
-    # numbers on a different scale from the anchored ones, with nothing marking
-    # them apart. That happened on the first real round -- update 39 came out at
-    # +28 while update 33 sat at +676, which reads as a collapse and was an
-    # artifact of two disconnected components.
-    #
-    # Reserving a slot keeps every round tied to the scale by construction, at
-    # the cost of one lopsided match in three. Defined before the pool because
-    # the pool filters it out: an empty `$reference` would make `grep -vF ""`
-    # match every line and leave nothing to sample.
+    # A slot is reserved for a fixed reference, explained where it's drawn below.
+    # Defined before the pool because the pool filters it out: an empty
+    # `$reference` would make `grep -vF ""` match every line and leave nothing.
     reference="$anchor"
-    [ -z "$reference" ] && reference="$seed_model"
 
     mapfile -t pool < <(
       {
@@ -506,5 +462,4 @@ print('\n'.join(random.Random(int(sys.argv[2])).sample(pool, count)))
   fi
 done
 
-touch "$games/$label.stop"
 echo "[loop] finished $updates updates"

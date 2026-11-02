@@ -20,7 +20,7 @@ pub struct Counters {
     pub published_games: u64,
     pub published_samples: u64,
     pub capped_games: u64,
-    pub soft_resigned_games: u64,
+    pub tail_games: u64,
     pub discarded_games: u64,
     pub write_nanoseconds: u64,
 }
@@ -35,7 +35,7 @@ impl Counters {
         self.published_games += other.published_games;
         self.published_samples += other.published_samples;
         self.capped_games += other.capped_games;
-        self.soft_resigned_games += other.soft_resigned_games;
+        self.tail_games += other.tail_games;
         self.discarded_games += other.discarded_games;
         self.write_nanoseconds += other.write_nanoseconds;
     }
@@ -58,9 +58,7 @@ impl Counters {
                 .published_samples
                 .saturating_sub(previous.published_samples),
             capped_games: self.capped_games.saturating_sub(previous.capped_games),
-            soft_resigned_games: self
-                .soft_resigned_games
-                .saturating_sub(previous.soft_resigned_games),
+            tail_games: self.tail_games.saturating_sub(previous.tail_games),
             discarded_games: self
                 .discarded_games
                 .saturating_sub(previous.discarded_games),
@@ -87,7 +85,7 @@ impl Counters {
             "published_games": self.published_games,
             "published_samples": self.published_samples,
             "capped_games": self.capped_games,
-            "soft_resigned_games": self.soft_resigned_games,
+            "tail_games": self.tail_games,
             "discarded_games": self.discarded_games,
             "write_wall_seconds_summed": self.write_nanoseconds as f64 / 1e9,
             "searched_plies_per_second": rate(self.searched_plies),
@@ -103,7 +101,7 @@ impl Counters {
 pub struct Bucket {
     pub board_units_rounded: u32,
     pub stage: u32,
-    pub soft_resigned: bool,
+    pub in_tail: bool,
 }
 
 impl Bucket {
@@ -112,7 +110,7 @@ impl Bucket {
             board_units_rounded: (1.0 / progress.radius).round() as u32,
             stage: ((u64::from(progress.ply) * 3) / u64::from(progress.maximum_plies.max(1))).min(2)
                 as u32,
-            soft_resigned: progress.soft_resigned,
+            in_tail: progress.in_tail,
         }
     }
 }
@@ -190,7 +188,7 @@ impl GenerationTelemetry {
         radius: f64,
         samples: usize,
         capped: bool,
-        soft_resigned: bool,
+        in_tail: bool,
         duration: Duration,
     ) {
         let mut state = self.actors[actor].lock().expect("telemetry actor lock");
@@ -198,7 +196,7 @@ impl GenerationTelemetry {
             published_games: u64::from(samples > 0),
             published_samples: samples as u64,
             capped_games: u64::from(samples > 0 && capped),
-            soft_resigned_games: u64::from(samples > 0 && soft_resigned),
+            tail_games: u64::from(samples > 0 && in_tail),
             discarded_games: u64::from(samples == 0),
             write_nanoseconds: duration.as_nanos().min(u128::from(u64::MAX)) as u64,
             ..Counters::default()
@@ -248,7 +246,7 @@ impl Snapshot {
             json!({
                 "board_units_rounded": bucket.board_units_rounded,
                 "stage": (["opening", "middle", "late"][bucket.stage as usize]),
-                "soft_resigned": bucket.soft_resigned,
+                "in_tail": bucket.in_tail,
                 "counters": counters.delta_since(previous.buckets.get(bucket).copied().unwrap_or_default()).json(seconds),
             })
         }).collect();
@@ -296,12 +294,12 @@ pub fn broker_json(metrics: BrokerMetrics, batch_capacity: usize) -> Value {
 mod tests {
     use super::*;
 
-    fn progress(radius: f64, ply: u32, soft_resigned: bool) -> GenerationProgress {
+    fn progress(radius: f64, ply: u32, in_tail: bool) -> GenerationProgress {
         GenerationProgress {
             radius,
             ply,
             maximum_plies: 12,
-            soft_resigned,
+            in_tail,
             policy_eligible: true,
             simulations: 10,
             evaluations: 8,
@@ -328,7 +326,7 @@ mod tests {
             0
         );
         assert_eq!(after.totals.capped_games, 1);
-        assert_eq!(after.totals.soft_resigned_games, 1);
+        assert_eq!(after.totals.tail_games, 1);
         assert_eq!(after.boards[&18].published_samples, 12);
         assert_eq!(after.boards[&38].published_samples, 0);
     }

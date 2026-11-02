@@ -60,10 +60,11 @@ use vgo_inference::{
 use vgo_raster::{RasterConfig, RasterKind};
 use vgo_search::{Evaluator, NaiveEvaluator};
 use vgo_selfplay::generation::{
-    GameRecord, GameSamples, GameSettings, KOMI_AREA_COEFFICIENT, ResignTrial,
-    generate_game_observed, parse_board_mix, replay_capacity_for,
+    GameRecord, GameSamples, GameSettings, KOMI_AREA_COEFFICIENT, generate_game_observed,
+    parse_board_mix, replay_capacity_for,
 };
 use vgo_selfplay::replay_stream::{PublishedReplay, ReplayStream, stone_capacity_for_radius};
+use vgo_selfplay::tail::{TailSchedule, TailSettings};
 use vgo_selfplay::telemetry::GenerationTelemetry;
 
 // Rasters are allocated by actors and freed by the broker, and a move churns
@@ -181,16 +182,18 @@ struct Config {
     komi_high: f64,
     #[arg(long, default_value = "vgo")]
     ruleset: Ruleset,
-    #[arg(long, default_value_t = 0.0)]
-    resign_threshold: f64,
+    /// Thresholds from `training/loop/tail-calibration.py`. Without one, every
+    /// game gets full search.
+    #[arg(long)]
+    tail_schedule: Option<PathBuf>,
+    #[arg(long, default_value_t = 400)]
+    tail_simulations: u32,
     #[arg(long, default_value_t = 5)]
-    resign_window: u32,
-    #[arg(long, default_value_t = 20)]
-    resign_minimum_ply: u32,
-    #[arg(long, default_value_t = 2400)]
-    resign_soft_simulations: u32,
-    #[arg(long, default_value_t = 0.0)]
-    resign_disable_fraction: f64,
+    tail_window: u32,
+    #[arg(long, default_value_t = 0.6)]
+    tail_exit_value: f64,
+    #[arg(long, default_value_t = 2)]
+    tail_exit_window: u32,
     #[arg(long, default_value_t = 50_001)]
     seed: u64,
 
@@ -219,6 +222,23 @@ impl Config {
     /// ignores its mix plays every game on the fallback board with nothing else
     /// looking wrong.
     fn game_settings(&self) -> Result<GameSettings, String> {
+        let schedule = self
+            .tail_schedule
+            .as_ref()
+            .map(|path| {
+                let text = fs::read_to_string(path)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                TailSchedule::parse(&text)
+            })
+            .transpose()?;
+        let tail = TailSettings {
+            schedule,
+            simulations: self.tail_simulations,
+            window: self.tail_window,
+            exit_value: self.tail_exit_value,
+            exit_window: self.tail_exit_window,
+        };
+        tail.validate()?;
         Ok(GameSettings {
             policy_resolution: self.policy_resolution,
             simulations: self.simulations,
@@ -239,11 +259,7 @@ impl Config {
             komi_area_coefficient: self.komi_area_coefficient,
             maximum_plies: self.maximum_plies,
             ruleset: self.ruleset,
-            resign_threshold: self.resign_threshold,
-            resign_window: self.resign_window,
-            resign_minimum_ply: self.resign_minimum_ply,
-            resign_soft_simulations: self.resign_soft_simulations,
-            resign_disable_fraction: self.resign_disable_fraction,
+            tail,
         })
     }
 }
@@ -262,7 +278,6 @@ struct GameWriter {
     replay_capacity: usize,
     stone_capacity: usize,
     simulations: u32,
-    radius: f64,
     model_sha256: Option<String>,
 }
 
@@ -291,7 +306,6 @@ impl GameWriter {
             replay_capacity: replay_capacity_for(config.maximum_candidates, policy_size),
             stone_capacity: stone_capacity_for_radius(smallest_radius),
             simulations: config.simulations,
-            radius: config.radius,
             model_sha256,
         }
     }
@@ -322,11 +336,7 @@ impl GameWriter {
         }
         fs::create_dir_all(&staging)?;
 
-        let GameSamples {
-            samples,
-            record,
-            calibration,
-        } = game;
+        let GameSamples { samples, record } = game;
         let mut stream = ReplayStream::create(
             &staging.join("dataset.vgo"),
             samples.len(),
@@ -339,15 +349,17 @@ impl GameWriter {
         stream.write_game(samples)?;
         let published = stream.publish()?;
         write_game_record(&staging.join("games.jsonl"), &record, published.samples)?;
-        if !calibration.is_empty() {
-            write_calibration(&staging.join("resign-calibration.jsonl"), &calibration)?;
-        }
-        self.write_manifest(&staging.join("manifest.json"), &published)?;
+        self.write_manifest(&staging.join("manifest.json"), &published, &record)?;
         fs::rename(&staging, &final_path)?;
         Ok(published.samples)
     }
 
-    fn write_manifest(&self, path: &Path, published: &PublishedReplay) -> io::Result<()> {
+    fn write_manifest(
+        &self,
+        path: &Path,
+        published: &PublishedReplay,
+        record: &GameRecord,
+    ) -> io::Result<()> {
         let mut writer = BufWriter::new(fs::File::create(path)?);
         writeln!(writer, "{{")?;
         writeln!(writer, "  \"schema\": \"vgo.replay-shard.v1\",")?;
@@ -360,7 +372,8 @@ impl GameWriter {
         writeln!(writer, "  \"width\": {},", self.raster.width)?;
         writeln!(writer, "  \"policy_size\": {},", self.policy_size)?;
         writeln!(writer, "  \"simulations\": {},", self.simulations)?;
-        writeln!(writer, "  \"radius\": {},", self.radius)?;
+        writeln!(writer, "  \"radius\": {},", record.radius)?;
+        writeln!(writer, "  \"tail_samples\": {},", record.tail_samples)?;
         if let Some(sha) = &self.model_sha256 {
             writeln!(writer, "  \"behavior_model_sha256\": \"{sha}\",")?;
         }
@@ -384,8 +397,9 @@ fn write_game_record(path: &Path, record: &GameRecord, samples: usize) -> io::Re
             r#"{{"game":{},"komi":{:.6},"radius":{:.8},"plies":{},"passes":{},"#,
             r#""self_captures":{},"black_utility":{},"margin":{:.6},"#,
             r#""black_area":{:.8},"white_area":{:.8},"#,
-            r#""reached_ply_cap":{},"resigned":{},"soft_resign_ply":{},"#,
-            r#""first_sample":0,"sample_count":{},"final_stones":[{}],"search_budgets":{},"policy_eligible":{}}}"#
+            r#""reached_ply_cap":{},"maximum_plies":{},"tail_spans":{},"tail_samples":{},"#,
+            r#""first_sample":0,"sample_count":{},"final_stones":[{}],"search_budgets":{},"#,
+            r#""policy_eligible":{},"root_values":{},"search_kl":{},"top_gap":{}}}"#
         ),
         record.game,
         record.komi,
@@ -398,10 +412,9 @@ fn write_game_record(path: &Path, record: &GameRecord, samples: usize) -> io::Re
         record.black_area,
         record.white_area,
         record.reached_ply_cap,
-        record.resigned,
-        record
-            .soft_resign_ply
-            .map_or_else(|| "null".to_owned(), |ply| ply.to_string()),
+        record.maximum_plies,
+        serde_json::to_string(&record.tail_spans)?,
+        record.tail_samples,
         samples,
         record
             .final_stones
@@ -411,42 +424,17 @@ fn write_game_record(path: &Path, record: &GameRecord, samples: usize) -> io::Re
             .join(","),
         serde_json::to_string(&record.search_budgets)?,
         serde_json::to_string(&record.policy_eligible)?,
+        rounded(&record.searches.root_values),
+        rounded(&record.searches.kl),
+        rounded(&record.searches.top_gap),
     )?;
     writer.flush()
 }
 
-/// One row per (threshold, window) the rule could have used, describing what it
-/// would have done to *this* game: whether it would have conceded, whether that
-/// concession would have been wrong, and how many plies it would have skipped.
-/// Under soft resignation every game calibrates, because the game plays on to a
-/// real terminal state and the counterfactual is therefore known rather than
-/// sampled.
-///
-/// Written raw, per game, rather than pre-pooled. The generator does not know
-/// which window a future run will pool over, and a shard-level aggregate cannot
-/// be un-summed; 36 rows of small integers per game is cheaper than regenerating.
-///
-/// `training/loop/resign-calibration.py` is the consumer: it pools these over the
-/// trailing window, requires at least thirty firings before trusting a rate, and
-/// picks the lowest threshold whose false-positive rate stays under the target.
-/// Nothing qualifying leaves the fallback in place, which is what makes
-/// adaptation safe to leave on while the value head is still learning.
-fn write_calibration(path: &Path, calibration: &[ResignTrial]) -> io::Result<()> {
-    let mut writer = BufWriter::new(fs::File::create(path)?);
-    for trial in calibration {
-        writeln!(
-            writer,
-            r#"{{"threshold":{:.4},"window":{},"minimum_ply":{},"fired":{},"wrong":{},"plies_saved":{},"confidence":{:.4}}}"#,
-            trial.threshold,
-            trial.window,
-            trial.minimum_ply,
-            u32::from(trial.fired),
-            u32::from(trial.wrong),
-            trial.plies_saved,
-            trial.fired_confidence,
-        )?;
-    }
-    writer.flush()
+/// Four places: enough to read a saturated value, at a third of the bytes.
+fn rounded(values: &[f32]) -> String {
+    let values: Vec<String> = values.iter().map(|value| format!("{value:.4}")).collect();
+    format!("[{}]", values.join(","))
 }
 
 /// Stop the run after `--profile-seconds` so the profile can be written.
@@ -699,15 +687,13 @@ impl Actor {
                     return Err(io::Error::other(error));
                 }
             };
-            // A game with no terminal label teaches nothing; it is dropped
-            // rather than written, and the actor moves on.
             if game.samples.is_empty() {
                 telemetry.discarded(actor);
                 continue;
             }
             let capped = game.record.reached_ply_cap;
             let radius = game.samples[0].position.radius();
-            let soft_resigned = game.record.soft_resign_ply.is_some();
+            let reached_tail = !game.record.tail_spans.is_empty();
             telemetry.phase(actor, "writing");
             let writing_started = Instant::now();
             let written = self.writer.write(index, game)?;
@@ -716,7 +702,7 @@ impl Actor {
                 radius,
                 written,
                 capped,
-                soft_resigned,
+                reached_tail,
                 writing_started.elapsed(),
             );
             if written > 0 {
@@ -931,7 +917,6 @@ mod tests {
                 if record.policy_eligible[index] { 16 } else { 4 }
             );
         }
-        assert_eq!(game.calibration.len(), 36);
         let again = generate_game(
             &config.game_settings().unwrap(),
             &NaiveEvaluator,

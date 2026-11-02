@@ -93,10 +93,12 @@ class LearnerConfig:
     shape: dict[str, object] | None = None
     # Weight on the auxiliary ownership loss, relative to policy at 1.0. Zero
     # disables the head's supervision *and* stops the window holding its
-    # targets, which is 0.063 MB per sample -- a fifth of a packed sample. The
-    # head still exists and still exports as nothing, so this is reversible
-    # without touching model identity.
+    # targets, which is 0.016 MB per sample. The head still exists and still
+    # exports as nothing, so this is reversible without touching model identity.
     ownership_weight: float = OWNERSHIP_WEIGHT
+    # Share of tail plies to train on. Every ply stays on disk, so this can change
+    # without regenerating anything.
+    tail_keep: float = 1.0
     # Trailing residual blocks in each ddrnet context stage to replace with
     # transformer blocks. Identity config at 0, which is byte-identical to a
     # net built without it. Attention is the one part of this model that is
@@ -157,6 +159,8 @@ class LearnerConfig:
             raise ValueError("validation fraction must be in [0, 1)")
         if not math.isfinite(self.ownership_weight) or self.ownership_weight < 0.0:
             raise ValueError("ownership weight must be finite and nonnegative")
+        if not 0.0 < self.tail_keep <= 1.0:
+            raise ValueError("tail keep must be in (0, 1]")
 
 
 @dataclass(frozen=True)
@@ -263,11 +267,10 @@ def _stable_game_hashes(dataset: RasterDataset, digest: str) -> torch.Tensor:
 def _drop_ownership(dataset: PreparedRasterDataset) -> PreparedRasterDataset:
     """Release ownership targets a zero-weighted loss will never read.
 
-    Dense over the policy grid at float32, so they are 0.063 MB per sample --
-    a third of a packed sample, resident for every update the shard's window
-    spans. The stager already zero-fills the ownership slot for shards that
-    have none, so dropping them here takes the same path a pre-`final_stones`
-    shard does.
+    Dense over the policy grid, so they are 0.016 MB per sample, resident for
+    every update the shard's window spans. The stager already zero-fills the
+    ownership slot for shards that have none, so dropping them here takes the
+    same path a pre-`final_stones` shard does.
     """
     if dataset.ownerships is None:
         return dataset
@@ -326,11 +329,15 @@ class ReplayCache:
         self._entries: dict[Path, PreparedReplayShard] = {}
         self._raster_kind: str | None = None
         self._resolution: int | None = None
+        self._tail_keep = 1.0
         self.hits = 0
         self.misses = 0
 
     def use_raster_kind(
-        self, raster_kind: str | None, resolution: int | None = None
+        self,
+        raster_kind: str | None,
+        resolution: int | None = None,
+        tail_keep: float = 1.0,
     ) -> None:
         """Render with `raster_kind` from here on, dropping anything else.
 
@@ -345,12 +352,14 @@ class ReplayCache:
         new entries only. In practice the kind is run identity and never changes
         mid-run, which is exactly why a silent mismatch would go unnoticed.
         """
-        if (raster_kind, resolution) == (self._raster_kind, self._resolution):
+        wanted = (raster_kind, resolution, tail_keep)
+        if wanted == (self._raster_kind, self._resolution, self._tail_keep):
             return
-        self._raster_kind = raster_kind
-        self._resolution = resolution
+        self._raster_kind, self._resolution, self._tail_keep = wanted
         self._entries.clear()
         keywords: dict[str, object] = {"raster_kind": raster_kind}
+        if tail_keep < 1.0:
+            keywords["tail_keep"] = tail_keep
         if resolution is not None:
             keywords["resolution"] = resolution
         self._loader = partial(load_dataset, **keywords)
@@ -866,7 +875,7 @@ class BatchStager:
             if dataset.ownerships is None:
                 destination.zero_()
             else:
-                torch.index_select(dataset.ownerships, 0, part.rows, out=destination)
+                destination.copy_(dataset.ownerships.index_select(0, part.rows))
             offset += part_count
         if spec.transform:
             dataset = spec.parts[0].shard.dataset
@@ -1454,7 +1463,9 @@ class PersistentLearner:
 
         hits_before = self.replay_cache.hits
         misses_before = self.replay_cache.misses
-        self.replay_cache.use_raster_kind(config.raster_kind, config.resolution)
+        self.replay_cache.use_raster_kind(
+            config.raster_kind, config.resolution, config.tail_keep
+        )
         window = self.replay_cache.window(request.datasets, config.batch_size)
         if config.ownership_weight == 0.0:
             # Release the targets the loss will not read. Done here rather than

@@ -12,73 +12,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
 _TRAINING = Path(__file__).resolve().parents[2] / "training"
 sys.path.insert(0, str(_TRAINING))
 from vgo_training.learner import LearnerConfig, LearnerUpdate, PersistentLearner  # noqa: E402
-
-
-def window_from_games(root: Path, window_samples: int) -> tuple[list[Path], int]:
-    """The most recent games totalling at least ``window_samples`` samples.
-
-    Samples, not games and not shards, because they are the only unit that means
-    the same thing twice. A game runs 70 plies on an 18-unit board and 312 on a
-    38-unit one, so "the last N games" is a quantity of data that swings by a
-    factor of four with the board mix; shards from the old generator varied 2.5x
-    in sample count for the same reason. What the learner actually spends, and
-    what the gradient signal scales with, is samples.
-
-    Recency is the game number, not directory order. Generation labels restart
-    at `gen-000000` for every run and collide across them: the current tree has
-    six unrelated `gen-000001-*` directories, and one `gen-000000-seed` holding
-    games from two different runs. Sorting by label therefore put the newest
-    run *first*, and a window took the tail of the oldest generations still on
-    disk -- three consecutive bulk updates trained on the identical 759 stale
-    games while ~2,000 fresh ones sat unread, which reads as a flat loop rather
-    than as a bug.
-
-    Game numbers order correctly across runs because the generator assigns them
-    globally (`--first-game`, advanced past everything a previous process could
-    claim). They agree with file mtime on 98.8% of sampled pairs; the remainder
-    is 32 actors finishing games out of order within one batch, which is
-    unordered anyway. A directory that is not `game-<digits>` predates the
-    per-game writer and sorts oldest rather than being dropped.
-
-    Counts come from each manifest, so choosing a window costs a few hundred
-    small reads rather than loading any data.
-    """
-
-    entries: list[tuple[int, str, Path, int]] = []
-    for generation in sorted(p for p in root.iterdir() if p.is_dir()):
-        for game in sorted(p for p in generation.iterdir() if p.is_dir()):
-            manifest = game / "manifest.json"
-            dataset = game / "dataset.vgo"
-            if not manifest.is_file() or not dataset.is_file():
-                continue  # a game still being written, or a staging leftover
-            try:
-                samples = int(json.loads(manifest.read_text())["samples"])
-            except (ValueError, KeyError, OSError):
-                continue
-            if samples <= 0:
-                continue
-            number = re.fullmatch(r"game-(\d+)", game.name)
-            entries.append(
-                (int(number.group(1)) if number else -1, game.name, dataset, samples)
-            )
-    entries.sort(key=lambda entry: (entry[0], entry[1]))
-
-    chosen: list[Path] = []
-    total = 0
-    for _, _, dataset, samples in reversed(entries):
-        if total >= window_samples:
-            break
-        chosen.append(dataset)
-        total += samples
-    chosen.reverse()  # oldest first, so the window reads in play order
-    return chosen, total
+from vgo_training.window import window_from_games  # noqa: E402
 
 
 def main() -> None:
@@ -154,13 +94,17 @@ def main() -> None:
     parser.add_argument("--final-learning-rate-fraction", type=float, default=0.01)
     parser.add_argument("--report-every", type=int, default=1)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--tail-keep", type=float, default=1.0,
+        help="share of tail plies to train on. Every ply stays on disk.",
+    )
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
     arguments = parser.parse_args()
     if arguments.games_root is not None:
         if arguments.window_samples <= 0:
             parser.error("--games-root needs a positive --window-samples")
         datasets, total = window_from_games(
-            arguments.games_root, arguments.window_samples
+            arguments.games_root, arguments.window_samples, arguments.tail_keep
         )
         if not datasets:
             parser.error(f"no complete games under {arguments.games_root}")
@@ -201,6 +145,7 @@ def main() -> None:
         final_learning_rate_fraction=arguments.final_learning_rate_fraction,
         report_every=arguments.report_every,
         validation_fraction=arguments.validation_fraction,
+        tail_keep=arguments.tail_keep,
         augment=arguments.augment,
     )
 

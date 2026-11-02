@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 import hashlib
@@ -939,6 +939,7 @@ def load_dataset(
     *,
     raster_kind: str | None = None,
     resolution: int | None = None,
+    tail_keep: float = 1.0,
 ) -> RasterDataset:
     """Loads a shard, rendering its positions with `raster_kind`.
 
@@ -954,6 +955,9 @@ def load_dataset(
     `None` falls back to reading the header's channel count, which is a legacy
     convenience for shards and tests that predate the question. It cannot be
     relied on: two layouts of equal width can mean different things.
+
+    `tail_keep` is the share of tail plies to keep. All of them stay on disk, so
+    this can change without regenerating anything.
     """
     # Checked before the file is touched: a misspelled kind is the caller's
     # mistake, and reporting it as a bad shard sends the reader to the wrong
@@ -1096,7 +1100,7 @@ def load_dataset(
     if np.any(policy_masks[np.arange(samples)[replay_actions], selected[replay_actions]] == 0.0):
         raise ValueError("selected replay action is absent from the policy mask")
 
-    return RasterDataset(
+    dataset = RasterDataset(
         # Half precision. A raster is 0/1 planes and one ramp; fp16 is exact for
         # the first and keeps about three decimals of the second, which an
         # ablation could not distinguish from fp32 (2.8211 CE against 2.8441 for
@@ -1137,6 +1141,7 @@ def load_dataset(
             policy_size=policy_size,
         ),
     )
+    return thin_tail(dataset, path, tail_keep)
 
 
 _CONCATENATED_FIELDS = (
@@ -1238,6 +1243,52 @@ def load_datasets(paths: Iterable[str | Path]) -> RasterDataset:
     )
 
 
+def kept_rows(path: Path, plies: np.ndarray, tail_keep: float) -> np.ndarray:
+    """Which rows of a shard survive thinning, from its `games.jsonl`.
+
+    Seeded by game number, so a window holds the same rows every time it loads.
+    Rows of games without tail spans all survive.
+    """
+    keep = np.ones(plies.shape[0], dtype=bool)
+    sidecar = path.parent / "games.jsonl"
+    if tail_keep >= 1.0 or not sidecar.exists():
+        return keep
+    for row in map(json.loads, filter(str.strip, sidecar.read_text().splitlines())):
+        spans = row.get("tail_spans") or []
+        if not spans:
+            continue
+        start, count = int(row["first_sample"]), int(row["sample_count"])
+        draws = np.random.default_rng(int(row["game"])).random(int(row["plies"]) + 1)
+        game_plies = plies[start : start + count]
+        in_tail = np.zeros(game_plies.shape[0], dtype=bool)
+        for first, end in spans:
+            in_tail |= (game_plies >= first) & (game_plies < end)
+        keep[start : start + count] = ~in_tail | (draws[game_plies] < tail_keep)
+    return keep
+
+
+def _select_rows(value, rows: torch.Tensor, samples: int):
+    """`value` with `rows` kept in every per-sample tensor, however it's nested."""
+    if isinstance(value, torch.Tensor):
+        return value[rows] if value.ndim and value.shape[0] == samples else value
+    if is_dataclass(value):
+        changes = {
+            field.name: _select_rows(getattr(value, field.name), rows, samples)
+            for field in fields(value)
+            if isinstance(getattr(value, field.name), torch.Tensor)
+            or is_dataclass(getattr(value, field.name))
+        }
+        return replace(value, **changes)
+    return value
+
+
+def thin_tail(dataset: RasterDataset, path: Path, tail_keep: float) -> RasterDataset:
+    keep = kept_rows(path, dataset.plies.numpy(), tail_keep)
+    if keep.all():
+        return dataset
+    return _select_rows(dataset, torch.from_numpy(keep), dataset.samples)
+
+
 def shard_ownership(path: Path, samples: int, resolution: int) -> "np.ndarray | None":
     """Per-sample ownership targets for a shard, or None if it has no sidecar.
 
@@ -1257,7 +1308,9 @@ def shard_ownership(path: Path, samples: int, resolution: int) -> "np.ndarray | 
         return None
 
     cells = resolution * resolution
-    out = np.zeros((samples, cells), dtype=np.float32)
+    # Bytes: these are +1 and -1, and a float per cell of a 128 grid costs as much
+    # as a third of a packed sample.
+    out = np.zeros((samples, cells), dtype=np.int8)
     for row in rows:
         stones = row.get("final_stones") or []
         start, count = int(row["first_sample"]), int(row["sample_count"])
@@ -1291,7 +1344,7 @@ def ownership_targets(
     """
     cells = resolution * resolution
     if not final_stones:
-        return np.zeros((mover_is_black.shape[0], cells), dtype=np.float32)
+        return np.zeros((mover_is_black.shape[0], cells), dtype=np.int8)
 
     step = 1.0 / resolution
     axis = (np.arange(resolution, dtype=np.float64) + 0.5) * step
@@ -1306,7 +1359,7 @@ def ownership_targets(
 
     # Mover-relative: flip the sign for samples where White is to move.
     view = np.where(mover_is_black[:, None], 1.0, -1.0)
-    return (np.where(black_owns, 1.0, -1.0)[None, :] * view).astype(np.float32)
+    return (np.where(black_owns, 1.0, -1.0)[None, :] * view).astype(np.int8)
 
 
 def replay_diagnostics(dataset: RasterDataset, *, maximum_pairs: int = 400) -> dict[str, object]:
