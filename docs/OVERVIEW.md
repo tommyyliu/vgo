@@ -56,10 +56,13 @@ design document. In short:
 - **Rating is a graph, not a gate.** Every `anchor_every` updates the new model
   plays short matches against a few sampled earlier models. `evaluation/ratings.py`
   fits everything at once (Bradley-Terry), anchored at `sl-w64b16 = 0`.
-- **Resignation is soft and self-calibrating.** A conceded game plays on at a
-  cheaper search budget, so every game still reaches a real result. The
-  threshold is re-picked before each generator from the measured false
-  positives (`training/loop/resign-calibration.py`).
+- **Decided games get cheaper search.** A game that looks decided plays on at a
+  lower budget, without root noise, and returns to full search if the trailing
+  side recovers, so every game still reaches a real result. How far behind counts
+  depends on board and stage, from a schedule rebuilt before each generator
+  (`training/loop/tail-calibration.py`). Nothing starts in the first quarter of a
+  game, and a new run plays at full search until there is evidence. One in four
+  tail plies trains; the rest stay on disk.
 - **Boards are mixed.** Generation draws 50% at radius 1/38, 25% at 1/18, and
   25% uniformly between them, with komi set per board (a fixed number of points,
   as in Go). The loop's own rating runs at 1/18, and
@@ -144,7 +147,7 @@ collapsed by `value_utility` to the [-1, 1] scalar the search consumes. A tanh
 scalar with MSE was abandoned: its `(1 - v^2)` gradient factor vanished exactly
 on confidently wrong positions.
 
-**Ownership is auxiliary** and currently weighted 0. It is training-only and
+**Ownership is auxiliary**, weighted 1.5 in the loop. It is training-only and
 never enters the exported graph.
 
 **Optimizer: Adam.** Muon led early in A/Bs and was overtaken by update 24 in the
@@ -164,9 +167,10 @@ throughput (1.72k -> 3.7k positions/s) with bit-identical outputs.
 Rust loads the graph through ONNX Runtime's TensorRT provider (fp16) and serves
 it behind a batching broker. Two inference slots overlap host staging with GPU
 execution, and each keeps a full batch on deck to start the moment it finishes.
-`--inference-slots 2 --maximum-batch 32 --leaf-batch 4` is the known-good combination:
-3 slots gain nothing over whole games and hang at 256, at 4 the inference threads
-livelock, and batch 64 is slower.
+`--maximum-batch 32 --leaf-batch 4` is the known-good combination. The loop uses 3
+slots for its lighter net at 128. On the full net 3 gain nothing over whole games
+and they hang at 256, so use 2 there. At 4 the inference threads livelock, and
+batch 64 is slower.
 
 The generator asks CUDA to block rather than spin while waiting on the GPU,
 which frees two cores that were otherwise pinned at 100%.

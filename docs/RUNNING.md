@@ -81,7 +81,7 @@ VGO_OUTPUT=artifacts/my-run VGO_SEED_MODEL=artifacts/sl-w64b16/sl-w64b16.onnx \
 
 Every knob is an environment variable documented in the script header:
 `VGO_WINDOW_SAMPLES`, `VGO_TURNOVER`, `VGO_EPOCHS`, `VGO_SIMULATIONS`,
-`VGO_ACTORS`, the `VGO_RESIGN_*` and `VGO_ANCHOR_*` families, and so on. The
+`VGO_ACTORS`, the `VGO_TAIL_*` and `VGO_ANCHOR_*` families, and so on. The
 script resumes from whatever `models/` holds, so rerunning it after a stop
 continues the run.
 
@@ -102,10 +102,10 @@ the graph metadata and backend contract are authoritative. New exports describe
 their actual graph inputs in the `inputs` array and declare `input_layout`.
 
 The records distinguish searched plies (including games in flight) from games
-and samples successfully published. They report capped and soft-resigned games,
+and samples successfully published. They report capped games, games that reached the tail,
 search and write durations, actor activity, and Linux RSS/peak RSS. Per-board
 counters group radii by rounded `1/r`; search buckets further divide each game's
-ply cap into opening/middle/late thirds and separate soft-resigned searches.
+ply cap into opening/middle/late thirds and separate tail searches.
 These stage names describe progress through the configured cap, not settlement.
 
 Neural runs also include interval and cumulative broker metrics: average batch
@@ -134,7 +134,8 @@ A run directory holds:
 
 | path | contents |
 |---|---|
-| `games/gen-N-<sha>/game-M/` | `dataset.vgo`, `manifest.json`, `resign-calibration.jsonl` |
+| `games/gen-N-<sha>/game-M/` | `dataset.vgo`, `manifest.json`, `games.jsonl` |
+| `tail-schedules/<label>.json` | the tail thresholds each generator ran with |
 | `models/update-N.{pt,onnx}` | each round's checkpoint and export, with `.json` sidecars |
 | `run.log`, `generate.log`, `train.log` | append-only across launches |
 | `anchor.jsonl`, `anchor.log` | rating matches |
@@ -178,15 +179,15 @@ Warm starts inherit the checkpoint's architecture. For the bulk loop, set
 The continuous generator accepts `--full-search-fraction 0.25
 --fast-simulations 200` with, for example, `--simulations 1000`. Every game's
 first turn is full; later turns choose a seeded full/fast budget. Fast turns
-disable root noise and move temperature. Soft resignation can reduce either
-budget further. Defaults keep every turn full, preserving the existing recipe.
+disable root noise and move temperature. The search tail can reduce either
+budget further, and does the same. Defaults keep every turn full, preserving the existing recipe.
 
 Only full-selected turns enter replay: **both policy and value training use
 these rows with their normal weights**. Fast turns still determine the final
-outcome and contribute to resignation calibration. `games.jsonl` contains
+outcome, and their root values feed tail calibration. `games.jsonl` contains
 per-ply `search_budgets` and `policy_eligible` arrays; join replay rows by ply.
 Telemetry distinguishes searched plies from policy-eligible plies and actually
-published samples. Budget and eligibility are different after soft resignation.
+published samples. Budget and eligibility are different in the tail.
 
 The bulk-loop equivalents are `VGO_FULL_SEARCH_FRACTION` and
 `VGO_FAST_SIMULATIONS`. The initial naive generation stays full-budget. These
@@ -228,7 +229,7 @@ fixed between experiments; queue contention is part of this measurement.
 
 ```bash
 evaluation/selfplay-sgf.py artifacts/my-run/games/gen-000003-.../game-000123 out.sgf
-training/loop/resign-calibration.py artifacts/my-run/games --games 400
+training/loop/tail-calibration.py artifacts/my-run/games --output /tmp/schedule.json
 ```
 
 The SGF loads in the reference application: open
@@ -310,11 +311,6 @@ Native failures also arm a final three-second watchdog because native exit
 handlers can hang after the error is reported. Linux then exits with status 70
 without running those handlers; other targets abort. In-flight games can be
 abandoned, while published replay remains atomic.
-
-Calibration rows now carry `minimum_ply`; `resign-calibration.py --minimum-ply 20`
-filters for the live default floor. The bulk loop passes its configured floor.
-Legacy rows describe a counterfactual floor of zero and are excluded from
-floor-20 threshold selection until matching new data is available.
 
 ## Traps
 

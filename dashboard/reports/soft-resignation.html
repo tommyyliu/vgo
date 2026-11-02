@@ -14,7 +14,7 @@
     <li><a href="#today">What's wrong today</a></li>
     <li><a href="#principles">Principles</a></li>
     <li><a href="#flow">The new flow</a></li>
-    <li><a href="#table">The comeback table</a></li>
+    <li><a href="#table">The threshold schedule</a></li>
     <li><a href="#work">The work, in order</a></li>
     <li><a href="#cost">What it costs and buys</a></li>
     <li><a href="#tests">How we'll test it</a></li>
@@ -26,7 +26,7 @@
 
 <main>
 <header>
-  <div class="eyebrow"><span class="pill">Plan</span><span>Proposed, 2 Nov 2026</span></div>
+  <div class="eyebrow"><span class="pill">Plan</span><span>Built on branch search-tail, 2 Nov 2026</span></div>
   <h1>Soft resignation</h1>
   <p class="lede">Soft resignation saves about 29% of search. It also fills half the training window with cheap positions, and its calibration almost never changes anything. This plan keeps a real saving and fixes both problems.</p>
 </header>
@@ -44,7 +44,7 @@
     <li>Save every ply's root value, so any rule can be tested on games already played.</li>
     <li>Make the cheap tail reversible, and play it without noise.</li>
     <li>Keep every ply on disk, and thin tail plies when training loads them.</li>
-    <li>Decide from measured comeback rates by board and game stage, and leave the rule off where evidence is thin.</li>
+    <li>Set thresholds by board and game stage from measured comeback rates, start nothing in the first quarter of a game, and leave the rule off where evidence is thin.</li>
   </ul>
 </div>
 
@@ -107,7 +107,7 @@
 <h2 id="flow">The new flow</h2>
 <figure>
   <div class="scroll">
-  <svg viewBox="0 0 980 214" role="img" aria-label="Today, games save fixed rule outcomes that set one pooled threshold, which starts a permanent tail, and every ply trains at full weight. In the plan, games save per-ply values that build a comeback table, which drives a reversible tail, and tail plies are thinned at training time.">
+  <svg viewBox="0 0 980 214" role="img" aria-label="Today, games save fixed rule outcomes that set one pooled threshold, which starts a permanent tail, and every ply trains at full weight. In the plan, games save per-ply values that build a threshold schedule, which drives a reversible tail, and tail plies are thinned at training time.">
     <defs><marker id="head" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="currentColor"/></marker></defs>
     <text class="head" x="185" y="18" text-anchor="middle">Saved after each game</text>
     <text class="head" x="415" y="18" text-anchor="middle">Chosen before each generator</text>
@@ -134,7 +134,7 @@
     <rect class="box new" x="90" y="130" width="190" height="72" rx="8"/>
     <text class="strong" x="185" y="160" text-anchor="middle">Per-ply values</text><text class="small" x="185" y="179" text-anchor="middle">any rule can be replayed</text>
     <rect class="box new" x="320" y="130" width="190" height="72" rx="8"/>
-    <text class="strong" x="415" y="160" text-anchor="middle">Comeback table</text><text class="small" x="415" y="179" text-anchor="middle">by board, stage and value</text>
+    <text class="strong" x="415" y="160" text-anchor="middle">Threshold schedule</text><text class="small" x="415" y="179" text-anchor="middle">by board, stage and value</text>
     <rect class="box new" x="550" y="130" width="190" height="72" rx="8"/>
     <text class="strong" x="645" y="160" text-anchor="middle">Reversible tail</text><text class="small" x="645" y="179" text-anchor="middle">played without noise</text>
     <rect class="box new" x="780" y="130" width="190" height="72" rx="8"/>
@@ -150,10 +150,10 @@
   <figcaption>Each step changes: what's saved, how the rule is chosen, what the tail does, and how training uses it.</figcaption>
 </figure>
 
-<p>During play, a game moves between two states. A game can now leave the tail, and it can enter again later.</p>
+<p>During play, a game moves between two states. A game can now leave the tail, and it can enter again later. The rule sits in its own small module, <code>tail.rs</code>, and <code>play_game</code> no longer knows about it.</p>
 <figure>
   <div class="scroll">
-  <svg viewBox="0 0 800 196" role="img" aria-label="A game moves from full search to the cheap tail after five own turns in open table cells, and back to full search when value recovers past 0.90 for two own turns.">
+  <svg viewBox="0 0 800 196" role="img" aria-label="A game moves from full search to the cheap tail after five own turns past the schedule threshold, and back to full search when value recovers past 0.60 for two own turns.">
     <defs><marker id="head2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="currentColor"/></marker></defs>
     <rect class="box" x="10" y="54" width="220" height="88" rx="10"/>
     <text class="strong" x="120" y="88" text-anchor="middle">Full search</text>
@@ -164,38 +164,53 @@
     <text class="small" x="680" y="108" text-anchor="middle">400 simulations, no noise</text>
     <text class="small" x="680" y="125" text-anchor="middle">1 ply in 4 trained</text>
     <path class="arrow" d="M230 78 C 330 34, 470 34, 568 78" marker-end="url(#head2)"/>
-    <text x="400" y="30" text-anchor="middle">5 own turns in open table cells</text>
+    <text x="400" y="30" text-anchor="middle">5 own turns past the schedule threshold</text>
     <path class="arrow" d="M570 120 C 470 164, 330 164, 232 120" marker-end="url(#head2)"/>
-    <text x="400" y="176" text-anchor="middle">value back past 0.90 for 2 own turns</text>
+    <text x="400" y="176" text-anchor="middle">value back past 0.60 for 2 own turns</text>
   </svg>
   </div>
-  <figcaption>Both directions use the conceding seat's own turns. The two thresholds differ so a game doesn't flip back and forth.</figcaption>
+  <figcaption>Both directions use the conceding seat's own turns. The exit sits well below every entry, so a game doesn't flip back and forth.</figcaption>
 </figure>
 
-<h2 id="table">The comeback table</h2>
-<p>This replaces the threshold. It asks one question: when a game looked like this, how often did the trailing side come back?</p>
+<h2 id="table">The threshold schedule</h2>
+<p>One threshold can't suit both an early big-board position and a late small-board one. So each board and stage gets its own, chosen from one measurement: when a side trailed like this, how often did it win or tie anyway?</p>
+<p>A floor alone doesn't settle this. These are games whose first firing came after each point. The 25% floor helps every board, and on bigger boards the real step comes near halfway, where much looser thresholds hold up.</p>
+<div class="scroll"><table>
+  <thead><tr><th>Board</th><th>Threshold</th><th class="num">Any stage</th><th class="num">Past 25%</th><th class="num">Past 50%</th><th class="num">Past 75%</th></tr></thead>
+  <tbody>
+    <tr class="first-of-board"><td rowspan="3">38</td><td>0.90</td><td class="heat" style="--h:46%">19.2%<small>777</small></td><td class="heat" style="--h:28%">11.7%<small>223</small></td><td class="heat" style="--h:15%">6.3%<small>127</small></td><td class="heat" style="--h:15%">6.1%<small>66</small></td></tr>
+    <tr><td>0.95</td><td class="heat" style="--h:43%">17.9%<small>720</small></td><td class="heat" style="--h:21%">8.7%<small>229</small></td><td class="heat" style="--h:9%">3.7%<small>135</small></td><td class="heat" style="--h:9%">3.6%<small>84</small></td></tr>
+    <tr><td>0.99</td><td class="heat" style="--h:43%">17.9%<small>632</small></td><td class="heat" style="--h:22%">9.2%<small>206</small></td><td class="heat" style="--h:4%">1.8%<small>109</small></td><td class="heat" style="--h:4%">1.5%<small>68</small></td></tr>
+    <tr class="first-of-board"><td rowspan="3">19–37</td><td>0.90</td><td class="heat" style="--h:20%">8.2%<small>352</small></td><td class="heat" style="--h:18%">7.4%<small>95</small></td><td class="heat" style="--h:5%">2.1%<small>48</small></td><td class="heat" style="--h:10%">4.2%<small>24</small></td></tr>
+    <tr><td>0.95</td><td class="heat" style="--h:18%">7.6%<small>342</small></td><td class="heat" style="--h:16%">6.8%<small>103</small></td><td class="heat">0.0%<small>56</small></td><td class="heat">0.0%<small>31</small></td></tr>
+    <tr><td>0.99</td><td class="heat" style="--h:17%">6.9%<small>306</small></td><td class="heat" style="--h:10%">4.2%<small>95</small></td><td class="heat">0.0%<small>43</small></td><td class="heat">0.0%<small>24</small></td></tr>
+    <tr class="first-of-board"><td rowspan="3">18</td><td>0.90</td><td class="heat" style="--h:12%">5.0%<small>402</small></td><td class="heat" style="--h:14%">5.9%<small>323</small></td><td class="heat" style="--h:11%">4.5%<small>132</small></td><td class="heat" style="--h:4%">1.8%<small>57</small></td></tr>
+    <tr><td>0.95</td><td class="heat" style="--h:8%">3.5%<small>376</small></td><td class="heat" style="--h:10%">4.0%<small>321</small></td><td class="heat" style="--h:7%">3.1%<small>127</small></td><td class="heat">0.0%<small>57</small></td></tr>
+    <tr><td>0.99</td><td class="heat" style="--h:6%">2.4%<small>336</small></td><td class="heat" style="--h:6%">2.6%<small>313</small></td><td class="heat" style="--h:8%">3.4%<small>119</small></td><td class="heat" style="--h:5%">2.1%<small>47</small></td></tr>
+  </tbody>
+</table></div>
+<p class="tablenote">Window 5, 128 input. A game that fired early and stayed behind isn't counted in the later columns, so per-ply data may read differently.</p>
 <ul>
-  <li><strong>Cells.</strong> Each cell is a board band (18, 19–37, 38), a stage (the four columns above), and a value band (0.95, 0.99, 0.999). That's 36 cells.</li>
-  <li><strong>Counting.</strong> A game counts once per cell, the first time it reaches that cell, because plies within a game aren't independent.</li>
-  <li><strong>Open cells.</strong> A cell opens when the 95% upper bound on its comeback rate is below the target. A cell with few games has a wide bound, so it stays closed.</li>
-  <li><strong>Entering the tail.</strong> A seat must sit in open cells for 5 of its own turns in a row.</li>
-  <li><strong>Refreshing.</strong> Before each generator starts, the table is rebuilt from the last 1,000 games.</li>
+  <li><strong>Cells.</strong> Each cell is a board band (18, 19–37, 38), a stage (25%, 50% and 75% of the ply cap) and a trailing value (0.80, 0.90, 0.95, 0.99). That's 36 cells.</li>
+  <li><strong>Counting.</strong> A seat counts once per cell, the first time it holds a 5-turn streak there, because plies within a game aren't independent.</li>
+  <li><strong>Choosing.</strong> Each board and stage takes the loosest value whose 95% upper bound on comebacks is below the target. If none passes, that stage is closed. A cell needs at least 73 games even with no comebacks.</li>
+  <li><strong>Refreshing.</strong> Before each generator starts, the schedule is rebuilt from the last 1,000 games a model played.</li>
+  <li><strong>The floor.</strong> No game starts a tail in the first quarter. Doomed early games exist, but value can't pick them out yet.</li>
 </ul>
-<p>This also handles games that are doomed early. If a cell for an early position with extreme value has few comebacks, it opens by itself, with no floor holding it back. If the data says value can't tell early, it stays closed.</p>
-<p>The target is a plain setting, with a default of 5%. No principled number exists for it. 5% is simply AlphaGo Zero's convention, and a reversible tail makes a wrong call cheaper, so we can move it freely.</p>
-<p>A fresh run starts with an empty table, so every cell is closed and every game gets full search. Those early games are also the clean ones, because no tail has touched them. We expect that to take about an hour of generation, or longer if early nets don't reach the target.</p>
+<p>The target is a plain setting, with a default of 5%. No principled number exists for it, and a reversible tail makes a wrong call cheaper, so we can move it freely.</p>
+<p>A fresh run starts with no evidence, so every stage is closed and every game gets full search. Those early games are also clean, because no tail has touched them. We expect that to take an hour or two of generation, or longer if early nets don't reach the target.</p>
 
 <h2 id="work">The work, in order</h2>
 <ol class="steps">
   <li><div>
     <h3>Save per-ply search data</h3>
-    <p>Add <code>root_values</code>, <code>search_kl</code> and <code>top_gap</code> to <code>games.jsonl</code>, at a few KB per game. The last two serve the <a href="search-budget">search budget work</a>. Fix the manifest's <code>radius</code>, which records the flag and not the game's board, and add <code>tail_samples</code>.</p>
+    <p>Add <code>root_values</code>, <code>search_kl</code> and <code>top_gap</code> to <code>games.jsonl</code>, at a few KB per game. The last two serve the <a href="search-budget">search budget work</a>. Fix the manifest's <code>radius</code>, which recorded the flag and not the game's board, and add <code>tail_samples</code>.</p>
     <p class="where"><code>generation.rs</code>, <code>generate_continuous.rs</code></p>
   </div></li>
   <li><div>
     <h3>Write one tail rule</h3>
-    <p>A small <code>TailRule</code> state machine replaces <code>ResignRule</code> and the two near-duplicate branches in the play loop. It takes each ply's root value and says whether the next ply is in the tail. Hard resignation goes too: all 10,580 games in r128-s2000 read <code>resigned: false</code>.</p>
-    <p class="where"><code>lib.rs</code>, <code>generation.rs</code>. Removes <code>--resign-disable-fraction</code>, <code>resign_exempt</code> and <code>resigned</code>.</p>
+    <p>A small <code>TailTracker</code> in <code>tail.rs</code> replaces <code>ResignRule</code> and the two near-duplicate branches in the play loop. It takes each ply's root value and says whether the next ply is in the tail. Hard resignation goes too: all 10,580 games in r128-s2000 read <code>resigned: false</code>.</p>
+    <p class="where"><code>tail.rs</code>, <code>lib.rs</code>, <code>generation.rs</code>. Removes <code>--resign-disable-fraction</code>, <code>resign_exempt</code> and <code>resigned</code>.</p>
   </div></li>
   <li><div>
     <h3>Play the tail clean</h3>
@@ -204,23 +219,23 @@
   </div></li>
   <li><div>
     <h3>Thin at load</h3>
-    <p>Every ply stays on disk. A new <code>--tail-keep</code> setting, default 0.25, drops tail rows before rendering, seeded by game and ply, so it saves memory and can change without regenerating. Window selection counts kept samples, so a 150k window stays 150k.</p>
-    <p class="where"><code>dataset.py</code>, <code>learner.py</code>, <code>train-once.py</code>, <code>count_samples</code> in <code>bulk-loop.sh</code></p>
+    <p>Every ply stays on disk. A new <code>--tail-keep</code> setting, 0.25 in the loop, drops tail rows as each game loads, seeded by game, so it saves memory and can change without regenerating. Window selection counts kept samples, so a 150k window stays 150k.</p>
+    <p class="where"><code>dataset.py</code>, <code>learner.py</code>, <code>window.py</code>, <code>train-once.py</code></p>
   </div></li>
   <li><div>
     <h3>Replace calibration</h3>
-    <p>A new <code>tail-calibration.py</code> replays recent games, builds the table and writes <code>tail-table.json</code>, which the generator reads with <code>--tail-table</code>.</p>
+    <p>A new <code>tail-calibration.py</code> reads recent games and writes a schedule to <code>tail-schedules/</code>, which the generator reads with <code>--tail-schedule</code>.</p>
     <p class="where">Removes <code>resign-calibration.py</code>, <code>ResignTrial</code>, <code>calibration_trials</code>, <code>CALIBRATION_*</code>, <code>write_calibration</code>, the per-game calibration file, and the <code>bc</code> calls in the loop.</p>
   </div></li>
   <li><div>
     <h3>Report what it did</h3>
-    <p>At each generator start, log one line per board: games, open cells, tail share and comeback rate. A failed build stops the loop with a clear message. Add the same numbers to <code>events.jsonl</code> and a dashboard panel.</p>
-    <p class="where"><code>bulk-loop.sh</code>, <code>dashboard/collect.py</code></p>
+    <p>At each generator start, log one line per board: games, tail share, and each stage's threshold and comebacks. A failed build stops the loop with a clear message, and the schedule file keeps the record. A dashboard panel waits for a real run to show.</p>
+    <p class="where"><code>tail-calibration.py</code>, <code>bulk-loop.sh</code></p>
   </div></li>
 </ol>
 
 <h2 id="cost">What it costs and buys</h2>
-<p>Thinning alone keeps today's saving and changes what training sees. If the table also holds the rule back until about halfway through big-board games, the saving shrinks and the data gets cleaner.</p>
+<p>Thinning alone keeps today's saving and changes what training sees. If the schedule also holds the rule back until about halfway through big-board games, the saving shrinks and the data gets cleaner.</p>
 <div class="scroll"><table>
   <thead><tr><th></th><th class="num">Today</th><th class="num">Thinned</th><th class="num">Thinned, firing from 50% of cap</th></tr></thead>
   <tbody>
@@ -252,7 +267,7 @@
 <h2 id="risks">Risks and open questions</h2>
 <ul>
   <li><strong>Cold start works against early speed.</strong> The rule stays off while nets are weakest, which gives up to 29% of search in the phase where speed matters most. Weak value heads make poor calls anyway, so we accept this for the first run and will watch how long it lasts.</li>
-  <li><strong>The table lags the model.</strong> 1,000 games span a few models. A stale table is mildly conservative as nets improve, which is the safe direction.</li>
+  <li><strong>The schedule lags the model.</strong> 1,000 games span a few models. A stale schedule is mildly conservative as nets improve, which is the safe direction.</li>
   <li><strong>Cells may stay thin.</strong> If 36 cells take too long to fill, merge bands before relaxing the bound.</li>
   <li><strong>Thinning could hurt late-game play.</strong> Compare <code>--tail-keep</code> 1.0 and 0.25 on one window, then play the two nets against each other.</li>
   <li><strong>The tail may flip back and forth.</strong> Exit settings are a first guess. Per-ply data will show how often it happens.</li>
@@ -261,7 +276,7 @@
 
 <h2 id="scope">Left out on purpose</h2>
 <ul>
-  <li><strong>A standing 10% of exempt games.</strong> The cold start gives clean games for free. It can come back if the table looks wrong.</li>
+  <li><strong>A standing 10% of exempt games.</strong> The cold start gives clean games for free. It can come back if the schedule looks wrong.</li>
   <li><strong>Changing the ply cap.</strong> High cap rates are known behaviour, and the roadmap says not to reopen that without new evidence.</li>
   <li><strong>A smooth budget.</strong> That's a larger idea, covered in <a href="search-budget">Where should search go?</a></li>
   <li><strong>Using the settled plane as proof a game is decided.</strong> Captures can shrink settled regions (lemma A8), so that would need its own proof.</li>

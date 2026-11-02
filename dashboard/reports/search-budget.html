@@ -126,7 +126,7 @@
     <tr><td>Search surprise</td><td>How far search moved from the net's prior. KL(search ‖ prior).</td><td>Yes</td><td>Depends on budget, so compare like with like.</td></tr>
     <tr><td>Top-two gap</td><td>Whether the choice between the best moves is close.</td><td>Yes</td><td>Saturated values make every gap look small.</td></tr>
     <tr><td>Value swing</td><td>The net changing its mind from ply to ply.</td><td>Yes, from root values</td><td>Hard to tell noise from a real turn.</td></tr>
-    <tr><td>Calibrated win chance</td><td>How uncertain the outcome is, corrected for overconfidence.</td><td>From the comeback table</td><td>Only as good as the table's coverage.</td></tr>
+    <tr><td>Calibrated win chance</td><td>How uncertain the outcome is, corrected for overconfidence.</td><td>From calibration</td><td>Only as good as calibration's coverage.</td></tr>
     <tr><td>Unsettled area</td><td>How much of the board is still open.</td><td>No, but the engine computes it</td><td>Captures can reopen it. Fine for budgets, not as proof.</td></tr>
     <tr><td>Contested area</td><td>Cells the ownership head is unsure about.</td><td>No, the head isn't exported</td><td>Adds inference cost if exported.</td></tr>
     <tr><td>Score against open area</td><td>Whether the deficit is bigger than what's left to win.</td><td>No, needs a score head</td><td>Further away, and depends on two predictions.</td></tr>

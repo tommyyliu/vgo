@@ -143,5 +143,5 @@ These are empirical choices, judged by arena play. Evidence is in
 [`docs/OVERVIEW.md`](../docs/OVERVIEW.md).
 
 - Bulk retraining from scratch on a recent window, with no promotion gate.
-- Soft resignation, with thresholds calibrated from measured false positives.
+- A cheaper search tail for games that look decided, with thresholds by board and stage from recent games.
 - Bradley-Terry ratings over a match graph.

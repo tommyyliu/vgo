@@ -28,12 +28,12 @@
   },
   {
     "id": "ownership-loss",
-    "status": "Next",
+    "status": "Running",
     "bucket": "Extract",
     "effort": "M",
-    "title": "Train the ownership head",
-    "why": "Weight 0 in the bulk loop since 219d67a, with no recorded arena result. sigmago measured +194 ± 28 with ownership and score heads together, but -96 ± 49 on a smaller run.",
-    "test": "Train on one frozen corpus at weights 0, 0.5 and 1.5, then arena at equal sims on both boards."
+    "title": "Check the ownership head",
+    "why": "On by default in the loop at weight 1.5, because it costs nothing at inference and varies within a game, so it can't be memorized the way the value label is. sigmago measured +194 ± 28 with ownership and score heads together, but -96 ± 49 on a smaller run, and we have no arena result of our own.",
+    "test": "At a few updates of the fresh run, train a twin at weight 0 on the same window and arena the two at equal sims on both boards."
   },
   {
     "id": "window-size",

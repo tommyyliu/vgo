@@ -102,11 +102,11 @@ the dataset inside a private staging directory; the game directory is renamed
 into place after its manifest and sidecars have been written.
 
 The manifest identifies the dataset digest, model digest when present, sample
-count, nominal raster dimensions, policy size, and simulation budget.
-`games.jsonl` records the actual per-game radius/komi, final scores and stones,
-cap status, and soft resignation. Full resolved run configuration and stage
-timings live in `performance.jsonl`, rather than being repeated in every game
-manifest. `resign-calibration.jsonl` stores counterfactual threshold outcomes.
+count, the game's radius and tail sample count, nominal raster dimensions, policy
+size, and simulation budget. `games.jsonl` records the per-game radius/komi, final
+scores and stones, cap status, tail spans, and per-ply root value, search KL and
+top-two gap. Full resolved run configuration and stage timings live in
+`performance.jsonl`, rather than being repeated in every game manifest.
 
 A stop file drains games already in flight. Cancellation aborts searches on
 failure or at a profiling deadline. Actor handles are joined before inference
@@ -146,8 +146,8 @@ persists between rounds except files.
 The continuous generator appends startup, periodic, and final records to each
 generation's `performance.jsonl`, with brief summaries in `generate.log`.
 Records distinguish work in flight from published data, include process memory,
-and group search work by rounded board size, thirds of the game cap, and soft
-resignation status. Neural runs include interval and cumulative broker counters.
+and group search work by rounded board size, thirds of the game cap, and whether
+the search was in the tail. Neural runs include interval and cumulative broker counters.
 The bulk loop's `events.jsonl` marks training and generator handoffs. See
 [`RUNNING.md`](../RUNNING.md#continuous-run-performance) for fields and interpretation.
 

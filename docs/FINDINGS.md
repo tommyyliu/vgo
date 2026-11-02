@@ -23,11 +23,13 @@ Don't reopen these without new evidence.
 | Bigger nets at this compute | Dead end. One doubling of simulations is worth about 61 Elo |
 | Tanh value head with MSE | Gradient vanished on confidently wrong positions |
 | Random-candidate sampler | Target carried no board-dependent signal |
-| Three inference lanes on the current net | No gain over whole games: 18.5k positions/s against 18.6k at 128, 7.3k against 7.4k at 192. Hung at 256, 2 runs of 2. A net 1.6x faster or more does gain, +15% in 140 s early-game runs at 128, so recheck if one is adopted |
+| Three inference lanes on the current net | No gain over whole games: 18.5k positions/s against 18.6k at 128, 7.3k against 7.4k at 192. Hung at 256, 2 runs of 2. A net 1.6x faster or more does gain, +15% in 140 s early-game runs at 128. The lighter net then ran 15 minutes on three lanes at 128 with no failures, at 33.8k positions/s |
 | Maximum batch 64 | Slower: 16.8k positions/s against 18.8k at 32, two lanes at 128. The card runs near its compute limit at 32 |
 | Vectorized bounded transform in place of the envelope | Big boards flat, small boards 25% slower. A row's reach is set by its farthest pixel, which on a small board is 40 offsets or more |
 | Fixed-batch TensorRT engines | +0.9% and -1.2% against a batch 1 to 32 profile, so the graph's `Shape` nodes cost nothing |
 | GroupNorm lowered through pooling | 17% slower than the exported `InstanceNormalization`, for identical results |
 | Depthwise, inverted and grouped blocks | Worst speed for their arithmetic: inverted -24%, grouped -20%, depthwise +10% on 61% of the arithmetic. Fewer plain blocks buy more |
+| One resignation threshold for every board and stage | Held its fallback on 23 of 24 picks across three runs. At 128 input it was wrong 2.4% of the time on the 18 board and 17.8% on the 38 board, and on the 38 board no threshold or window beat 12%. Stage mattered far more: 23.2% in the first 15% of the cap, 1.8% past halfway. Replaced by thresholds by board and stage |
+| Hard resignation | Unused: all 10,580 games in r128-s2000 read `resigned: false`. Removed, so every game reaches a real result |
 | PixelShuffle policy upsampling | No speed gain, and +0.073 validation policy KL after 8 epochs against a seed spread of 0.003. Taking it out of two stacked shapes moved them from +0.075 to +0.013 and +0.018. Option removed |
 | Lower priority for actor threads | No gain pinned to 8 cores: lane wake delay went from 119 to 102 us, and the GPU did not rise. The stall was the broker round trip, now removed by the deck |
