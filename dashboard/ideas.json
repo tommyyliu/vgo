@@ -45,6 +45,15 @@
     "test": "Bootstrap at 128. Train a 192 net from scratch on the same window, then play them at equal time with --opponent-resolution on both boards. Move up once it wins."
   },
   {
+    "id": "faster-net",
+    "status": "Next",
+    "bucket": "Speed",
+    "effort": "M",
+    "title": "Train the faster net shapes",
+    "why": "Fewer detail blocks, no attention and one norm take the card's ceiling at 128 from 21k positions/s to 34-41k, and the generator to 33-39k with three lanes. At 61 Elo a doubling that is worth 40-60 Elo if a shape keeps its strength. Strength is unmeasured, and these rates need about 15 vCPU per card.",
+    "test": "Train the shortlist and a control on one frozen window, compare validation, then arena the best at equal time on both boards. Check a trained one over whole games on 8 vCPU."
+  },
+  {
     "id": "score-head",
     "status": "Later",
     "bucket": "Extract",
@@ -104,8 +113,8 @@
     "bucket": "Speed",
     "effort": "S",
     "title": "Settle one norm per block",
-    "why": "Measured about 4-9% faster search, with mixed, inconclusive arenas. The GPU is now the limit on throughput, and this is the one measured way left to lift it.",
-    "test": "Only worth a larger arena if 128 input is adopted first."
+    "why": "About 15% more positions/s at the card's ceiling, with mixed, inconclusive arenas: 86-106 over four small matches. The GPU is the limit on throughput at 128.",
+    "test": "Train it with the faster net shapes, on the same window as their control."
   },
   {
     "id": "tree-reuse",

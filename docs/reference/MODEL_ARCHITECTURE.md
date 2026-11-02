@@ -85,9 +85,8 @@ positions. Measured forward cost per stage at batch 32:
 | context_stage1 | 16x16 | 1.48 |
 | context_stage2 | 8x8 | 1.28 |
 
-Full forward is 14.5 ms at batch 32. Anything aiming to cut inference cost has
-to come out of the detail branch or the block count; the policy resize is
-0.017 ms and the stem alone 0.29 ms, so neither is worth touching.
+Full forward is 14.5 ms at batch 32. For what actually moves throughput, see
+[Inference speed](#inference-speed).
 
 ## Components
 
@@ -161,6 +160,53 @@ Off by default; each is byte-identical to the default when disabled.
 rotary position tables are built per board size, so a model with attention is
 fixed to the raster resolution it was constructed for and `raster_resolution`
 becomes required.
+
+## Inference speed
+
+Measured 2026-11-01 on a 300 W RTX 5070 Ti at 128 input, batch 32, two lanes, with
+[`performance/model_timing.py`](../../performance/model_timing.py). That is the card's
+ceiling. Shapes are defined in
+[`performance/model_variants.py`](../../performance/model_variants.py). The loop's net
+reads 21.1k positions/s, repeatable to about 1%, and a trained net reads the same as a
+random one. Strength was not measured for any of this.
+
+| Change | Arithmetic | Positions/s |
+|---|---|---|
+| Detail blocks 4/4/4 to 1/1/2 | 70% | +43% |
+| Detail blocks 4/4/4 to 2/2/2 | 78% | +28% |
+| `--blocks 8` | 63% | +48% |
+| `--blocks 12` | 81% | +21% |
+| Detail width 64 to 32 | 64% | +36% |
+| No trunk norms (a bound, not a design) | 100% | +29% |
+| One norm per block | 100% | +15% |
+| Attention blocks to residual blocks | 100% | +7% |
+| Tail residual block 128-64-128 bottleneck | 88% | +4% to +8% |
+| Remove the DAPPM context module | 100% | +2%, noise |
+| PixelShuffle policy, 16 channels | 100% | none |
+| Input 96 / 192 / 256 | 56% / 228% / 411% | +34% / -65% / -79% |
+
+Stacked, the shapes reach 34k to 41k. What decides the result:
+
+- **Time follows arithmetic for plain blocks**, so cutting them pays one for one. Each
+  residual stage, context stages included, is about 15% of the arithmetic, because doubling
+  the channels at half the resolution keeps the cost constant.
+- **Cheap convolutions are not cheap here.** Depthwise blocks do 61% of the arithmetic for
+  +10%, and inverted and grouped blocks run slower than the plain block.
+- **GroupNorm is about 22% of inference time**, so trunk norms cost more than their
+  arithmetic suggests.
+- **Narrowing from 64 saves little until 32.** With norms off, detail widths 48, 56 and 60 all
+  read 28k, against 27k at 64, 38k at 32 and 18k at 96. Multiples of 32 look like the efficient
+  widths, though 40, 72 and 80 were not measured with norms off.
+- **Some group sizes hit a slow path.** Width 48 reads 15k with 8 groups and 22k with 2, 3, 6
+  or 12. Groups of 5, 6, 7, 9 and 13 channels were slow, as was 10 at width 60, while 4, 8, 12,
+  16 and 24 were not. The cause is not known. `_group_count` picks a slow case at widths such as
+  40, 48, 56 and 72, so try other group counts before trusting a timing at those widths.
+
+In the generator the lanes set the rate, not the card. Each spends about 0.3 ms per batch on
+the CPU around `session.run`, so a 39k ceiling gave 31k. A third lane gave +15% on these
+nets, against +7% on the current one in the same short runs and nothing over whole games. The
+CPU then has to keep up: on two lanes, over 140 s early in games, the same nets stopped at
+25.7k on 8 physical cores and 22k on 8 threads of 4 cores. Whole games need more CPU than that.
 
 ## What is known about changing it
 

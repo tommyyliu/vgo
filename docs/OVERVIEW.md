@@ -179,7 +179,8 @@ The protocol and evaluator interface are in
 **Two GroupNorms per residual block, 8 groups.** The groups are statistically
 interchangeable (spread across group means 1.24x against 3.35x within), and
 LayerNorm trains equivalently. Grouping is kept for throughput: 1 group is ~43%
-slower on TensorRT, and 4-96 groups are within 0.4% of each other.
+slower on TensorRT, and 4-96 groups are within 0.4% of each other at width 96. Other widths
+can hit a slow path: see [Inference speed](reference/MODEL_ARCHITECTURE.md#inference-speed).
 
 **One norm per block is a known, unadopted win**: +11% inference and -10%
 training wall time, with no activation growth (peak validation activation

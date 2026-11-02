@@ -45,6 +45,9 @@ performance/run.py                 # compare with history and record; needs a qu
   profile shares from runs of different lengths cover different stages of the game.
 - Never run timings alongside anything else, and bound every background job and wait.
 - Kill processes by exact PID. `pkill -f` and grep loops match their own shell.
+- To time a model, export it and run `performance/model_timing.py`, repeating a baseline between
+  runs. That is the card's ceiling, so confirm a change in the generator, where the lanes and CPU
+  limit a fast net. See "Inference speed" in `docs/reference/MODEL_ARCHITECTURE.md`.
 
 ## Current cost, 128 raster, 2026-11-01
 
