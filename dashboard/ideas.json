@@ -63,6 +63,24 @@
     "test": "Arena `blocks8`, `c_d222_short_n1` and `m_d111_c22` against the current net at equal time on both boards, about 500 games each. Check a trained one over whole games on 8 vCPU. Checkpoints are in `artifacts/shape-screen/runs/`, and the dashboard's Net shapes tab shows the screen."
   },
   {
+    "id": "lane-cpu",
+    "status": "Next",
+    "bucket": "Speed",
+    "effort": "M",
+    "title": "Cut the CPU work inside inference lanes",
+    "why": "At 192 the lighter net reads 16.4k positions/s in the generator against a 23k card ceiling, with the CPU 60% idle. Each lane spends 28% of its time packing inputs and materializing outputs, about 1.1 ms a batch, and the card waits. A third lane makes it worse. Applying the board rotation twice per batch also wastes training CPU: the second call only needs the ownership map.",
+    "test": "Time `input_packing` and `output_materialization` in broker telemetry before and after, then confirm in the generator."
+  },
+  {
+    "id": "naive-stop",
+    "status": "Next",
+    "bucket": "Engineering",
+    "effort": "S",
+    "title": "Stop the naive generator once its window is full",
+    "why": "The first update of a fresh run took 64 minutes against about 9, because the naive generator kept all 32 threads while training prepared batches, and it wrote 38 GB of games nobody trains on. Stopping it by hand brought the card straight back.",
+    "test": "Touch the stop file when the first training starts, and confirm a fresh run's first update finishes in about 10 minutes."
+  },
+  {
     "id": "score-head",
     "status": "Later",
     "bucket": "Extract",

@@ -23,7 +23,7 @@ Don't reopen these without new evidence.
 | Bigger nets at this compute | Dead end. One doubling of simulations is worth about 61 Elo |
 | Tanh value head with MSE | Gradient vanished on confidently wrong positions |
 | Random-candidate sampler | Target carried no board-dependent signal |
-| Three inference lanes on the current net | No gain over whole games: 18.5k positions/s against 18.6k at 128, 7.3k against 7.4k at 192. Hung at 256, 2 runs of 2. A net 1.6x faster or more does gain, +15% in 140 s early-game runs at 128. The lighter net then ran 15 minutes on three lanes at 128 with no failures, at 33.8k positions/s |
+| Three inference lanes on the current net | No gain over whole games: 18.5k positions/s against 18.6k at 128, 7.3k against 7.4k at 192. Hung at 256, 2 runs of 2. A net 1.6x faster or more does gain, +15% in 140 s early-game runs at 128. The lighter net then ran 15 minutes on three lanes at 128 with no failures, at 33.8k positions/s. At 192 three lanes lose: 13.5k against 16.4k, because each session slows from 2.8 ms to 4.8 ms a batch |
 | Maximum batch 64 | Slower: 16.8k positions/s against 18.8k at 32, two lanes at 128. The card runs near its compute limit at 32 |
 | Vectorized bounded transform in place of the envelope | Big boards flat, small boards 25% slower. A row's reach is set by its farthest pixel, which on a small board is 40 offsets or more |
 | Fixed-batch TensorRT engines | +0.9% and -1.2% against a batch 1 to 32 profile, so the graph's `Shape` nodes cost nothing |

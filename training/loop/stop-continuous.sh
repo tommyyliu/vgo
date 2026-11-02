@@ -65,7 +65,7 @@ for p in /proc/[0-9]*; do
   pid=${p#/proc/}
   [ "$pid" = "$$" ] && continue
   [ "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" = "/usr/bin/bash" ] || continue
-  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "continuous-loop" && loop_pids+=("$pid")
+  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "bulk-loop" && loop_pids+=("$pid")
 done
 if [ "${#loop_pids[@]}" -gt 0 ]; then
   echo "[stop] loop: ${loop_pids[*]}"
