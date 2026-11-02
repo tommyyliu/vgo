@@ -153,6 +153,7 @@ Off by default; each is byte-identical to the default when disabled.
 | option | effect | status |
 |---|---|---|
 | `context_attention_blocks` | replaces trailing residual blocks in each context stage with transformer blocks | measured: faster early, converges to a tie |
+| `shape` | dict of channel, block count and tail departures, carried in the checkpoint; keys in `SHAPE_KEYS` | screened on loss only, see [Training screen](#training-screen) |
 | `global_pooling` | heads read mean, size-scaled mean and max instead of the mean alone | branch `experiment/global-pooling` |
 | `optimistic_policy` | second policy head weighted toward better-than-predicted outcomes, for search to read | branch `experiment/optimistic-policy` |
 
@@ -207,6 +208,34 @@ the CPU around `session.run`, so a 39k ceiling gave 31k. A third lane gave +15% 
 nets, against +7% on the current one in the same short runs and nothing over whole games. The
 CPU then has to keep up: on two lanes, over 140 s early in games, the same nets stopped at
 25.7k on 8 physical cores and 22k on 8 threads of 4 cores. Whole games need more CPU than that.
+
+### Training screen
+
+Each shape trained from scratch with the loop's recipe, 8 epochs on the newest 150k samples of
+`r128-s2000`. KL is final validation policy KL against the mean of three control seeds, which
+was 1.884 with a standard deviation of 0.003. Speeds were measured on random weights, and the
+stacks in the PixelShuffle build, which timed the same as bilinear. Generator speeds are 110 s
+early-game runs on all 32 threads with three lanes, so whole games on fewer cores will read lower.
+
+| Shape | Card | Generator | KL |
+|---|---|---|---|
+| `d222`, detail blocks 2/2/2 | +28% | | -0.013 |
+| `blocks8` | +48% | | -0.009 |
+| `d112`, detail blocks 1/1/2 | +43% | | -0.005 |
+| `norm1`, one norm per block | +15% | | +0.001 |
+| `attn0`, no attention | +7% | | +0.010 |
+| `wd32`, detail width 32 | +36% | | +0.010 |
+| `c_d222_short_n1`: 2/2/2, context 3/3, bottleneck tail, no attention, one norm | +82% | +66% | +0.014 |
+| `c_d222_c22_n1`: the same with context 2/2 | +92% | +54% | +0.018 |
+| `c_w32_ctx96_bt_a0_n1`: detail 32, context 96, bottleneck tail, no attention, one norm | +96% | +85% | +0.042 |
+
+Value metrics do not separate these. Controls spread 0.549 to 0.568 in MAE, and `norm1` read
+0.648 while every stack containing one norm read 0.516 to 0.558. Validation holds about 70
+games and each net memorizes its training games, at MAE 0.05, so read KL only.
+
+This shows how fast a shape learns in a short run, not how strong it ends up. Attention is
+the warning: it wins early here and has converged to a tie in longer runs. No KL gap has been
+converted to Elo, and `c_d222_c22_n1`'s low generator rate is unexplained.
 
 ## What is known about changing it
 

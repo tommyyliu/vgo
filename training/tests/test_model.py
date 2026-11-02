@@ -212,7 +212,6 @@ class ModelTests(unittest.TestCase):
             "detail_blocks": [1, 2, 1],
             "context_blocks": [2, 1],
             "tail": "bottleneck",
-            "policy_upsample": "pixelshuffle",
         }
         torch.manual_seed(42)
         model = build_model(
@@ -237,13 +236,6 @@ class ModelTests(unittest.TestCase):
             torch.save(checkpoint, path)
             loaded, _ = load_model(path)
         torch.testing.assert_close(loaded(states)[0], expected[0])
-
-    def test_pixelshuffle_refuses_a_fractional_ratio(self) -> None:
-        with self.assertRaisesRegex(ValueError, "whole ratio"):
-            build_model(
-                channels=7, width=16, blocks=4, policy_resolution=128,
-                raster_resolution=192, shape={"policy_upsample": "pixelshuffle"},
-            )
 
     def test_full_legal_loss_pushes_down_unexplored_legal_cells(self) -> None:
         states = torch.zeros(1, 10, 1, 3)

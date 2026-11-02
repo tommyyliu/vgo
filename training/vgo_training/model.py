@@ -265,7 +265,6 @@ SHAPE_KEYS = frozenset(
         "detail_blocks",  # [entry, stage1, stage2]
         "context_blocks",  # [stage1, stage2], attention blocks included
         "tail",  # "residual" or "bottleneck"
-        "policy_upsample",  # "bilinear" or "pixelshuffle"
     }
 )
 
@@ -479,34 +478,11 @@ class DDRNetPolicyValueNet(nn.Module):
                 else residual_stack(fused_channels, 1, norm_groups, norms_per_block)
             ),
         )
-        upsample = shape.get("policy_upsample", "bilinear")
-        if upsample not in ("bilinear", "pixelshuffle"):
-            raise ValueError(f"unknown policy upsample: {upsample!r}")
-        upscale = 1
-        if upsample == "pixelshuffle":
-            if raster_resolution is None:
-                raise ValueError("pixelshuffle needs raster_resolution")
-            trunk_size = -(-raster_resolution // stem_stride)
-            target = policy_resolution or raster_resolution
-            upscale = target // trunk_size
-            if upscale * trunk_size != target:
-                raise ValueError(
-                    f"pixelshuffle needs a whole ratio, not {trunk_size} to {target}"
-                )
-
-        def policy_output() -> nn.Module:
-            if upsample == "bilinear":
-                return nn.Conv2d(head_channels, 1, kernel_size=1)
-            return nn.Sequential(
-                nn.Conv2d(head_channels, upscale * upscale, kernel_size=1),
-                nn.PixelShuffle(upscale),
-            )
-
         self.policy_features = nn.Sequential(
             nn.Conv2d(fused_channels, head_channels, kernel_size=3, padding=1),
             nn.ReLU(),
         )
-        self.policy_map = policy_output()
+        self.policy_map = nn.Conv2d(head_channels, 1, kernel_size=1)
         # Ownership: who holds each cell when the game ends, in [-1, 1] from the
         # mover's view. Spatial rather than scalar on purpose -- a game's ~58
         # positions all share one value label, which a net of this capacity
@@ -528,7 +504,7 @@ class DDRNetPolicyValueNet(nn.Module):
             nn.Conv2d(fused_channels, head_channels, kernel_size=3, padding=1),
             nn.ReLU(),
         )
-        self.policy_map_normed = policy_output()
+        self.policy_map_normed = nn.Conv2d(head_channels, 1, kernel_size=1)
         self.ownership_features_normed = nn.Sequential(
             nn.Conv2d(fused_channels, head_channels, kernel_size=3, padding=1),
             nn.ReLU(),
