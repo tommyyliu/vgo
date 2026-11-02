@@ -202,6 +202,22 @@ class ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "detail_block"):
             build_model(channels=7, width=16, blocks=4, shape={"detail_block": [1, 1, 1]})
 
+    def test_a_net_can_have_empty_stages_and_a_conv_tail(self) -> None:
+        """The smallest net has no blocks at all, only the path through the branches."""
+        model = build_model(
+            channels=7, width=16, blocks=4, norm_groups=8, raster_resolution=32,
+            shape={"detail_blocks": [0, 0, 0], "context_blocks": [0, 0], "tail": "conv"},
+        ).eval()
+        self.assertEqual(len(model.detail_tail), 1)
+        self.assertEqual(len(model.detail_stage1), 0)
+        policy, value = model(torch.zeros(2, 7, 32, 32))
+        self.assertEqual(policy.shape, (2, 32 * 32 + 1))
+        self.assertEqual(value.shape, (2,))
+
+    def test_an_unknown_tail_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown tail"):
+            build_model(channels=7, width=16, blocks=4, shape={"tail": "none"})
+
     def test_shape_round_trips_through_the_loader(self) -> None:
         """Every shape key changes the function, so losing one is a silent bug."""
         shape = {

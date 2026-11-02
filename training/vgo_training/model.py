@@ -264,7 +264,7 @@ SHAPE_KEYS = frozenset(
         "fused_channels",
         "detail_blocks",  # [entry, stage1, stage2]
         "context_blocks",  # [stage1, stage2], attention blocks included
-        "tail",  # "residual" or "bottleneck"
+        "tail",  # "residual", "bottleneck", or "conv" for the 1x1 projection alone
     }
 )
 
@@ -467,17 +467,19 @@ class DDRNetPolicyValueNet(nn.Module):
             else nn.Conv2d(context_channels, fused_channels, kernel_size=1)
         )
         tail = shape.get("tail", "residual")
-        if tail not in ("residual", "bottleneck"):
+        if tail not in ("residual", "bottleneck", "conv"):
             raise ValueError(f"unknown tail: {tail!r}")
-        self.detail_tail = nn.Sequential(
-            nn.Conv2d(detail_channels, fused_channels, kernel_size=1),
-            nn.ReLU(),
-            *(
-                [BottleneckBlock(fused_channels, norm_groups)]
-                if tail == "bottleneck"
-                else residual_stack(fused_channels, 1, norm_groups, norms_per_block)
-            ),
-        )
+        tail_layers: list[nn.Module] = [
+            nn.Conv2d(detail_channels, fused_channels, kernel_size=1)
+        ]
+        if tail == "bottleneck":
+            tail_layers += [nn.ReLU(), BottleneckBlock(fused_channels, norm_groups)]
+        elif tail == "residual":
+            tail_layers += [
+                nn.ReLU(),
+                *residual_stack(fused_channels, 1, norm_groups, norms_per_block),
+            ]
+        self.detail_tail = nn.Sequential(*tail_layers)
         self.policy_features = nn.Sequential(
             nn.Conv2d(fused_channels, head_channels, kernel_size=3, padding=1),
             nn.ReLU(),

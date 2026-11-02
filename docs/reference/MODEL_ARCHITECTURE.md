@@ -186,7 +186,21 @@ random one. Strength was not measured for any of this.
 | PixelShuffle policy, 16 channels | 100% | none |
 | Input 96 / 192 / 256 | 56% / 228% / 411% | +34% / -65% / -79% |
 
-Stacked, the shapes reach 34k to 41k. What decides the result:
+Stacked, the shapes reach 34k to 41k. Stripping further, the current net's 49 µs per position
+divides like this, from a net with nothing in it and one part added back at a time:
+
+| Part | µs | Share |
+|---|---|---|
+| Detail blocks 4/4/4 | 13.0 | 27% |
+| Norms, across all blocks | 10.0 | 20% |
+| Floor: input, stem, downsampling, fusion, policy conv, output | 9.7 | 20% |
+| Context blocks 4/4 | 7.2 | 15% |
+| Attention | 3.2 | 7% |
+| Tail block | 2.3 | 5% |
+| DAPPM | 0.8 | 2% |
+| Not additive | 2.7 | 6% |
+
+What decides the result:
 
 - **Time follows arithmetic for plain blocks**, so cutting them pays one for one. Each
   residual stage, context stages included, is about 15% of the arithmetic, because doubling
@@ -213,29 +227,43 @@ CPU then has to keep up: on two lanes, over 140 s early in games, the same nets 
 
 Each shape trained from scratch with the loop's recipe, 8 epochs on the newest 150k samples of
 `r128-s2000`. KL is final validation policy KL against the mean of three control seeds, which
-was 1.884 with a standard deviation of 0.003. Speeds were measured on random weights, and the
+was 1.884 with a standard deviation of 0.003. Card speeds were measured on random weights, and the
 stacks in the PixelShuffle build, which timed the same as bilinear. Generator speeds are the first
-75 s of early-game runs on all 32 threads with three lanes, so whole games on fewer cores will
-read lower. The dashboard's Net shapes tab draws this from
+75 s of early-game runs on all 32 threads with three lanes, on trained weights except where marked,
+so whole games on fewer cores will read lower. The dashboard's Net shapes tab draws this from
 [`performance/shape-screen.json`](../../performance/shape-screen.json).
 
 | Shape | Card | Generator | KL |
 |---|---|---|---|
 | `d222`, detail blocks 2/2/2 | +28% | | -0.013 |
-| `blocks8` | +48% | | -0.009 |
+| `blocks8` | +48% | +40% | -0.009 |
 | `d112`, detail blocks 1/1/2 | +43% | | -0.005 |
 | `norm1`, one norm per block | +15% | | +0.001 |
 | `attn0`, no attention | +7% | | +0.010 |
 | `wd32`, detail width 32 | +36% | | +0.010 |
-| `c_d222_short_n1`: 2/2/2, context 3/3, bottleneck tail, no attention, one norm | +82% | +64% | +0.013 |
-| `c_d222_c22_n1`: the same with context 2/2 | +92% | +51% | +0.018 |
-| `c_w32_ctx96_bt_a0_n1`: detail 32, context 96, bottleneck tail, no attention, one norm | +96% | +82% | +0.042 |
+| `c_d222_short_n1`: 2/2/2, context 3/3, bottleneck tail, no attention, one norm | +82% | +63% | +0.013 |
+| `c_d222_c22_n1`: the same with context 2/2 | +92% | +53%, random weights | +0.018 |
+| `c_w32_ctx96_bt_a0_n1`: detail 32, context 96, bottleneck tail, no attention, one norm | +96% | +83%, random weights | +0.042 |
+| `m_d222_c22`: 2/2/2, context 2/2, no tail block, no attention, one norm | +111% | | +0.031 |
+| `m_d222_c11`: the same with context 1/1 | +135% | | +0.033 |
+| `m_d111_c22`: 1/1/1, context 2/2, no tail block, no attention, one norm | +165% | +76% | +0.022 |
+| `m_d111_c11`: one block per stage | +204% | +87% | +0.037 |
+| `m_d011_c11`: the same with no entry block | +210% | | +0.042 |
+| `m_w32`: everything half as wide | +246% | | +0.068 |
+| `floor`: no blocks at all | +366% | | +0.117 |
 
 Value metrics do not separate these. Controls spread 0.549 to 0.568 in MAE, and `norm1` read
 0.648 while every stack containing one norm read 0.516 to 0.558. Validation holds about 70
 games and each net memorizes its training games, at MAE 0.05, so read KL only. Total validation
 loss is lowest at epoch 1 to 3 in 14 of the 15 runs and then stays flat or climbs, for the same
 reason. No shortlisted shape reads worse on it than the controls, at 6.51 to 6.61.
+
+The generator stops gaining near 40k here, so 54k and 62k on the card read 37k and 40k. On 8 threads
+of 4 cores `blocks8`'s gain was gone within three minutes, and `m_d111_c22` led the current net by
+13% and was falling.
+
+`floor` matches the control on value sign, 72.1% against 72.7%, so value can't separate shapes at
+this scale. It is +0.117 on policy KL, so this screen does detect lost capacity through policy.
 
 This shows how fast a shape learns in a short run, not how strong it ends up. Attention is
 the warning: it wins early here and has converged to a tie in longer runs. No KL gap has been
