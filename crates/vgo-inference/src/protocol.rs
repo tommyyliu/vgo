@@ -102,7 +102,7 @@ impl InferenceOutput {
         if !current_value.is_finite() || !(-1.0..=1.0).contains(&current_value) {
             return Err(EvaluationError::new("invalid inference value"));
         }
-        if policy.iter().any(|logit| !logit.is_finite()) {
+        if !all_finite(&policy) {
             return Err(EvaluationError::new("non-finite policy logit"));
         }
         Ok(Self {
@@ -131,6 +131,16 @@ impl InferenceOutput {
     pub fn into_parts(self) -> (u64, f64, Vec<f32>) {
         (self.id, self.current_value, self.policy)
     }
+}
+
+/// Whether no value is infinite or NaN, which are the floats with every exponent
+/// bit set. Folding those bits has no early exit, so it vectorizes. `any` with
+/// `is_finite` does not, and on a policy map it cost 0.1 ms of each batch on a lane.
+fn all_finite(values: &[f32]) -> bool {
+    const EXPONENT: u32 = 0x7f80_0000;
+    !values.iter().fold(false, |found, value| {
+        found | (value.to_bits() & EXPONENT == EXPONENT)
+    })
 }
 
 pub fn encode_request_frame(batch: &[InferenceInput]) -> Result<Vec<u8>, EvaluationError> {
@@ -297,8 +307,8 @@ mod tests {
     use vgo_raster::{RasterConfig, rasterize};
 
     use super::{
-        InferenceInput, PROTOCOL_VERSION, RESPONSE_MAGIC, encode_request_frame,
-        read_response_frame, read_response_frame_with_policy,
+        InferenceInput, InferenceOutput, PROTOCOL_VERSION, RESPONSE_MAGIC, all_finite,
+        encode_request_frame, read_response_frame, read_response_frame_with_policy,
     };
 
     fn inputs() -> Vec<InferenceInput> {
@@ -324,6 +334,47 @@ mod tests {
             }
         }
         response
+    }
+
+    #[test]
+    fn finite_check_agrees_with_is_finite_on_every_kind_of_float() {
+        let values = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.5,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::MAX,
+            f32::MIN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::from_bits(0x7f80_0001),
+            f32::from_bits(0xffff_ffff),
+        ];
+        for value in values {
+            assert_eq!(
+                all_finite(&[value]),
+                value.is_finite(),
+                "{:#x}",
+                value.to_bits()
+            );
+            // The last slot, because a vectorized fold has a tail of its own.
+            let mut policy = vec![1.0; 16_385];
+            policy[16_384] = value;
+            assert_eq!(
+                all_finite(&policy),
+                value.is_finite(),
+                "{:#x}",
+                value.to_bits()
+            );
+            assert_eq!(
+                InferenceOutput::new(1, 0.0, policy).is_ok(),
+                value.is_finite()
+            );
+        }
     }
 
     #[test]
