@@ -198,6 +198,53 @@ class ModelTests(unittest.TestCase):
             policy, _ = model(torch.zeros(1, 7, resolution, resolution))
             self.assertEqual(policy.shape[1], resolution * resolution + 1)
 
+    def test_a_misspelled_shape_key_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "detail_block"):
+            build_model(channels=7, width=16, blocks=4, shape={"detail_block": [1, 1, 1]})
+
+    def test_shape_round_trips_through_the_loader(self) -> None:
+        """Every shape key changes the function, so losing one is a silent bug."""
+        shape = {
+            "detail_channels": 16,
+            "context_channels": 32,
+            "deep_channels": 64,
+            "fused_channels": 48,
+            "detail_blocks": [1, 2, 1],
+            "context_blocks": [2, 1],
+            "tail": "bottleneck",
+            "policy_upsample": "pixelshuffle",
+        }
+        torch.manual_seed(42)
+        model = build_model(
+            channels=7, width=32, blocks=4, norm_groups=8, raster_resolution=32, shape=shape
+        ).eval()
+        states = torch.randn(2, 7, 32, 32)
+        expected = model(states)
+        self.assertEqual(expected[0].shape[1], 32 * 32 + 1)
+        checkpoint = {
+            "architecture": "ddrnet",
+            "channels": 7,
+            "height": 32,
+            "width": 32,
+            "model_width": 32,
+            "blocks": 4,
+            "norm_groups": 8,
+            "shape": shape,
+            "state_dict": model.state_dict(),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ddrnet.pt"
+            torch.save(checkpoint, path)
+            loaded, _ = load_model(path)
+        torch.testing.assert_close(loaded(states)[0], expected[0])
+
+    def test_pixelshuffle_refuses_a_fractional_ratio(self) -> None:
+        with self.assertRaisesRegex(ValueError, "whole ratio"):
+            build_model(
+                channels=7, width=16, blocks=4, policy_resolution=128,
+                raster_resolution=192, shape={"policy_upsample": "pixelshuffle"},
+            )
+
     def test_full_legal_loss_pushes_down_unexplored_legal_cells(self) -> None:
         states = torch.zeros(1, 10, 1, 3)
         states[:, 7] = torch.tensor([[[0.5, 0.25, -0.5]]])

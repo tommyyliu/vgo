@@ -118,6 +118,33 @@ class ResidualBlock(nn.Module):
         return torch.relu(inputs + self.layers(inputs))
 
 
+class BottleneckBlock(nn.Module):
+    """A residual block whose 3x3 runs at half the width, costing about 30% as much."""
+
+    def __init__(self, width: int, groups: int | None = None) -> None:
+        super().__init__()
+        inner = width // 2
+
+        def norm(channels: int) -> nn.Module:
+            if groups is None:
+                return nn.Identity()
+            return nn.GroupNorm(_group_count(channels, groups), channels)
+
+        self.layers = nn.Sequential(
+            nn.Conv2d(width, inner, kernel_size=1, bias=False),
+            norm(inner),
+            nn.ReLU(),
+            nn.Conv2d(inner, inner, kernel_size=3, padding=1, bias=False),
+            norm(inner),
+            nn.ReLU(),
+            nn.Conv2d(inner, width, kernel_size=1, bias=False),
+            norm(width),
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return torch.relu(inputs + self.layers(inputs))
+
+
 class _Down(nn.Module):
     """Stride-2 conv downsample followed by residual blocks at the smaller scale.
 
@@ -227,6 +254,22 @@ class _DDRContext(nn.Module):
         return torch.relu(self.compression(combined) + self.shortcut(inputs))
 
 
+# Experimental departures from the shape `width` and `blocks` imply, as a dict so
+# one checkpoint field carries them all. Unset keys keep the default.
+SHAPE_KEYS = frozenset(
+    {
+        "detail_channels",
+        "context_channels",
+        "deep_channels",
+        "fused_channels",
+        "detail_blocks",  # [entry, stage1, stage2]
+        "context_blocks",  # [stage1, stage2], attention blocks included
+        "tail",  # "residual" or "bottleneck"
+        "policy_upsample",  # "bilinear" or "pixelshuffle"
+    }
+)
+
+
 class DDRNetPolicyValueNet(nn.Module):
     """DDRNet-inspired dual-resolution policy/value network.
 
@@ -258,8 +301,13 @@ class DDRNetPolicyValueNet(nn.Module):
         attention_heads: int = 8,
         raster_resolution: int | None = None,
         norms_per_block: int = 2,
+        shape: dict[str, object] | None = None,
     ) -> None:
         super().__init__()
+        shape = shape or {}
+        # A misspelled key would otherwise train the default net under a new name.
+        if unknown := set(shape) - SHAPE_KEYS:
+            raise ValueError(f"unknown shape keys: {sorted(unknown)}")
         if stem_stride not in (1, 2, 4):
             raise ValueError("stem stride must be 1, 2, or 4")
         # Attention is the only part of this net that is not resolution-agnostic:
@@ -289,10 +337,18 @@ class DDRNetPolicyValueNet(nn.Module):
             raise ValueError("norms_per_block must be 1 or 2")
         self.norms_per_block = norms_per_block
         stem_channels = max(8, width // 2)
-        detail_channels = width
-        context_channels = width * 2
-        deep_channels = width * 4
+        head_channels = width
+        detail_channels = int(shape.get("detail_channels", width))
+        context_channels = int(shape.get("context_channels", width * 2))
+        deep_channels = int(shape.get("deep_channels", width * 4))
+        fused_channels = int(shape.get("fused_channels", context_channels))
         stage_blocks = max(1, (blocks + 3) // 4)
+        entry_blocks, stage1_blocks, stage2_blocks = shape.get(
+            "detail_blocks", (stage_blocks, stage_blocks, stage_blocks)
+        )
+        context1_blocks, context2_blocks = shape.get(
+            "context_blocks", (stage_blocks, stage_blocks)
+        )
 
         # The stem sets the resolution the whole tower reasons at, which the
         # default 4 puts at raster/4 -- 32x32 from a 128 input, where a stone of
@@ -320,16 +376,16 @@ class DDRNetPolicyValueNet(nn.Module):
             nn.ReLU(),
         )
         self.detail_entry = nn.Sequential(
-            *residual_stack(detail_channels, stage_blocks, norm_groups, norms_per_block)
+            *residual_stack(detail_channels, entry_blocks, norm_groups, norms_per_block)
         )
 
         self.detail_stage1 = nn.Sequential(
-            *residual_stack(detail_channels, stage_blocks, norm_groups, norms_per_block)
+            *residual_stack(detail_channels, stage1_blocks, norm_groups, norms_per_block)
         )
         self.context_stage1 = _Down(
             detail_channels,
             context_channels,
-            stage_blocks,
+            context1_blocks,
             groups=norm_groups,
             attention_blocks=context_attention_blocks,
             attention_heads=attention_heads,
@@ -348,12 +404,12 @@ class DDRNetPolicyValueNet(nn.Module):
         )
 
         self.detail_stage2 = nn.Sequential(
-            *residual_stack(detail_channels, stage_blocks, norm_groups, norms_per_block)
+            *residual_stack(detail_channels, stage2_blocks, norm_groups, norms_per_block)
         )
         self.context_stage2 = _Down(
             context_channels,
             deep_channels,
-            stage_blocks,
+            context2_blocks,
             groups=norm_groups,
             attention_blocks=context_attention_blocks,
             attention_heads=attention_heads,
@@ -405,19 +461,52 @@ class DDRNetPolicyValueNet(nn.Module):
         # the rest; that copy is what inference uses, so no running statistics
         # are needed at export and there is no train/inference divergence.
         self.semantic_norm = nn.BatchNorm2d(context_channels)
-        self.fused_norm = nn.BatchNorm2d(context_channels)
+        self.fused_norm = nn.BatchNorm2d(fused_channels)
+        self.semantic_to_fused = (
+            nn.Identity()
+            if fused_channels == context_channels
+            else nn.Conv2d(context_channels, fused_channels, kernel_size=1)
+        )
+        tail = shape.get("tail", "residual")
+        if tail not in ("residual", "bottleneck"):
+            raise ValueError(f"unknown tail: {tail!r}")
         self.detail_tail = nn.Sequential(
-            nn.Conv2d(detail_channels, context_channels, kernel_size=1),
+            nn.Conv2d(detail_channels, fused_channels, kernel_size=1),
             nn.ReLU(),
-            *residual_stack(context_channels, 1, norm_groups, norms_per_block),
-        )
-        self.policy_features = nn.Sequential(
-            nn.Conv2d(
-                context_channels, detail_channels, kernel_size=3, padding=1
+            *(
+                [BottleneckBlock(fused_channels, norm_groups)]
+                if tail == "bottleneck"
+                else residual_stack(fused_channels, 1, norm_groups, norms_per_block)
             ),
+        )
+        upsample = shape.get("policy_upsample", "bilinear")
+        if upsample not in ("bilinear", "pixelshuffle"):
+            raise ValueError(f"unknown policy upsample: {upsample!r}")
+        upscale = 1
+        if upsample == "pixelshuffle":
+            if raster_resolution is None:
+                raise ValueError("pixelshuffle needs raster_resolution")
+            trunk_size = -(-raster_resolution // stem_stride)
+            target = policy_resolution or raster_resolution
+            upscale = target // trunk_size
+            if upscale * trunk_size != target:
+                raise ValueError(
+                    f"pixelshuffle needs a whole ratio, not {trunk_size} to {target}"
+                )
+
+        def policy_output() -> nn.Module:
+            if upsample == "bilinear":
+                return nn.Conv2d(head_channels, 1, kernel_size=1)
+            return nn.Sequential(
+                nn.Conv2d(head_channels, upscale * upscale, kernel_size=1),
+                nn.PixelShuffle(upscale),
+            )
+
+        self.policy_features = nn.Sequential(
+            nn.Conv2d(fused_channels, head_channels, kernel_size=3, padding=1),
             nn.ReLU(),
         )
-        self.policy_map = nn.Conv2d(detail_channels, 1, kernel_size=1)
+        self.policy_map = policy_output()
         # Ownership: who holds each cell when the game ends, in [-1, 1] from the
         # mover's view. Spatial rather than scalar on purpose -- a game's ~58
         # positions all share one value label, which a net of this capacity
@@ -425,10 +514,10 @@ class DDRNetPolicyValueNet(nn.Module):
         # Ownership varies within a game, so the same trajectory cannot collapse
         # to one number.
         self.ownership_features = nn.Sequential(
-            nn.Conv2d(context_channels, detail_channels, kernel_size=3, padding=1),
+            nn.Conv2d(fused_channels, head_channels, kernel_size=3, padding=1),
             nn.ReLU(),
         )
-        self.ownership_map = nn.Conv2d(detail_channels, 1, kernel_size=1)
+        self.ownership_map = nn.Conv2d(head_channels, 1, kernel_size=1)
         self.pass_head = nn.Linear(context_channels, 1)
         self.value_head = value_head(context_channels)
 
@@ -436,17 +525,15 @@ class DDRNetPolicyValueNet(nn.Module):
         # bulk of the loss, so they drive optimization; the heads above learn the
         # same predictions from unnormalized features and are used at inference.
         self.policy_features_normed = nn.Sequential(
-            nn.Conv2d(
-                context_channels, detail_channels, kernel_size=3, padding=1
-            ),
+            nn.Conv2d(fused_channels, head_channels, kernel_size=3, padding=1),
             nn.ReLU(),
         )
-        self.policy_map_normed = nn.Conv2d(detail_channels, 1, kernel_size=1)
+        self.policy_map_normed = policy_output()
         self.ownership_features_normed = nn.Sequential(
-            nn.Conv2d(context_channels, detail_channels, kernel_size=3, padding=1),
+            nn.Conv2d(fused_channels, head_channels, kernel_size=3, padding=1),
             nn.ReLU(),
         )
-        self.ownership_map_normed = nn.Conv2d(detail_channels, 1, kernel_size=1)
+        self.ownership_map_normed = nn.Conv2d(head_channels, 1, kernel_size=1)
         self.pass_head_normed = nn.Linear(context_channels, 1)
         self.value_head_normed = value_head(context_channels)
 
@@ -508,7 +595,7 @@ class DDRNetPolicyValueNet(nn.Module):
         semantic = self.context(context)
         fused = torch.relu(
             self.detail_tail(detail)
-            + self._resize(semantic, detail.shape[-2:])
+            + self._resize(self.semantic_to_fused(semantic), detail.shape[-2:])
         )
         target_size = (
             (self.policy_resolution, self.policy_resolution)
@@ -607,6 +694,7 @@ def build_model(
     attention_heads: int = 8,
     raster_resolution: int | None = None,
     norms_per_block: int = 2,
+    shape: dict[str, object] | None = None,
 ) -> DDRNetPolicyValueNet:
     """`policy_resolution` coarsens the placement grid the policy head emits
     while leaving the input raster untouched; None keeps them equal.
@@ -624,6 +712,7 @@ def build_model(
         attention_heads=attention_heads,
         raster_resolution=raster_resolution,
         norms_per_block=norms_per_block,
+        shape=shape,
     )
 
 
@@ -656,6 +745,7 @@ def load_model(checkpoint_path: Path) -> tuple[DDRNetPolicyValueNet, dict[str, o
         attention_heads=int(checkpoint.get("attention_heads", 8)),
         raster_resolution=height,
         norms_per_block=int(checkpoint.get("norms_per_block", 2)),
+        shape=checkpoint.get("shape"),
     )
     # The batch-normalized twin heads and the ownership head exist only while
     # training, so an exported model lacks them. Everything inference reads

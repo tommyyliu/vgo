@@ -89,6 +89,8 @@ class LearnerConfig:
     norm_groups: int | None = None
     norms_per_block: int = 2
     stem_stride: int = 4
+    # Experimental departures from the default shape; see `SHAPE_KEYS` in model.py.
+    shape: dict[str, object] | None = None
     # Weight on the auxiliary ownership loss, relative to policy at 1.0. Zero
     # disables the head's supervision *and* stops the window holding its
     # targets, which is 0.063 MB per sample -- a fifth of a packed sample. The
@@ -1231,6 +1233,7 @@ class PersistentLearner:
                 and int(metadata.get("blocks", -1)) == config.blocks
                 and int(metadata.get("norms_per_block", 2)) == config.norms_per_block
                 and int(metadata.get("stem_stride", 4)) == config.stem_stride
+                and metadata.get("shape") == config.shape
             )
             if reused:
                 parent_checkpoint = str(self.current_checkpoint)
@@ -1286,6 +1289,7 @@ class PersistentLearner:
                     "norm_groups": checkpoint.get("norm_groups"),
                     "norms_per_block": int(checkpoint.get("norms_per_block", 2)),
                     "stem_stride": int(checkpoint.get("stem_stride", 4)),
+                    "shape": checkpoint.get("shape"),
                     "context_attention_blocks": int(
                         checkpoint.get("context_attention_blocks", 0)
                     ),
@@ -1298,6 +1302,7 @@ class PersistentLearner:
                     blocks=config.blocks,
                     policy_resolution=decoupled,
                     stem_stride=config.stem_stride,
+                    shape=config.shape,
                     norm_groups=config.norm_groups,
                     norms_per_block=config.norms_per_block,
                     context_attention_blocks=config.context_attention_blocks,
@@ -1317,6 +1322,7 @@ class PersistentLearner:
                     "norm_groups": config.norm_groups,
                     "norms_per_block": config.norms_per_block,
                     "stem_stride": config.stem_stride,
+                    "shape": config.shape,
                     "context_attention_blocks": config.context_attention_blocks,
                     "attention_heads": config.attention_heads,
                 }

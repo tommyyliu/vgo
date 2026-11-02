@@ -124,6 +124,10 @@ def main() -> None:
     parser.add_argument("--norms-per-block", type=int, choices=(1, 2), default=2)
     parser.add_argument("--stem-stride", type=int, choices=(1, 2, 4), default=4)
     parser.add_argument(
+        "--shape", type=json.loads, default=None,
+        help="JSON of departures from the default shape; see SHAPE_KEYS in model.py",
+    )
+    parser.add_argument(
         "--context-attention-blocks",
         type=int,
         default=0,
@@ -184,6 +188,7 @@ def main() -> None:
         norm_groups=arguments.norm_groups,
         norms_per_block=arguments.norms_per_block,
         stem_stride=arguments.stem_stride,
+        shape=arguments.shape,
         threads=arguments.threads,
         device=arguments.device,
         precision=arguments.precision,
