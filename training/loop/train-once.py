@@ -122,6 +122,7 @@ def main() -> None:
     )
     parser.add_argument("--norm-groups", type=int, default=8)
     parser.add_argument("--norms-per-block", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--stem-stride", type=int, choices=(1, 2, 4), default=4)
     parser.add_argument(
         "--context-attention-blocks",
         type=int,
@@ -182,6 +183,7 @@ def main() -> None:
         attention_heads=arguments.attention_heads,
         norm_groups=arguments.norm_groups,
         norms_per_block=arguments.norms_per_block,
+        stem_stride=arguments.stem_stride,
         threads=arguments.threads,
         device=arguments.device,
         precision=arguments.precision,

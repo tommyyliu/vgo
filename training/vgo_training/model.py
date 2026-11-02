@@ -274,10 +274,16 @@ class DDRNetPolicyValueNet(nn.Module):
         self.context_attention_blocks = context_attention_blocks
         self.attention_heads = attention_heads
         self.raster_resolution = raster_resolution
-        # Stem divides by stem_stride; each context stage halves again.
-        trunk = None if raster_resolution is None else raster_resolution // stem_stride
-        context1_board = None if trunk is None else (trunk // 2, trunk // 2)
-        context2_board = None if trunk is None else (trunk // 4, trunk // 4)
+        # Stem divides by stem_stride; each context stage halves again. A
+        # stride-2 convolution with padding 1 rounds up, so these do too:
+        # 200 reaches 50, 25, 13, not the 12 that floor division gives.
+        trunk = (
+            None if raster_resolution is None else -(-raster_resolution // stem_stride)
+        )
+        context1 = None if trunk is None else -(-trunk // 2)
+        context2 = None if trunk is None else -(-trunk // 4)
+        context1_board = None if context1 is None else (context1, context1)
+        context2_board = None if context2 is None else (context2, context2)
         self.norm_groups = norm_groups
         if norms_per_block not in (1, 2):
             raise ValueError("norms_per_block must be 1 or 2")
@@ -642,6 +648,9 @@ def load_model(checkpoint_path: Path) -> tuple[DDRNetPolicyValueNet, dict[str, o
             if stored_policy is not None and int(stored_policy) != height
             else None
         ),
+        # The stride changes no weight shape, so a wrong one loads cleanly and
+        # computes a different function.
+        stem_stride=int(checkpoint.get("stem_stride", 4)),
         norm_groups=checkpoint.get("norm_groups"),
         context_attention_blocks=int(checkpoint.get("context_attention_blocks", 0)),
         attention_heads=int(checkpoint.get("attention_heads", 8)),

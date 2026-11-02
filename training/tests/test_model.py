@@ -157,6 +157,47 @@ class ModelTests(unittest.TestCase):
         torch.testing.assert_close(actual[0], expected[0])
         torch.testing.assert_close(actual[1], expected[1])
 
+    def test_loader_restores_the_stem_stride(self) -> None:
+        """A stride changes no weight shape, so getting it wrong loads cleanly."""
+        torch.manual_seed(42)
+        model = build_model(channels=7, width=16, blocks=4, stem_stride=2).eval()
+        states = torch.randn(2, 7, 32, 32)
+        expected = model(states)
+        checkpoint = {
+            "architecture": "ddrnet",
+            "channels": 7,
+            "height": 32,
+            "width": 32,
+            "model_width": 16,
+            "blocks": 4,
+            "stem_stride": 2,
+            "state_dict": model.state_dict(),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ddrnet.pt"
+            torch.save(checkpoint, path)
+            loaded, _ = load_model(path)
+        torch.testing.assert_close(loaded(states)[0], expected[0])
+
+    def test_attention_tables_match_the_strided_board(self) -> None:
+        """Strided convolutions round up, so the tables must too.
+
+        The sizes are multiples of 16 for the loop, and 200 and 130 are the
+        ones where floor and ceiling part: 200 reaches 13 at the deep stage,
+        130 reaches 33 after the stem.
+        """
+        for resolution in (128, 130, 200):
+            model = build_model(
+                channels=7,
+                width=32,
+                blocks=4,
+                context_attention_blocks=1,
+                attention_heads=8,
+                raster_resolution=resolution,
+            ).eval()
+            policy, _ = model(torch.zeros(1, 7, resolution, resolution))
+            self.assertEqual(policy.shape[1], resolution * resolution + 1)
+
     def test_full_legal_loss_pushes_down_unexplored_legal_cells(self) -> None:
         states = torch.zeros(1, 10, 1, 3)
         states[:, 7] = torch.tensor([[[0.5, 0.25, -0.5]]])
