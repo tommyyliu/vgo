@@ -214,8 +214,10 @@ CPU then has to keep up: on two lanes, over 140 s early in games, the same nets 
 Each shape trained from scratch with the loop's recipe, 8 epochs on the newest 150k samples of
 `r128-s2000`. KL is final validation policy KL against the mean of three control seeds, which
 was 1.884 with a standard deviation of 0.003. Speeds were measured on random weights, and the
-stacks in the PixelShuffle build, which timed the same as bilinear. Generator speeds are 110 s
-early-game runs on all 32 threads with three lanes, so whole games on fewer cores will read lower.
+stacks in the PixelShuffle build, which timed the same as bilinear. Generator speeds are the first
+75 s of early-game runs on all 32 threads with three lanes, so whole games on fewer cores will
+read lower. The dashboard's Net shapes tab draws this from
+[`performance/shape-screen.json`](../../performance/shape-screen.json).
 
 | Shape | Card | Generator | KL |
 |---|---|---|---|
@@ -225,13 +227,15 @@ early-game runs on all 32 threads with three lanes, so whole games on fewer core
 | `norm1`, one norm per block | +15% | | +0.001 |
 | `attn0`, no attention | +7% | | +0.010 |
 | `wd32`, detail width 32 | +36% | | +0.010 |
-| `c_d222_short_n1`: 2/2/2, context 3/3, bottleneck tail, no attention, one norm | +82% | +66% | +0.014 |
-| `c_d222_c22_n1`: the same with context 2/2 | +92% | +54% | +0.018 |
-| `c_w32_ctx96_bt_a0_n1`: detail 32, context 96, bottleneck tail, no attention, one norm | +96% | +85% | +0.042 |
+| `c_d222_short_n1`: 2/2/2, context 3/3, bottleneck tail, no attention, one norm | +82% | +64% | +0.013 |
+| `c_d222_c22_n1`: the same with context 2/2 | +92% | +51% | +0.018 |
+| `c_w32_ctx96_bt_a0_n1`: detail 32, context 96, bottleneck tail, no attention, one norm | +96% | +82% | +0.042 |
 
 Value metrics do not separate these. Controls spread 0.549 to 0.568 in MAE, and `norm1` read
 0.648 while every stack containing one norm read 0.516 to 0.558. Validation holds about 70
-games and each net memorizes its training games, at MAE 0.05, so read KL only.
+games and each net memorizes its training games, at MAE 0.05, so read KL only. Total validation
+loss is lowest at epoch 1 to 3 in 14 of the 15 runs and then stays flat or climbs, for the same
+reason. No shortlisted shape reads worse on it than the controls, at 6.51 to 6.61.
 
 This shows how fast a shape learns in a short run, not how strong it ends up. Attention is
 the warning: it wins early here and has converged to a tie in longer runs. No KL gap has been

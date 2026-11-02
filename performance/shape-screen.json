@@ -1,0 +1,742 @@
+{
+ "measured": "2026-11-01",
+ "window": {
+  "run": "r128-s2000",
+  "games": 778,
+  "samples": 150141,
+  "validation_samples": 13124,
+  "epochs": 8
+ },
+ "card_baseline": 21100,
+ "generator_baseline": 21413,
+ "cpu_limit": [
+  {
+   "name": "Fast net, 32 threads",
+   "points": [
+    {
+     "x": 15,
+     "y": 28451
+    },
+    {
+     "x": 30,
+     "y": 28774
+    },
+    {
+     "x": 45,
+     "y": 28707
+    },
+    {
+     "x": 60,
+     "y": 28949
+    },
+    {
+     "x": 75,
+     "y": 29028
+    },
+    {
+     "x": 90,
+     "y": 29034
+    },
+    {
+     "x": 105,
+     "y": 29322
+    }
+   ]
+  },
+  {
+   "name": "Fast net, 8 physical cores",
+   "points": [
+    {
+     "x": 15,
+     "y": 28661
+    },
+    {
+     "x": 30,
+     "y": 28456
+    },
+    {
+     "x": 45,
+     "y": 27052
+    },
+    {
+     "x": 60,
+     "y": 26717
+    },
+    {
+     "x": 75,
+     "y": 26263
+    },
+    {
+     "x": 90,
+     "y": 25796
+    },
+    {
+     "x": 105,
+     "y": 25311
+    },
+    {
+     "x": 120,
+     "y": 24784
+    },
+    {
+     "x": 135,
+     "y": 24281
+    }
+   ]
+  },
+  {
+   "name": "Fast net, 8 threads of 4 cores",
+   "points": [
+    {
+     "x": 15,
+     "y": 25622
+    },
+    {
+     "x": 30,
+     "y": 24872
+    },
+    {
+     "x": 45,
+     "y": 24013
+    },
+    {
+     "x": 60,
+     "y": 23163
+    },
+    {
+     "x": 75,
+     "y": 22792
+    },
+    {
+     "x": 90,
+     "y": 22382
+    },
+    {
+     "x": 105,
+     "y": 22079
+    },
+    {
+     "x": 120,
+     "y": 21450
+    },
+    {
+     "x": 135,
+     "y": 20975
+    }
+   ]
+  },
+  {
+   "name": "Current net, 8 threads of 4 cores",
+   "points": [
+    {
+     "x": 15,
+     "y": 19348
+    },
+    {
+     "x": 30,
+     "y": 19398
+    },
+    {
+     "x": 45,
+     "y": 19351
+    },
+    {
+     "x": 60,
+     "y": 19385
+    },
+    {
+     "x": 75,
+     "y": 19351
+    },
+    {
+     "x": 90,
+     "y": 19215
+    },
+    {
+     "x": 105,
+     "y": 18954
+    },
+    {
+     "x": 120,
+     "y": 19033
+    },
+    {
+     "x": 135,
+     "y": 19140
+    }
+   ]
+  }
+ ],
+ "shapes": [
+  {
+   "name": "control",
+   "group": "Control",
+   "change": "The loop's net: detail 4/4/4, context 4/4 with one attention block per stage, two norms per block.",
+   "parameters": 7967812,
+   "arithmetic": 1.0,
+   "card_gain": 0,
+   "generator": 21413,
+   "kl": [
+    2.1169,
+    2.0126,
+    1.9763,
+    1.9786,
+    1.9595,
+    1.9548,
+    1.9498,
+    1.8849
+   ],
+   "loss": [
+    6.504,
+    6.43,
+    6.287,
+    6.606,
+    6.482,
+    6.727,
+    6.621,
+    6.514
+   ],
+   "final": {
+    "policy_kl": 1.8849,
+    "policy_top1": 0.0901,
+    "loss": 6.514,
+    "value_sign_accuracy": 0.736,
+    "value_mae": 0.549,
+    "training_policy_kl": 1.8677,
+    "training_value_mae": 0.051
+   }
+  },
+  {
+   "name": "control_seed2",
+   "group": "Control",
+   "change": "The same net with another seed, to measure noise.",
+   "parameters": 7967812,
+   "arithmetic": 1.0,
+   "card_gain": 0,
+   "generator": 21413,
+   "kl": [
+    2.0464,
+    2.0183,
+    1.9789,
+    1.9777,
+    1.9694,
+    1.934,
+    1.9103,
+    1.8807
+   ],
+   "loss": [
+    6.438,
+    6.162,
+    6.345,
+    6.53,
+    6.443,
+    6.601,
+    6.556,
+    6.607
+   ],
+   "final": {
+    "policy_kl": 1.8807,
+    "policy_top1": 0.0936,
+    "loss": 6.607,
+    "value_sign_accuracy": 0.723,
+    "value_mae": 0.568,
+    "training_policy_kl": 1.8614,
+    "training_value_mae": 0.047
+   }
+  },
+  {
+   "name": "control_seed3",
+   "group": "Control",
+   "change": "The same net with a third seed.",
+   "parameters": 7967812,
+   "arithmetic": 1.0,
+   "card_gain": 0,
+   "generator": 21413,
+   "kl": [
+    2.0557,
+    2.0117,
+    1.9789,
+    1.9494,
+    1.9442,
+    1.9321,
+    1.9059,
+    1.8859
+   ],
+   "loss": [
+    6.16,
+    6.25,
+    6.38,
+    6.737,
+    6.641,
+    6.52,
+    6.61,
+    6.589
+   ],
+   "final": {
+    "policy_kl": 1.8859,
+    "policy_top1": 0.0954,
+    "loss": 6.589,
+    "value_sign_accuracy": 0.723,
+    "value_mae": 0.567,
+    "training_policy_kl": 1.8678,
+    "training_value_mae": 0.053
+   }
+  },
+  {
+   "name": "blocks8",
+   "group": "Single change",
+   "change": "Half the depth everywhere: detail 2/2/2, context 2/2. Attention kept.",
+   "parameters": 4571716,
+   "arithmetic": 0.63,
+   "card_gain": 48,
+   "generator": null,
+   "kl": [
+    2.1107,
+    2.0025,
+    2.0424,
+    1.9602,
+    1.966,
+    1.9292,
+    1.8954,
+    1.8749
+   ],
+   "loss": [
+    6.368,
+    6.633,
+    6.561,
+    6.891,
+    6.473,
+    6.882,
+    6.506,
+    6.524
+   ],
+   "final": {
+    "policy_kl": 1.8749,
+    "policy_top1": 0.0939,
+    "loss": 6.524,
+    "value_sign_accuracy": 0.736,
+    "value_mae": 0.538,
+    "training_policy_kl": 1.8538,
+    "training_value_mae": 0.045
+   }
+  },
+  {
+   "name": "d112",
+   "group": "Single change",
+   "change": "Detail branch cut to 1/1/2. Context branch unchanged.",
+   "parameters": 7375940,
+   "arithmetic": 0.7,
+   "card_gain": 43,
+   "generator": null,
+   "kl": [
+    2.0479,
+    1.9957,
+    1.977,
+    1.9492,
+    1.9527,
+    1.9139,
+    1.9178,
+    1.8785
+   ],
+   "loss": [
+    6.142,
+    6.951,
+    6.51,
+    6.305,
+    6.544,
+    6.496,
+    6.578,
+    6.401
+   ],
+   "final": {
+    "policy_kl": 1.8785,
+    "policy_top1": 0.095,
+    "loss": 6.401,
+    "value_sign_accuracy": 0.751,
+    "value_mae": 0.516,
+    "training_policy_kl": 1.8567,
+    "training_value_mae": 0.044
+   }
+  },
+  {
+   "name": "wd32",
+   "group": "Single change",
+   "change": "Detail branch half as wide, 32 channels. Depth unchanged.",
+   "parameters": 7166436,
+   "arithmetic": 0.64,
+   "card_gain": 36,
+   "generator": null,
+   "kl": [
+    2.0783,
+    2.0566,
+    1.9948,
+    1.966,
+    1.9634,
+    1.9563,
+    1.9211,
+    1.8942
+   ],
+   "loss": [
+    6.219,
+    7.488,
+    6.391,
+    6.602,
+    6.719,
+    6.667,
+    6.794,
+    6.593
+   ],
+   "final": {
+    "policy_kl": 1.8942,
+    "policy_top1": 0.0917,
+    "loss": 6.593,
+    "value_sign_accuracy": 0.724,
+    "value_mae": 0.571,
+    "training_policy_kl": 1.8816,
+    "training_value_mae": 0.049
+   }
+  },
+  {
+   "name": "d222",
+   "group": "Single change",
+   "change": "Detail branch cut to 2/2/2. Context branch unchanged.",
+   "parameters": 7523908,
+   "arithmetic": 0.78,
+   "card_gain": 28,
+   "generator": null,
+   "kl": [
+    2.0585,
+    2.0288,
+    1.9863,
+    2.0177,
+    1.9275,
+    1.9121,
+    1.8966,
+    1.871
+   ],
+   "loss": [
+    6.332,
+    7.267,
+    6.375,
+    7.072,
+    6.688,
+    6.796,
+    6.47,
+    6.443
+   ],
+   "final": {
+    "policy_kl": 1.871,
+    "policy_top1": 0.0951,
+    "loss": 6.443,
+    "value_sign_accuracy": 0.74,
+    "value_mae": 0.54,
+    "training_policy_kl": 1.8538,
+    "training_value_mae": 0.045
+   }
+  },
+  {
+   "name": "norm1",
+   "group": "Single change",
+   "change": "One norm per residual block instead of two. Same arithmetic, but norms run slowly.",
+   "parameters": 7963716,
+   "arithmetic": 1.0,
+   "card_gain": 15,
+   "generator": null,
+   "kl": [
+    2.0861,
+    2.0106,
+    2.001,
+    2.0115,
+    1.9545,
+    1.9395,
+    1.9177,
+    1.885
+   ],
+   "loss": [
+    6.134,
+    6.89,
+    6.859,
+    6.874,
+    6.729,
+    6.975,
+    6.829,
+    6.902
+   ],
+   "final": {
+    "policy_kl": 1.885,
+    "policy_top1": 0.0936,
+    "loss": 6.902,
+    "value_sign_accuracy": 0.679,
+    "value_mae": 0.648,
+    "training_policy_kl": 1.8759,
+    "training_value_mae": 0.043
+   }
+  },
+  {
+   "name": "attn0",
+   "group": "Single change",
+   "change": "Attention blocks replaced by plain residual blocks.",
+   "parameters": 8132324,
+   "arithmetic": 1.0,
+   "card_gain": 7,
+   "generator": null,
+   "kl": [
+    2.0771,
+    2.0118,
+    2.0012,
+    1.9833,
+    1.9452,
+    1.9462,
+    1.9141,
+    1.894
+   ],
+   "loss": [
+    6.281,
+    6.29,
+    6.522,
+    6.733,
+    6.501,
+    6.727,
+    6.656,
+    6.696
+   ],
+   "final": {
+    "policy_kl": 1.894,
+    "policy_top1": 0.093,
+    "loss": 6.696,
+    "value_sign_accuracy": 0.707,
+    "value_mae": 0.608,
+    "training_policy_kl": 1.8889,
+    "training_value_mae": 0.054
+   }
+  },
+  {
+   "name": "c_d222_short_n1",
+   "group": "Stack",
+   "change": "Detail 2/2/2, context 3/3, bottleneck tail, no attention, one norm.",
+   "parameters": 5968563,
+   "arithmetic": 0.58,
+   "card_gain": 82,
+   "generator": 35140,
+   "kl": [
+    2.0938,
+    2.0206,
+    1.9861,
+    1.9681,
+    1.9616,
+    1.9497,
+    1.9196,
+    1.8973
+   ],
+   "loss": [
+    6.613,
+    6.242,
+    6.452,
+    6.446,
+    6.604,
+    6.89,
+    6.583,
+    6.44
+   ],
+   "final": {
+    "policy_kl": 1.8973,
+    "policy_top1": 0.0904,
+    "loss": 6.44,
+    "value_sign_accuracy": 0.737,
+    "value_mae": 0.54,
+    "training_policy_kl": 1.8891,
+    "training_value_mae": 0.042
+   }
+  },
+  {
+   "name": "c_d222_c22_n1",
+   "group": "Stack",
+   "change": "Detail 2/2/2, context 2/2, bottleneck tail, no attention, one norm.",
+   "parameters": 4493235,
+   "arithmetic": 0.51,
+   "card_gain": 92,
+   "generator": 32436,
+   "kl": [
+    2.0464,
+    2.0184,
+    1.9868,
+    1.9685,
+    1.9629,
+    1.9483,
+    1.9235,
+    1.9014
+   ],
+   "loss": [
+    6.158,
+    6.612,
+    6.445,
+    6.41,
+    6.78,
+    6.594,
+    6.57,
+    6.463
+   ],
+   "final": {
+    "policy_kl": 1.9014,
+    "policy_top1": 0.0892,
+    "loss": 6.463,
+    "value_sign_accuracy": 0.74,
+    "value_mae": 0.535,
+    "training_policy_kl": 1.897,
+    "training_value_mae": 0.041
+   }
+  },
+  {
+   "name": "c_w32_ctx96_bt_a0_n1",
+   "group": "Stack",
+   "change": "Detail width 32 at full depth, context widths 96 and 192, bottleneck tail, no attention, one norm.",
+   "parameters": 4196708,
+   "arithmetic": 0.38,
+   "card_gain": 96,
+   "generator": 38903,
+   "kl": [
+    2.1063,
+    2.0384,
+    2.0127,
+    1.9961,
+    1.9812,
+    1.9716,
+    1.9429,
+    1.9258
+   ],
+   "loss": [
+    6.552,
+    6.975,
+    6.631,
+    6.711,
+    6.633,
+    6.483,
+    6.438,
+    6.529
+   ],
+   "final": {
+    "policy_kl": 1.9258,
+    "policy_top1": 0.0885,
+    "loss": 6.529,
+    "value_sign_accuracy": 0.737,
+    "value_mae": 0.547,
+    "training_policy_kl": 1.924,
+    "training_value_mae": 0.05
+   }
+  },
+  {
+   "name": "up_ps",
+   "group": "Closed",
+   "change": "Policy map learned as 16 outputs per 32x32 cell and PixelShuffled, instead of one output resized.",
+   "parameters": 7968787,
+   "arithmetic": 1.0,
+   "card_gain": 0,
+   "generator": null,
+   "kl": [
+    2.1681,
+    2.1606,
+    2.0464,
+    2.0333,
+    2.0276,
+    1.991,
+    1.9913,
+    1.9572
+   ],
+   "loss": [
+    6.401,
+    6.551,
+    6.349,
+    6.668,
+    6.606,
+    6.623,
+    6.449,
+    6.54
+   ],
+   "final": {
+    "policy_kl": 1.9572,
+    "policy_top1": 0.0847,
+    "loss": 6.54,
+    "value_sign_accuracy": 0.735,
+    "value_mae": 0.544,
+    "training_policy_kl": 1.9503,
+    "training_value_mae": 0.053
+   }
+  },
+  {
+   "name": "c_d222_short_n1_ps",
+   "group": "Closed",
+   "change": "c_d222_short_n1 with PixelShuffle.",
+   "parameters": 5968563,
+   "arithmetic": 0.58,
+   "card_gain": 82,
+   "generator": 35140,
+   "kl": [
+    2.1756,
+    2.1681,
+    2.032,
+    2.0264,
+    1.9978,
+    1.9918,
+    1.9776,
+    1.9583
+   ],
+   "loss": [
+    6.492,
+    6.773,
+    6.449,
+    6.769,
+    6.546,
+    6.629,
+    6.512,
+    6.458
+   ],
+   "final": {
+    "policy_kl": 1.9583,
+    "policy_top1": 0.0856,
+    "loss": 6.458,
+    "value_sign_accuracy": 0.751,
+    "value_mae": 0.516,
+    "training_policy_kl": 1.963,
+    "training_value_mae": 0.049
+   }
+  },
+  {
+   "name": "c_d222_c22_n1_ps",
+   "group": "Closed",
+   "change": "c_d222_c22_n1 with PixelShuffle.",
+   "parameters": 4493235,
+   "arithmetic": 0.51,
+   "card_gain": 92,
+   "generator": 32436,
+   "kl": [
+    2.1676,
+    2.1876,
+    2.0415,
+    2.0107,
+    1.9995,
+    1.9925,
+    1.9753,
+    1.9597
+   ],
+   "loss": [
+    6.44,
+    6.588,
+    6.28,
+    6.764,
+    6.485,
+    6.648,
+    6.669,
+    6.595
+   ],
+   "final": {
+    "policy_kl": 1.9597,
+    "policy_top1": 0.0847,
+    "loss": 6.595,
+    "value_sign_accuracy": 0.727,
+    "value_mae": 0.558,
+    "training_policy_kl": 1.9649,
+    "training_value_mae": 0.046
+   }
+  }
+ ]
+}

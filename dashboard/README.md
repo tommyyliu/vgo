@@ -8,8 +8,9 @@ Run it from the repository root. It needs only Python.
 |---|---|
 | Performance | speed of each path, timing history, generation and training throughput |
 | Research | signal per compute, model strength, arena ledger, lemma status, ideas |
+| Net shapes | what each timed and trained net shape changes, its speed and its validation |
 
-Metrics are read from `artifacts/`, `performance/history.jsonl` and `spec/LEMMAS.md`, and
+Metrics are read from `artifacts/`, `performance/`, and `spec/LEMMAS.md`, and
 refresh every 5 minutes. The loop panels use `artifacts/vgo-bulk` when it exists, and the
 archived run otherwise. The work list, both experiments and engineering, is `ideas.json`,
 which the Research tab edits.

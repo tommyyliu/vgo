@@ -1,8 +1,9 @@
-"""Dashboard data: speed, signal per compute, strength, lemmas and what's next."""
+"""Dashboard data: speed, signal per compute, strength, lemmas, net shapes and what's next."""
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import statistics
@@ -19,6 +20,10 @@ LOOPS = ("artifacts/vgo-bulk", "artifacts/old/main/vgo-continuous")
 LOOP = LOOPS[1]
 ANCHOR = "sl-w64b16"
 MIN_LEDGER_GAMES = 40
+SHAPE_SCREEN = "performance/shape-screen.json"
+ELO_PER_DOUBLING = 61  # Closed ideas in docs/FINDINGS.md.
+VCPU_PER_10K = 5  # "Sizing a machine" in docs/RUNNING.md.
+SHORTLIST = {"blocks8", "c_d222_short_n1"}
 TELEMETRY_RUNS = {
     "Fixed budget, 1000 sims, 128 input": "artifacts/old/main/experiments-2026-10-14/budget-games/fixed",
     "Randomized budget, 128 input": "artifacts/old/main/experiments-2026-10-14/budget-games/randomized",
@@ -433,6 +438,195 @@ def spec_section(root: Path) -> dict:
             "question": "What do we know, and what is still open?", "blocks": blocks}
 
 
+def shape_speed(shape: dict, screen: dict) -> dict:
+    """What a shape's speed buys, from the generator if it ran there.
+
+    The card ceiling otherwise, which is an upper bound.
+    """
+    if shape["generator"]:
+        rate, baseline = shape["generator"], screen["generator_baseline"]
+    else:
+        baseline = screen["card_baseline"]
+        rate = baseline * (1 + shape["card_gain"] / 100)
+    ratio = rate / baseline
+    saved = 1 - 1 / ratio
+    return {
+        "generator_gain": percent_change(screen["generator_baseline"], shape["generator"])
+        if shape["generator"] else None,
+        "time": 1 / ratio, "elo": ELO_PER_DOUBLING * math.log2(ratio),
+        "vcpu": rate / 10_000 * VCPU_PER_10K,
+        "worth": "Yes" if saved >= 0.25 else "Some" if saved >= 0.10 else "No",
+    }
+
+
+def shape_deltas(shapes: list[dict]) -> tuple[dict[str, float], float]:
+    """Each shape's policy KL against the mean of the controls, and the controls' spread."""
+    controls = [s["final"]["policy_kl"] for s in shapes if s["group"] == "Control"]
+    mean = statistics.mean(controls)
+    return {s["name"]: s["final"]["policy_kl"] - mean for s in shapes}, statistics.stdev(controls)
+
+
+def shape_sections(root: Path) -> list[dict]:
+    screen = read_json(root / SHAPE_SCREEN)
+    if not screen:
+        return []
+    shapes = screen["shapes"]
+    named = {s["name"]: s for s in shapes}
+    delta, spread = shape_deltas(shapes)
+    window = screen["window"]
+    limit = {s["name"]: s["points"] for s in screen["cpu_limit"]}
+    fast, slow = limit["Fast net, 8 threads of 4 cores"][-1], limit["Current net, 8 threads of 4 cores"][-1]
+    fastest = max((s for s in shapes if s["generator"]), key=lambda s: s["generator"])
+    early, swift = named["c_d222_short_n1"], named["c_w32_ctx96_bt_a0_n1"]
+    early_speed, swift_speed = shape_speed(early, screen), shape_speed(swift, screen)
+    tested = [s for s in shapes if s["group"] not in ("Control", "Closed")]
+
+    which = {"id": "shapes-which", "title": "Which net when",
+             "question": "Which shape fits each stage of a run?", "blocks": [
+        {"type": "stats", "items": [
+            {"label": "Current net", "value": f"{screen['generator_baseline'] / 1000:.1f}k/s",
+             "sub": "generator, 32 threads, early game"},
+            {"label": "Fastest measured", "value": f"{fastest['generator'] / 1000:.1f}k/s",
+             "sub": fastest["name"]},
+            {"label": "Fast net on 8 vCPU", "value": f"{percent_change(slow['y'], fast['y']):+.0f}%",
+             "sub": f"after {fast['x']} s, and still falling"},
+            {"label": "Policy KL noise", "value": f"{spread:.3f}", "sub": "spread of three control seeds"},
+        ]},
+        {"type": "table", "title": "A plan for a run",
+         "caption": "Any net's games train any shape, as this screen did, so switching costs one retrain "
+                    "from the window, about 8 minutes per 150k samples. Weights do not carry between shapes.",
+         "columns": [{"key": "stage", "label": "Stage"}, {"key": "cares", "label": "What matters"},
+                     {"key": "use", "label": "Use", "format": "code"}, {"key": "why", "label": "Why"}],
+         "rows": [
+            {"stage": "Early", "cares": "Games per hour", "use": early["name"],
+             "why": f"{early_speed['generator_gain']:+.0f}% in the generator, so the same games take "
+                    f"{1 - early_speed['time']:.0%} less time, at {delta[early['name']]:+.3f} KL. "
+                    f"{swift['name']} is only {percent_change(early['generator'], swift['generator']):.0f}% faster "
+                    f"again for {delta[swift['name']] / delta[early['name']]:.0f} times the KL cost."},
+            {"stage": "Middle", "cares": "Both", "use": "blocks8",
+             "why": f"{named['blocks8']['card_gain']:+d}% on the card with no policy penalty, and it needs no new "
+                    "code. Not yet run in the generator."},
+            {"stage": "Late", "cares": "Modeling ability", "use": "control",
+             "why": "Eight epochs can't show capacity, so nothing here argues for leaving the current net. "
+                    "Bigger nets are closed at this compute, so a late move to one needs new evidence."},
+         ]},
+        {"type": "note", "text": "These are loss curves from one 8-epoch run each, not strength. A shape that "
+                                 "looks free here can still fall behind in a long run, and adoption needs a "
+                                 "matched-compute arena."},
+    ]}
+
+    what = {"id": "shapes-what", "title": "What each shape is",
+            "question": "What does each experiment change?", "blocks": [
+        {"type": "table", "title": "Parts of the net",
+         "caption": "Input is 128x128, reduced to a 32x32 grid before these parts. Each residual stage is "
+                    "about 15% of the arithmetic.",
+         "columns": [{"key": "part", "label": "Part"}, {"key": "job", "label": "Job"},
+                     {"key": "now", "label": "In the current net"}],
+         "rows": [
+            {"part": "Detail branch", "job": "Keeps fine placement, at 32x32",
+             "now": "Three stages of 4 blocks, written 4/4/4, 64 channels"},
+            {"part": "Context branch", "job": "Sees the whole board, at 16x16 and 8x8",
+             "now": "Two stages of 4 blocks, written 4/4, 128 and 256 channels"},
+            {"part": "Attention", "job": "Lets far parts of the board interact directly",
+             "now": "The last block of each context stage"},
+            {"part": "Norms", "job": "Keep activations stable. About 22% of inference time",
+             "now": "Two GroupNorms in every residual block"},
+            {"part": "Tail", "job": "Merges the detail branch before the policy head",
+             "now": "One 128-channel residual block. A bottleneck narrows it 128-64-128"},
+            {"part": "Policy upsampling", "job": "Turns the 32x32 map into 128x128 policy",
+             "now": "One output per cell, resized bilinearly"},
+         ]},
+        {"type": "table", "title": "The shapes",
+         "caption": "Names: c_ a stack, d222 detail blocks, short context 3/3, c22 context 2/2, w32 detail width, "
+                    "ctx96 context width, bt bottleneck tail, a0 no attention, n1 one norm, ps PixelShuffle. "
+                    "Parameters are the exported net's. Arithmetic is relative to the current net.",
+         "columns": [{"key": "name", "label": "Shape", "format": "code"}, {"key": "group", "label": "Kind", "format": "nowrap"},
+                     {"key": "change", "label": "What changes"},
+                     {"key": "parameters", "label": "Parameters", "format": "compact", "align": "right"},
+                     {"key": "arithmetic", "label": "Arithmetic", "format": "share", "align": "right"}],
+         "rows": [{k: s[k] for k in ("name", "group", "change", "parameters", "arithmetic")} for s in shapes
+                  if s["name"] not in ("control_seed2", "control_seed3")]},
+    ]}
+
+    speed_rows = sorted(({**shape_speed(s, screen), "name": s["name"], "card_gain": s["card_gain"]} for s in tested),
+                        key=lambda r: r["time"])
+    speed = {"id": "shapes-speed", "title": "What is meaningfully faster",
+             "question": "Which shapes save real time, and on what machine?", "blocks": [
+        {"type": "table", "title": "Speed against the current net",
+         "caption": f"Card: the ceiling at 128, batch 32, two lanes, against {screen['card_baseline'] / 1000:.1f}k "
+                    f"positions/s. Generator: 75 s early in games on all 32 threads with three lanes, against "
+                    f"{screen['generator_baseline'] / 1000:.1f}k, using random weights for the stacks. A dash means "
+                    "not run. The last three columns use the generator where it ran and the card otherwise, which "
+                    f"is an upper bound. Elo is {ELO_PER_DOUBLING} a doubling, if the shape keeps its strength. "
+                    f"vCPU is about {VCPU_PER_10K} per 10k positions/s. Meaningful means at least a quarter of "
+                    "the time saved.",
+         "columns": [{"key": "name", "label": "Shape", "format": "code"},
+                     {"key": "card_gain", "label": "Card", "format": "gain", "align": "right"},
+                     {"key": "generator_gain", "label": "Generator", "format": "gain", "align": "right"},
+                     {"key": "time", "label": "Same games take", "format": "share", "align": "right"},
+                     {"key": "elo", "label": "Elo at equal time", "format": "elo", "align": "right"},
+                     {"key": "vcpu", "label": "vCPU per card", "format": "whole", "align": "right"},
+                     {"key": "worth", "label": "Meaningful", "align": "right"}],
+         "rows": speed_rows},
+        {"type": "note", "text": "A faster net only pays where the CPU can feed it. On 8 vCPU the current net is "
+                                 "already close to the CPU's limit, so these gains need about 15 to 20 vCPU per card."},
+        {"type": "line", "title": "Generator rate as CPU runs short",
+         "caption": "c_d222_bt_a0_n1, 63% faster on the card, early in games with two lanes. With fewer CPUs it "
+                    "starts fast and falls toward the current net as boards fill. Later boards cost more CPU "
+                    "than these two minutes reach.",
+         "xLabel": "Seconds", "yLabel": "Positions/s", "series": screen["cpu_limit"]},
+    ]}
+
+    def kind(shape: dict) -> str:
+        return "closed" if shape["group"] == "Closed" else "pick" if shape["name"] in SHORTLIST else "other"
+
+    plotted = [s for s in shapes if s["name"] not in ("control_seed2", "control_seed3")]
+    means = [statistics.mean(c) for c in zip(*(s["kl"] for s in shapes if s["group"] == "Control"))]
+    epochs = range(1, len(means) + 1)
+    seeds = [delta[s["name"]] for s in shapes if s["group"] == "Control"]
+    totals = sorted(s["final"]["loss"] for s in shapes if s["group"] == "Control")
+    early_best = sum(min(range(len(s["loss"])), key=s["loss"].__getitem__) < 3 for s in shapes)
+    train_mae = statistics.mean(s["final"]["training_value_mae"] for s in shapes)
+    held_mae = statistics.mean(s["final"]["value_mae"] for s in shapes)
+    learning = {"id": "shapes-learning", "title": "What the speed costs",
+                "question": "How well did each shape learn on held-out games?", "blocks": [
+        {"type": "scatter", "title": "Speed against policy loss",
+         "caption": "Lower right is best: faster, with no loss. The band is the three control seeds.",
+         "xLabel": "Card speed gain, %", "yLabel": "Validation policy KL vs control",
+         "band": [min(seeds), max(seeds)],
+         "legend": {"pick": "Shortlisted", "other": "Tested", "closed": "PixelShuffle, closed"},
+         "points": [{"x": s["card_gain"], "y": delta[s["name"]], "label": s["name"], "kind": kind(s)}
+                    for s in plotted]},
+        {"type": "line", "title": "Validation policy KL by epoch",
+         "caption": "Lower is better. PixelShuffle starts behind and stays there, and the stack without it "
+                    "tracks the control. The last epochs fall fastest because the learning rate decays.",
+         "xLabel": "Epoch", "yLabel": "Policy KL", "decimals": 3, "series": [
+            {"name": "Control, mean of 3 seeds", "points": [{"x": e, "y": v} for e, v in zip(epochs, means)]},
+            *[{"name": name, "points": [{"x": e, "y": v} for e, v in zip(epochs, named[name]["kl"])]}
+              for name in ("c_d222_short_n1", "c_w32_ctx96_bt_a0_n1", "up_ps")]]},
+        {"type": "note", "text": f"Total validation loss can't rank these. It is lowest at epoch 1 to 3 in "
+                                 f"{early_best} of {len(shapes)} runs, then stays flat or climbs while policy KL keeps "
+                                 f"falling, because every net memorizes game outcomes: value MAE averages "
+                                 f"{train_mae:.2f} on training games and {held_mae:.2f} on held-out ones. No shortlisted "
+                                 f"shape is worse than the controls, which read {totals[0]:.2f} to {totals[-1]:.2f}."},
+        {"type": "table", "title": "Final validation",
+         "caption": f"Final epoch on {window['validation_samples']:,} held-out positions from about 70 of the "
+                    f"{window['games']} games, read from the heads that inference uses. Trained from scratch on the "
+                    f"newest {window['samples']:,} samples of {window['run']}. Value columns are too noisy to rank "
+                    "shapes: norm1 looks worst alone, yet every stack with one norm reads as well as the controls.",
+         "columns": [{"key": "name", "label": "Shape", "format": "code"},
+                     {"key": "policy_kl", "label": "Policy KL", "format": "fixed", "digits": 3, "align": "right"},
+                     {"key": "delta", "label": "vs control", "format": "delta", "noise": 2 * spread, "align": "right"},
+                     {"key": "policy_top1", "label": "Top move", "format": "share", "align": "right"},
+                     {"key": "loss", "label": "Total loss", "format": "fixed", "digits": 2, "align": "right"},
+                     {"key": "value_sign_accuracy", "label": "Value sign", "format": "share", "align": "right"},
+                     {"key": "value_mae", "label": "Value MAE", "format": "fixed", "digits": 2, "align": "right"}],
+         "rows": sorted(({"name": s["name"], "delta": delta[s["name"]], **s["final"]} for s in shapes),
+                        key=lambda r: r["policy_kl"])},
+    ]}
+    return [{**section, "tab": "shapes"} for section in (which, what, speed, learning)]
+
+
 def collect(path: Path) -> dict:
     root = Path(path)
     global LOOP
@@ -450,5 +644,6 @@ def collect(path: Path) -> dict:
             spec_section(root),
             {"id": "next", "tab": "research", "title": "What to try next",
              "question": "What's most worth testing?", "blocks": [{"type": "ideas"}]},
+            *shape_sections(root),
         ],
     }

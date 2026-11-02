@@ -6,6 +6,7 @@
 | Timing and verification code | [`crates/vgo-bench`](../crates/vgo-bench) |
 | A model's positions/s ceiling on the card | `model_timing.py` |
 | Model shapes timed on 2026-11-01 | `model_variants.py` |
+| Speed and training results for those shapes | `shape-screen.json`, shown on the dashboard |
 | Fixed positions | `positions.txt` |
 | Timing history, one record per run | `history.jsonl` |
 | Expected output digests | `golden.txt`, checked by `correctness/check.sh` |

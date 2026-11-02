@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+
 import pytest
 
 from dashboard import collect as vo
@@ -94,6 +96,48 @@ def test_sample_rate_skips_gaps_between_updates():
 def test_collect_tolerates_an_empty_project(tmp_path):
     result = vo.collect(tmp_path)
     assert [s["id"] for s in result["sections"]] == ["speed", "signal", "model", "spec", "next"]
+
+
+def shape(name, group="Single change", kl=1.9, card_gain=0, generator=None):
+    return {"name": name, "group": group, "card_gain": card_gain, "generator": generator,
+            "final": {"policy_kl": kl}}
+
+
+SCREEN = {"card_baseline": 20_000, "generator_baseline": 10_000}
+
+
+def test_shape_speed_uses_the_generator_when_it_ran():
+    speed = vo.shape_speed(shape("x", card_gain=300, generator=20_000), SCREEN)
+    assert speed["generator_gain"] == pytest.approx(100)
+    assert speed["time"] == pytest.approx(0.5)
+    assert speed["elo"] == pytest.approx(vo.ELO_PER_DOUBLING)
+    assert speed["vcpu"] == pytest.approx(10)
+
+
+def test_shape_speed_falls_back_to_the_card():
+    speed = vo.shape_speed(shape("x", card_gain=100), SCREEN)
+    assert speed["generator_gain"] is None
+    assert speed["time"] == pytest.approx(0.5)
+    assert speed["vcpu"] == pytest.approx(20)
+
+
+@pytest.mark.parametrize("gain, worth", [(0, "No"), (10, "No"), (20, "Some"), (33, "Some"), (34, "Yes")])
+def test_shape_speed_counts_as_meaningful_from_a_quarter_of_the_time(gain, worth):
+    assert vo.shape_speed(shape("x", card_gain=gain), SCREEN)["worth"] == worth
+
+
+def test_shape_deltas_are_against_the_mean_of_the_controls():
+    shapes = [shape("a", "Control", 1.8), shape("b", "Control", 2.0), shape("x", kl=2.3)]
+    delta, spread = vo.shape_deltas(shapes)
+    assert delta["x"] == pytest.approx(0.4)
+    assert spread == pytest.approx(0.1414, abs=1e-3)
+
+
+def test_the_recorded_screen_builds_a_page():
+    sections = vo.shape_sections(Path(__file__).resolve().parents[2])
+    assert [s["tab"] for s in sections] == ["shapes"] * 4
+    types = {b["type"] for s in sections for b in s["blocks"]}
+    assert types <= {"stats", "table", "note", "line", "scatter"}
 
 
 @pytest.fixture

@@ -50,8 +50,8 @@
     "bucket": "Speed",
     "effort": "M",
     "title": "Train the faster net shapes",
-    "why": "Fewer detail blocks, no attention and one norm take the card's ceiling at 128 from 21k positions/s to 34-41k, and the generator to 33-39k with three lanes. At 61 Elo a doubling that is worth 40-60 Elo if a shape keeps its strength. In a loss screen `blocks8` (+48% on the card) showed no policy penalty and `c_d222_short_n1` (+66% in the generator) showed +0.014 KL, against a seed spread of 0.003. Strength is unmeasured, and these rates need about 15 vCPU per card.",
-    "test": "Arena `blocks8` and `c_d222_short_n1` against the current net at equal time on both boards, about 500 games each. Check a trained one over whole games on 8 vCPU. Checkpoints are in `artifacts/shape-screen/runs/`, and the screen is under \"Inference speed\" in `docs/reference/MODEL_ARCHITECTURE.md`."
+    "why": "Fewer detail blocks, no attention and one norm take the card's ceiling at 128 from 21k positions/s to 34-41k, and the generator to 33-39k with three lanes. At 61 Elo a doubling that is worth 40-60 Elo if a shape keeps its strength. In a loss screen `blocks8` (+48% on the card) showed no policy penalty and `c_d222_short_n1` (+64% in the generator) showed +0.013 KL, against a seed spread of 0.003. Early in a run generation speed matters more than play, and any net's games train any shape, so a fast shape could generate first and the run could retrain to a stronger one later. Strength is unmeasured, and these rates need 15 to 20 vCPU per card: on 8 vCPU a net 63% faster on the card led by 10% after two minutes and was still falling.",
+    "test": "Arena `blocks8` and `c_d222_short_n1` against the current net at equal time on both boards, about 500 games each. Check a trained one over whole games on 8 vCPU. Checkpoints are in `artifacts/shape-screen/runs/`, and the dashboard's Net shapes tab shows the screen."
   },
   {
     "id": "score-head",

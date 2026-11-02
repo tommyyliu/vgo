@@ -29,5 +29,5 @@ Don't reopen these without new evidence.
 | Fixed-batch TensorRT engines | +0.9% and -1.2% against a batch 1 to 32 profile, so the graph's `Shape` nodes cost nothing |
 | GroupNorm lowered through pooling | 17% slower than the exported `InstanceNormalization`, for identical results |
 | Depthwise, inverted and grouped blocks | Worst speed for their arithmetic: inverted -24%, grouped -20%, depthwise +10% on 61% of the arithmetic. Fewer plain blocks buy more |
-| PixelShuffle policy upsampling | No speed gain, and +0.073 validation policy KL after 8 epochs against a seed spread of 0.003. Taking it out of two stacked shapes moved them from +0.075 to +0.014 and +0.018. Option removed |
+| PixelShuffle policy upsampling | No speed gain, and +0.073 validation policy KL after 8 epochs against a seed spread of 0.003. Taking it out of two stacked shapes moved them from +0.075 to +0.013 and +0.018. Option removed |
 | Lower priority for actor threads | No gain pinned to 8 cores: lane wake delay went from 119 to 102 us, and the GPU did not rise. The stall was the broker round trip, now removed by the deck |
