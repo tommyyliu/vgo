@@ -18,6 +18,9 @@ from vgo_training.learner import (
     LearnerUpdate,
     PersistentLearner,
     ReplayCache,
+    masked_value_cross_entropy,
+    thin_value_labels,
+    value_cross_entropy,
 )
 
 
@@ -110,6 +113,49 @@ class ReplayCacheTests(unittest.TestCase):
                 pair <= training_rows or pair <= validation_rows,
                 f"game rows {pair} crossed the split",
             )
+
+    def test_value_thinning_keeps_one_label_per_stride_of_each_game(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cache, path, _ = cache_fixture(Path(temporary))
+            window = cache.window([path], 4)
+            original = window.shards[0].dataset.values.clone()
+            view = window.split(0.0).training
+            thinned = thin_value_labels(view, 2, seed=5)
+            again = thin_value_labels(view, 2, seed=5)
+            values = thinned.selections[0].shard.dataset.values
+
+        # Two plies per game: exactly one keeps its label, and it is the same one
+        # on a second call with the same seed.
+        for first in range(0, 12, 2):
+            kept = (~torch.isnan(values[first : first + 2])).sum().item()
+            self.assertEqual(kept, 1, f"game at rows {first}-{first + 1}")
+        self.assertTrue(
+            torch.equal(
+                torch.isnan(values),
+                torch.isnan(again.selections[0].shard.dataset.values),
+            )
+        )
+        known = ~torch.isnan(values)
+        self.assertTrue(torch.equal(values[known], original[known]))
+        # The cached shard, which validation reads, keeps every label.
+        self.assertTrue(torch.equal(window.shards[0].dataset.values, original))
+        self.assertIs(thin_value_labels(view, 1, seed=5), view)
+
+    def test_masked_value_loss_drops_rather_than_reweights(self) -> None:
+        logits = torch.randn(6, 2, generator=torch.Generator().manual_seed(4))
+        targets = torch.tensor([1.0, -1.0, 1.0, -1.0, 0.0, 1.0])
+        self.assertTrue(
+            torch.allclose(
+                masked_value_cross_entropy(logits, targets),
+                value_cross_entropy(logits, targets),
+            )
+        )
+        thinned = targets.clone()
+        thinned[[1, 3, 4]] = float("nan")
+        kept = value_cross_entropy(logits[[0, 2, 5]], targets[[0, 2, 5]])
+        loss = masked_value_cross_entropy(logits, thinned)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.allclose(loss, kept * 3 / 6))
 
     def test_sliding_window_evicts_before_loading_the_entering_shard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

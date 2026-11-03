@@ -99,6 +99,14 @@ def main() -> None:
         help="share of tail plies to train on. Every ply stays on disk.",
     )
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--value-stride", type=int, default=1,
+        help="train the value head on every Nth position of each game only",
+    )
+    parser.add_argument(
+        "--weight-decay", type=float, default=0.0,
+        help="AdamW weight decay on weight matrices; 0 is plain Adam",
+    )
     arguments = parser.parse_args()
     if arguments.games_root is not None:
         if arguments.window_samples <= 0:
@@ -147,6 +155,8 @@ def main() -> None:
         validation_fraction=arguments.validation_fraction,
         tail_keep=arguments.tail_keep,
         augment=arguments.augment,
+        value_stride=arguments.value_stride,
+        weight_decay=arguments.weight_decay,
     )
 
     arguments.output.parent.mkdir(parents=True, exist_ok=True)

@@ -123,6 +123,16 @@ class LearnerConfig:
     report_every: int = 20
     validation_fraction: float = 0.1
     augment: bool = True
+    # Train the value head on every `value_stride`-th position of each game, from
+    # a per-game offset; the others train policy and ownership only. Every ply of
+    # a game shares one outcome, so a window of ~800 games is ~800 labels repeated
+    # hundreds of times, and the value head memorized them (train MAE 0.03,
+    # held-out 0.65). Dropped labels are dropped, not reweighted: the loss is
+    # summed over kept rows and divided by the whole batch.
+    value_stride: int = 1
+    # Decoupled (AdamW) weight decay on weights of rank 2 and up; biases and
+    # norm scales are exempt. Zero keeps plain Adam.
+    weight_decay: float = 0.0
 
     def validate(self) -> None:
         if self.epochs <= 0:
@@ -161,6 +171,10 @@ class LearnerConfig:
             raise ValueError("ownership weight must be finite and nonnegative")
         if not 0.0 < self.tail_keep <= 1.0:
             raise ValueError("tail keep must be in (0, 1]")
+        if self.value_stride < 1:
+            raise ValueError("value stride must be at least 1")
+        if not math.isfinite(self.weight_decay) or self.weight_decay < 0.0:
+            raise ValueError("weight decay must be finite and nonnegative")
 
 
 @dataclass(frozen=True)
@@ -1097,7 +1111,62 @@ def _atomic_torch_save(value: object, output: Path) -> None:
 
 
 def _build_optimizer(model: nn.Module, config: "LearnerConfig") -> torch.optim.Optimizer:
-    return torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    if config.weight_decay == 0.0:
+        return torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    decayed = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
+    exempt = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
+    return torch.optim.AdamW(
+        [
+            {"params": decayed, "weight_decay": config.weight_decay},
+            {"params": exempt, "weight_decay": 0.0},
+        ],
+        lr=config.learning_rate,
+    )
+
+
+def thin_value_labels(view: ReplayView, stride: int, seed: int) -> ReplayView:
+    """The same view with all but every `stride`-th value label of a game masked.
+
+    Masked labels become NaN in a copy of each shard's values, so the cached
+    shards, and the validation view that shares them, are untouched. A game is
+    identified by its split hash; a row's place in its game is its rank among
+    that game's rows in shard order, and each game starts from its own offset,
+    drawn from the seed and the game, so no ply of the game is favoured.
+    """
+    if stride == 1:
+        return view
+    selections = []
+    for selection in view.selections:
+        shard = selection.shard
+        games = shard.split_hashes.numpy()
+        order = np.argsort(games, kind="stable")
+        sorted_games = games[order]
+        starts = np.r_[0, np.flatnonzero(sorted_games[1:] != sorted_games[:-1]) + 1]
+        rank = np.empty(len(games), dtype=np.int64)
+        rank[order] = np.arange(len(games)) - np.repeat(
+            starts, np.diff(np.r_[starts, len(games)])
+        )
+        offset = (games.astype(np.uint64) ^ np.uint64(seed)) % np.uint64(stride)
+        keep = (rank + offset.astype(np.int64)) % stride == 0
+        values = shard.dataset.values.clone()
+        values[torch.from_numpy(~keep)] = float("nan")
+        thinned = replace(shard, dataset=replace(shard.dataset, values=values))
+        selections.append(ShardSelection(thinned, selection.rows))
+    return ReplayView(tuple(selections))
+
+
+def masked_value_cross_entropy(
+    logits: torch.Tensor, targets: torch.Tensor
+) -> torch.Tensor:
+    """`value_cross_entropy` over the rows whose target is not NaN, divided by
+    the whole batch, so a thinned label contributes nothing rather than having
+    its weight moved onto the labels that remain."""
+    known = ~torch.isnan(targets)
+    win = (torch.where(known, targets, 0.0).to(logits.dtype) + 1.0) / 2.0
+    per_row = nn.functional.cross_entropy(
+        logits, torch.stack((win, 1.0 - win), dim=1), reduction="none"
+    )
+    return (per_row * known.to(per_row.dtype)).sum() / max(1, targets.numel())
 
 
 class PersistentLearner:
@@ -1527,9 +1596,15 @@ class PersistentLearner:
         best_score = selection_score(best)
         optimization_started = time.perf_counter()
 
+        # Value thinning applies to the batches trained on only. Metrics read the
+        # full training view, so train value MAE still covers every row.
+        trained_view = thin_value_labels(split.training, config.value_stride, config.seed)
+        value_loss_function = (
+            value_cross_entropy if config.value_stride == 1 else masked_value_cross_entropy
+        )
         self.model.train()
         for epoch in range(1, config.epochs + 1):
-            specs = split.training.batches(
+            specs = trained_view.batches(
                 config.batch_size,
                 shuffle=True,
                 generator=generator,
@@ -1558,7 +1633,7 @@ class PersistentLearner:
                     policy_loss = policy_cross_entropy(
                         logits, policy_targets, policy_masks
                     )
-                    value_loss = value_cross_entropy(values, value_targets)
+                    value_loss = value_loss_function(values, value_targets)
                     loss = policy_loss + config.value_weight * value_loss
                     # Ownership is dense spatial supervision: one target per
                     # cell rather than one scalar per position, which is what
@@ -1592,7 +1667,7 @@ class PersistentLearner:
                         normed_logits, normed_values = outputs[2], outputs[3]
                         normed_loss = policy_cross_entropy(
                             normed_logits, policy_targets, policy_masks
-                        ) + config.value_weight * value_cross_entropy(
+                        ) + config.value_weight * value_loss_function(
                             normed_values, value_targets
                         )
                         if len(outputs) >= 6 and train_ownership:
