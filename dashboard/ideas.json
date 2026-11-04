@@ -20,6 +20,17 @@
     "ask": "Merge into main? Pushing stays your call."
   },
   {
+    "id": "5b4efdee",
+    "kind": "task",
+    "status": "Review",
+    "bucket": "Measurement",
+    "effort": "M",
+    "title": "Decide a repetition rule",
+    "why": "Self-play games repeat exact positions often: 5.7% of big-board positions recur, mostly as four-ply cycles (repeat-points). The rules allow repetition, and the net has no history, so it cannot tell a cycle from progress. Random-stop ends the cycles played against a passing opponent (42% of big-board repeats); the rest, where both sides keep moving, run on to the cap. Options are in docs/history/GAMEPLAY_VARIANTS.md.",
+    "test": "Find a position players would rationally repeat, then choose between unrestricted repetition, simple ko and superko.",
+    "ask": "Should self-play and arena forbid recreating an earlier position with the same side to move (positional superko)? It removes every cycle at the source, costs a position-hash set per game, and changes the game for human play too unless it is kept to self-play. The alternatives are to leave cycles to random-stop and the cap, or to give the net history planes (3 plies cut policy KL 1.721 to 1.706)."
+  },
+  {
     "id": "rust-rebuild",
     "kind": "task",
     "status": "Done",
@@ -77,13 +88,13 @@
   {
     "id": "repeat-points",
     "kind": "task",
-    "status": "Next",
+    "status": "Done",
     "bucket": "Generate",
     "effort": "M",
-    "title": "Check the repeated points are board-unchanged self-captures",
+    "title": "Find why stalling players repeat the same points",
     "why": "In recorded games the side behind alternated between the same two coordinates for about 150 plies. Your read: the move is a one-stone self-capture, so the board after it equals the board before, the net sees the same input, and it picks the same point again. Self-captures rose from 3% to 8-10% of plies over the run, which fits.",
     "test": "Replay the recorded positions: confirm the board is identical before and after each repeated move. If so, a move that leaves the board unchanged is a pass in disguise, which is a rule question for 5b4efdee.",
-    "progress": "Not started."
+    "result": "Not board-unchanged moves: in self-play from update 12 on, only 0.4-0.8% of placements leave the board as it was, and none is answered by a pass. The stall is exact repetition: 5.7% of big-board positions (3.7% mid, 1.3% small) repeat an earlier position with the same side to move, almost all four plies apart, a two-move cycle where each move changes the board and the pair restores it. 42% of big-board repeats are one side cycling while the other passes, which random-stop ends; the other 58% are cycles where both sides move. The net cannot see a repetition: it has no history input."
   },
   {
     "id": "naive-stop",
@@ -250,18 +261,6 @@
     "test": "Delete it unless something still needs the fallback.",
     "held": "Cleanup",
     "revisit": "Next time the training rasterizer is touched."
-  },
-  {
-    "id": "5b4efdee",
-    "kind": "task",
-    "status": "Parked",
-    "bucket": "Measurement",
-    "effort": "M",
-    "title": "Repetition and ko policy",
-    "why": "Automated play reaches cycles, but it's unknown whether a strategically meaningful human cycle exists. Rule variants are in docs/history/GAMEPLAY_VARIANTS.md.",
-    "test": "Find a position players would rationally repeat, then choose between unrestricted repetition, simple ko and superko.",
-    "held": "After another task",
-    "revisit": "After repeat-points: if the repeats are board-unchanged self-captures, decide whether such a move counts as a pass."
   },
   {
     "id": "search-value",
