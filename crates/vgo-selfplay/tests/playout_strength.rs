@@ -41,6 +41,7 @@ fn duel<E: Evaluator>(
             let report = play_game(
                 Position::new(radius, Vec::new(), Color::Black),
                 maximum_plies,
+                None,
                 |position, _ply| {
                     let high_to_move = (position.to_move() == Color::Black) == high_is_black;
                     let sims = if high_to_move { high } else { low };

@@ -21,7 +21,7 @@ use vgo_search::{
     Action, EvaluationError, Evaluator, NaiveEvaluator, ReusableSearch, ReuseMetrics, SearchConfig,
     search_for_duration, search_with_evaluator,
 };
-use vgo_selfplay::{award_by_area, play_game as run_playout};
+use vgo_selfplay::{RandomStop, award_by_area, play_game as run_playout};
 
 // Rasters are allocated by actors and freed by the broker, and a move churns
 // position state: mimalloc measured 3-9% faster than glibc here, and no worse on
@@ -179,6 +179,14 @@ struct Arguments {
     /// pair face the same game.
     #[arg(long, default_value_t = 0.0)]
     komi: f64,
+    /// After a side has passed this many times running, each further pass by
+    /// it ends the game with `--random-stop-probability`, awarded by area: the
+    /// rule self-play uses, so a rating measures the game being trained. 0 is
+    /// off. See `vgo_selfplay::RandomStop`.
+    #[arg(long, default_value_t = 0)]
+    random_stop_after: u32,
+    #[arg(long, default_value_t = 0.25)]
+    random_stop_probability: f64,
     /// Which rules to play. Must match the models being compared: a result
     /// measured under one ruleset says nothing about play under the other.
     #[arg(long, default_value = "vgo")]
@@ -220,6 +228,8 @@ struct GameResult {
     // Candidate, opponent. Timed search can exceed its advisory deadline while
     // a broker round is pending, so report actual work and elapsed search time.
     searches: [SeatSearches; 2],
+    /// Ended by the random stop during a one-sided pass streak.
+    random_stop: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -338,6 +348,9 @@ fn validate_arguments(arguments: &Arguments) -> Result<(), &'static str> {
                 != 0.0)
     {
         return Err("tree reuse requires zero root exploration noise for that seat");
+    }
+    if !(0.0..=1.0).contains(&arguments.random_stop_probability) {
+        return Err("random stop probability must be in [0, 1]");
     }
     if arguments.pairs == 0
         || arguments.simulations == 0
@@ -480,6 +493,13 @@ fn play_game(
             .with_ruleset(arguments.ruleset)
             .with_komi(arguments.komi),
         arguments.maximum_plies,
+        (arguments.random_stop_after > 0).then_some((
+            RandomStop {
+                after: arguments.random_stop_after,
+                probability: arguments.random_stop_probability,
+            },
+            seed,
+        )),
         |position, ply| {
             let index = usize::from(position.to_move() != candidate_color);
             let seat = &seats[index];
@@ -540,6 +560,7 @@ fn play_game(
         plies: playout.stats.plies,
         moves,
         searches,
+        random_stop: playout.random_stop,
     })
 }
 
@@ -729,7 +750,9 @@ fn write_sgfs(
         // Every game is decided now, so "decided" says nothing. What is
         // worth finding in a directory listing is which games stalled to
         // the cap rather than ending on their own.
-        let status = if result.plies >= arguments.maximum_plies {
+        let status = if result.random_stop {
+            "stopped"
+        } else if result.plies >= arguments.maximum_plies {
             "capped"
         } else {
             "natural"
@@ -753,6 +776,8 @@ struct MatchTotals {
     /// plies is far past where the board settles, so a high share means the
     /// sides are stalling rather than that the game is long.
     capped: usize,
+    /// Games ended by the random stop.
+    random_stops: usize,
     searches: [SeatSearches; 2],
 }
 
@@ -764,7 +789,8 @@ impl MatchTotals {
                 total.absorb(game);
             }
             totals.plies += u64::from(result.plies);
-            totals.capped += usize::from(result.plies >= maximum_plies);
+            totals.capped += usize::from(result.plies >= maximum_plies && !result.random_stop);
+            totals.random_stops += usize::from(result.random_stop);
             match result.outcome.winner {
                 Some(winner) if winner == result.candidate_color => {
                     totals.wins += 1;
@@ -832,6 +858,7 @@ fn run_match(
             "  \"completed\": {},\n",
             "  \"truncated\": 0,\n",
             "  \"reached_ply_cap\": {},\n",
+            "  \"random_stops\": {},\n",
             "  \"candidate_wins\": {},\n",
             "  \"candidate_losses\": {},\n",
             "  \"draws\": {},\n",
@@ -860,6 +887,7 @@ fn run_match(
         games,
         games,
         totals.capped,
+        totals.random_stops,
         totals.wins,
         totals.losses,
         totals.draws,

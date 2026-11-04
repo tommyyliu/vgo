@@ -66,13 +66,13 @@
   {
     "id": "random-stop",
     "kind": "task",
-    "status": "Next",
+    "status": "Done",
     "bucket": "Generate",
     "effort": "M",
     "title": "End one-sided pass streaks at random, as a bootstrap",
     "why": "72% of big-board games with a long pass streak ran to the 312-ply cap, so labels read who leads at ply 312. Once a side has passed 4 times running, ending the game with probability 0.25 on each further pass would have ended 74% of big-board games early, about 61 plies sooner, and changed the eventual winner in 13% of those. A stopgap until the value head supports hard resignation: no model input or search change, so it comes out cleanly.",
     "test": "Implement in self-play and arena only, seeded for reproducible digests. Check the share of capped games and plies per game in a short run.",
-    "progress": "Design agreed: self-play and arena only, no model input or search change, seeded."
+    "result": "RandomStop in vgo-selfplay's play_game, shared by self-play and the arena: --random-stop-after 4 --random-stop-probability 0.25, on by default in bulk-loop.sh for both generation and rating rounds. Seeded from the game seed and ply; game records carry random_stop, arena records random_stops, and SGFs a 'stopped' status. Off, games are unchanged: the four self-play digests match golden once the new random_stop field is removed from each record. A naive-play digest case now covers the stop. Not yet seen in a real run."
   },
   {
     "id": "repeat-points",

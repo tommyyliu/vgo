@@ -86,7 +86,13 @@ limits can require an engine rebuild.
 
 - selection of the search's preferred playable action, or pass if none exists;
 - transition application and event accounting;
-- pass/pass termination and maximum-ply bounds; and
+- pass/pass termination and maximum-ply bounds;
+- the optional random stop (`RandomStop`): once one side has passed `after` times
+  running while the other plays, each further pass by it ends the game with a
+  fixed probability, drawn from the game seed and ply, and the game is awarded by
+  area. A bootstrap until the value head supports resignation; the loop runs it at
+  4 and 0.25 in self-play and rating rounds alike. Neither model nor search sees
+  it; and
 - accumulated search and gameplay statistics.
 
 The arena and replay generator share this progression. The current Vgo rules
@@ -104,7 +110,7 @@ into place after its manifest and sidecars have been written.
 The manifest identifies the dataset digest, model digest when present, sample
 count, the game's radius and tail sample count, nominal raster dimensions, policy
 size, and simulation budget. `games.jsonl` records the per-game radius/komi, final
-scores and stones, cap status, tail spans, and per-ply root value, search KL and
+scores and stones, cap status, whether the random stop ended it, tail spans, and per-ply root value, search KL and
 top-two gap. Full resolved run configuration and stage timings live in
 `performance.jsonl`, rather than being repeated in every game manifest.
 

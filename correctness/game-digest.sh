@@ -19,7 +19,11 @@ bin="$root/target/release"
 
 generate () {
   local ruleset="$1" actors="$2" maximum_plies="$3"; shift 3
-  local output="$work/generate-$ruleset-$actors-$maximum_plies-${#evaluator[@]}"
+  # Named from every argument, as arena() does: two cases that differ only in
+  # extra flags once shared a directory, and the generator numbered the second
+  # run's games after the first's, so the second hash re-read the first games.
+  local output="$work/generate-$ruleset-$actors-$maximum_plies-${#evaluator[@]}-$*"
+  output="${output// /_}"
   "$bin/vgo-generate-continuous" --output-root "$output" --label digest \
     "${evaluator[@]}" --provider cpu --fp16 false --cache-directory "$work/cache" \
     --maximum-games 8 --actors "$actors" --inference-slots 1 --maximum-batch 8 --delay-ms 1 \
@@ -69,6 +73,9 @@ report () {
 # Model games reach the cap; naive ones end by passing, which covers the other exit.
 evaluator=()
 report generate-naive generate vgo 1 40 --board-mix 1:18
+# The random stop: naive play makes short one-sided pass streaks, and at these
+# settings it ends one of the eight games, so the rule's path is in the hash.
+report generate-stop generate vgo 1 40 --board-mix 1:18 --random-stop-after 1 --random-stop-probability 0.5
 evaluator=(--model "$model")
 report generate-mixed generate vgo 4 24 --board-mix 1:18 --board-mix 1:18-30
 report generate-vgo generate vgo 1 40 --board-mix 1:18

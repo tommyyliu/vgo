@@ -127,6 +127,14 @@ tail_simulations="${VGO_TAIL_SIMULATIONS:-400}"
 tail_window="${VGO_TAIL_WINDOW:-5}"
 # Share of tail plies to train on. All of them stay on disk.
 tail_keep="${VGO_TAIL_KEEP:-0.25}"
+# The random stop, a bootstrap until the value head supports resignation: once a
+# side has passed this many times running, each further pass ends the game with
+# the probability below, awarded by area. Self-play and rating rounds both use
+# it, so ratings measure the game being trained. On the first fresh run's games
+# it would have ended 74% of big-board games about 61 plies early, where 72% of
+# long streaks ran to the cap. VGO_RANDOM_STOP_AFTER=0 turns it off.
+random_stop_after="${VGO_RANDOM_STOP_AFTER:-4}"
+random_stop_probability="${VGO_RANDOM_STOP_PROBABILITY:-0.25}"
 packed_input="${VGO_PACKED_INPUT:-1}"
 root_noise="${VGO_ROOT_NOISE:-0.10}"
 # Measurement against a fixed anchor, every N rounds. Both seats always get the
@@ -247,6 +255,7 @@ start_generator () {
     --tail-schedule "$schedule" --tail-simulations "$tail_budget" --tail-window "$tail_window" \
     --temperature 1.0 --temperature-plies 30 \
     --root-exploration-noise "$root_noise" \
+    --random-stop-after "$random_stop_after" --random-stop-probability "$random_stop_probability" \
     --leaf-batch 4 --maximum-batch 32 --delay-ms 1 --inference-slots "$inference_slots" \
     --provider tensorrt --fp16 true \
     --cache-directory "$root/artifacts/onnx-cache" \
@@ -464,6 +473,7 @@ print('\n'.join(random.Random(int(sys.argv[2])).sample(pool, count)))
         --policy-resolution 128 --resolution "$resolution" \
         --simulations "$anchor_simulations" --pairs "$anchor_pairs" \
         --max-plies "$anchor_max_plies" --threads 8 --maximum-batch 32 \
+        --random-stop-after "$random_stop_after" --random-stop-probability "$random_stop_probability" \
         --coarse-pool 16 --widening-coefficient 4.0 --maximum-candidates 321 \
         --seed $((500000 + update)) \
         >> "$output/anchor.jsonl" 2>>"$output/anchor.log"

@@ -48,6 +48,8 @@ pub struct GameSettings {
     pub maximum_plies: u32,
     pub ruleset: Ruleset,
     pub tail: TailSettings,
+    /// See [`crate::RandomStop`]. None plays every game to its end or the cap.
+    pub random_stop: Option<crate::RandomStop>,
 }
 
 impl GameSettings {
@@ -387,6 +389,8 @@ pub struct GameRecord {
     /// the game is genuinely long. It was 88% among games containing a run of
     /// no-op self-captures and 0% among games without one.
     pub reached_ply_cap: bool,
+    /// Ended by [`crate::RandomStop`] during a one-sided pass streak.
+    pub random_stop: bool,
     /// The cap itself, which calibration reads game stage against.
     pub maximum_plies: u32,
     /// Ply ranges played in the tail, end exclusive.
@@ -630,6 +634,7 @@ pub fn generate_game_observed(
             .with_ruleset(settings.ruleset)
             .with_komi(komi),
         maximum_plies,
+        settings.random_stop.map(|rule| (rule, game_seed)),
         |position, ply| {
             if stopped.load(Ordering::Acquire) {
                 return Err(EvaluationError::new("replay generation cancelled"));
@@ -714,6 +719,7 @@ fn finish_game(
         black_area: final_score.black,
         white_area: final_score.white,
         reached_ply_cap: playout.outcome.is_none(),
+        random_stop: playout.random_stop,
         maximum_plies,
         tail_spans,
         tail_samples,
@@ -820,6 +826,7 @@ mod tests {
                 exit_value: 0.6,
                 exit_window: 2,
             },
+            random_stop: None,
         };
         let normal = ply_search_config(&settings, base, true, false);
         assert_eq!(normal.simulations, 100);

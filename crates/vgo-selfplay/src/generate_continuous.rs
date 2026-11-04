@@ -194,6 +194,13 @@ struct Config {
     tail_exit_value: f64,
     #[arg(long, default_value_t = 2)]
     tail_exit_window: u32,
+    /// After a side has passed this many times running, each further pass by
+    /// it ends the game with `--random-stop-probability`; see
+    /// `vgo_selfplay::RandomStop`. 0 turns the rule off.
+    #[arg(long, default_value_t = 0)]
+    random_stop_after: u32,
+    #[arg(long, default_value_t = 0.25)]
+    random_stop_probability: f64,
     #[arg(long, default_value_t = 50_001)]
     seed: u64,
 
@@ -260,8 +267,18 @@ impl Config {
             maximum_plies: self.maximum_plies,
             ruleset: self.ruleset,
             tail,
+            random_stop: random_stop(self.random_stop_after, self.random_stop_probability)?,
         })
     }
+}
+
+fn random_stop(after: u32, probability: f64) -> Result<Option<vgo_selfplay::RandomStop>, String> {
+    if !(0.0..=1.0).contains(&probability) {
+        return Err(format!(
+            "--random-stop-probability must be in [0, 1], got {probability}"
+        ));
+    }
+    Ok((after > 0).then_some(vgo_selfplay::RandomStop { after, probability }))
 }
 
 fn file_sha256(path: &Path) -> io::Result<String> {
@@ -397,7 +414,7 @@ fn write_game_record(path: &Path, record: &GameRecord, samples: usize) -> io::Re
             r#"{{"game":{},"komi":{:.6},"radius":{:.8},"plies":{},"passes":{},"#,
             r#""self_captures":{},"black_utility":{},"margin":{:.6},"#,
             r#""black_area":{:.8},"white_area":{:.8},"#,
-            r#""reached_ply_cap":{},"maximum_plies":{},"tail_spans":{},"tail_samples":{},"#,
+            r#""reached_ply_cap":{},"random_stop":{},"maximum_plies":{},"tail_spans":{},"tail_samples":{},"#,
             r#""first_sample":0,"sample_count":{},"final_stones":[{}],"search_budgets":{},"#,
             r#""policy_eligible":{},"root_values":{},"search_kl":{},"top_gap":{}}}"#
         ),
@@ -412,6 +429,7 @@ fn write_game_record(path: &Path, record: &GameRecord, samples: usize) -> io::Re
         record.black_area,
         record.white_area,
         record.reached_ply_cap,
+        record.random_stop,
         record.maximum_plies,
         serde_json::to_string(&record.tail_spans)?,
         record.tail_samples,
