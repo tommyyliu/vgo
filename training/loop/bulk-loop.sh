@@ -246,8 +246,10 @@ build_tail_schedule () {
 build_komi_schedule () {
   local path="$1" previous
   previous=$(ls -1t "$output/komi-schedules/"*.json 2>/dev/null | head -1)
+  # To stderr: start_generator's stdout is the generator's pid, and the summary
+  # line once landed there instead.
   "$python" "$root/training/loop/komi-calibration.py" "$games" --output "$path" \
-    --max-step "$komi_max_step" ${previous:+--previous "$previous"}
+    --max-step "$komi_max_step" ${previous:+--previous "$previous"} >&2
 }
 
 start_generator () {
