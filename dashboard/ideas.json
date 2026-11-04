@@ -1,44 +1,15 @@
 [
   {
-    "id": "review-komi",
-    "kind": "task",
-    "status": "Review",
-    "bucket": "Generate",
-    "effort": "S",
-    "title": "Komi is not calibrated from results",
-    "why": "You asked whether komi is already centred on the point where Black and White are even. It isn't. bulk-loop.sh sets the centre by hand (coefficient 28.0, about 7 points) and samples komi up to 78% either side of it. generation.rs mentions a fit_komi_power_law that would refit it from games, but that function does not exist. Measured over this run, Black won about 10% of small-board games and 30% of big-board games, and even the lowest komi in the range left Black behind.",
-    "ask": "Should the loop refit the komi centre per board from recent games, aiming at a 50% win rate? I'd do it after random-stop, since the stalled games are part of why White wins, and record the fit in the run's events."
-  },
-  {
-    "id": "review-branch",
-    "kind": "task",
-    "status": "Review",
-    "bucket": "Engineering",
-    "effort": "S",
-    "title": "Branch collapse-recipe is ready to merge",
-    "why": "Commits on top of main: value-label thinning (--value-stride, --value-labels-per-game), weight decay, packed ownership and uint8 ridge (window 107 to 57 KiB a sample), training-only history planes, and the tracker and findings updates. All default off or lossless except the ridge, which matched fp16 on held-out loss. correctness/check.sh passes on the rebuilt binaries.",
-    "ask": "Merge into main? Pushing stays your call."
-  },
-  {
     "id": "5b4efdee",
     "kind": "task",
-    "status": "Review",
+    "status": "Parked",
     "bucket": "Measurement",
     "effort": "M",
     "title": "Decide a repetition rule",
     "why": "Self-play games repeat exact positions often: 5.7% of big-board positions recur, mostly as four-ply cycles (repeat-points). The rules allow repetition, and the net has no history, so it cannot tell a cycle from progress. Random-stop ends the cycles played against a passing opponent (42% of big-board repeats); the rest, where both sides keep moving, run on to the cap. Options are in docs/history/GAMEPLAY_VARIANTS.md.",
     "test": "Find a position players would rationally repeat, then choose between unrestricted repetition, simple ko and superko.",
-    "ask": "Should self-play and arena forbid recreating an earlier position with the same side to move (positional superko)? It removes every cycle at the source, costs a position-hash set per game, and changes the game for human play too unless it is kept to self-play. The alternatives are to leave cycles to random-stop and the cap, or to give the net history planes (3 plies cut policy KL 1.721 to 1.706)."
-  },
-  {
-    "id": "review-fresh-run",
-    "kind": "task",
-    "status": "Review",
-    "bucket": "Loop",
-    "effort": "S",
-    "title": "Settings for the fresh overnight run",
-    "why": "Planned: start from the naive generator in a new output directory; value recipe of 16 labels per game at value weight 1/16 (won 172-28 against update 23); a 450k window with 3 epochs (training peaks near 27 GB); ownership 1.5; random stop at 4 and 0.25; rating rounds on 1/38 every 3 updates against the model 6 back plus two recent ones; the naive generator drained when the first training starts. With the lighter m_d111_c22 net, the generator read 30-37k positions/s at 128 input, against about 14k sustained at 192 in the last run, so 192 makes roughly half the games per night.",
-    "ask": "128 or 192 input? Your earlier plan was to bootstrap at 128 and move up later; the last run used 192 throughout. And start before or after deciding the repetition rule (review item above)? Starting now means cycles that both sides play still run to the cap."
+    "held": "Needs more evidence",
+    "revisit": "If cycles where both sides keep moving still run to the cap in the 128 run; check the share of capped games with repeats."
   },
   {
     "id": "rust-rebuild",
@@ -120,25 +91,24 @@
   {
     "id": "fresh-run",
     "kind": "task",
-    "status": "Next",
+    "status": "Running",
     "bucket": "Loop",
     "effort": "L",
     "title": "Fresh overnight run with the fixes",
     "why": "Replaces forking from update 12: the fixes should help early phases too. Strength rose to about update 12 and then fell about 20 Elo an update, newer windows trained worse nets, and the value head memorized its window.",
     "test": "After value-recipe, random-stop, ratings-fix and naive-stop: start from the naive generator with the new recipe, and watch the rating curve for the rise-then-fall shape.",
-    "progress": "Ready: the loop carries every fix. Waiting on the choices in review-fresh-run."
+    "progress": "Started 2026-11-04 in artifacts/vgo-128: 128 input, 2 lanes, every fix on (value recipe, 450k window, random stop, komi recentring, 1/38 rating rounds, naive drain). Watch for the curve to plateau."
   },
   {
     "id": "komi-range",
     "kind": "task",
-    "status": "Later",
+    "status": "Done",
     "bucket": "Generate",
     "effort": "S",
     "title": "Let komi follow the result per board",
     "why": "Black's self-play win rate fell to about 10% on small boards and 30% on big ones, and the fitted fair komi was often below the sampler's floor. Partly a game-end effect, so decide after random-stop.",
     "test": "Measure Black's win rate by board after random-stop, then widen the range or fit the centre from recent games.",
-    "held": "After another task",
-    "revisit": "After random-stop, or sooner if you answer review-komi."
+    "result": "Built as dynamic recentring (training/loop/komi-calibration.py): refit before each generator, at most 1 point a refit, held until komi clearly moves the result; spread fixed at 5.46 points. The slope is logged for a later spread rule."
   },
   {
     "id": "faster-net",

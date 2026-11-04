@@ -16,7 +16,7 @@ ARTIFACT_ROOTS = ("artifacts",)  # Walked recursively, so this includes artifact
 # Large trees that hold games and models, not results.
 SKIP_DIRS = {"games", "replay", "seed-replay", "onnx-cache", "telemetry", "models", "updates"}
 # The current loop, or the archived one until a fresh run exists.
-LOOPS = ("artifacts/vgo-bulk", "artifacts/old/main/vgo-continuous")
+LOOPS = ("artifacts/vgo-128", "artifacts/vgo-bulk", "artifacts/old/main/vgo-continuous")
 LOOP = LOOPS[1]
 ANCHOR = "sl-w64b16"
 MIN_LEDGER_GAMES = 40
