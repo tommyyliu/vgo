@@ -12,6 +12,12 @@ What the project has learned, and how results get decided. Dated detail is in
 3. **Results.** Every experiment ends with a written verdict here. A result that exists only
    under `artifacts/` isn't recorded.
 
+## Adopted
+
+| Change | Evidence |
+|---|---|
+| Value targets on 16 positions per game, at total value weight 1/16 (2026-11-04) | Two seeds trained on update 23's own window, 8 epochs as update 23 was, beat update 23 and its seed twin 172-28 on 1/38 at 800 simulations, every match 43-7; colour-swapped pairs 73-1. On a 450k window, 16 labels per game had the best held-out value MSE (0.58 against 0.99 unthinned), and policy KL fell as the value weight fell, flat at the no-value bound from 1/8 down. The loop now trains this on a 450k window, 3 epochs, 5% turnover |
+
 ## Closed ideas
 
 Don't reopen these without new evidence.

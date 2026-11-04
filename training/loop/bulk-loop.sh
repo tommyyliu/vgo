@@ -64,9 +64,11 @@ output="$(cd "$output" && pwd)"
 games="$output/games"
 models="$output/models"
 
-# 150k rather than the 200k that produced the +307: that run peaked at 46 GB of
-# 60 with nothing else on the box, and here a generator is resident throughout.
-window="${VGO_WINDOW_SAMPLES:-150000}"
+# 450k since 2026-11-04. The value head memorized a 150k window (train MAE 0.03,
+# held-out 0.65), and a window drawn from twice as many generations beat update
+# 23's own 34-14. Ownership as bits and the ridge as uint8 brought the window to
+# 57 KiB a sample, so 450k trains at a 27 GB peak where 150k once took 18.
+window="${VGO_WINDOW_SAMPLES:-450000}"
 # Input raster, square. The policy grid stays at 128 either way, so this changes
 # what the network sees, not which moves it can propose: boundary cells whose
 # centre is illegal still snap to the nearest legal point inside them. 128 searches
@@ -85,8 +87,17 @@ read -r -a board_mix <<< "${VGO_BOARD_MIX:-50:38 25:18 25:18-38}"
 # Fraction of the window replaced before retraining. Training competes with
 # generation; the historical duty estimate above was measured on a different
 # recipe and should be rechecked from the current lifecycle/performance logs.
-turnover="${VGO_TURNOVER:-0.15}"
-epochs="${VGO_EPOCHS:-8}"
+# 5% of 450k is the 22.5k samples a retrain waited for at 15% of 150k, so updates
+# keep their cadence; 3 epochs keeps the steps per update near the old 8 on 150k.
+turnover="${VGO_TURNOVER:-0.05}"
+epochs="${VGO_EPOCHS:-3}"
+# Value targets: 16 positions per game, spread evenly, at a total value weight
+# of 1/16 of an unthinned window. Every ply of a game shares one outcome, so the
+# full window memorized ~800 labels; on update 23's window this recipe cut
+# held-out value MSE from 0.99 to 0.58, and the policy improved as the value
+# weight fell, flat at the no-value bound from 1/8 down. See docs/FINDINGS.md.
+value_labels_per_game="${VGO_VALUE_LABELS_PER_GAME:-16}"
+value_weight="${VGO_VALUE_WEIGHT:-0.0625}"
 updates="${VGO_UPDATES:-200}"
 actors="${VGO_ACTORS:-64}"
 inference_slots="${VGO_INFERENCE_SLOTS:-3}"
@@ -361,7 +372,8 @@ for ((update = first_update; update < first_update + updates; update++)); do
       "${shape_flags[@]}" \
       --attention-heads 8 --norm-groups 8 --norms-per-block "$norms_per_block" --precision bfloat16 \
       --epochs "$epochs" --batch-size 64 --learning-rate 0.0005 \
-      --value-weight 2.0 --ownership-weight "$ownership_weight" --validation-fraction 0.1 \
+      --value-weight "$value_weight" --value-labels-per-game "$value_labels_per_game" \
+      --ownership-weight "$ownership_weight" --validation-fraction 0.1 \
       --tail-keep "$tail_keep" \
       --schedule wsd --warmup-epochs 0 --compile \
       --seed $((90000 + update)) --report-every 1 \

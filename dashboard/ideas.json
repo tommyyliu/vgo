@@ -37,7 +37,7 @@
     "bucket": "Loop",
     "effort": "S",
     "title": "Settings for the fresh overnight run",
-    "why": "Planned: start from the naive generator in a new output directory; value recipe of 16 labels per game at value weight 1/16 (if its arena holds up); a 450k window with 3 epochs (training peaks near 27 GB); ownership 1.5; random stop at 4 and 0.25; rating rounds on 1/38 every 3 updates against the model 6 back plus two recent ones; the naive generator drained when the first training starts. With the lighter m_d111_c22 net, the generator read 30-37k positions/s at 128 input, against about 14k sustained at 192 in the last run, so 192 makes roughly half the games per night.",
+    "why": "Planned: start from the naive generator in a new output directory; value recipe of 16 labels per game at value weight 1/16 (won 172-28 against update 23); a 450k window with 3 epochs (training peaks near 27 GB); ownership 1.5; random stop at 4 and 0.25; rating rounds on 1/38 every 3 updates against the model 6 back plus two recent ones; the naive generator drained when the first training starts. With the lighter m_d111_c22 net, the generator read 30-37k positions/s at 128 input, against about 14k sustained at 192 in the last run, so 192 makes roughly half the games per night.",
     "ask": "128 or 192 input? Your earlier plan was to bootstrap at 128 and move up later; the last run used 192 throughout. And start before or after deciding the repetition rule (review item above)? Starting now means cycles that both sides play still run to the cap."
   },
   {
@@ -54,13 +54,13 @@
   {
     "id": "value-recipe",
     "kind": "task",
-    "status": "Running",
+    "status": "Done",
     "bucket": "Extract",
     "effort": "S",
     "title": "Arena the value recipe, then adopt it",
     "why": "The value head memorized its window: train MAE 0.03, held-out 0.65. On update 23's 450k window, 16 labels per game cut held-out value MSE from 0.99 to 0.58 and lifted the winner from 71% to 79%. Policy KL fell as the value weight dropped and was flat at the no-value bound for weights of 1/8 and below. Stride-8 thinning plus weight decay already beat update 23 116-84. All held-out numbers are one seed.",
     "test": "Arena the 16-labels, weight-1/16 nets on update 23's window against update 23 and its twin on the 38 board, about 200 games. Two seeds. Then wire --value-labels-per-game 16 --value-weight 0.0625 and a 450k window into bulk-loop.sh.",
-    "progress": "Training two seeds on update 23's 150k window (8 epochs, as update 23 was), then 200 games against update 23 and its twin on the 38 board."
+    "result": "Adopted: 172-28 (86%, about +315 Elo, 95% 0.81-0.91) for two seeds against update 23 and its twin, 43-7 in each of the four matches, pairs 73-1. bulk-loop.sh now trains --value-labels-per-game 16 --value-weight 0.0625 on a 450k window, 3 epochs, 5% turnover (VGO_ overrides for each)."
   },
   {
     "id": "ratings-fix",
@@ -126,7 +126,7 @@
     "title": "Fresh overnight run with the fixes",
     "why": "Replaces forking from update 12: the fixes should help early phases too. Strength rose to about update 12 and then fell about 20 Elo an update, newer windows trained worse nets, and the value head memorized its window.",
     "test": "After value-recipe, random-stop, ratings-fix and naive-stop: start from the naive generator with the new recipe, and watch the rating curve for the rise-then-fall shape.",
-    "progress": "Ready apart from the value recipe's arena and the open choices in review-fresh-run."
+    "progress": "Ready: the loop carries every fix. Waiting on the choices in review-fresh-run."
   },
   {
     "id": "komi-range",
