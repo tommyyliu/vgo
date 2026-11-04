@@ -31,6 +31,16 @@
     "ask": "Should self-play and arena forbid recreating an earlier position with the same side to move (positional superko)? It removes every cycle at the source, costs a position-hash set per game, and changes the game for human play too unless it is kept to self-play. The alternatives are to leave cycles to random-stop and the cap, or to give the net history planes (3 plies cut policy KL 1.721 to 1.706)."
   },
   {
+    "id": "review-fresh-run",
+    "kind": "task",
+    "status": "Review",
+    "bucket": "Loop",
+    "effort": "S",
+    "title": "Settings for the fresh overnight run",
+    "why": "Planned: start from the naive generator in a new output directory; value recipe of 16 labels per game at value weight 1/16 (if its arena holds up); a 450k window with 3 epochs (training peaks near 27 GB); ownership 1.5; random stop at 4 and 0.25; rating rounds on 1/38 every 3 updates against the model 6 back plus two recent ones; the naive generator drained when the first training starts. With the lighter m_d111_c22 net, the generator read 30-37k positions/s at 128 input, against about 14k sustained at 192 in the last run, so 192 makes roughly half the games per night.",
+    "ask": "128 or 192 input? Your earlier plan was to bootstrap at 128 and move up later; the last run used 192 throughout. And start before or after deciding the repetition rule (review item above)? Starting now means cycles that both sides play still run to the cap."
+  },
+  {
     "id": "rust-rebuild",
     "kind": "task",
     "status": "Done",
@@ -99,13 +109,13 @@
   {
     "id": "naive-stop",
     "kind": "task",
-    "status": "Next",
+    "status": "Done",
     "bucket": "Engineering",
     "effort": "S",
     "title": "Stop the naive generator once its window is full",
     "why": "The first update of a fresh run took 64 minutes against about 9, because the naive generator kept all 32 threads while training prepared batches, and it wrote 38 GB of games nobody trains on. Stopping it by hand brought the card straight back.",
     "test": "Touch the stop file when the first training starts, and confirm a fresh run's first update finishes in about 10 minutes.",
-    "progress": "Not started. Matters for the fresh run's first update."
+    "result": "bulk-loop.sh touches the naive generator's stop file when the first training starts. In a three-update scratch run, 8,026 of its 8,027 games predate the stop and the last finished in flight a second later. The same run confirmed random stops in self-play (55 of 332 model games) and rating rounds on 1/38 (about 255 plies a game)."
   },
   {
     "id": "fresh-run",
@@ -116,7 +126,7 @@
     "title": "Fresh overnight run with the fixes",
     "why": "Replaces forking from update 12: the fixes should help early phases too. Strength rose to about update 12 and then fell about 20 Elo an update, newer windows trained worse nets, and the value head memorized its window.",
     "test": "After value-recipe, random-stop, ratings-fix and naive-stop: start from the naive generator with the new recipe, and watch the rating curve for the rise-then-fall shape.",
-    "progress": "Waiting on the tasks above. Open choice: 128 or 192 input for the bootstrap; the last run used 192."
+    "progress": "Ready apart from the value recipe's arena and the open choices in review-fresh-run."
   },
   {
     "id": "komi-range",

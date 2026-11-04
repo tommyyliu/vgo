@@ -330,6 +330,16 @@ for ((update = first_update; update < first_update + updates; update++)); do
     sleep 60
   done
 
+  # The naive generator's games stop being useful once there is enough to train
+  # on: the first trained model replaces it either way. Left running, it held all
+  # 32 threads through the first training, which took 64 minutes against about 9,
+  # and wrote 38 GB of games no window used. The stop file drains it instead.
+  if [ -z "$model" ] && [ ! -e "$games/$label.stop" ]; then
+    touch "$games/$label.stop"
+    record_event generator_draining "label=$label" "pid=$generator" "reason=naive_window_full"
+    echo "[loop] update $update: naive generator stopped; training has its window"
+  fi
+
   checkpoint="$models/update-$(printf '%06d' "$update").pt"
   echo "[loop] update $update: training from scratch on the most recent $window samples"
   record_event training_started "update=$update" "checkpoint=$checkpoint" "generator_pid=$generator"
