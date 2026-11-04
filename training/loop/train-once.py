@@ -109,6 +109,11 @@ def main() -> None:
         "evenly, with the value loss scaled back to the unthinned total",
     )
     parser.add_argument(
+        "--history-plies", type=int, default=0,
+        help="add the stones of this many previous positions as input planes "
+        "(training only: such a net cannot be exported for play)",
+    )
+    parser.add_argument(
         "--weight-decay", type=float, default=0.0,
         help="AdamW weight decay on weight matrices; 0 is plain Adam",
     )
@@ -162,6 +167,7 @@ def main() -> None:
         augment=arguments.augment,
         value_stride=arguments.value_stride,
         value_labels_per_game=arguments.value_labels_per_game,
+        history_plies=arguments.history_plies,
         weight_decay=arguments.weight_decay,
     )
 

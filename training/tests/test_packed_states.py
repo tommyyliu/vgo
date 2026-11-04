@@ -166,3 +166,38 @@ class PackedStateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HistoryPlaneTests(unittest.TestCase):
+    def test_history_planes_are_earlier_stones_from_the_movers_view(self) -> None:
+        from vgo_training.packed_states import add_history
+
+        generator = torch.Generator().manual_seed(5)
+        samples, height, width = 8, 8, 8
+        states = torch.zeros((samples, 7, height, width), dtype=torch.float16)
+        for channel in (0, 1, 3):
+            states[:, channel] = (
+                torch.rand((samples, height, width), generator=generator) > 0.5
+            ).to(torch.float16)
+        states[:, 2] = torch.rand((samples, height, width), generator=generator).half()
+        for channel, value in ((4, 0.02), (5, 0.0), (6, 0.05)):
+            states[:, channel] = value
+        # Two games, rows shuffled: game 7 plies 0-4, game 9 plies 0-2.
+        games = torch.tensor([7, 9, 7, 7, 9, 7, 9, 7])
+        plies = torch.tensor([3, 1, 0, 4, 0, 1, 2, 2])
+        packed = add_history(pack(states), games, plies, 3)
+        self.assertEqual(packed.channels, 13)
+        out = packed.expand()
+        row = {(int(g), int(p)): r for r, (g, p) in enumerate(zip(games, plies))}
+        for r, (g, p) in enumerate(zip(games.tolist(), plies.tolist())):
+            self.assertTrue(torch.equal(out[r, :7], states[r]))
+            for k in (1, 2, 3):
+                mine, theirs = out[r, 7 + 2 * (k - 1)], out[r, 8 + 2 * (k - 1)]
+                source = row.get((g, p - k))
+                if source is None:
+                    self.assertEqual(float(mine.abs().sum() + theirs.abs().sum()), 0.0)
+                    continue
+                # k plies back the mover was the other side when k is odd.
+                expected = (1, 0) if k % 2 else (0, 1)
+                self.assertTrue(torch.equal(mine, states[source, expected[0]]), (r, k))
+                self.assertTrue(torch.equal(theirs, states[source, expected[1]]), (r, k))

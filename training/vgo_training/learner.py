@@ -24,7 +24,12 @@ from .dataset import (
     load_dataset,
 )
 from .model import build_model
-from .packed_states import is_packable, pack as pack_states, quantize as quantize_states
+from .packed_states import (
+    add_history,
+    is_packable,
+    pack as pack_states,
+    quantize as quantize_states,
+)
 from .packed_policy import (
     is_packable as is_policy_packable,
     pack as pack_policy,
@@ -135,6 +140,9 @@ class LearnerConfig:
     # Instead of a stride: this many value labels per game, spread evenly over
     # it, with the value loss scaled back to the unthinned total. 0 is off.
     value_labels_per_game: int = 0
+    # Stones of this many previous positions as extra input planes. Training
+    # only: the Rust raster does not render them, so such a net cannot play.
+    history_plies: int = 0
     # Decoupled (AdamW) weight decay on weights of rank 2 and up; biases and
     # norm scales are exempt. Zero keeps plain Adam.
     weight_decay: float = 0.0
@@ -178,6 +186,8 @@ class LearnerConfig:
             raise ValueError("tail keep must be in (0, 1]")
         if self.value_stride < 1:
             raise ValueError("value stride must be at least 1")
+        if self.history_plies < 0:
+            raise ValueError("history plies must be nonnegative")
         if self.value_labels_per_game < 0:
             raise ValueError("value labels per game must be nonnegative")
         if self.value_labels_per_game and self.value_stride != 1:
@@ -372,6 +382,7 @@ class ReplayCache:
         self._raster_kind: str | None = None
         self._resolution: int | None = None
         self._tail_keep = 1.0
+        self._history = 0
         self.hits = 0
         self.misses = 0
 
@@ -380,6 +391,7 @@ class ReplayCache:
         raster_kind: str | None,
         resolution: int | None = None,
         tail_keep: float = 1.0,
+        history: int = 0,
     ) -> None:
         """Render with `raster_kind` from here on, dropping anything else.
 
@@ -394,10 +406,10 @@ class ReplayCache:
         new entries only. In practice the kind is run identity and never changes
         mid-run, which is exactly why a silent mismatch would go unnoticed.
         """
-        wanted = (raster_kind, resolution, tail_keep)
-        if wanted == (self._raster_kind, self._resolution, self._tail_keep):
+        wanted = (raster_kind, resolution, tail_keep, history)
+        if wanted == (self._raster_kind, self._resolution, self._tail_keep, self._history):
             return
-        self._raster_kind, self._resolution, self._tail_keep = wanted
+        self._raster_kind, self._resolution, self._tail_keep, self._history = wanted
         self._entries.clear()
         keywords: dict[str, object] = {"raster_kind": raster_kind}
         if tail_keep < 1.0:
@@ -435,9 +447,14 @@ class ReplayCache:
         # The ridge plane is most of what is left: uint8 halves it. See
         # `quantize` in vgo_training/packed_states.py.
         if prepared.packed_states is not None:
-            prepared = replace(
-                prepared, packed_states=quantize_states(prepared.packed_states)
-            )
+            packed = quantize_states(prepared.packed_states)
+            if self._history:
+                if packed.samples != raw.game_ids.numel():
+                    raise ValueError("history needs one prepared row per raw row")
+                packed = add_history(packed, raw.game_ids, raw.plies, self._history)
+            prepared = replace(prepared, packed_states=packed)
+        elif self._history:
+            raise ValueError("history planes need packed states")
         # The targets are the rest of the window once states are packed: dense
         # float32 that is 99.67% zeros, plus a mask at one byte per bit.
         prepared = _pack_policy(prepared)
@@ -1610,7 +1627,7 @@ class PersistentLearner:
         hits_before = self.replay_cache.hits
         misses_before = self.replay_cache.misses
         self.replay_cache.use_raster_kind(
-            config.raster_kind, config.resolution, config.tail_keep
+            config.raster_kind, config.resolution, config.tail_keep, config.history_plies
         )
         window = self.replay_cache.window(request.datasets, config.batch_size)
         if config.ownership_weight == 0.0:

@@ -306,3 +306,47 @@ def conformance_error(
         difference = (restored[:, channel].float() - reference[:, channel].float())
         report[f"channel_{channel}"] = float(difference.abs().max().item())
     return report
+
+
+def add_history(
+    packed: PackedStates, game_ids: torch.Tensor, plies: torch.Tensor, history: int
+) -> PackedStates:
+    """The same planes plus the stones of the `history` previous positions.
+
+    For each k in 1..history, two bit planes follow the existing channels: the
+    side to move's stones and the opponent's, as they stood k plies earlier,
+    from the *current* mover's point of view -- so planes from an odd number of
+    plies back swap the stored current/opponent order, since the mover then was
+    the other side. A position with no row k plies earlier in its game (the
+    opening, or a ply not on disk) gets empty planes.
+
+    Training-only for now: the Rust raster does not render these planes, so a
+    net trained on them cannot be exported for play.
+    """
+    if history <= 0:
+        return packed
+    layout = packed.layout
+    current = layout.binary.index(CURRENT_STONES)
+    opponent = layout.binary.index(OPPONENT_STONES)
+    row_of = {
+        (int(game), int(ply)): row
+        for row, (game, ply) in enumerate(zip(game_ids.tolist(), plies.tolist()))
+    }
+    samples, _, width = packed.bits.shape
+    extra = torch.zeros((samples, 2 * history, width), dtype=packed.bits.dtype)
+    for row, (game, ply) in enumerate(zip(game_ids.tolist(), plies.tolist())):
+        for k in range(1, history + 1):
+            source = row_of.get((int(game), int(ply) - k))
+            if source is None:
+                continue
+            mine, theirs = (opponent, current) if k % 2 else (current, opponent)
+            extra[row, 2 * (k - 1)] = packed.bits[source, mine]
+            extra[row, 2 * (k - 1) + 1] = packed.bits[source, theirs]
+    channels = layout.channels + 2 * history
+    new_layout = Layout(
+        channels=channels,
+        binary=(*layout.binary, *range(layout.channels, channels)),
+        scalar=layout.scalar,
+        continuous=layout.continuous,
+    )
+    return replace(packed, bits=torch.cat((packed.bits, extra), dim=1), layout=new_layout)
