@@ -16,30 +16,30 @@
     "bucket": "Engineering",
     "effort": "S",
     "title": "Branch collapse-recipe is ready to merge",
-    "why": "Commits on top of main: value-label thinning (--value-stride, --value-labels-per-game), weight decay, packed ownership and uint8 ridge (window 107 to 57 KiB a sample), training-only history planes, and the tracker and findings updates. All default off or lossless except the ridge, which matched fp16 on held-out loss. The Python suite passes; the Rust side is not rebuilt yet (rust-rebuild).",
-    "ask": "Merge into main once rust-rebuild passes check.sh? Pushing stays your call."
+    "why": "Commits on top of main: value-label thinning (--value-stride, --value-labels-per-game), weight decay, packed ownership and uint8 ridge (window 107 to 57 KiB a sample), training-only history planes, and the tracker and findings updates. All default off or lossless except the ridge, which matched fp16 on held-out loss. correctness/check.sh passes on the rebuilt binaries.",
+    "ask": "Merge into main? Pushing stays your call."
   },
   {
     "id": "rust-rebuild",
     "kind": "task",
-    "status": "Next",
+    "status": "Done",
     "bucket": "Engineering",
     "effort": "S",
     "title": "Rebuild and check the Rust side after the Fedora upgrade",
     "why": "The upgrade moved system Python to 3.15 and broke training/.venv, which was rebuilt on a uv-managed 3.14. The Rust binaries were not rebuilt or run since.",
     "test": "cargo build --release, then correctness/check.sh.",
-    "progress": "Not started. Needed first: the arena binaries predate the upgrade."
+    "result": "Rebuilt in release mode on 2026-11-04; correctness/check.sh passed (Rust, 154 training and 33 dashboard tests)."
   },
   {
     "id": "value-recipe",
     "kind": "task",
-    "status": "Next",
+    "status": "Running",
     "bucket": "Extract",
     "effort": "S",
     "title": "Arena the value recipe, then adopt it",
     "why": "The value head memorized its window: train MAE 0.03, held-out 0.65. On update 23's 450k window, 16 labels per game cut held-out value MSE from 0.99 to 0.58 and lifted the winner from 71% to 79%. Policy KL fell as the value weight dropped and was flat at the no-value bound for weights of 1/8 and below. Stride-8 thinning plus weight decay already beat update 23 116-84. All held-out numbers are one seed.",
     "test": "Arena the 16-labels, weight-1/16 nets on update 23's window against update 23 and its twin on the 38 board, about 200 games. Two seeds. Then wire --value-labels-per-game 16 --value-weight 0.0625 and a 450k window into bulk-loop.sh.",
-    "progress": "Not started. Training the seeds takes about 20 minutes each; the arena about 2.5 hours."
+    "progress": "Training two seeds on update 23's 150k window (8 epochs, as update 23 was), then 200 games against update 23 and its twin on the 38 board."
   },
   {
     "id": "ratings-fix",
