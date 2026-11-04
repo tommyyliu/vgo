@@ -19,7 +19,7 @@ format and no migration is needed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -93,6 +93,9 @@ class PackedStates:
     `bits` holds `BINARY_CHANNELS` as one bit per pixel, `continuous` holds
     `CONTINUOUS_CHANNELS` at fp16, and `scalars` holds one value per
     `SCALAR_CHANNELS` entry per sample. `expand` reverses this exactly.
+
+    When `quantized`, `continuous` is uint8 on a uniform 1/255 grid over [0, 1]
+    instead -- see `quantize` -- and `expand` returns it to within 1/510.
     """
 
     bits: torch.Tensor  # (samples, len(BINARY_CHANNELS), ceil(pixels/8)) uint8
@@ -101,6 +104,7 @@ class PackedStates:
     height: int
     width: int
     layout: Layout = COMPACT_LAYOUT
+    quantized: bool = False
 
     @property
     def samples(self) -> int:
@@ -117,7 +121,7 @@ class PackedStates:
 
     @property
     def dtype(self) -> torch.dtype:
-        return self.continuous.dtype
+        return self.scalars.dtype
 
     def nbytes(self) -> int:
         return sum(
@@ -145,7 +149,7 @@ class PackedStates:
         if out is None:
             out = torch.empty(
                 (count, self.layout.channels, self.height, self.width),
-                dtype=self.continuous.dtype,
+                dtype=self.dtype,
                 device=device,
             )
 
@@ -158,6 +162,8 @@ class PackedStates:
             out[:, channel] = unpacked[:, slot].view(
                 count, self.height, self.width
             ).to(out.dtype)
+        if self.quantized:
+            continuous = continuous.float() / QUANTIZATION_LEVELS
         for slot, channel in enumerate(self.layout.continuous):
             out[:, channel] = continuous[:, slot]
         for slot, channel in enumerate(self.layout.scalar):
@@ -174,7 +180,34 @@ class PackedStates:
             height=self.height,
             width=self.width,
             layout=self.layout,
+            quantized=self.quantized,
         )
+
+
+# The continuous plane is `voronoi_ridge`, 1 - (second - nearest) / radius
+# clamped to [0, 1] -- 72 KiB of a 105 KiB sample at 192 input. Held as uint8 on
+# a uniform grid it is half that. Uniform rather than fp8 because the plane is
+# bounded and its values near 1, on the Voronoi boundaries, matter most: e4m3
+# steps by 1/16 there against 1/255 here.
+QUANTIZATION_LEVELS = 255
+
+
+def quantize(packed: PackedStates) -> PackedStates:
+    """The same planes with `continuous` as uint8, when it lies in [0, 1].
+
+    Lossy by design: each value moves by at most 1/510. Anything outside [0, 1]
+    is returned unchanged rather than clipped.
+    """
+    if packed.quantized:
+        return packed
+    plane = packed.continuous.float()
+    if plane.numel() and not bool(((plane >= 0) & (plane <= 1)).all()):
+        return packed
+    return replace(
+        packed,
+        continuous=torch.round(plane * QUANTIZATION_LEVELS).to(torch.uint8),
+        quantized=True,
+    )
 
 
 def is_packable(states: np.ndarray | torch.Tensor) -> bool:

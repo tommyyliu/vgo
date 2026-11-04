@@ -13,6 +13,7 @@ from vgo_training.packed_states import (
     conformance_error,
     is_packable,
     pack,
+    quantize,
 )
 
 
@@ -53,6 +54,31 @@ class PackedStateTests(unittest.TestCase):
         self.assertTrue(
             torch.equal(packed.expand(rows), states.index_select(0, rows))
         )
+
+    def test_quantized_ridge_is_within_half_a_step(self) -> None:
+        states = sample_states(9)
+        packed = quantize(pack(states))
+        self.assertTrue(packed.quantized)
+        self.assertEqual(packed.continuous.dtype, torch.uint8)
+        restored = packed.expand()
+        self.assertEqual(restored.dtype, torch.float16)
+        error = (restored[:, VORONOI_RIDGE].float() - states[:, VORONOI_RIDGE].float()).abs()
+        # Half a step of the uint8 grid, plus fp16 rounding of the result.
+        self.assertLessEqual(float(error.max()), 0.5 / 255 + 1e-3 * 0.5)
+        self.assertGreater(float(error.max()), 0.0)  # it really is lossy
+        # The exact planes stay exact, also through `to` and row selection.
+        for channel in range(states.shape[1]):
+            if channel != VORONOI_RIDGE:
+                self.assertTrue(torch.equal(restored[:, channel], states[:, channel]))
+        rows = torch.tensor([7, 0, 3])
+        self.assertTrue(torch.equal(packed.to("cpu").expand(rows), restored.index_select(0, rows)))
+        self.assertIs(quantize(packed), packed)
+
+    def test_out_of_range_ridge_is_not_quantized(self) -> None:
+        states = sample_states()
+        states[0, VORONOI_RIDGE, 0, 0] = 1.5
+        packed = pack(states)
+        self.assertIs(quantize(packed), packed)
 
     def test_packing_shrinks_the_planes(self) -> None:
         states = sample_states(16, 32, 32)

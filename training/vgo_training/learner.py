@@ -24,7 +24,7 @@ from .dataset import (
     load_dataset,
 )
 from .model import build_model
-from .packed_states import is_packable, pack as pack_states
+from .packed_states import is_packable, pack as pack_states, quantize as quantize_states
 from .packed_policy import (
     is_packable as is_policy_packable,
     pack as pack_policy,
@@ -425,6 +425,12 @@ class ReplayCache:
         # 4.2x less; the stager expands only the rows a batch needs, at 0.04%
         # of a training step. Layouts without that structure keep dense states.
         prepared = _pack_states(prepared)
+        # The ridge plane is most of what is left: uint8 halves it. See
+        # `quantize` in vgo_training/packed_states.py.
+        if prepared.packed_states is not None:
+            prepared = replace(
+                prepared, packed_states=quantize_states(prepared.packed_states)
+            )
         # The targets are the rest of the window once states are packed: dense
         # float32 that is 99.67% zeros, plus a mask at one byte per bit.
         prepared = _pack_policy(prepared)
