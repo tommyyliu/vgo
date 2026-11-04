@@ -135,3 +135,54 @@ def pack(policies: torch.Tensor, masks: torch.Tensor) -> PackedPolicy:
         mask_bits=packed_bits,
         policy_size=policy_size,
     )
+
+
+@dataclass(frozen=True)
+class PackedOwnership:
+    """Final-board ownership at one bit per cell: 1 where the mover owns it.
+
+    The targets are mover-relative +/-1 per cell -- never 0, since every cell has
+    a nearest stone -- and were held as int8, 16 KB a sample at a 128 policy
+    grid. One bit carries the same information, 2 KB. `is_ownership_packable`
+    checks the +/-1 assumption on the data, so anything else stays as it was.
+    """
+
+    bits: torch.Tensor  # uint8 [samples, ceil(cells / 8)], little-endian per byte
+    cells: int
+
+    @property
+    def samples(self) -> int:
+        return int(self.bits.shape[0])
+
+    @property
+    def nbytes(self) -> int:
+        return self.bits.nbytes
+
+    def expand(self, rows: torch.Tensor, out: torch.Tensor) -> None:
+        """Write the +/-1 targets for `rows` into `out`."""
+        bits = self.bits.index_select(0, rows)
+        unpacked = torch.zeros(
+            (bits.shape[0], bits.shape[1] * 8), dtype=torch.uint8, device=bits.device
+        )
+        for bit in range(8):
+            unpacked[:, bit::8] = (bits >> bit) & 1
+        out.copy_(unpacked[:, : self.cells].to(out.dtype) * 2 - 1)
+
+
+def is_ownership_packable(ownerships: torch.Tensor) -> bool:
+    """Whether every target is exactly +1 or -1, which one bit reproduces."""
+    return (
+        ownerships.ndim == 2
+        and ownerships.shape[0] > 0
+        and bool(((ownerships == 1) | (ownerships == -1)).all())
+    )
+
+
+def pack_ownership(ownerships: torch.Tensor) -> PackedOwnership:
+    samples, cells = ownerships.shape
+    owned = (ownerships > 0).to(torch.uint8)
+    bits = torch.zeros((samples, (cells + 7) // 8), dtype=torch.uint8)
+    for bit in range(8):
+        columns = owned[:, bit::8]
+        bits[:, : columns.shape[1]] |= columns << bit
+    return PackedOwnership(bits=bits, cells=cells)

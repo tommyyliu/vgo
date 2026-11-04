@@ -11,7 +11,7 @@ import subprocess
 
 if TYPE_CHECKING:
     from .packed_states import PackedStates
-    from .packed_policy import PackedPolicy
+    from .packed_policy import PackedOwnership, PackedPolicy
 import tempfile
 
 import numpy as np
@@ -223,6 +223,10 @@ class PreparedRasterDataset:
     # keep empty views for their shapes, and callers wanting rows expand this.
     # See vgo_training/packed_policy.py.
     packed_policy: "PackedPolicy | None" = None
+    # Ownership at one bit per cell, 2 KB a sample against 16 KB as int8. When
+    # set, `ownerships` is an empty view, so `ownerships is None` still means
+    # "this shard has no targets". See vgo_training/packed_policy.py.
+    packed_ownership: "PackedOwnership | None" = None
 
     @property
     def samples(self) -> int:

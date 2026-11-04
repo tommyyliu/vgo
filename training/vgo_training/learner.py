@@ -28,6 +28,8 @@ from .packed_states import is_packable, pack as pack_states
 from .packed_policy import (
     is_packable as is_policy_packable,
     pack as pack_policy,
+    is_ownership_packable,
+    pack_ownership,
 )
 from .model import load_model
 from .supervision import (
@@ -288,7 +290,26 @@ def _drop_ownership(dataset: PreparedRasterDataset) -> PreparedRasterDataset:
     """
     if dataset.ownerships is None:
         return dataset
-    return replace(dataset, ownerships=None)
+    return replace(dataset, ownerships=None, packed_ownership=None)
+
+
+def _pack_ownership(dataset: PreparedRasterDataset) -> PreparedRasterDataset:
+    """Hold ownership at one bit per cell when every target is +/-1.
+
+    `ownerships` stays as an empty view, so a shard with targets is still told
+    apart from one without by `ownerships is None`.
+    """
+    if (
+        dataset.ownerships is None
+        or dataset.packed_ownership is not None
+        or not is_ownership_packable(dataset.ownerships)
+    ):
+        return dataset
+    return replace(
+        dataset,
+        ownerships=dataset.ownerships[:0].clone(),
+        packed_ownership=pack_ownership(dataset.ownerships),
+    )
 
 
 def _pack_states(dataset: RasterDataset) -> RasterDataset:
@@ -407,6 +428,8 @@ class ReplayCache:
         # The targets are the rest of the window once states are packed: dense
         # float32 that is 99.67% zeros, plus a mask at one byte per bit.
         prepared = _pack_policy(prepared)
+        # Ownership is +/-1 per cell, 16 KB a sample as int8 and 2 KB as bits.
+        prepared = _pack_ownership(prepared)
         entry = PreparedReplayShard(
             path=resolved,
             digest=digest,
@@ -886,8 +909,11 @@ class BatchStager:
             # and zeroing the destination slice is far cheaper than materialising
             # a zero source of `samples x policy_size` to index into.
             destination = slot.host[4][offset : offset + part_count]
+            packed_ownership = getattr(dataset, "packed_ownership", None)
             if dataset.ownerships is None:
                 destination.zero_()
+            elif packed_ownership is not None:
+                packed_ownership.expand(part.rows, destination)
             else:
                 destination.copy_(dataset.ownerships.index_select(0, part.rows))
             offset += part_count
