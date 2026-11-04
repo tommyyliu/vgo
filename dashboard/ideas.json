@@ -55,13 +55,13 @@
   {
     "id": "value-metric",
     "kind": "task",
-    "status": "Next",
+    "status": "Done",
     "bucket": "Measurement",
     "effort": "S",
     "title": "Report value MSE or log loss, not MAE",
     "why": "MAE ranked an overconfident value head best: stride-8 thinning read 0.56 MAE but 0.70 MSE against 0.59 MSE for 16 labels per game. The learner's selection score and logs use MAE.",
     "test": "Add value MSE and cross-entropy to evaluate(), and use one of them in the selection score.",
-    "progress": "Not started."
+    "result": "evaluate() reports value_mse and value_log_loss beside value_mae; epoch logs and the train/val line print MSE first. The diagnostic selection score is now policy_kl + value_mse at weight 1 (the final epoch is still what gets published). The dashboard's update rows carry value_mse."
   },
   {
     "id": "random-stop",

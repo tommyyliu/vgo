@@ -1066,7 +1066,7 @@ def evaluate(
     model.eval()
     # One slot per metric summed below; keep in step with the torch.stack call
     # and with the totals[...] indices after it.
-    accumulator = torch.zeros(6, dtype=torch.float64, device=stager.device)
+    accumulator = torch.zeros(7, dtype=torch.float64, device=stager.device)
     # Five, not four: the stager carries ownership alongside the rest. Metrics
     # do not use it -- the ownership head is training-only -- but the tuple
     # still has to be unpacked.
@@ -1099,6 +1099,11 @@ def evaluate(
                 masked_logits.argmax(dim=1) == targets.argmax(dim=1)
             ).to(dtype=logits.dtype)
             absolute_error = (predictions - values).abs()
+        # Log loss of the win probability (1 + v) / 2 against the outcome, in
+        # float32: a bfloat16 prediction one step from +/-1 would read as certain.
+        win = ((predictions.float() + 1.0) / 2.0).clamp(1e-6, 1.0 - 1e-6)
+        outcome = (values.float() + 1.0) / 2.0
+        log_loss = -(outcome * win.log() + (1.0 - outcome) * (1.0 - win).log())
         accumulator += torch.stack(
             (
                 cross_entropy.sum(),
@@ -1107,6 +1112,7 @@ def evaluate(
                 top1.sum(),
                 absolute_error.sum(),
                 value_correct.sum(),
+                log_loss.sum().to(absolute_error.dtype),
             )
         ).to(dtype=torch.float64)
 
@@ -1123,6 +1129,13 @@ def evaluate(
         "policy_kl": cross_entropy - target_entropy,
         "policy_top1": totals[3] / view.samples,
         "value_mae": totals[4] / view.samples,
+        # Proper scores for the value head. MAE is not one: it rewards a
+        # confident prediction over a calibrated one, and on update 23's window
+        # it ranked a stride-thinned head best (0.56) whose MSE was the worst
+        # thinned one (0.70). Squared error is on the [-1, 1] scale, so always
+        # predicting 0 scores 1.0; log loss is in nats, ln 2 for 50%.
+        "value_mse": value_mse,
+        "value_log_loss": totals[6] / view.samples,
         # The head predicts a category now, so report how often it picks the
         # right one. 0.5 is chance; value_mae can look respectable while sign
         # accuracy sits at chance, which is what memorisation looks like.
@@ -1682,8 +1695,11 @@ class PersistentLearner:
             precision=config.precision,
         )
 
+        # Diagnostics only: the final epoch is published. Value MSE at a fixed
+        # weight of 1, not the training value weight, which at 1/16 would leave
+        # the value term out of the score.
         def selection_score(current: dict[str, float]) -> float:
-            return current["policy_kl"] + config.value_weight * current["value_mae"]
+            return current["policy_kl"] + current["value_mse"]
 
         best_epoch = 0
         best = initial_validation
@@ -1807,6 +1823,7 @@ class PersistentLearner:
                 self._log(
                     f"epoch={epoch:4d} policy_kl={current['policy_kl']:.5f} "
                     f"top1={current['policy_top1']:.3f} "
+                    f"value_mse={current['value_mse']:.5f} "
                     f"value_mae={current['value_mae']:.5f} "
                     f"lr={scheduler.get_last_lr()[0]:.6f}"
                 )
@@ -1868,9 +1885,11 @@ class PersistentLearner:
         # invisible without reading the JSON afterwards. Log it per update.
         self._log(
             "train/val  "
+            f"value_mse {final_training['value_mse']:.5f}/"
+            f"{final_validation['value_mse']:.5f} "
+            f"gap {final_validation['value_mse'] - final_training['value_mse']:+.5f}  "
             f"value_mae {final_training['value_mae']:.5f}/"
-            f"{final_validation['value_mae']:.5f} "
-            f"gap {final_validation['value_mae'] - final_training['value_mae']:+.5f}  "
+            f"{final_validation['value_mae']:.5f}  "
             f"policy_kl {final_training['policy_kl']:.5f}/"
             f"{final_validation['policy_kl']:.5f} "
             f"gap {final_validation['policy_kl'] - final_training['policy_kl']:+.5f}"
@@ -1944,7 +1963,7 @@ class PersistentLearner:
             # set large enough for selection to mean something, best_epoch would
             # concentrate near the end and this would go to roughly zero.
             "published_epoch": "final",
-            "selection_metric": "policy_kl + value_weight * value_mae",
+            "selection_metric": "policy_kl + value_mse",
             "selection_regret": (
                 selection_score(final_validation_metrics) - best_score
             ),

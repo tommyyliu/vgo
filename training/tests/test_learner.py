@@ -19,6 +19,7 @@ from vgo_training.learner import (
     LearnerUpdate,
     PersistentLearner,
     ReplayCache,
+    evaluate,
     masked_value_cross_entropy,
     thin_value_labels,
     value_cross_entropy,
@@ -189,6 +190,32 @@ class ReplayCacheTests(unittest.TestCase):
         loss = masked_value_cross_entropy(logits, thinned)
         self.assertTrue(torch.isfinite(loss))
         self.assertTrue(torch.allclose(loss, kept * 3 / 6))
+
+    def test_evaluate_reports_proper_value_scores(self) -> None:
+        predicted = torch.linspace(-0.9, 0.3, 12)
+
+        class Fixed(torch.nn.Module):
+            """Uniform policy, and a value that rises with the row, as the targets do."""
+
+            def forward(self, states):
+                return torch.zeros(states.shape[0], 32 * 32 + 1), predicted[: states.shape[0]]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            cache, path, _ = cache_fixture(Path(temporary))
+            window = cache.window([path], 12)
+            view = window.split(0.0).training
+            stager = BatchStager(batch_size=12, channels=window.channels, height=32, width=32,
+                                 policy_size=32 * 32 + 1, device=torch.device("cpu"),
+                                 state_dtype=window.shards[0].dataset.states.dtype)
+            result = evaluate(Fixed(), view, stager, batch_size=12, value_weight=1.0,
+                              precision="float32")
+            stager.close()
+        values = torch.linspace(-1.0, 1.0, 12)  # the fixture's targets, in row order
+        self.assertAlmostEqual(result["value_mse"], float(((predicted - values) ** 2).mean()), places=5)
+        self.assertAlmostEqual(result["value_mae"], float((predicted - values).abs().mean()), places=5)
+        win, outcome = (predicted + 1) / 2, (values + 1) / 2
+        log_loss = -(outcome * win.log() + (1 - outcome) * (1 - win).log())
+        self.assertAlmostEqual(result["value_log_loss"], float(log_loss.mean()), places=5)
 
     def test_sliding_window_evicts_before_loading_the_entering_shard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

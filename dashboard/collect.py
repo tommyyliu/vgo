@@ -169,6 +169,7 @@ def loop_updates(root: Path) -> list[dict]:
             "parameters": report.get("parameters"), "epochs": report.get("epochs"),
             "wall": report.get("wall_seconds"), "optimization": report.get("optimization_seconds"),
             "policy_kl": validation.get("policy_kl"), "value_mae": validation.get("value_mae"),
+            "value_mse": validation.get("value_mse"),
             "target_entropy": validation.get("policy_target_entropy"),
         })
     return rows
