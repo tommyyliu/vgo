@@ -262,12 +262,12 @@
   },
   {
     "id": "history-planes",
-    "status": "Running",
+    "status": "Next",
     "bucket": "Extract",
     "effort": "S",
     "title": "Test the stones of previous positions as input",
-    "why": "The net sees only the current position and whether the last move was a pass, so it cannot see a repetition. --history-plies adds the stones of N earlier positions in training only; the Rust raster does not render them yet.",
-    "test": "3 plies on the 450k recipe run, against the same run without history: held-out policy KL and value MSE. Adopting it needs the raster and inference to render the planes."
+    "why": "The net sees only the current position and whether the last move was a pass, so it cannot see a repetition. --history-plies adds the stones of N earlier positions in training only. On update 23's 450k window with the value recipe (one seed), 3 plies cut held-out policy KL from 1.721 to 1.706 and lifted top-1 from 0.122 to 0.127, about five times the run-to-run spread of the weight sweep; value MSE was unchanged (0.590 against 0.582). Training peaked at 38 GB against 27 and took 28 minutes against 18.",
+    "test": "Render the planes in the Rust raster and inference, then arena a 3-ply net against the same recipe without history. Try 1 and 2 plies to see where the gain comes from."
   },
   {
     "id": "rust-rebuild",
