@@ -104,6 +104,11 @@ def main() -> None:
         help="train the value head on every Nth position of each game only",
     )
     parser.add_argument(
+        "--value-labels-per-game", type=int, default=0,
+        help="train the value head on this many positions per game, spread "
+        "evenly, with the value loss scaled back to the unthinned total",
+    )
+    parser.add_argument(
         "--weight-decay", type=float, default=0.0,
         help="AdamW weight decay on weight matrices; 0 is plain Adam",
     )
@@ -156,6 +161,7 @@ def main() -> None:
         tail_keep=arguments.tail_keep,
         augment=arguments.augment,
         value_stride=arguments.value_stride,
+        value_labels_per_game=arguments.value_labels_per_game,
         weight_decay=arguments.weight_decay,
     )
 

@@ -132,6 +132,9 @@ class LearnerConfig:
     # held-out 0.65). Dropped labels are dropped, not reweighted: the loss is
     # summed over kept rows and divided by the whole batch.
     value_stride: int = 1
+    # Instead of a stride: this many value labels per game, spread evenly over
+    # it, with the value loss scaled back to the unthinned total. 0 is off.
+    value_labels_per_game: int = 0
     # Decoupled (AdamW) weight decay on weights of rank 2 and up; biases and
     # norm scales are exempt. Zero keeps plain Adam.
     weight_decay: float = 0.0
@@ -175,6 +178,10 @@ class LearnerConfig:
             raise ValueError("tail keep must be in (0, 1]")
         if self.value_stride < 1:
             raise ValueError("value stride must be at least 1")
+        if self.value_labels_per_game < 0:
+            raise ValueError("value labels per game must be nonnegative")
+        if self.value_labels_per_game and self.value_stride != 1:
+            raise ValueError("choose a value stride or labels per game, not both")
         if not math.isfinite(self.weight_decay) or self.weight_decay < 0.0:
             raise ValueError("weight decay must be finite and nonnegative")
 
@@ -1156,49 +1163,87 @@ def _build_optimizer(model: nn.Module, config: "LearnerConfig") -> torch.optim.O
     )
 
 
-def thin_value_labels(view: ReplayView, stride: int, seed: int) -> ReplayView:
-    """The same view with all but every `stride`-th value label of a game masked.
+def _game_ranks(games: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Each row's rank among its game's rows in shard order, and its game's length."""
+    order = np.argsort(games, kind="stable")
+    sorted_games = games[order]
+    starts = np.r_[0, np.flatnonzero(sorted_games[1:] != sorted_games[:-1]) + 1]
+    lengths = np.diff(np.r_[starts, len(games)])
+    rank = np.empty(len(games), dtype=np.int64)
+    rank[order] = np.arange(len(games)) - np.repeat(starts, lengths)
+    length = np.empty(len(games), dtype=np.int64)
+    length[order] = np.repeat(lengths, lengths)
+    return rank, length
+
+
+def thin_value_labels(
+    view: ReplayView, stride: int, seed: int, per_game: int = 0
+) -> tuple[ReplayView, float]:
+    """The same view with most value labels of each game masked, and the share kept.
+
+    `stride` keeps every `stride`-th position of a game. `per_game`, when
+    positive, instead keeps `per_game` positions spread evenly over each game --
+    at `floor((k + u) * length / per_game)` for k < per_game, with u in [0, 1)
+    drawn per game -- or every position of a game shorter than that. Counting
+    per game gives every outcome the same number of labels whatever the board:
+    games run ~58 plies on 1/18 and ~290 on 1/38.
 
     Masked labels become NaN in a copy of each shard's values, so the cached
     shards, and the validation view that shares them, are untouched. A game is
-    identified by its split hash; a row's place in its game is its rank among
-    that game's rows in shard order, and each game starts from its own offset,
-    drawn from the seed and the game, so no ply of the game is favoured.
+    identified by its split hash, and its offset is drawn from the seed and the
+    game, so no ply of a game is favoured.
     """
-    if stride == 1:
-        return view
+    if stride == 1 and per_game == 0:
+        return view, 1.0
     selections = []
+    kept = total = 0
     for selection in view.selections:
         shard = selection.shard
         games = shard.split_hashes.numpy()
-        order = np.argsort(games, kind="stable")
-        sorted_games = games[order]
-        starts = np.r_[0, np.flatnonzero(sorted_games[1:] != sorted_games[:-1]) + 1]
-        rank = np.empty(len(games), dtype=np.int64)
-        rank[order] = np.arange(len(games)) - np.repeat(
-            starts, np.diff(np.r_[starts, len(games)])
-        )
-        offset = (games.astype(np.uint64) ^ np.uint64(seed)) % np.uint64(stride)
-        keep = (rank + offset.astype(np.int64)) % stride == 0
+        rank, length = _game_ranks(games)
+        mixed = games.astype(np.uint64) ^ np.uint64(seed)
+        if per_game:
+            # u from the game's hash: the top 24 bits of a SplitMix64-mixed value.
+            u = ((mixed * np.uint64(0x9E3779B97F4A7C15)) >> np.uint64(40)).astype(
+                np.float64
+            ) / float(1 << 24)
+            # Row r is chosen when some k has floor((k + u) * length / n) == r,
+            # i.e. when [r * n / length - u, (r + 1) * n / length - u) holds an
+            # integer. Short games keep every row.
+            n = float(per_game)
+            low = np.ceil(rank * n / length - u)
+            high = (rank + 1) * n / length - u
+            keep = (low < high) | (length <= per_game)
+        else:
+            offset = (mixed % np.uint64(stride)).astype(np.int64)
+            keep = (rank + offset) % stride == 0
+        rows = selection.rows.numpy()
+        kept += int(keep[rows].sum())
+        total += len(rows)
         values = shard.dataset.values.clone()
         values[torch.from_numpy(~keep)] = float("nan")
         thinned = replace(shard, dataset=replace(shard.dataset, values=values))
         selections.append(ShardSelection(thinned, selection.rows))
-    return ReplayView(tuple(selections))
+    return ReplayView(tuple(selections)), kept / max(1, total)
 
 
 def masked_value_cross_entropy(
-    logits: torch.Tensor, targets: torch.Tensor
+    logits: torch.Tensor, targets: torch.Tensor, scale: float = 1.0
 ) -> torch.Tensor:
     """`value_cross_entropy` over the rows whose target is not NaN, divided by
-    the whole batch, so a thinned label contributes nothing rather than having
-    its weight moved onto the labels that remain."""
+    the whole batch and multiplied by `scale`.
+
+    At scale 1 a thinned label contributes nothing rather than having its
+    weight moved onto the labels that remain. A scale of one over the kept
+    share restores the total value gradient of the unthinned window, which is
+    what separates "fewer labels" from "less value weight".
+    """
     known = ~torch.isnan(targets)
     win = (torch.where(known, targets, 0.0).to(logits.dtype) + 1.0) / 2.0
     per_row = nn.functional.cross_entropy(
         logits, torch.stack((win, 1.0 - win), dim=1), reduction="none"
     )
-    return (per_row * known.to(per_row.dtype)).sum() / max(1, targets.numel())
+    return scale * (per_row * known.to(per_row.dtype)).sum() / max(1, targets.numel())
 
 
 class PersistentLearner:
@@ -1630,10 +1675,20 @@ class PersistentLearner:
 
         # Value thinning applies to the batches trained on only. Metrics read the
         # full training view, so train value MAE still covers every row.
-        trained_view = thin_value_labels(split.training, config.value_stride, config.seed)
-        value_loss_function = (
-            value_cross_entropy if config.value_stride == 1 else masked_value_cross_entropy
+        trained_view, kept_share = thin_value_labels(
+            split.training, config.value_stride, config.seed, config.value_labels_per_game
         )
+        if config.value_stride == 1 and config.value_labels_per_game == 0:
+            value_loss_function = value_cross_entropy
+        else:
+            # Per-game thinning restores the total value gradient; stride
+            # thinning keeps the drop-not-reweight behaviour it was tested with.
+            value_scale = 1.0 / kept_share if config.value_labels_per_game else 1.0
+            self._log(
+                f"[value] training on {kept_share:.1%} of value labels, "
+                f"loss scale {value_scale:.2f}"
+            )
+            value_loss_function = partial(masked_value_cross_entropy, scale=value_scale)
         self.model.train()
         for epoch in range(1, config.epochs + 1):
             specs = trained_view.batches(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from io import StringIO
 import inspect
 import json
@@ -120,8 +121,8 @@ class ReplayCacheTests(unittest.TestCase):
             window = cache.window([path], 4)
             original = window.shards[0].dataset.values.clone()
             view = window.split(0.0).training
-            thinned = thin_value_labels(view, 2, seed=5)
-            again = thin_value_labels(view, 2, seed=5)
+            thinned, share = thin_value_labels(view, 2, seed=5)
+            again, _ = thin_value_labels(view, 2, seed=5)
             values = thinned.selections[0].shard.dataset.values
 
         # Two plies per game: exactly one keeps its label, and it is the same one
@@ -139,7 +140,33 @@ class ReplayCacheTests(unittest.TestCase):
         self.assertTrue(torch.equal(values[known], original[known]))
         # The cached shard, which validation reads, keeps every label.
         self.assertTrue(torch.equal(window.shards[0].dataset.values, original))
-        self.assertIs(thin_value_labels(view, 1, seed=5), view)
+        self.assertEqual(share, 0.5)
+        self.assertEqual(thin_value_labels(view, 1, seed=5), (view, 1.0))
+
+    def test_labels_per_game_spreads_a_fixed_count_over_each_game(self) -> None:
+        # Games of 40, 17 and 3 plies, interleaved as rows of one shard.
+        games = torch.tensor([0] * 40 + [1] * 17 + [2] * 3, dtype=torch.int64)
+        games = games[torch.randperm(60, generator=torch.Generator().manual_seed(2))]
+
+        def load(_: str | Path) -> RasterDataset:
+            return replace(raw_fixture(60), game_ids=games)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            _, path, _ = cache_fixture(Path(temporary))
+            cache = ReplayCache(loader=load)
+            window = cache.window([path], 4)
+            view = window.split(0.0).training
+            for seed in (1, 2, 3):
+                thinned, share = thin_value_labels(view, 1, seed=seed, per_game=4)
+                values = thinned.selections[0].shard.dataset.values
+                kept = ~torch.isnan(values)
+                counts = {g: int(kept[games == g].sum()) for g in (0, 1, 2)}
+                # Four per game, every row of the 3-ply game.
+                self.assertEqual(counts, {0: 4, 1: 4, 2: 3}, f"seed {seed}")
+                self.assertAlmostEqual(share, 11 / 60)
+                # Spread: in the 40-ply game the kept ranks are 10 apart.
+                ranks = kept[games == 0].nonzero().flatten()
+                self.assertEqual(set(torch.diff(ranks).tolist()), {10})
 
     def test_masked_value_loss_drops_rather_than_reweights(self) -> None:
         logits = torch.randn(6, 2, generator=torch.Generator().manual_seed(4))
@@ -148,6 +175,12 @@ class ReplayCacheTests(unittest.TestCase):
             torch.allclose(
                 masked_value_cross_entropy(logits, targets),
                 value_cross_entropy(logits, targets),
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                masked_value_cross_entropy(logits, targets, scale=3.0),
+                3.0 * value_cross_entropy(logits, targets),
             )
         )
         thinned = targets.clone()
