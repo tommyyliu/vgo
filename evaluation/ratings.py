@@ -59,6 +59,31 @@ def model_id(path: str) -> int:
     return NAMED[stem]
 
 
+# Virtual even games against a rating-0 phantom, per player. Enough to keep a
+# model that never lost finite; the old 2.0 halved the first fresh run's curve,
+# whose rating pairings hold about 6 games each (update 8: +323 against +627).
+PRIOR_GAMES = 0.1
+
+
+def read_records(text: str) -> list[dict]:
+    """Every JSON object in the text, pretty-printed or one per line.
+
+    A regex matched these until the records grew a second level of nesting
+    (`candidate_search.reuse`), after which it returned fragments and nothing
+    parsed.
+    """
+    decoder, position, found = json.JSONDecoder(), 0, []
+    while (start := text.find("{", position)) >= 0:
+        try:
+            value, position = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            position = start + 1
+            continue
+        if isinstance(value, dict):
+            found.append(value)
+    return found
+
+
 def label(identifier: int) -> str:
     for name, value in NAMED.items():
         if value == identifier:
@@ -94,9 +119,7 @@ def main() -> None:
     if not path.exists():
         print(f"  no matches yet at {path}")
         return
-    raw = path.read_text()
-    records = [json.loads(m) for m in
-               re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", raw)]
+    records = read_records(path.read_text())
 
     matches, rows, skipped = [], [], 0
     for record in records:
@@ -141,7 +164,7 @@ def main() -> None:
         anchored.add(node)
         stack.extend(adjacency[node] - anchored)
 
-    ratings = fit_ratings(matches, anchor=anchor)
+    ratings = fit_ratings(matches, anchor=anchor, prior_games=PRIOR_GAMES)
     floating = sorted(set(ratings) - anchored)
     games = {}
     for m in matches:

@@ -44,13 +44,13 @@
   {
     "id": "ratings-fix",
     "kind": "task",
-    "status": "Next",
+    "status": "Done",
     "bucket": "Measurement",
     "effort": "S",
     "title": "Fix the rating pipeline",
     "why": "evaluation/ratings.py could not parse the loop's anchor records (its regex stops one level of nesting short of candidate_search.reuse), and the dashboard's strength curve anchors on sl-w64b16, which this run never plays. A fresh run would have no visible strength curve.",
     "test": "Parse anchor.jsonl from artifacts/vgo-bulk, anchor the curve on the run's own update 0, and show updates 3 to 29 on the dashboard with error bars.",
-    "progress": "Not started."
+    "result": "evaluation/ratings.py parses nested records (27 matches, 162 games of this run now read). The dashboard anchors on the run's earliest update when the supervised baseline never played, so the strength curve shows. The rating prior drops from 2 virtual games to 0.1: at about 6 games a pairing the old prior halved the curve (update 8 +323 against +627). Rating rounds in bulk-loop.sh now play the 38 board at its 312-ply cap, and the reserved reference is the model 6 updates back instead of a fixed update 0, which leaves the pool once the run passes update 6. Cost: 18 big-board games every 3 updates, about 15-30 minutes of shared GPU, until random-stop shortens games."
   },
   {
     "id": "value-metric",

@@ -116,12 +116,26 @@ def loop_matches(root: Path) -> list[dict]:
     return matches
 
 
+def rating_anchor(matches: list[dict]) -> str:
+    """The supervised baseline when the run played it, else the run's earliest update.
+
+    A fresh run never plays sl-w64b16, so anchoring there left every model
+    unconnected and the strength curve empty.
+    """
+    players = {m["a"] for m in matches} | {m["b"] for m in matches}
+    if ANCHOR in players:
+        return ANCHOR
+    updates = sorted((update_number(p), p) for p in players if update_number(p) is not None)
+    return updates[0][1] if updates else sorted(players)[0]
+
+
 def rating_table(matches: list[dict]) -> list[dict]:
     if not matches:
         return []
-    fitted = rt.fit(matches, ANCHOR)
-    errors = rt.standard_errors(matches, fitted, ANCHOR)
-    joined = rt.connected(matches, ANCHOR)
+    anchor = rating_anchor(matches)
+    fitted = rt.fit(matches, anchor)
+    errors = rt.standard_errors(matches, fitted, anchor)
+    joined = rt.connected(matches, anchor)
     table = []
     for name, rating in fitted.items():
         games = sum(m["a_wins"] + m["b_wins"] + m.get("draws", 0)
@@ -129,7 +143,7 @@ def rating_table(matches: list[dict]) -> list[dict]:
         table.append({
             "model": name, "update": update_number(name), "rating": rating,
             "se": errors.get(name, 0.0), "games": games, "connected": name in joined,
-            "bound": name != ANCHOR and rt.only_a_bound(matches, name),
+            "bound": name != anchor and rt.only_a_bound(matches, name), "anchor": anchor,
         })
     return table
 
@@ -351,6 +365,11 @@ def signal_section(root: Path, updates: list[dict], runs: list[dict]) -> dict:
             "blocks": blocks}
 
 
+def anchor_text(anchor: str) -> str:
+    number = update_number(anchor)
+    return "the supervised baseline" if anchor == ANCHOR else f"update {number}" if number is not None else anchor
+
+
 def model_section(table: list[dict], updates: list[dict], rows: list[dict]) -> dict:
     cumulative = {u["update"]: u["cumulative"] for u in updates}
     curve = sorted(
@@ -362,7 +381,7 @@ def model_section(table: list[dict], updates: list[dict], rows: list[dict]) -> d
     if curve:
         latest = curve[-1]
         stats.append({"label": "Latest rated model", "value": f"update {latest['update']}",
-                      "sub": f"{latest['rating']:+.0f} ± {latest['se']:.0f} Elo vs supervised baseline"})
+                      "sub": f"{latest['rating']:+.0f} ± {latest['se']:.0f} Elo vs {anchor_text(latest['anchor'])}"})
     if placed:
         best = max(placed, key=lambda r: r["rating"] - 2 * r["se"])
         stats.append({"label": "Best-supported model", "value": f"update {best['update']}",
@@ -380,9 +399,8 @@ def model_section(table: list[dict], updates: list[dict], rows: list[dict]) -> d
         names = ", ".join(str(r["update"]) for r in bounded)
         blocks.append({
             "type": "note", "tone": "warning",
-            "text": f"Updates {names} swept every game they played, so their ratings are lower "
-                    "bounds. They haven't played the later models, so the apparent drop after them "
-                    "may not be real. Re-rating them against update 45 would settle it.",
+            "text": f"Updates {names} won or lost every game they played, so their ratings are only "
+                    "bounds and they are left off the curve. Matches against closer models would place them.",
         })
     if placed:
         series = [{
@@ -393,7 +411,7 @@ def model_section(table: list[dict], updates: list[dict], rows: list[dict]) -> d
         }]
         blocks.append({
             "type": "line", "title": "Strength against samples generated",
-            "caption": "Elo against the supervised baseline. Excludes unplaced models.",
+            "caption": f"Elo against {anchor_text(placed[0]['anchor'])}. Excludes unplaced models.",
             "xLabel": "Samples generated", "yLabel": "Elo", "xFormat": "millions", "series": series,
         })
     if rows:

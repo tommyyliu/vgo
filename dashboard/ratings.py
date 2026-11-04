@@ -1,6 +1,6 @@
 """Bradley-Terry ratings with uncertainty, for arena results.
 
-Matches vgo's own fitter (same prior, same scale), and adds what it doesn't report:
+Matches vgo's own fitter in evaluation/ratings.py (same prior, same scale), and adds what it doesn't report:
 a standard error, the connected component, and whether a rating is only a bound.
 """
 
@@ -10,7 +10,10 @@ import math
 from collections import defaultdict
 
 ELO = 400.0 / math.log(10.0)
-PRIOR_GAMES = 2.0
+# Virtual even games against a rating-0 phantom, per player: enough to keep a
+# model that never lost finite. 2.0 halved the first fresh run's curve, whose
+# rating pairings hold about 6 games each. Same value as evaluation/ratings.py.
+PRIOR_GAMES = 0.1
 
 
 def fit(matches: list[dict], anchor) -> dict[object, float]:

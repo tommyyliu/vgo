@@ -209,3 +209,25 @@ def test_every_block_type_has_a_renderer():
     sections = vo.collect(Path(__file__).resolve().parents[2])["sections"]
     assert {b["type"] for s in sections for b in s["blocks"]} <= names
     assert "work" in {b["type"] for s in sections for b in s["blocks"]}
+
+
+def test_rating_records_with_two_levels_of_nesting_parse():
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from evaluation.ratings import read_records
+
+    record = {"candidate_model": "a/update-000003.onnx", "candidate_wins": 5,
+              "candidate_search": {"reuse": {"hits": 0}}, "opponent_model": "a/update-000000.onnx"}
+    text = json.dumps(record, indent=2) + "\n" + json.dumps(record) + "\n"
+    assert read_records(text) == [record, record]
+
+
+def test_a_run_without_the_baseline_anchors_on_its_earliest_update():
+    matches = [{"a": "update-000003", "b": "update-000001", "a_wins": 4, "b_wins": 2},
+               {"a": "update-000006", "b": "update-000003", "a_wins": 3, "b_wins": 3}]
+    assert vo.rating_anchor(matches) == "update-000001"
+    table = {r["model"]: r for r in vo.rating_table(matches)}
+    assert table["update-000001"]["rating"] == 0
+    assert all(r["connected"] for r in table.values())
+    with_baseline = matches + [{"a": "update-000001", "b": vo.ANCHOR, "a_wins": 3, "b_wins": 3}]
+    assert vo.rating_anchor(with_baseline) == vo.ANCHOR

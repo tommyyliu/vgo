@@ -147,17 +147,22 @@ anchor_pool="${VGO_ANCHOR_POOL:-12}"
 # is what makes the *series* comparable, and -44 / -89 / +280 were all measured
 # here.
 anchor_simulations="${VGO_ANCHOR_SIMULATIONS:-800}"
-# The anchor itself. Fixed for the life of the run: changing it discards every
-# game measured against the old one. Defaults to the seed model.
+# A fixed anchor, if set: every round then plays it, and the rating graph keeps
+# that model at zero. Unset (the default), the reserved slot goes to the model
+# `anchor_lag` updates back instead. A fixed early anchor is swept once the run
+# moves on, and a sweep says almost nothing; a model a few updates back is close
+# enough to lose to, and still ties each round to the older, connected graph.
 anchor_model="${VGO_ANCHOR_MODEL:-}"
-# The board the anchor is played on, and the ply cap that belongs to it.
+anchor_lag="${VGO_ANCHOR_LAG:-6}"
+# The board rating rounds are played on, and the ply cap that belongs to it.
 # Generation scales its cap by (reference / radius)^2; the arena takes a flat
-# number, so it has to be told. 70 is the 1/18 value -- set to 200, two thirds
-# of every game was both sides shuffling in a full board, and a pass count read
-# off those games said the search was broken when it was the cap.
-anchor_radius="${VGO_ANCHOR_RADIUS:-0.05555555555555555}"
-anchor_max_plies="${VGO_ANCHOR_MAX_PLIES:-70}"
-anchor_komi="${VGO_ANCHOR_KOMI:-0.09}"
+# number, so it has to be told. 1/38 since 2026-11-04: on 1/18 the first run's
+# curve rose to update 12 while 1/38 showed it falling from there, and big
+# boards are 73% of self-play plies. 312 is the 1/38 cap; komi is the
+# coefficient's centre for this radius (28 * r^2).
+anchor_radius="${VGO_ANCHOR_RADIUS:-0.02631578947368421}"
+anchor_max_plies="${VGO_ANCHOR_MAX_PLIES:-312}"
+anchor_komi="${VGO_ANCHOR_KOMI:-0.019390581717451522}"
 maximum_plies="${VGO_MAX_PLIES:-70}"
 seed_model="${VGO_SEED_MODEL:-}"
 [ -n "$seed_model" ] && seed_model="$(cd "$(dirname "$seed_model")" && pwd)/$(basename "$seed_model")"
@@ -267,7 +272,9 @@ trap '[ -n "$label" ] && touch "$games/$label.stop"' EXIT
 model="$seed_model"
 # With no seed and no named anchor, the run's first trained model becomes the
 # reference once it exists, so a from-scratch run still builds a rating graph.
-anchor="${anchor_model:-$seed_model}"
+# The first model rating rounds may reach back to: a fixed anchor if one is set,
+# else the seed, else the first model this process trains.
+first_rated="${anchor_model:-$seed_model}"
 
 # Continue the update numbering from whatever is on disk. Restarting from zero
 # rewrites `update-000000`, which on a restart is usually the model just passed
@@ -365,7 +372,7 @@ print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$onnx")
   touch "$games/$previous_label.stop"
   record_event generator_draining "label=$previous_label" "pid=$previous_generator"
   model="$onnx"
-  [ -z "$anchor" ] && anchor="$onnx"
+  [ -z "$anchor_model" ] && [ -z "$first_rated" ] && first_rated="$onnx"
   baseline=$(count_samples)
   echo "[loop] update $update done: generation $generation started (pid $generator), $previous_label draining"
 
@@ -375,7 +382,7 @@ print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$onnx")
   # started. `first_update` moves with every restart, so a rounds-based cadence
   # resets to zero each time -- across five restarts it fired exactly once, and
   # every measurement in between had to be run by hand.
-  if [ -n "$anchor" ] && [ $(( update % anchor_every )) -eq 0 ]; then
+  if [ -n "$first_rated" ] && [ $(( update % anchor_every )) -eq 0 ]; then
     # A pool, not a fixed opponent. One unchanging anchor stops measuring
     # anything the moment it is outclassed: sl-w64b16 lost 48-0 twice running,
     # which bounds the candidate from below and says nothing else, for 70
@@ -401,15 +408,22 @@ print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$onnx")
     # A slot is reserved for a fixed reference, explained where it's drawn below.
     # Defined before the pool because the pool filters it out: an empty
     # `$reference` would make `grep -vF ""` match every line and leave nothing.
-    reference="$anchor"
+    if [ -n "$anchor_model" ]; then
+      reference="$anchor_model"
+    else
+      # The model `anchor_lag` updates back, or the run's first model while the
+      # run is younger than that. Either way it already has a path to the rest.
+      lagged="$models/update-$(printf '%06d' $(( update > anchor_lag ? update - anchor_lag : 0 ))).onnx"
+      reference=$([ -f "$lagged" ] && echo "$lagged" || echo "$first_rated")
+    fi
 
     mapfile -t pool < <(
       {
         ls -1 "$models"/update-*.onnx 2>/dev/null | tail -n "$anchor_pool"
-        [ -n "$anchor" ] && echo "$anchor"
-        [ -n "$seed_model" ] && echo "$seed_model"
+        [ -n "$anchor_model" ] && echo "$anchor_model"
       } | grep -v "update-$(printf '%06d' "$update").onnx" \
-        | grep -vF "$reference" | awk '!seen[$0]++'
+        | grep -vF "$reference" | awk '!seen[$0]++' \
+        | { if [ "$update" -gt "$anchor_lag" ]; then grep -v "/update-000000.onnx$"; else cat; fi; }
     )
     if [ "${#pool[@]}" -gt 0 ]; then
       # Seeded in Python rather than with `shuf --random-source`. A constant
