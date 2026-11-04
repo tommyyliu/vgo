@@ -21,7 +21,8 @@ IDEAS = HOME / "ideas.json"
 REPORTS = HOME / "reports"
 CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8"}
 TTL = 300
-IDEA_FIELDS = {"title", "bucket", "status", "why", "test", "effort", "result"}
+IDEA_FIELDS = {"title", "kind", "bucket", "status", "why", "test", "effort", "result",
+               "progress", "held", "revisit", "ask"}
 MAX_FIELD = 4000
 
 
@@ -66,6 +67,17 @@ class State:
             target = body.get("id")
             if body.get("delete"):
                 ideas = [i for i in ideas if i["id"] != target]
+            elif body.get("move") in (-1, 1):
+                # Order is priority: swap with the nearest item of the same status.
+                index = next((n for n, i in enumerate(ideas) if i["id"] == target), None)
+                if index is not None:
+                    status = ideas[index].get("status")
+                    step = body["move"]
+                    other = index + step
+                    while 0 <= other < len(ideas) and ideas[other].get("status") != status:
+                        other += step
+                    if 0 <= other < len(ideas):
+                        ideas[index], ideas[other] = ideas[other], ideas[index]
             else:
                 clean = {
                     k: str(v).strip()[:MAX_FIELD]
@@ -75,7 +87,7 @@ class State:
                 if existing:
                     existing.update(clean)
                 else:
-                    ideas.append({"id": uuid.uuid4().hex[:8], "status": "Next", **clean})
+                    ideas.append({"id": uuid.uuid4().hex[:8], "status": "Next", "kind": "task", **clean})
             write_json(self.ideas_path, ideas)
             return ideas
 

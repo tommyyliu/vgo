@@ -1,3 +1,4 @@
+import re
 import json
 from pathlib import Path
 
@@ -95,7 +96,7 @@ def test_sample_rate_skips_gaps_between_updates():
 
 def test_collect_tolerates_an_empty_project(tmp_path):
     result = vo.collect(tmp_path)
-    assert [s["id"] for s in result["sections"]] == ["speed", "signal", "model", "spec", "next", "reports"]
+    assert [s["id"] for s in result["sections"]] == ["work", "speed", "signal", "model", "spec", "reports"]
 
 
 def shape(name, group="Single change", kl=1.9, card_gain=0, generator=None):
@@ -183,3 +184,28 @@ def test_lemma_status_reads_the_spec(tmp_path):
         "### O1. Gap\n\n*Status: Open.* text\n")
     assert [(r["id"], r["status"]) for r in vo.lemma_status(tmp_path)] == [
         ("A1", "Proved"), ("E6", "Conditional"), ("O1", "Open")]
+
+
+def test_work_fields_are_kept(state):
+    fields = {"title": "t", "kind": "idea", "progress": "p", "held": "Cleanup", "revisit": "r", "ask": "a"}
+    idea = state.save_idea({"fields": fields})[0]
+    assert {k: idea[k] for k in fields} == fields
+
+
+def test_move_swaps_with_the_nearest_item_of_the_same_status(state):
+    for title, status in (("a", "Next"), ("b", "Later"), ("c", "Next"), ("d", "Next")):
+        state.save_idea({"fields": {"title": title, "status": status}})
+    ids = {i["title"]: i["id"] for i in state.ideas()}
+    state.save_idea({"id": ids["c"], "move": -1})
+    assert [i["title"] for i in state.ideas()] == ["c", "b", "a", "d"]
+    state.save_idea({"id": ids["d"], "move": 1})  # already last of its status: no change
+    assert [i["title"] for i in state.ideas()] == ["c", "b", "a", "d"]
+
+
+def test_every_block_type_has_a_renderer():
+    page = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text()
+    renderers = re.search(r"const RENDER = \{([^}]*)\}", page).group(1)
+    names = {n.strip() for n in renderers.split(",")}
+    sections = vo.collect(Path(__file__).resolve().parents[2])["sections"]
+    assert {b["type"] for s in sections for b in s["blocks"]} <= names
+    assert "work" in {b["type"] for s in sections for b in s["blocks"]}

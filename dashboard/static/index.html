@@ -124,6 +124,23 @@ select, input, textarea { background: var(--page); border: 1px solid var(--borde
 .row-actions { display: flex; gap: 8px; align-items: center; }
 .flash { color: var(--muted); font-size: 13px; }
 .done-list { margin-top: 12px; color: var(--muted); }
+.work-group { margin-bottom: 22px; }
+.work-group > h3 { font-size: 15px; margin-bottom: 4px; }
+.work-group > .caption { margin-bottom: 9px; }
+.review { border-left: 3px solid var(--series-4); }
+.ask { background: var(--warning-bg); border-radius: 6px; padding: 6px 9px; margin: 6px 0 4px; color: var(--ink); }
+.progress { color: var(--ink); margin: 3px 0; }
+.revisit { color: var(--ink); margin: 3px 0; }
+.rank { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 6px; font-weight: 500; }
+.tag { display: inline-block; font-size: 11.5px; border: 1px solid var(--border); border-radius: 999px;
+  padding: 0 7px; margin-left: 6px; color: var(--ink-2); font-weight: 500; vertical-align: 1px; }
+.tag.running { border-color: var(--series); color: var(--accent-ink); }
+.held-group { margin-bottom: 12px; }
+.held-group h4 { margin: 0 0 6px; font-size: 13px; font-weight: 600; color: var(--ink-2); }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 8px; align-items: start; }
+.cards .idea { margin-bottom: 0; }
+.mini { padding: 1px 7px; font-size: 12.5px; }
+.glance { display: block; font-weight: 400; color: var(--ink-2); font-size: 13px; margin: 2px 0 0 14px; }
 .error { color: var(--critical); padding: 20px 0; }
 @media (max-width: 820px) {
   .board { grid-template-columns: 1fr; }
@@ -147,10 +164,13 @@ select, input, textarea { background: var(--page); border: 1px solid var(--borde
 <div id="tip" role="status"></div>
 <script>
 "use strict";
-const TABS = { performance: "Performance", research: "Research", shapes: "Net shapes", reports: "Reports" };
-const COLUMNS = ["Next", "Running", "Later"];
-const CLOSED = ["Done", "Rejected", "Parked"];
-const STATUSES = [...COLUMNS, ...CLOSED];
+const TABS = { work: "Work", performance: "Performance", research: "Research", shapes: "Net shapes", reports: "Reports" };
+const OPEN = ["Review", "Running", "Next", "Later", "Parked"];
+const CLOSED = ["Done", "Rejected"];
+const STATUSES = [...OPEN, ...CLOSED];
+const KINDS = { task: "Task", idea: "Idea to explore" };
+/* Why a task is on the backlog; the board groups by this. */
+const HELD = ["After another task", "Needs more evidence", "Needs arena time", "Not worth it yet", "Cleanup"];
 const BUCKETS = ["Generate", "Extract", "Replay", "Loop", "Speed", "Measurement", "Engineering"];
 const EFFORT = { S: "Small", M: "Medium", L: "Large" };
 const state = { ideas: [] };
@@ -417,13 +437,20 @@ function ideaForm(idea, onDone) {
       onDone();
     } catch (e) { flash.textContent = `Not saved: ${e.message}`; }
   } },
-    el("label", {}, "Idea", input("title", { required: true })),
+    el("label", {}, "Title", input("title", { required: true })),
     el("div", { class: "pair" },
-      el("label", {}, "Status", select("status", STATUSES.map(s => [s, s]), idea.status || "Next")),
-      el("label", {}, "Bucket", select("bucket", BUCKETS.map(s => [s, s]), idea.bucket || "Generate"))),
-    el("label", {}, "Effort", select("effort", Object.entries(EFFORT), idea.effort || "M")),
+      el("label", {}, "Kind", select("kind", Object.entries(KINDS), idea.kind || "task")),
+      el("label", {}, "Status", select("status", STATUSES.map(s => [s, s]), idea.status || "Next"))),
+    el("div", { class: "pair" },
+      el("label", {}, "Bucket", select("bucket", BUCKETS.map(s => [s, s]), idea.bucket || "Generate")),
+      el("label", {}, "Effort", select("effort", Object.entries(EFFORT), idea.effort || "M"))),
     el("label", {}, "Why", area("why")),
     el("label", {}, "How to test it", area("test")),
+    el("label", {}, "Progress (current work)", area("progress")),
+    el("div", { class: "pair" },
+      el("label", {}, "Held because (backlog)", select("held", [["", "–"], ...HELD.map(h => [h, h])], idea.held || "")),
+      el("label", {}, "Bring back when", input("revisit"))),
+    el("label", {}, "What you need to decide (review)", area("ask")),
     el("label", {}, "Result", area("result")),
     el("div", { class: "row-actions" },
       el("button", { type: "submit", textContent: "Save" }),
@@ -436,48 +463,101 @@ function ideaForm(idea, onDone) {
   return form;
 }
 
-function ideaCard(idea, redraw) {
+function ideaCard(idea, redraw, options = {}) {
   const body = el("div", {});
-  const details = el("details", { class: "idea" },
-    el("summary", { textContent: idea.title }),
+  /* Progress and the bring-back trigger show under the title, so a closed card still says them. */
+  const glance = idea.progress ? `Progress: ${idea.progress}` : idea.revisit ? `Bring back: ${idea.revisit}` : "";
+  const lines = [
+    idea.ask ? el("div", { class: "ask" }, el("strong", { textContent: "To decide: " }), idea.ask) : null,
+    idea.progress && idea.revisit ? el("p", { class: "revisit" }, el("strong", { textContent: "Bring back: " }), idea.revisit) : null,
+  ];
+  const move = step => el("button", { class: "mini", textContent: step < 0 ? "↑" : "↓",
+    title: step < 0 ? "Higher priority" : "Lower priority", onclick: async event => {
+      event.preventDefault();
+      await saveIdea({ id: idea.id, move: step });
+      redraw();
+    } });
+  const details = el("details", { class: `idea${idea.status === "Review" ? " review" : ""}`, open: !!options.open },
+    el("summary", {},
+      options.rank ? el("span", { class: "rank", textContent: `${options.rank}.` }) : null,
+      idea.title,
+      options.tag ? el("span", { class: `tag ${options.tag.toLowerCase()}`, textContent: options.tag }) : null,
+      glance ? el("span", { class: "glance", textContent: glance }) : null),
     el("div", { class: "meta", textContent: `${idea.bucket || "Unsorted"} · ${EFFORT[idea.effort] || "Medium"} effort` }),
+    ...lines,
     idea.why ? el("p", { textContent: idea.why }) : null,
     idea.test ? el("p", {}, el("strong", { textContent: "Test: " }), idea.test) : null,
     idea.result ? el("p", { class: "result" }, el("strong", { textContent: "Result: " }), idea.result) : null,
     body,
-    el("button", { textContent: "Edit", onclick: event => {
-      event.target.remove();
-      body.append(ideaForm(idea, redraw));
-    } }));
+    el("div", { class: "row-actions" },
+      el("button", { textContent: "Edit", onclick: event => {
+        event.target.parentNode.remove();
+        body.append(ideaForm(idea, redraw));
+      } }),
+      options.movable ? move(-1) : null,
+      options.movable ? move(1) : null));
   return details;
 }
 
-function ideas() {
+function work() {
   const root = el("div", {});
-  const redraw = () => root.replaceChildren(...board(redraw));
+  const redraw = () => root.replaceChildren(...workBoard(redraw));
   redraw();
   return root;
 }
 
-function board(redraw) {
-  const add = el("div", {});
-  const bar = el("div", { class: "idea-bar" },
-    el("button", { textContent: "Add idea", onclick: () => add.replaceChildren(
-      el("div", { class: "idea" }, ideaForm({ status: "Next" }, redraw))) }));
-  const columns = el("div", { class: "board" }, ...COLUMNS.map(status => {
-    const cards = state.ideas.filter(i => i.status === status);
-    return el("div", { class: "column" },
-      el("h3", { textContent: `${status} (${cards.length})` }),
-      ...cards.map(i => ideaCard(i, redraw)));
-  }));
-  const closed = state.ideas.filter(i => CLOSED.includes(i.status));
-  const rest = closed.length ? el("div", { class: "done-list" },
-    el("h3", { textContent: `Closed (${closed.length})`, style: "margin-bottom:7px" }),
-    el("div", { class: "board" }, ...closed.map(i => ideaCard(i, redraw)))) : null;
-  return [bar, add, columns, rest].filter(Boolean);
+function group(title, caption, ...content) {
+  return el("div", { class: "work-group" },
+    el("h3", { textContent: title }),
+    caption ? el("p", { class: "caption", textContent: caption }) : null,
+    ...content);
 }
 
-const RENDER = { stats, note, table, line, scatter, links, ideas };
+function workBoard(redraw) {
+  const all = state.ideas;
+  const kind = i => i.kind || "task";
+  const add = el("div", {});
+  const bar = el("div", { class: "idea-bar" },
+    el("button", { textContent: "Add task or idea", onclick: () => add.replaceChildren(
+      el("div", { class: "idea" }, ideaForm({ status: "Next", kind: "task" }, redraw))) }));
+
+  const review = all.filter(i => i.status === "Review");
+  const current = all.filter(i => kind(i) === "task" && ["Running", "Next"].includes(i.status))
+    .sort((a, b) => (a.status === "Running" ? 0 : 1) - (b.status === "Running" ? 0 : 1));
+  const backlog = all.filter(i => kind(i) === "task" && ["Later", "Parked"].includes(i.status));
+  const ideas = all.filter(i => kind(i) === "idea" && OPEN.includes(i.status) && i.status !== "Review");
+  const closed = all.filter(i => CLOSED.includes(i.status));
+
+  const reasons = [...HELD, ...new Set(backlog.map(i => i.held).filter(h => h && !HELD.includes(h)))];
+  const held = [...reasons, ""].map(reason => {
+    const cards = backlog.filter(i => (i.held || "") === reason);
+    return cards.length ? el("div", { class: "held-group" },
+      el("h4", { textContent: `${reason || "No reason given"} (${cards.length})` }),
+      el("div", { class: "cards" }, ...cards.map(i => ideaCard(i, redraw)))) : null;
+  }).filter(Boolean);
+
+  return [
+    bar, add,
+    group(`For your review (${review.length})`,
+      "Decisions and results waiting on you. Answer by editing the item or in conversation.",
+      ...review.map(i => ideaCard(i, redraw, { open: true }))),
+    group(`Current (${current.length})`,
+      "Work in priority order. Running first; the arrows reorder.",
+      ...current.map((i, n) => ideaCard(i, redraw, { rank: n + 1, movable: true,
+        tag: i.status === "Running" ? "Running" : null }))),
+    group(`Backlog (${backlog.length})`,
+      "Tasks that are waiting, grouped by why, each with when to bring it back.", ...held),
+    group(`Ideas to explore (${ideas.length})`,
+      "Not committed to. Promote one by making it a task.",
+      el("div", { class: "cards" }, ...ideas.map(i => ideaCard(i, redraw,
+        { tag: i.status === "Next" ? "Soon" : i.status === "Parked" ? "Parked" : null })))),
+    closed.length ? el("details", { class: "done-list" },
+      el("summary", { textContent: `Closed (${closed.length})` }),
+      el("div", { class: "cards" }, ...closed.map(i => ideaCard(i, redraw)))) : null,
+  ].filter(Boolean);
+}
+
+const RENDER = { stats, note, table, line, scatter, links, work };
 
 function render(data) {
   document.title = `${data.title} dashboard`;
@@ -492,7 +572,7 @@ function render(data) {
 function showTab() {
   const data = state.data;
   if (!data) return;
-  const tab = TABS[location.hash.slice(1)] ? location.hash.slice(1) : "performance";
+  const tab = TABS[location.hash.slice(1)] ? location.hash.slice(1) : "work";
   $("nav").replaceChildren(...Object.entries(TABS).map(([id, label]) => el("a", {
     href: `#${id}`, textContent: label, "aria-current": id === tab ? "page" : "false",
     style: id === tab ? "color: var(--ink); font-weight: 600" : "" })));

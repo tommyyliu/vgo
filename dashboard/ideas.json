@@ -1,15 +1,271 @@
 [
   {
-    "id": "info-metric",
+    "id": "review-komi",
+    "kind": "task",
+    "status": "Review",
+    "bucket": "Generate",
+    "effort": "S",
+    "title": "Komi is not calibrated from results",
+    "why": "You asked whether komi is already centred on the point where Black and White are even. It isn't. bulk-loop.sh sets the centre by hand (coefficient 28.0, about 7 points) and samples komi up to 78% either side of it. generation.rs mentions a fit_komi_power_law that would refit it from games, but that function does not exist. Measured over this run, Black won about 10% of small-board games and 30% of big-board games, and even the lowest komi in the range left Black behind.",
+    "ask": "Should the loop refit the komi centre per board from recent games, aiming at a 50% win rate? I'd do it after random-stop, since the stalled games are part of why White wins, and record the fit in the run's events."
+  },
+  {
+    "id": "review-branch",
+    "kind": "task",
+    "status": "Review",
+    "bucket": "Engineering",
+    "effort": "S",
+    "title": "Branch collapse-recipe is ready to merge",
+    "why": "Commits on top of main: value-label thinning (--value-stride, --value-labels-per-game), weight decay, packed ownership and uint8 ridge (window 107 to 57 KiB a sample), training-only history planes, and the tracker and findings updates. All default off or lossless except the ridge, which matched fp16 on held-out loss. The Python suite passes; the Rust side is not rebuilt yet (rust-rebuild).",
+    "ask": "Merge into main once rust-rebuild passes check.sh? Pushing stays your call."
+  },
+  {
+    "id": "rust-rebuild",
+    "kind": "task",
+    "status": "Next",
+    "bucket": "Engineering",
+    "effort": "S",
+    "title": "Rebuild and check the Rust side after the Fedora upgrade",
+    "why": "The upgrade moved system Python to 3.15 and broke training/.venv, which was rebuilt on a uv-managed 3.14. The Rust binaries were not rebuilt or run since.",
+    "test": "cargo build --release, then correctness/check.sh.",
+    "progress": "Not started. Needed first: the arena binaries predate the upgrade."
+  },
+  {
+    "id": "value-recipe",
+    "kind": "task",
+    "status": "Next",
+    "bucket": "Extract",
+    "effort": "S",
+    "title": "Arena the value recipe, then adopt it",
+    "why": "The value head memorized its window: train MAE 0.03, held-out 0.65. On update 23's 450k window, 16 labels per game cut held-out value MSE from 0.99 to 0.58 and lifted the winner from 71% to 79%. Policy KL fell as the value weight dropped and was flat at the no-value bound for weights of 1/8 and below. Stride-8 thinning plus weight decay already beat update 23 116-84. All held-out numbers are one seed.",
+    "test": "Arena the 16-labels, weight-1/16 nets on update 23's window against update 23 and its twin on the 38 board, about 200 games. Two seeds. Then wire --value-labels-per-game 16 --value-weight 0.0625 and a 450k window into bulk-loop.sh.",
+    "progress": "Not started. Training the seeds takes about 20 minutes each; the arena about 2.5 hours."
+  },
+  {
+    "id": "ratings-fix",
+    "kind": "task",
     "status": "Next",
     "bucket": "Measurement",
     "effort": "S",
-    "title": "Measure information per search directly",
-    "why": "Nothing measures how much a search teaches. KL(search policy || prior) and value change per search would give a real signal-per-compute number.",
-    "test": "Log both per position in a short run, and check they separate full searches from cheap ones."
+    "title": "Fix the rating pipeline",
+    "why": "evaluation/ratings.py could not parse the loop's anchor records (its regex stops one level of nesting short of candidate_search.reuse), and the dashboard's strength curve anchors on sl-w64b16, which this run never plays. A fresh run would have no visible strength curve.",
+    "test": "Parse anchor.jsonl from artifacts/vgo-bulk, anchor the curve on the run's own update 0, and show updates 3 to 29 on the dashboard with error bars.",
+    "progress": "Not started."
+  },
+  {
+    "id": "value-metric",
+    "kind": "task",
+    "status": "Next",
+    "bucket": "Measurement",
+    "effort": "S",
+    "title": "Report value MSE or log loss, not MAE",
+    "why": "MAE ranked an overconfident value head best: stride-8 thinning read 0.56 MAE but 0.70 MSE against 0.59 MSE for 16 labels per game. The learner's selection score and logs use MAE.",
+    "test": "Add value MSE and cross-entropy to evaluate(), and use one of them in the selection score.",
+    "progress": "Not started."
+  },
+  {
+    "id": "random-stop",
+    "kind": "task",
+    "status": "Next",
+    "bucket": "Generate",
+    "effort": "M",
+    "title": "End one-sided pass streaks at random, as a bootstrap",
+    "why": "72% of big-board games with a long pass streak ran to the 312-ply cap, so labels read who leads at ply 312. Once a side has passed 4 times running, ending the game with probability 0.25 on each further pass would have ended 74% of big-board games early, about 61 plies sooner, and changed the eventual winner in 13% of those. A stopgap until the value head supports hard resignation: no model input or search change, so it comes out cleanly.",
+    "test": "Implement in self-play and arena only, seeded for reproducible digests. Check the share of capped games and plies per game in a short run.",
+    "progress": "Design agreed: self-play and arena only, no model input or search change, seeded."
+  },
+  {
+    "id": "repeat-points",
+    "kind": "task",
+    "status": "Next",
+    "bucket": "Generate",
+    "effort": "M",
+    "title": "Check the repeated points are board-unchanged self-captures",
+    "why": "In recorded games the side behind alternated between the same two coordinates for about 150 plies. Your read: the move is a one-stone self-capture, so the board after it equals the board before, the net sees the same input, and it picks the same point again. Self-captures rose from 3% to 8-10% of plies over the run, which fits.",
+    "test": "Replay the recorded positions: confirm the board is identical before and after each repeated move. If so, a move that leaves the board unchanged is a pass in disguise, which is a rule question for 5b4efdee.",
+    "progress": "Not started."
+  },
+  {
+    "id": "naive-stop",
+    "kind": "task",
+    "status": "Next",
+    "bucket": "Engineering",
+    "effort": "S",
+    "title": "Stop the naive generator once its window is full",
+    "why": "The first update of a fresh run took 64 minutes against about 9, because the naive generator kept all 32 threads while training prepared batches, and it wrote 38 GB of games nobody trains on. Stopping it by hand brought the card straight back.",
+    "test": "Touch the stop file when the first training starts, and confirm a fresh run's first update finishes in about 10 minutes.",
+    "progress": "Not started. Matters for the fresh run's first update."
+  },
+  {
+    "id": "fresh-run",
+    "kind": "task",
+    "status": "Next",
+    "bucket": "Loop",
+    "effort": "L",
+    "title": "Fresh overnight run with the fixes",
+    "why": "Replaces forking from update 12: the fixes should help early phases too. Strength rose to about update 12 and then fell about 20 Elo an update, newer windows trained worse nets, and the value head memorized its window.",
+    "test": "After value-recipe, random-stop, ratings-fix and naive-stop: start from the naive generator with the new recipe, and watch the rating curve for the rise-then-fall shape.",
+    "progress": "Waiting on the tasks above. Open choice: 128 or 192 input for the bootstrap; the last run used 192."
+  },
+  {
+    "id": "komi-range",
+    "kind": "task",
+    "status": "Later",
+    "bucket": "Generate",
+    "effort": "S",
+    "title": "Let komi follow the result per board",
+    "why": "Black's self-play win rate fell to about 10% on small boards and 30% on big ones, and the fitted fair komi was often below the sampler's floor. Partly a game-end effect, so decide after random-stop.",
+    "test": "Measure Black's win rate by board after random-stop, then widen the range or fit the centre from recent games.",
+    "held": "After another task",
+    "revisit": "After random-stop, or sooner if you answer review-komi."
+  },
+  {
+    "id": "faster-net",
+    "kind": "task",
+    "status": "Later",
+    "bucket": "Speed",
+    "effort": "M",
+    "title": "Train the faster net shapes",
+    "why": "Fewer blocks, no attention and one norm take the card's ceiling at 128 from 21k positions/s to as much as 62k, but the generator stops gaining near 40k here. Trained nets read 30k for `blocks8` (no policy penalty in a loss screen), 35k for `c_d222_short_n1` (+0.013 KL) and 37k for `m_d111_c22` (+0.022 KL), against a seed spread of 0.003. Early in a run generation speed matters more than play, and any net's games train any shape, so a fast shape could generate first and the run could retrain to a stronger one later. Strength is unmeasured, and these rates need 15 to 20 vCPU per card: on 8 threads of 4 cores `blocks8` lost its whole gain within three minutes.",
+    "test": "Arena `blocks8`, `c_d222_short_n1` and `m_d111_c22` against the current net at equal time on both boards, about 500 games each. Check a trained one over whole games on 8 vCPU. Checkpoints are in `artifacts/shape-screen/runs/`, and the dashboard's Net shapes tab shows the screen.",
+    "held": "Needs arena time",
+    "revisit": "When choosing the net for the later, stronger phase of a run. m_d111_c22 already generates early."
+  },
+  {
+    "id": "one-norm",
+    "kind": "task",
+    "status": "Later",
+    "bucket": "Speed",
+    "effort": "S",
+    "title": "Settle one norm per block",
+    "why": "About 15% more positions/s at the card's ceiling, with mixed, inconclusive arenas: 86-106 over four small matches. The GPU is the limit on throughput at 128.",
+    "test": "Train it with the faster net shapes, on the same window as their control.",
+    "held": "After another task",
+    "revisit": "With faster-net: train it on the same window as their control."
+  },
+  {
+    "id": "lane-cpu",
+    "kind": "task",
+    "status": "Later",
+    "bucket": "Speed",
+    "effort": "M",
+    "title": "Cut the CPU work inside inference lanes",
+    "why": "At 192 the lighter net reads 16.4k positions/s in the generator against a 23k card ceiling, with the CPU 60% idle. Each lane spends 28% of its time packing inputs and materializing outputs, about 1.1 ms a batch, and the card waits. A third lane makes it worse. Applying the board rotation twice per batch also wastes training CPU: the second call only needs the ownership map.",
+    "test": "Time `input_packing` and `output_materialization` in broker telemetry before and after, then confirm in the generator.",
+    "held": "Not worth it yet",
+    "revisit": "Before renting: the home box is GPU-bound, but rented boxes have fewer CPUs per GPU."
+  },
+  {
+    "id": "e0bf7471",
+    "kind": "task",
+    "status": "Later",
+    "bucket": "Speed",
+    "effort": "S",
+    "title": "Measure self-play on rented hardware",
+    "why": "Here 8 vCPU hold 18.1k positions/s at 128 over whole games, at 95% GPU. A faster card needs more, about 5 vCPU per 10k positions/s by extrapolation, and rented hardware has different wake-up costs, so it needs checking on the real box.",
+    "test": "Run 64 actors at 128 for 7 minutes pinned to half the cores, so games finish, and record positions/s, GPU use and busy cores.",
+    "held": "Not worth it yet",
+    "revisit": "Before renting hardware for a long run."
+  },
+  {
+    "id": "connect-ratings",
+    "kind": "task",
+    "status": "Later",
+    "bucket": "Measurement",
+    "effort": "S",
+    "title": "Connect updates 33 and 36 to the rating graph",
+    "why": "Both swept the baseline 48-0, so they're only lower bounds. Whether the loop kept improving after them is unknown.",
+    "test": "Play both against update 45 and update 42. About 40 games each is enough for a large gap.",
+    "held": "Not worth it yet",
+    "revisit": "Only if the fresh run needs comparing against the old r128 run's ratings."
+  },
+  {
+    "id": "f59494cb",
+    "kind": "task",
+    "status": "Later",
+    "bucket": "Measurement",
+    "effort": "M",
+    "title": "Vgo learnings",
+    "why": "Most runs in artifacts/old/ are in no note. Required before that folder is deleted.",
+    "test": "Write one line per run in docs/FINDINGS.md: question, result, verdict, trust.",
+    "held": "Cleanup",
+    "revisit": "Before deleting artifacts/old/, which needs it."
+  },
+  {
+    "id": "40ec030a",
+    "kind": "task",
+    "status": "Later",
+    "bucket": "Engineering",
+    "effort": "M",
+    "title": "Rule regression fixtures",
+    "why": "Capture cases have no reproducible shared positions.",
+    "test": "Fixtures for nonlocal capture through pocket closure, disconnected self-capture, opponent removal reviving a group, and simultaneous captures run from one command and are shared with Rust.",
+    "held": "Cleanup",
+    "revisit": "When the capture rules change, for example for 5b4efdee."
+  },
+  {
+    "id": "c779f7c5",
+    "kind": "task",
+    "status": "Later",
+    "bucket": "Engineering",
+    "effort": "M",
+    "title": "Browser tests in check.sh",
+    "why": "A stale UI test went unnoticed because nothing runs these automatically.",
+    "test": "js-app/tests run headless on Linux. Today they need PowerShell and Windows Chrome.",
+    "held": "Cleanup",
+    "revisit": "Next time the web app changes."
+  },
+  {
+    "id": "56317eb8",
+    "kind": "task",
+    "status": "Later",
+    "bucket": "Engineering",
+    "effort": "M",
+    "title": "Deterministic parallel arena",
+    "why": "fp16 inference can reorder near-ties as batch shapes change.",
+    "test": "Decide between bitwise repeatability and bounded stability, then show identical results across repeated fixed-seed runs.",
+    "held": "Cleanup",
+    "revisit": "If arena results need exact reproduction, for example to settle a disputed match."
+  },
+  {
+    "id": "a254b512",
+    "kind": "task",
+    "status": "Later",
+    "bucket": "Engineering",
+    "effort": "M",
+    "title": "Official vertex reach test",
+    "why": "A bug in this check passes every test. A search of up to 3,000 random games found no position where it alone decides a group.",
+    "test": "Find such a position, or prove the other two checks cover it.",
+    "held": "Cleanup",
+    "revisit": "When the legality checks are next changed."
+  },
+  {
+    "id": "6cf9c874",
+    "kind": "task",
+    "status": "Later",
+    "bucket": "Engineering",
+    "effort": "S",
+    "title": "Decide the NumPy rasterizer",
+    "why": "A hand-kept second rasterizer is a correctness risk if Rust covers every case.",
+    "test": "Delete it unless something still needs the fallback.",
+    "held": "Cleanup",
+    "revisit": "Next time the training rasterizer is touched."
+  },
+  {
+    "id": "5b4efdee",
+    "kind": "task",
+    "status": "Parked",
+    "bucket": "Measurement",
+    "effort": "M",
+    "title": "Repetition and ko policy",
+    "why": "Automated play reaches cycles, but it's unknown whether a strategically meaningful human cycle exists. Rule variants are in docs/history/GAMEPLAY_VARIANTS.md.",
+    "test": "Find a position players would rationally repeat, then choose between unrestricted repetition, simple ko and superko.",
+    "held": "After another task",
+    "revisit": "After repeat-points: if the repeats are board-unchanged self-captures, decide whether such a move counts as a pass."
   },
   {
     "id": "search-value",
+    "kind": "idea",
     "status": "Next",
     "bucket": "Generate",
     "effort": "L",
@@ -18,26 +274,30 @@
     "test": "Record per-ply root value, KL(search policy || prior) and the value gap between the top two moves in a fresh run. See which of them predicts the result changing, then try a budget that follows it. info-metric is the first step. The dashboard's Reports tab has the ideas report."
   },
   {
-    "id": "connect-ratings",
+    "id": "info-metric",
+    "kind": "idea",
     "status": "Next",
     "bucket": "Measurement",
     "effort": "S",
-    "title": "Connect updates 33 and 36 to the rating graph",
-    "why": "Both swept the baseline 48-0, so they're only lower bounds. Whether the loop kept improving after them is unknown.",
-    "test": "Play both against update 45 and update 42. About 40 games each is enough for a large gap."
+    "title": "Measure information per search directly",
+    "why": "Nothing measures how much a search teaches. KL(search policy || prior) and value change per search would give a real signal-per-compute number.",
+    "test": "Log both per position in a short run, and check they separate full searches from cheap ones."
   },
   {
-    "id": "window-size",
-    "status": "Next",
-    "bucket": "Replay",
-    "effort": "S",
-    "title": "Retest a larger training window",
-    "why": "750k beat 250k 51-29 on the small board, while the big board was inconclusive. On 2026-11-03 a 150k window drawn from twice as many generations beat update 23's own window 34-14 on the 38 board. The window at 192 now costs 57 KiB a sample (ownership as bits, ridge as uint8), so 450k trains at a 27 GB peak.",
-    "test": "Part of value-recipe: arena the 450k window against 150k with the new value labels, on the 38 board."
+    "id": "history-steps",
+    "kind": "idea",
+    "status": "Later",
+    "bucket": "Extract",
+    "effort": "M",
+    "title": "Sweep the number of history steps",
+    "why": "3 plies of history cut held-out policy KL from 1.721 to 1.706 (top-1 0.122 to 0.127) with value unchanged, one seed, at 11 GB more training memory. Not needed yet. --history-plies exists in training; the Rust raster does not render the planes.",
+    "test": "Train 1, 2, 3 and 4 plies on one window and compare held-out policy KL. If 1 ply carries most of it, render it in Rust and arena it.",
+    "revisit": "After the fresh run is healthy."
   },
   {
     "id": "input-128",
-    "status": "Next",
+    "kind": "idea",
+    "status": "Later",
     "bucket": "Speed",
     "effort": "M",
     "title": "Confirm 128 input as the efficient default",
@@ -45,34 +305,8 @@
     "test": "Bootstrap at 128. Train a 192 net from scratch on the same window, then play them at equal time with --opponent-resolution on both boards. Move up once it wins."
   },
   {
-    "id": "faster-net",
-    "status": "Next",
-    "bucket": "Speed",
-    "effort": "M",
-    "title": "Train the faster net shapes",
-    "why": "Fewer blocks, no attention and one norm take the card's ceiling at 128 from 21k positions/s to as much as 62k, but the generator stops gaining near 40k here. Trained nets read 30k for `blocks8` (no policy penalty in a loss screen), 35k for `c_d222_short_n1` (+0.013 KL) and 37k for `m_d111_c22` (+0.022 KL), against a seed spread of 0.003. Early in a run generation speed matters more than play, and any net's games train any shape, so a fast shape could generate first and the run could retrain to a stronger one later. Strength is unmeasured, and these rates need 15 to 20 vCPU per card: on 8 threads of 4 cores `blocks8` lost its whole gain within three minutes.",
-    "test": "Arena `blocks8`, `c_d222_short_n1` and `m_d111_c22` against the current net at equal time on both boards, about 500 games each. Check a trained one over whole games on 8 vCPU. Checkpoints are in `artifacts/shape-screen/runs/`, and the dashboard's Net shapes tab shows the screen."
-  },
-  {
-    "id": "lane-cpu",
-    "status": "Next",
-    "bucket": "Speed",
-    "effort": "M",
-    "title": "Cut the CPU work inside inference lanes",
-    "why": "At 192 the lighter net reads 16.4k positions/s in the generator against a 23k card ceiling, with the CPU 60% idle. Each lane spends 28% of its time packing inputs and materializing outputs, about 1.1 ms a batch, and the card waits. A third lane makes it worse. Applying the board rotation twice per batch also wastes training CPU: the second call only needs the ownership map.",
-    "test": "Time `input_packing` and `output_materialization` in broker telemetry before and after, then confirm in the generator."
-  },
-  {
-    "id": "naive-stop",
-    "status": "Next",
-    "bucket": "Engineering",
-    "effort": "S",
-    "title": "Stop the naive generator once its window is full",
-    "why": "The first update of a fresh run took 64 minutes against about 9, because the naive generator kept all 32 threads while training prepared batches, and it wrote 38 GB of games nobody trains on. Stopping it by hand brought the card straight back.",
-    "test": "Touch the stop file when the first training starts, and confirm a fresh run's first update finishes in about 10 minutes."
-  },
-  {
     "id": "score-head",
+    "kind": "idea",
     "status": "Later",
     "bucket": "Extract",
     "effort": "M",
@@ -81,7 +315,18 @@
     "test": "Add after the ownership test, so the two effects can be told apart."
   },
   {
+    "id": "aux-heads",
+    "kind": "idea",
+    "status": "Later",
+    "bucket": "Extract",
+    "effort": "S",
+    "title": "Add short-horizon value and opponent-move heads",
+    "why": "Both can be labelled from existing games, adding more per-position signal.",
+    "test": "Add one at a time, after ownership."
+  },
+  {
     "id": "contested-branching",
+    "kind": "idea",
     "status": "Later",
     "bucket": "Generate",
     "effort": "M",
@@ -91,6 +336,7 @@
   },
   {
     "id": "randomized-budgets",
+    "kind": "idea",
     "status": "Later",
     "bucket": "Generate",
     "effort": "M",
@@ -99,16 +345,8 @@
     "test": "Retry with a recipe that keeps a healthy policy target, judged at equal elapsed compute."
   },
   {
-    "id": "aux-heads",
-    "status": "Later",
-    "bucket": "Extract",
-    "effort": "S",
-    "title": "Add short-horizon value and opponent-move heads",
-    "why": "Both can be labelled from existing games, adding more per-position signal.",
-    "test": "Add one at a time, after ownership."
-  },
-  {
     "id": "per-stage-eval",
+    "kind": "idea",
     "status": "Later",
     "bucket": "Measurement",
     "effort": "M",
@@ -118,6 +356,7 @@
   },
   {
     "id": "settled-plane",
+    "kind": "idea",
     "status": "Later",
     "bucket": "Speed",
     "effort": "M",
@@ -126,174 +365,14 @@
     "test": "Train with and without it on one corpus, then arena at equal time."
   },
   {
-    "id": "one-norm",
-    "status": "Later",
-    "bucket": "Speed",
-    "effort": "S",
-    "title": "Settle one norm per block",
-    "why": "About 15% more positions/s at the card's ceiling, with mixed, inconclusive arenas: 86-106 over four small matches. The GPU is the limit on throughput at 128.",
-    "test": "Train it with the faster net shapes, on the same window as their control."
-  },
-  {
     "id": "tree-reuse",
+    "kind": "idea",
     "status": "Parked",
     "bucket": "Speed",
     "effort": "L",
     "title": "Tree reuse in self-play",
     "why": "Arena prototype scored 24-24 and 23-25, and inherited only 9-12 visits per hit.",
-    "test": "No next step unless search budgets rise a lot."
-  },
-  {
-    "id": "e0bf7471",
-    "title": "Measure self-play on rented hardware",
-    "bucket": "Speed",
-    "status": "Later",
-    "why": "Here 8 vCPU hold 18.1k positions/s at 128 over whole games, at 95% GPU. A faster card needs more, about 5 vCPU per 10k positions/s by extrapolation, and rented hardware has different wake-up costs, so it needs checking on the real box.",
-    "test": "Run 64 actors at 128 for 7 minutes pinned to half the cores, so games finish, and record positions/s, GPU use and busy cores.",
-    "effort": "S"
-  },
-  {
-    "id": "40ec030a",
-    "title": "Rule regression fixtures",
-    "bucket": "Engineering",
-    "status": "Later",
-    "why": "Capture cases have no reproducible shared positions.",
-    "test": "Fixtures for nonlocal capture through pocket closure, disconnected self-capture, opponent removal reviving a group, and simultaneous captures run from one command and are shared with Rust.",
-    "effort": "M"
-  },
-  {
-    "id": "c779f7c5",
-    "title": "Browser tests in check.sh",
-    "bucket": "Engineering",
-    "status": "Later",
-    "why": "A stale UI test went unnoticed because nothing runs these automatically.",
-    "test": "js-app/tests run headless on Linux. Today they need PowerShell and Windows Chrome.",
-    "effort": "M"
-  },
-  {
-    "id": "2aa29f48",
-    "title": "Game-grouped validation",
-    "bucket": "Engineering",
-    "status": "Later",
-    "why": "Adjacent positions from one game can land on both sides of the split, which makes validation loss optimistic.",
-    "test": "All positions from one game land in one split, deterministically, tested with overlapping game IDs across shards.",
-    "effort": "S"
-  },
-  {
-    "id": "56317eb8",
-    "title": "Deterministic parallel arena",
-    "bucket": "Engineering",
-    "status": "Later",
-    "why": "fp16 inference can reorder near-ties as batch shapes change.",
-    "test": "Decide between bitwise repeatability and bounded stability, then show identical results across repeated fixed-seed runs.",
-    "effort": "M"
-  },
-  {
-    "id": "a254b512",
-    "title": "Official vertex reach test",
-    "bucket": "Engineering",
-    "status": "Later",
-    "why": "A bug in this check passes every test. A search of up to 3,000 random games found no position where it alone decides a group.",
-    "test": "Find such a position, or prove the other two checks cover it.",
-    "effort": "M"
-  },
-  {
-    "id": "5b4efdee",
-    "title": "Repetition and ko policy",
-    "bucket": "Measurement",
-    "status": "Parked",
-    "why": "Automated play reaches cycles, but it's unknown whether a strategically meaningful human cycle exists. Rule variants are in docs/history/GAMEPLAY_VARIANTS.md.",
-    "test": "Find a position players would rationally repeat, then choose between unrestricted repetition, simple ko and superko.",
-    "effort": "M"
-  },
-  {
-    "id": "f59494cb",
-    "title": "Vgo learnings",
-    "bucket": "Measurement",
-    "status": "Later",
-    "why": "Most runs in artifacts/old/ are in no note. Required before that folder is deleted.",
-    "test": "Write one line per run in docs/FINDINGS.md: question, result, verdict, trust.",
-    "effort": "M"
-  },
-  {
-    "id": "6cf9c874",
-    "title": "Decide the NumPy rasterizer",
-    "bucket": "Engineering",
-    "status": "Later",
-    "why": "A hand-kept second rasterizer is a correctness risk if Rust covers every case.",
-    "test": "Delete it unless something still needs the fallback.",
-    "effort": "S"
-  },
-  {
-    "id": "value-recipe",
-    "status": "Next",
-    "bucket": "Extract",
-    "effort": "S",
-    "title": "Adopt 16 value labels per game at value weight 1/16",
-    "why": "The value head memorized its window: train MAE 0.03, held-out 0.65. On update 23's 450k window, 16 labels per game cut held-out value MSE from 0.99 to 0.58 and lifted the winner from 71% to 79%. Policy KL fell as the value weight dropped and was flat at the no-value bound for weights of 1/8 and below. Stride-8 thinning plus weight decay already beat update 23 116-84. All held-out numbers are one seed.",
-    "test": "Train two seeds of the recipe on update 23's window and arena them against update 23 and its twin, about 200 games on the 38 board. Then wire --value-labels-per-game 16 --value-weight 0.0625 and the window into bulk-loop.sh."
-  },
-  {
-    "id": "random-stop",
-    "status": "Next",
-    "bucket": "Generate",
-    "effort": "M",
-    "title": "End one-sided pass streaks at random, as a bootstrap",
-    "why": "72% of big-board games with a long pass streak ran to the 312-ply cap, so labels read who leads at ply 312. Once a side has passed 4 times running, ending the game with probability 0.25 on each further pass would have ended 74% of big-board games early, about 61 plies sooner, and changed the eventual winner in 13% of those. A stopgap until the value head supports hard resignation: no model input or search change, so it comes out cleanly.",
-    "test": "Implement in self-play and arena only, seeded for reproducible digests. Check the share of capped games and plies per game in a short run."
-  },
-  {
-    "id": "repeat-points",
-    "status": "Next",
-    "bucket": "Generate",
-    "effort": "M",
-    "title": "Find why stalling players repeat the exact same two points",
-    "why": "In recorded games the side behind alternated between the same two coordinates for 150 plies, one on the 1/256 grid and one off it, which looks like snapping in candidate sampling. In a continuous game that means the move set there is effectively finite.",
-    "test": "Trace candidate generation at one such position: which points are proposed, which survive snapping, and why the same two win. Related to the parked repetition policy (5b4efdee)."
-  },
-  {
-    "id": "fork-12",
-    "status": "Later",
-    "bucket": "Generate",
-    "effort": "L",
-    "title": "Fork the run from update 12 with the new recipe",
-    "why": "Strength rose to update 11 or 12 and then fell about 20 Elo an update, and newer windows trained worse nets. The fork tests whether the value recipe, wider window and game-end change stop the decline. About 9 hours of generation.",
-    "test": "After value-recipe and random-stop, run about 12 updates from update 12 and rate them on the 38 board against the original 12 to 23 curve."
-  },
-  {
-    "id": "history-planes",
-    "status": "Next",
-    "bucket": "Extract",
-    "effort": "S",
-    "title": "Test the stones of previous positions as input",
-    "why": "The net sees only the current position and whether the last move was a pass, so it cannot see a repetition. --history-plies adds the stones of N earlier positions in training only. On update 23's 450k window with the value recipe (one seed), 3 plies cut held-out policy KL from 1.721 to 1.706 and lifted top-1 from 0.122 to 0.127, about five times the run-to-run spread of the weight sweep; value MSE was unchanged (0.590 against 0.582). Training peaked at 38 GB against 27 and took 28 minutes against 18.",
-    "test": "Render the planes in the Rust raster and inference, then arena a 3-ply net against the same recipe without history. Try 1 and 2 plies to see where the gain comes from."
-  },
-  {
-    "id": "rust-rebuild",
-    "status": "Next",
-    "bucket": "Engineering",
-    "effort": "S",
-    "title": "Rebuild and check the Rust side after the Fedora upgrade",
-    "why": "The upgrade moved system Python to 3.15 and broke training/.venv, which was rebuilt on a uv-managed 3.14. The Rust binaries were not rebuilt or run since.",
-    "test": "cargo build --release, then correctness/check.sh."
-  },
-  {
-    "id": "value-metric",
-    "status": "Next",
-    "bucket": "Measurement",
-    "effort": "S",
-    "title": "Report value MSE or log loss, not MAE",
-    "why": "MAE ranked an overconfident value head best: stride-8 thinning read 0.56 MAE but 0.70 MSE against 0.59 MSE for 16 labels per game. The learner's selection score and logs use MAE.",
-    "test": "Add value MSE and cross-entropy to evaluate(), and use one of them in the selection score."
-  },
-  {
-    "id": "komi-range",
-    "status": "Later",
-    "bucket": "Generate",
-    "effort": "S",
-    "title": "Let komi follow the result per board",
-    "why": "Black's self-play win rate fell to about 10% on small boards and 30% on big ones, and the fitted fair komi was often below the sampler's floor. Partly a game-end effect, so decide after random-stop.",
-    "test": "Measure Black's win rate by board after random-stop, then widen the range or fit the centre from recent games."
+    "test": "No next step unless search budgets rise a lot.",
+    "revisit": "Only if search budgets rise a lot."
   }
 ]
