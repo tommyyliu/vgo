@@ -27,22 +27,13 @@
     "test": "Play both against update 45 and update 42. About 40 games each is enough for a large gap."
   },
   {
-    "id": "ownership-loss",
-    "status": "Running",
-    "bucket": "Extract",
-    "effort": "M",
-    "title": "Check the ownership head",
-    "why": "On by default in the loop at weight 1.5, because it costs nothing at inference and varies within a game, so it can't be memorized the way the value label is. sigmago measured +194 ± 28 with ownership and score heads together, but -96 ± 49 on a smaller run, and we have no arena result of our own.",
-    "test": "At a few updates of the fresh run, train a twin at weight 0 on the same window and arena the two at equal sims on both boards."
-  },
-  {
     "id": "window-size",
     "status": "Next",
     "bucket": "Replay",
     "effort": "S",
     "title": "Retest a larger training window",
-    "why": "750k beat 250k 51-29 on the small board, while the big board was inconclusive. The loop runs 200k. This is the most direct evidence on getting more from existing data.",
-    "test": "Replicate with a second seed at 500k and 750k, and weigh strength against training time."
+    "why": "750k beat 250k 51-29 on the small board, while the big board was inconclusive. On 2026-11-03 a 150k window drawn from twice as many generations beat update 23's own window 34-14 on the 38 board. The window at 192 now costs 57 KiB a sample (ownership as bits, ridge as uint8), so 450k trains at a 27 GB peak.",
+    "test": "Part of value-recipe: arena the 450k window against 150k with the new value labels, on the 38 board."
   },
   {
     "id": "input-128",
@@ -232,5 +223,77 @@
     "why": "A hand-kept second rasterizer is a correctness risk if Rust covers every case.",
     "test": "Delete it unless something still needs the fallback.",
     "effort": "S"
+  },
+  {
+    "id": "value-recipe",
+    "status": "Next",
+    "bucket": "Extract",
+    "effort": "S",
+    "title": "Adopt 16 value labels per game at value weight 1/16",
+    "why": "The value head memorized its window: train MAE 0.03, held-out 0.65. On update 23's 450k window, 16 labels per game cut held-out value MSE from 0.99 to 0.58 and lifted the winner from 71% to 79%. Policy KL fell as the value weight dropped and was flat at the no-value bound for weights of 1/8 and below. Stride-8 thinning plus weight decay already beat update 23 116-84. All held-out numbers are one seed.",
+    "test": "Train two seeds of the recipe on update 23's window and arena them against update 23 and its twin, about 200 games on the 38 board. Then wire --value-labels-per-game 16 --value-weight 0.0625 and the window into bulk-loop.sh."
+  },
+  {
+    "id": "random-stop",
+    "status": "Next",
+    "bucket": "Generate",
+    "effort": "M",
+    "title": "End one-sided pass streaks at random, as a bootstrap",
+    "why": "72% of big-board games with a long pass streak ran to the 312-ply cap, so labels read who leads at ply 312. Once a side has passed 4 times running, ending the game with probability 0.25 on each further pass would have ended 74% of big-board games early, about 61 plies sooner, and changed the eventual winner in 13% of those. A stopgap until the value head supports hard resignation: no model input or search change, so it comes out cleanly.",
+    "test": "Implement in self-play and arena only, seeded for reproducible digests. Check the share of capped games and plies per game in a short run."
+  },
+  {
+    "id": "repeat-points",
+    "status": "Next",
+    "bucket": "Generate",
+    "effort": "M",
+    "title": "Find why stalling players repeat the exact same two points",
+    "why": "In recorded games the side behind alternated between the same two coordinates for 150 plies, one on the 1/256 grid and one off it, which looks like snapping in candidate sampling. In a continuous game that means the move set there is effectively finite.",
+    "test": "Trace candidate generation at one such position: which points are proposed, which survive snapping, and why the same two win. Related to the parked repetition policy (5b4efdee)."
+  },
+  {
+    "id": "fork-12",
+    "status": "Later",
+    "bucket": "Generate",
+    "effort": "L",
+    "title": "Fork the run from update 12 with the new recipe",
+    "why": "Strength rose to update 11 or 12 and then fell about 20 Elo an update, and newer windows trained worse nets. The fork tests whether the value recipe, wider window and game-end change stop the decline. About 9 hours of generation.",
+    "test": "After value-recipe and random-stop, run about 12 updates from update 12 and rate them on the 38 board against the original 12 to 23 curve."
+  },
+  {
+    "id": "history-planes",
+    "status": "Running",
+    "bucket": "Extract",
+    "effort": "S",
+    "title": "Test the stones of previous positions as input",
+    "why": "The net sees only the current position and whether the last move was a pass, so it cannot see a repetition. --history-plies adds the stones of N earlier positions in training only; the Rust raster does not render them yet.",
+    "test": "3 plies on the 450k recipe run, against the same run without history: held-out policy KL and value MSE. Adopting it needs the raster and inference to render the planes."
+  },
+  {
+    "id": "rust-rebuild",
+    "status": "Next",
+    "bucket": "Engineering",
+    "effort": "S",
+    "title": "Rebuild and check the Rust side after the Fedora upgrade",
+    "why": "The upgrade moved system Python to 3.15 and broke training/.venv, which was rebuilt on a uv-managed 3.14. The Rust binaries were not rebuilt or run since.",
+    "test": "cargo build --release, then correctness/check.sh."
+  },
+  {
+    "id": "value-metric",
+    "status": "Next",
+    "bucket": "Measurement",
+    "effort": "S",
+    "title": "Report value MSE or log loss, not MAE",
+    "why": "MAE ranked an overconfident value head best: stride-8 thinning read 0.56 MAE but 0.70 MSE against 0.59 MSE for 16 labels per game. The learner's selection score and logs use MAE.",
+    "test": "Add value MSE and cross-entropy to evaluate(), and use one of them in the selection score."
+  },
+  {
+    "id": "komi-range",
+    "status": "Later",
+    "bucket": "Generate",
+    "effort": "S",
+    "title": "Let komi follow the result per board",
+    "why": "Black's self-play win rate fell to about 10% on small boards and 30% on big ones, and the fitted fair komi was often below the sampler's floor. Partly a game-end effect, so decide after random-stop.",
+    "test": "Measure Black's win rate by board after random-stop, then widen the range or fit the centre from recent games."
   }
 ]

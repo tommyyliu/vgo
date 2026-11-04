@@ -33,3 +33,5 @@ Don't reopen these without new evidence.
 | Hard resignation | Unused: all 10,580 games in r128-s2000 read `resigned: false`. Removed, so every game reaches a real result |
 | PixelShuffle policy upsampling | No speed gain, and +0.073 validation policy KL after 8 epochs against a seed spread of 0.003. Taking it out of two stacked shapes moved them from +0.075 to +0.013 and +0.018. Option removed |
 | Lower priority for actor threads | No gain pinned to 8 cores: lane wake delay went from 119 to 102 us, and the GPU did not rise. The stall was the broker round trip, now removed by the deck |
+| Ownership loss off | Lost 88-112 to update 23 and its twin on the 38 board, where the same window with ownership on scored even; colour-swapped pairs went 10-25, p 0.017. Kept at weight 1.5 |
+| Weight decay 0.05 (AdamW) | No change in held-out policy KL or value error on update 23's window, alone or with value thinning; the thinning carried that arm's gain |
