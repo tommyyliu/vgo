@@ -126,6 +126,14 @@ naive_simulations="${VGO_NAIVE_SIMULATIONS:-200}"
 # it wants less komi, not more. 1/38 sits at 53% and moves a point the wrong way,
 # which is the smaller of the two errors.
 komi_area_coefficient="${VGO_KOMI_AREA_COEFFICIENT:-28.0}"
+# Komi recentring, before each generator: training/loop/komi-calibration.py fits
+# Black's win rate on recent games by board size and komi, and moves the centre
+# toward the even point by at most this many points. It holds still until komi
+# clearly moves the result. The schedule replaces the coefficient above in self-
+# play; rating rounds keep their fixed komi so the series stays comparable.
+# VGO_KOMI_REFIT=0 keeps the fixed coefficient.
+komi_refit="${VGO_KOMI_REFIT:-1}"
+komi_max_step="${VGO_KOMI_MAX_STEP:-1.0}"
 # The search tail. Games that look decided play on at a cheaper budget, so search
 # moves to positions where it matters and every game still reaches a real result.
 # A schedule from recent games says how far behind a side must be, by board and
@@ -235,6 +243,13 @@ build_tail_schedule () {
     --games "$tail_games" --target "$tail_target" --window "$tail_window"
 }
 
+build_komi_schedule () {
+  local path="$1" previous
+  previous=$(ls -1t "$output/komi-schedules/"*.json 2>/dev/null | head -1)
+  "$python" "$root/training/loop/komi-calibration.py" "$games" --output "$path" \
+    --max-step "$komi_max_step" ${previous:+--previous "$previous"}
+}
+
 start_generator () {
   local label="$1" model="$2" first_game="$3"
   local budget="$simulations"
@@ -247,6 +262,13 @@ start_generator () {
   local schedule="$output/tail-schedules/$label.json"
   build_tail_schedule "$schedule" || { echo "[loop] could not build $schedule" >&2; return 1; }
   record_event tail_schedule "label=$label" "schedule=$schedule"
+  local komi_flag=()
+  if [ "$komi_refit" = 1 ]; then
+    local komi_schedule="$output/komi-schedules/$label.json"
+    build_komi_schedule "$komi_schedule" || { echo "[loop] could not build $komi_schedule" >&2; return 1; }
+    record_event komi_schedule "label=$label" "schedule=$komi_schedule"
+    komi_flag=(--komi-schedule "$komi_schedule")
+  fi
   local model_flag=()
   local search_fraction=1.0
   [ -n "$model" ] && model_flag=(--model "$model")
@@ -262,7 +284,7 @@ start_generator () {
     --max-plies "$maximum_plies" --radius 0.05555555555555555 \
     --coarse-pool 16 --widening-coefficient 6.0 --maximum-candidates 321 \
     --komi-area-coefficient "$komi_area_coefficient" \
-    --komi-low 0.017 --komi-high 0.137 \
+    --komi-low 0.017 --komi-high 0.137 "${komi_flag[@]}" \
     --tail-schedule "$schedule" --tail-simulations "$tail_budget" --tail-window "$tail_window" \
     --temperature 1.0 --temperature-plies 30 \
     --root-exploration-noise "$root_noise" \

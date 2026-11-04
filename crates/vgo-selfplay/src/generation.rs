@@ -50,6 +50,68 @@ pub struct GameSettings {
     pub tail: TailSettings,
     /// See [`crate::RandomStop`]. None plays every game to its end or the cap.
     pub random_stop: Option<crate::RandomStop>,
+    /// A refitted komi centre, from `training/loop/komi-calibration.py`. None
+    /// keeps the fixed `komi_area_coefficient` centre and relative range.
+    pub komi_schedule: Option<KomiSchedule>,
+}
+
+/// Komi in points, recentred from recent results.
+///
+/// A board of radius `r` holds about `(1/2r)^2` stones, so `points` of komi is
+/// `4 * points * r^2` of area -- the convention `komi_area_coefficient` uses,
+/// where 28 is 7 points. The centre may move with board size, which runs 1/r =
+/// 18 to 38 units across, and may go negative: in the first fresh run Black lost
+/// most small-board games even at the lowest komi on offer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KomiSchedule {
+    /// Centre in points at size 0, before `points_per_unit * size`.
+    pub centre_points: f64,
+    pub points_per_unit: f64,
+    /// Half the sampled range in points. Komi is a normal clipped to the range.
+    pub spread_points: f64,
+}
+
+impl KomiSchedule {
+    /// Reads `{"centre_points": .., "points_per_unit": .., "spread_points": ..}`;
+    /// other fields, such as the fit's diagnostics, are ignored.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|error| error.to_string())?;
+        let field = |name: &str| {
+            value
+                .get(name)
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| format!("komi schedule needs a number for {name}"))
+        };
+        let schedule = Self {
+            centre_points: field("centre_points")?,
+            points_per_unit: field("points_per_unit")?,
+            spread_points: field("spread_points")?,
+        };
+        schedule.validate()?;
+        Ok(schedule)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.centre_points.is_finite() && self.points_per_unit.is_finite()) {
+            return Err("komi schedule centre must be finite".to_owned());
+        }
+        if !(self.spread_points.is_finite() && self.spread_points >= 0.0) {
+            return Err("komi schedule spread must be finite and nonnegative".to_owned());
+        }
+        Ok(())
+    }
+
+    /// The sampled range, in area units, for a board of this radius.
+    #[must_use]
+    pub fn range(&self, radius: f64) -> (f64, f64) {
+        let centre = self.centre_points + self.points_per_unit / radius;
+        let area = 4.0 * radius * radius;
+        (
+            (centre - self.spread_points) * area,
+            (centre + self.spread_points) * area,
+        )
+    }
 }
 
 impl GameSettings {
@@ -62,7 +124,14 @@ impl GameSettings {
     #[must_use]
     pub(crate) fn board_for_game(&self, game_seed: u64) -> (f64, f64, u32) {
         let radius = sampled_radius(game_seed, &self.board_mix, self.radius);
-        let komi = if self.board_mix.is_empty() {
+        let komi = if let Some(schedule) = self.komi_schedule {
+            let (low, high) = schedule.range(radius);
+            if high > low {
+                sampled_komi(game_seed, low, high)
+            } else {
+                low
+            }
+        } else if self.board_mix.is_empty() {
             sampled_komi(game_seed, self.komi_low, self.komi_high)
         } else {
             let centre = komi_centre_for_radius(radius, self.komi_area_coefficient);
@@ -827,6 +896,7 @@ mod tests {
                 exit_window: 2,
             },
             random_stop: None,
+            komi_schedule: None,
         };
         let normal = ply_search_config(&settings, base, true, false);
         assert_eq!(normal.simulations, 100);
@@ -849,5 +919,100 @@ mod tests {
             extend_spans(&mut spans, ply);
         }
         assert_eq!(spans, vec![(4, 7), (9, 10)]);
+    }
+
+    #[test]
+    fn a_seven_point_schedule_is_the_fixed_coefficient_centre() {
+        let schedule = KomiSchedule {
+            centre_points: 7.0,
+            points_per_unit: 0.0,
+            spread_points: 0.0,
+        };
+        for radius in [1.0 / 18.0, 1.0 / 26.0, 1.0 / 38.0] {
+            let (low, high) = schedule.range(radius);
+            let fixed = komi_centre_for_radius(radius, 28.0);
+            assert!((low - fixed).abs() < 1e-12 && (high - fixed).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn the_centre_moves_with_board_size_and_may_go_negative() {
+        let schedule = KomiSchedule {
+            centre_points: -2.0,
+            points_per_unit: 0.25,
+            spread_points: 1.0,
+        };
+        // 18 units across: -2 + 4.5 = 2.5 points, so 1.5 to 3.5.
+        let r = 1.0 / 18.0;
+        let (low, high) = schedule.range(r);
+        assert!((low - 1.5 * 4.0 * r * r).abs() < 1e-12);
+        assert!((high - 3.5 * 4.0 * r * r).abs() < 1e-12);
+        let negative = KomiSchedule {
+            centre_points: -3.0,
+            points_per_unit: 0.0,
+            spread_points: 0.5,
+        };
+        assert!(negative.range(r).1 < 0.0);
+    }
+
+    #[test]
+    fn schedules_parse_and_reject_bad_input() {
+        let parsed = KomiSchedule::parse(
+            r#"{"centre_points": 6.5, "points_per_unit": 0.01, "spread_points": 5.5, "games": 900}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.spread_points, 5.5);
+        assert!(KomiSchedule::parse(r#"{"centre_points": 6.5, "points_per_unit": 0.0}"#).is_err());
+        assert!(
+            KomiSchedule::parse(
+                r#"{"centre_points": 6.5, "points_per_unit": 0.0, "spread_points": -1}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_schedule_replaces_the_coefficient_in_each_game() {
+        let mut settings = GameSettings {
+            policy_resolution: 16,
+            simulations: 100,
+            full_search_fraction: 1.0,
+            fast_simulations: 20,
+            coarse_pool: 16,
+            temperature: 1.0,
+            temperature_plies: 30,
+            leaf_batch: 4,
+            maximum_candidates: 321,
+            root_exploration_noise: 0.1,
+            widening_coefficient: 6.0,
+            seed: 1,
+            radius: 1.0 / 18.0,
+            board_mix: Vec::new(),
+            komi_low: 0.017,
+            komi_high: 0.137,
+            komi_area_coefficient: KOMI_AREA_COEFFICIENT,
+            maximum_plies: 70,
+            ruleset: Ruleset::default(),
+            tail: TailSettings {
+                schedule: None,
+                simulations: 40,
+                window: 5,
+                exit_value: 0.6,
+                exit_window: 2,
+            },
+            random_stop: None,
+            komi_schedule: Some(KomiSchedule {
+                centre_points: -1.0,
+                points_per_unit: 0.0,
+                spread_points: 0.5,
+            }),
+        };
+        let area = 4.0 / (18.0 * 18.0);
+        for seed in 0..50 {
+            let (_, komi, _) = settings.board_for_game(seed);
+            assert!((-1.5 * area..=-0.5 * area).contains(&komi), "komi {komi}");
+        }
+        settings.komi_schedule = None;
+        assert!(settings.board_for_game(3).1 > 0.0);
     }
 }

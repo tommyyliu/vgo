@@ -22,8 +22,9 @@ generate () {
   # Named from every argument, as arena() does: two cases that differ only in
   # extra flags once shared a directory, and the generator numbered the second
   # run's games after the first's, so the second hash re-read the first games.
-  local output="$work/generate-$ruleset-$actors-$maximum_plies-${#evaluator[@]}-$*"
-  output="${output// /_}"
+  local tag="$*"
+  tag="${tag//[ \/]/_}"
+  local output="$work/generate-$ruleset-$actors-$maximum_plies-${#evaluator[@]}-$tag"
   "$bin/vgo-generate-continuous" --output-root "$output" --label digest \
     "${evaluator[@]}" --provider cpu --fp16 false --cache-directory "$work/cache" \
     --maximum-games 8 --actors "$actors" --inference-slots 1 --maximum-batch 8 --delay-ms 1 \
@@ -70,6 +71,10 @@ report () {
   value="$("$@")"
   echo "$name $value"
 }
+# A recentred komi: negative on small boards, so the schedule path is in the hash.
+cat > "$work/komi.json" <<'JSON'
+{"centre_points": -3.0, "points_per_unit": 0.2, "spread_points": 2.0}
+JSON
 # Model games reach the cap; naive ones end by passing, which covers the other exit.
 evaluator=()
 report generate-naive generate vgo 1 40 --board-mix 1:18
@@ -80,6 +85,7 @@ evaluator=(--model "$model")
 report generate-mixed generate vgo 4 24 --board-mix 1:18 --board-mix 1:18-30
 report generate-vgo generate vgo 1 40 --board-mix 1:18
 report generate-official generate official 1 40 --board-mix 1:18
+report generate-komi generate vgo 1 40 --board-mix 1:18 --komi-schedule "$work/komi.json"
 arena_plies=24
 report arena-vs-model arena 2 --opponent "$model"
 report arena-vs-naive arena 1

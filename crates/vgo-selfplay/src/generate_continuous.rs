@@ -180,6 +180,11 @@ struct Config {
     komi_low: f64,
     #[arg(long, default_value_t = 0.137)]
     komi_high: f64,
+    /// A refitted komi centre and spread, from
+    /// `training/loop/komi-calibration.py`. Replaces the coefficient and the
+    /// low/high range above.
+    #[arg(long)]
+    komi_schedule: Option<PathBuf>,
     #[arg(long, default_value = "vgo")]
     ruleset: Ruleset,
     /// Thresholds from `training/loop/tail-calibration.py`. Without one, every
@@ -268,6 +273,16 @@ impl Config {
             ruleset: self.ruleset,
             tail,
             random_stop: random_stop(self.random_stop_after, self.random_stop_probability)?,
+            komi_schedule: self
+                .komi_schedule
+                .as_ref()
+                .map(|path| {
+                    let text = fs::read_to_string(path)
+                        .map_err(|error| format!("{}: {error}", path.display()))?;
+                    vgo_selfplay::generation::KomiSchedule::parse(&text)
+                        .map_err(|error| format!("{}: {error}", path.display()))
+                })
+                .transpose()?,
         })
     }
 }
