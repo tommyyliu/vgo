@@ -97,7 +97,7 @@
     "title": "Fresh overnight run with the fixes",
     "why": "Replaces forking from update 12: the fixes should help early phases too. Strength rose to about update 12 and then fell about 20 Elo an update, newer windows trained worse nets, and the value head memorized its window.",
     "test": "After value-recipe, random-stop, ratings-fix and naive-stop: start from the naive generator with the new recipe, and watch the rating curve for the rise-then-fall shape.",
-    "progress": "Started 2026-11-04 in artifacts/vgo-128. Check 2026-11-05 17:30 at update 36 (~44 min/update): rose to ~+950 by update 24, then flat around +850-1050 to update 36 (6-game matches, +-150 each); no decline like the old run's. Value head still not memorizing (train MSE 0.756 vs held-out 0.763). Komi is lagging: Black's share went 59% -> 39%, and the 18-unit centre is falling 1 point a refit (the cap) toward even. Paused 2026-11-06 after update 47 for the warm-start test; flat from update 24 to 45 at about +800 (-2.6 Elo/update)."
+    "progress": "Started 2026-11-04 in artifacts/vgo-128. Check 2026-11-05 17:30 at update 36 (~44 min/update): rose to ~+950 by update 24, then flat around +850-1050 to update 36 (6-game matches, +-150 each); no decline like the old run's. Value head still not memorizing (train MSE 0.756 vs held-out 0.763). Komi is lagging: Black's share went 59% -> 39%, and the 18-unit centre is falling 1 point a refit (the cap) toward even. Paused 2026-11-06 after update 47 for the warm-start test; flat from update 24 to 45 at about +800 (-2.6 Elo/update). Warm since update 48: every rating match won (48 17-1, 51 14-4, 54 15-3, 57 18-0, 60 5-1 so far); check 2026-11-06 15:00 has update 57 at +1719 (18 games, +-160) vs update 45 +735 (30, +-125), about +80 Elo/update. Held-out policy CE 4.465 -> 4.287 (47 -> 60), top-1 13.5% -> 15.6%."
   },
   {
     "id": "value-passes",
@@ -108,7 +108,27 @@
     "title": "Fewer passes for value than for policy under warm start",
     "why": "In the warm chain, policy kept improving up to 8 passes per sample, but value memorized: the train/held-out MSE gap reached +0.18 and held-out value MSE rose from 0.735 (link 05) to 0.803 (link 09).",
     "test": "Offline chains like warm-2026-11-06 with (a) value labels per game 16 -> 4 on warm links, (b) value weight halved, (c) value head reinitialized each update. Compare held-out value MSE at link 09, then arena the best against the plain warm link 09.",
-    "progress": "Watch the gap in the live loop's pt.json files first."
+    "progress": "Live loop, updates 48-60: train/held-out value gap +0.10 at 48-53, ~0 at 54-57, +0.07 at 60; held-out value MSE 0.79 -> 0.63 (on moving held-out sets). Not urgent while Elo climbs; see short-term-value, which attacks the same label noise."
+  },
+  {
+    "id": "short-term-value",
+    "kind": "idea",
+    "status": "Next",
+    "bucket": "Train",
+    "effort": "M",
+    "title": "Short-term value targets from recorded root values",
+    "why": "The value head memorizes noisy game outcomes. games.jsonl now records each ply's root value, so the blocker on branch experiment/short-term-value-targets (shards had only the outcome) is gone for runs since that field landed. On 1/38 (gens 11-12 of the warm run), search sides with the eventual loser at some point in 67% of games, and a third of plies come before its last wrong-sided ply; root value vs outcome MSE is 0.80/0.73/0.65/0.51/0.22 by game fifth. Swings over 0.5 between plies are rare (0.001 per ply), so wrong outcomes come from slow drift, not single blunders that could be cut out.",
+    "test": "Port the training half to main, reading root values from games.jsonl. Offline warm chain on the current window: outcome only vs outcome plus short-term auxiliary heads (KataGo's ~6/16/50-ply averages). Compare held-out outcome MSE and the train/held-out gap, then arena."
+  },
+  {
+    "id": "wide-window",
+    "kind": "idea",
+    "status": "Later",
+    "bucket": "Train",
+    "effort": "S",
+    "title": "Wider window at the same passes: a random half of 900k",
+    "why": "Spreads each sample's 8 passes over 16 updates instead of 8, for more diverse batches at the same compute and RAM (only the half used is loaded). Cost: older policy targets, from nets several hundred Elo weaker while the run climbs ~80 Elo an update.",
+    "test": "Offline warm chain: 450k contiguous vs a random 450k of the last 900k each link. Revisit when Elo flattens."
   },
   {
     "id": "warm-start",
