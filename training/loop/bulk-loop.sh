@@ -87,10 +87,25 @@ read -r -a board_mix <<< "${VGO_BOARD_MIX:-50:38 25:18 25:18-38}"
 # Fraction of the window replaced before retraining. Training competes with
 # generation; the historical duty estimate above was measured on a different
 # recipe and should be rechecked from the current lifecycle/performance logs.
-# 5% of 450k is the 22.5k samples a retrain waited for at 15% of 150k, so updates
-# keep their cadence; 3 epochs keeps the steps per update near the old 8 on 150k.
-turnover="${VGO_TURNOVER:-0.05}"
-epochs="${VGO_EPOCHS:-3}"
+#
+# Warm start (default since 2026-11-06): each update continues from the previous
+# update's checkpoint for `epochs` passes over the window. A sample then sees at
+# most `epochs / turnover` passes over its life -- 1 / 0.125 = 8 -- and fewer when
+# generation outruns training, since more than `turnover` lands per update. The
+# old incremental loop that lost 41-7 made about 12 passes (1 epoch on 150k every
+# 12k). Offline on vgo-128 (artifacts/warm-2026-11-06): a 10-link chain from
+# update 38 at these settings beat from-scratch update 45 on its own held-out
+# games (policy KL 0.429 vs 0.457, value MSE 0.803 vs 0.815) and won 31-9 on
+# 1/38. Value overfits at 8 passes (train/held-out MSE gap +0.18), so watch the
+# gap. VGO_WARM_START=0 restores from-scratch training at `scratch_epochs`.
+warm_start="${VGO_WARM_START:-1}"
+turnover="${VGO_TURNOVER:-0.125}"
+epochs="${VGO_EPOCHS:-1}"
+# A from-scratch update: the first one of a run, or every one with warm start off.
+scratch_epochs="${VGO_SCRATCH_EPOCHS:-3}"
+# Warm-start the first update of this launch from this checkpoint instead of the
+# previous update's, e.g. a chain trained offline. Later updates chain as usual.
+initial_checkpoint="${VGO_INITIAL_CHECKPOINT:-}"
 # Value targets: 16 positions per game, spread evenly, at a total value weight
 # of 1/16 of an unthinned window. Every ply of a game shares one outcome, so the
 # full window memorized ~800 labels; on update 23's window this recipe cut
@@ -331,7 +346,7 @@ first_update=$(( ${first_update:-(-1)} + 1 ))
 
 # New samples that must land before a retrain. Bash cannot multiply by 0.50.
 step=$("$python" -c "print(int($window * $turnover))")
-echo "[loop] window $window, retrain every $step new samples, $epochs epochs from scratch"
+echo "[loop] window $window, retrain every $step new samples, warm start $warm_start ($epochs epoch(s) warm, $scratch_epochs from scratch)"
 
 generation=0
 # Game indices never restart: a reused index replays a seed, and `write_game`
@@ -376,11 +391,20 @@ for ((update = first_update; update < first_update + updates; update++)); do
   fi
 
   checkpoint="$models/update-$(printf '%06d' "$update").pt"
-  echo "[loop] update $update: training from scratch on the most recent $window samples"
-  record_event training_started "update=$update" "checkpoint=$checkpoint" "generator_pid=$generator"
-  # No `--initial-checkpoint`, and that is the entire point of this script. The
-  # incremental chain is what accumulated the damage a from-scratch run on the
-  # same corpus beat 41-7.
+  previous_checkpoint="$models/update-$(printf '%06d' $((update - 1))).pt"
+  warm_flags=()
+  update_epochs="$scratch_epochs"
+  [ "$update" -eq "$first_update" ] && [ -n "$initial_checkpoint" ] && previous_checkpoint="$initial_checkpoint"
+  if [ "$warm_start" = "1" ] && [ "$update" -gt 0 ] && [ -f "$previous_checkpoint" ]; then
+    warm_flags=(--initial-checkpoint "$previous_checkpoint")
+    update_epochs="$epochs"
+    echo "[loop] update $update: warm start from ${previous_checkpoint##*/}, $update_epochs epoch(s) on the most recent $window samples"
+  else
+    echo "[loop] update $update: training from scratch, $update_epochs epochs on the most recent $window samples"
+  fi
+  record_event training_started "update=$update" "checkpoint=$checkpoint" "generator_pid=$generator" "warm=${#warm_flags[@]}"
+  # Passes per sample are capped by `epochs / turnover`; see the warm-start note
+  # where both are set.
   #
   # `--precision bfloat16`: the default is float32, which every update of the
   # incremental loop paid for nothing. Measured 11.6 s per 1k samples against
@@ -390,12 +414,12 @@ for ((update = first_update; update < first_update + updates; update++)); do
   # line comments out every remaining argument and the command runs truncated.
   ( cd "$root/training" && "$python" "$root/training/loop/train-once.py" \
       --games-root "$games" --window-samples "$window" \
-      --output "$checkpoint" \
+      --output "$checkpoint" "${warm_flags[@]}" \
       --raster-kind compact-radius --resolution "$resolution" \
       --model-width 64 --blocks 16 --context-attention-blocks "$context_attention_blocks" \
       "${shape_flags[@]}" \
       --attention-heads 8 --norm-groups 8 --norms-per-block "$norms_per_block" --precision bfloat16 \
-      --epochs "$epochs" --batch-size 64 --learning-rate 0.0005 \
+      --epochs "$update_epochs" --batch-size 64 --learning-rate 0.0005 \
       --value-weight "$value_weight" --value-labels-per-game "$value_labels_per_game" \
       --ownership-weight "$ownership_weight" --validation-fraction 0.1 \
       --tail-keep "$tail_keep" \
