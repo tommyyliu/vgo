@@ -100,15 +100,26 @@
     "progress": "Started 2026-11-04 in artifacts/vgo-128. Check 2026-11-05 17:30 at update 36 (~44 min/update): rose to ~+950 by update 24, then flat around +850-1050 to update 36 (6-game matches, +-150 each); no decline like the old run's. Value head still not memorizing (train MSE 0.756 vs held-out 0.763). Komi is lagging: Black's share went 59% -> 39%, and the 18-unit centre is falling 1 point a refit (the cap) toward even. Paused 2026-11-06 after update 47 for the warm-start test; flat from update 24 to 45 at about +800 (-2.6 Elo/update)."
   },
   {
+    "id": "value-passes",
+    "kind": "task",
+    "status": "Next",
+    "bucket": "Train",
+    "effort": "S",
+    "title": "Fewer passes for value than for policy under warm start",
+    "why": "In the warm chain, policy kept improving up to 8 passes per sample, but value memorized: the train/held-out MSE gap reached +0.18 and held-out value MSE rose from 0.735 (link 05) to 0.803 (link 09).",
+    "test": "Offline chains like warm-2026-11-06 with (a) value labels per game 16 -> 4 on warm links, (b) value weight halved, (c) value head reinitialized each update. Compare held-out value MSE at link 09, then arena the best against the plain warm link 09.",
+    "progress": "Watch the gap in the live loop's pt.json files first."
+  },
+  {
     "id": "warm-start",
     "kind": "task",
-    "status": "Running",
+    "status": "Done",
     "bucket": "Train",
     "effort": "M",
     "title": "Warm-start training, capped at 8 passes per sample",
     "why": "The vgo-128 run has been flat from update 24 to 45 (-2.6 Elo/update, big board). Each update trains a fresh net on 450k samples, about 2,700 games, so nothing accumulates. The old warm-start loop lost 41-7 to from-scratch, but it made about 12 passes per sample (1 epoch on 150k every 12k). Held-out games are fixed per game (hash salted by shard digest), so a warm chain never trains on its validation games.",
     "test": "Offline: from update 38, 10 links of 1 epoch each on windows stepping 56k samples (12.5% turnover, so at most 8 passes per sample), ending on update 45's exact window. Compare with update 45 on held-out value MSE, policy KL and the train/held-out gap, then 40 games on 1/38. If it wins, run the loop with --initial-checkpoint, 1 epoch, turnover 0.125.",
-    "progress": "2026-11-06: loop paused after update 47 to free GPU and RAM; chain scripts and models in artifacts/warm-2026-11-06."
+    "progress": "2026-11-06: the offline chain (update 38 -> 10 links, 1 epoch, 56k steps) beat from-scratch update 45 on its held-out games (policy KL 0.429 vs 0.457, top-1 13.7% vs 12.1%, value MSE 0.803 vs 0.815, sign 66.7% vs 64.7%) and won 31-9 on 1/38 (+215, roughly +100 to +390). Value overfits: train/held-out gap grew from ~0 to +0.18 and held-out value MSE rose after link 05. The loop now warm-starts (commit adf8c6b); resumed 2026-11-06 04:10 from update 48, generating with link-09 and warm-starting from it."
   },
   {
     "id": "komi-range",
