@@ -97,7 +97,18 @@
     "title": "Fresh overnight run with the fixes",
     "why": "Replaces forking from update 12: the fixes should help early phases too. Strength rose to about update 12 and then fell about 20 Elo an update, newer windows trained worse nets, and the value head memorized its window.",
     "test": "After value-recipe, random-stop, ratings-fix and naive-stop: start from the naive generator with the new recipe, and watch the rating curve for the rise-then-fall shape.",
-    "progress": "Started 2026-11-04 in artifacts/vgo-128: 128 input, 2 lanes, every fix on (value recipe, 450k window, random stop, komi recentring, 1/38 rating rounds, naive drain). Watch for the curve to plateau."
+    "progress": "Started 2026-11-04 in artifacts/vgo-128. Check 2026-11-05 17:30 at update 36 (~44 min/update): rose to ~+950 by update 24, then flat around +850-1050 to update 36 (6-game matches, +-150 each); no decline like the old run's. Value head still not memorizing (train MSE 0.756 vs held-out 0.763). Komi is lagging: Black's share went 59% -> 39%, and the 18-unit centre is falling 1 point a refit (the cap) toward even. Paused 2026-11-06 after update 47 for the warm-start test; flat from update 24 to 45 at about +800 (-2.6 Elo/update)."
+  },
+  {
+    "id": "warm-start",
+    "kind": "task",
+    "status": "Running",
+    "bucket": "Train",
+    "effort": "M",
+    "title": "Warm-start training, capped at 8 passes per sample",
+    "why": "The vgo-128 run has been flat from update 24 to 45 (-2.6 Elo/update, big board). Each update trains a fresh net on 450k samples, about 2,700 games, so nothing accumulates. The old warm-start loop lost 41-7 to from-scratch, but it made about 12 passes per sample (1 epoch on 150k every 12k). Held-out games are fixed per game (hash salted by shard digest), so a warm chain never trains on its validation games.",
+    "test": "Offline: from update 38, 10 links of 1 epoch each on windows stepping 56k samples (12.5% turnover, so at most 8 passes per sample), ending on update 45's exact window. Compare with update 45 on held-out value MSE, policy KL and the train/held-out gap, then 40 games on 1/38. If it wins, run the loop with --initial-checkpoint, 1 epoch, turnover 0.125.",
+    "progress": "2026-11-06: loop paused after update 47 to free GPU and RAM; chain scripts and models in artifacts/warm-2026-11-06."
   },
   {
     "id": "komi-range",
@@ -128,11 +139,23 @@
     "status": "Later",
     "bucket": "Speed",
     "effort": "S",
-    "title": "Settle one norm per block",
-    "why": "About 15% more positions/s at the card's ceiling, with mixed, inconclusive arenas: 86-106 over four small matches. The GPU is the limit on throughput at 128.",
-    "test": "Train it with the faster net shapes, on the same window as their control.",
-    "held": "After another task",
-    "revisit": "With faster-net: train it on the same window as their control."
+    "title": "Fixed-variance trunk: one norm per net instead of per block",
+    "why": "KataGo's method has two halves. vgo already has the second: twin heads, the batch-normed set carrying 80% of the loss and the plain set used for inference. The first half, which vgo lacks, replaces every trunk norm with a fixed scale K, chosen so that idealized variance resets to 1, on pre-activation blocks. vgo's blocks are post-activation (relu after the add), so this is a block rewrite and a retrain. Speed: no trunk norms was +29% on the card for the old net, but the generator runs the GPU at ~71% at home and is CPU-bound on Vast, so throughput gains are small now. The real question is training quality.",
+    "test": "Write the variance derivation for the DDRNet layout, where fusion sums two branches, and check activation variance at init. Then train control vs fixed-variance on one vgo-128 window and compare held-out KL; play an arena only if it ties or wins.",
+    "held": "Needs the GPU and RAM the live run uses; the memory watchdog kills any train-once.py",
+    "revisit": "When the vgo-128 run is paused or clearly plateaued"
+  },
+  {
+    "id": "nested-bottleneck",
+    "kind": "idea",
+    "status": "Later",
+    "bucket": "Speed",
+    "effort": "M",
+    "title": "Nested bottleneck blocks for the stronger net",
+    "why": "KataGo's block: 1x1 down to half width, two inner residual blocks of two 3x3s each, 1x1 up. Their b18c384 matched the old b40c256 on speed and came close to b60c320 on strength. vgo only has the plain bottleneck tail, with one 3x3, which KataGo found worse. It pays where full-width 3x3s dominate cost. In the current fast net (detail 1/1/1 at width 64) the fixed parts, norms and floor, take most of the time, and halving detail width alone cost +0.010 KL, so the gain is likely small now.",
+    "test": "Add it as a shape in performance/model_variants.py, then time it and loss-screen it against a plain stack of equal cost at the wider/deeper size planned for the later phase.",
+    "held": "Matters for the stronger net, not the fast generator net",
+    "revisit": "With faster-net, when choosing the later-phase net"
   },
   {
     "id": "lane-cpu",
