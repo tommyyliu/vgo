@@ -406,6 +406,11 @@ for ((update = first_update; update < first_update + updates; update++)); do
   # Passes per sample are capped by `epochs / turnover`; see the warm-start note
   # where both are set.
   #
+  # `--prepared-cache`: rendering the window was about 3 ms a sample, most of an
+  # update's 22 minutes, and 7/8 of each window was rendered by the update before.
+  # Keyed by shard content, settings and training code; holds about one window
+  # (28 KiB a sample on disk) and prunes the rest each update.
+  #
   # `--precision bfloat16`: the default is float32, which every update of the
   # incremental loop paid for nothing. Measured 11.6 s per 1k samples against
   # 7.5 s per 1k with `--compile` at 3.2x the parameters.
@@ -414,7 +419,7 @@ for ((update = first_update; update < first_update + updates; update++)); do
   # line comments out every remaining argument and the command runs truncated.
   ( cd "$root/training" && "$python" "$root/training/loop/train-once.py" \
       --games-root "$games" --window-samples "$window" \
-      --output "$checkpoint" "${warm_flags[@]}" \
+      --output "$checkpoint" "${warm_flags[@]}" --prepared-cache "$output/prepared-cache" \
       --raster-kind compact-radius --resolution "$resolution" \
       --model-width 64 --blocks 16 --context-attention-blocks "$context_attention_blocks" \
       "${shape_flags[@]}" \

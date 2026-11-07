@@ -85,6 +85,44 @@ def cache_fixture(directory: Path) -> tuple[ReplayCache, Path, list[int]]:
 
 
 class ReplayCacheTests(unittest.TestCase):
+    def test_spilled_shard_loads_identical_in_a_new_process_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, path, loads = cache_fixture(root)
+            spill = root / "spill"
+
+            def load(_: str | Path) -> RasterDataset:
+                loads.append(1)
+                return raw_fixture()
+
+            first = ReplayCache(loader=load, spill_directory=spill).window([path], 4)
+
+            def refuse(_: str | Path) -> RasterDataset:
+                raise AssertionError("a spilled shard must not be rendered again")
+
+            second_cache = ReplayCache(loader=refuse, spill_directory=spill)
+            second = second_cache.window([path], 4)
+            self.assertEqual(len(loads), 1)
+            self.assertEqual(second_cache.spill_hits, 1)
+            a, b = first.shards[0], second.shards[0]
+            self.assertEqual(a.digest, b.digest)
+            self.assertTrue(torch.equal(a.split_hashes, b.split_hashes))
+            for field in ("values", "policies", "policy_masks"):
+                self.assertTrue(torch.equal(getattr(a.dataset, field), getattr(b.dataset, field)))
+
+            # A new manifest digest is new content: render it, do not reuse.
+            path.with_name("manifest.json").write_text(
+                json.dumps({"dataset_sha256": "cd" * 32}), encoding="utf-8"
+            )
+            ReplayCache(loader=load, spill_directory=spill).window([path], 4)
+            self.assertEqual(len(loads), 2)
+
+            # Only the second digest's file was asked for, so the first is pruned.
+            pruner = ReplayCache(loader=refuse, spill_directory=spill)
+            pruner.window([path], 4)
+            self.assertEqual(pruner.prune_spill(), 1)
+            self.assertEqual(len(list(spill.glob("*.pt"))), 1)
+
     def test_unchanged_shard_is_prepared_once_and_reused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             cache, path, loads = cache_fixture(Path(temporary))

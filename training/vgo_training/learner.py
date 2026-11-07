@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from dataclasses import asdict, dataclass, replace
@@ -18,6 +19,7 @@ import torch
 from torch import nn
 
 from .dataset import (
+    _RUST_RENDERER,
     PreparedRasterDataset,
     RasterDataset,
     file_sha256,
@@ -369,15 +371,46 @@ def _pack_policy(dataset: RasterDataset) -> RasterDataset:
     )
 
 
+def _preparation_code_digest() -> str:
+    """Digest of everything besides the shard and settings that shapes a prepared shard.
+
+    Every module of the training package, not a hand-picked list: a list goes
+    stale the first time packing moves to a new module, and a stale spill file
+    would train on the old format without any error. The price is one full
+    re-preparation after any training code change, which is today's cost of
+    every update.
+    """
+    digest = hashlib.sha256(PREPARATION_VERSION.encode())
+    package = Path(__file__).resolve().parent
+    for source in sorted(package.glob("*.py")):
+        digest.update(source.name.encode())
+        digest.update(source.read_bytes())
+    renderer = _RUST_RENDERER
+    digest.update(file_sha256(renderer).encode() if renderer.exists() else b"no-renderer")
+    return digest.hexdigest()
+
+
 class ReplayCache:
-    """In-memory cache of validated, prepared immutable replay shards."""
+    """Cache of validated, prepared immutable replay shards.
+
+    In memory for the life of the process, and optionally spilled to
+    `spill_directory` so the next process -- the bulk loop starts one per
+    update -- loads the 7/8 of its window the last update already prepared
+    instead of rendering it again. Rendering is about 3 ms a sample, most of a
+    450k update's wall time; loading a spilled shard is a file read.
+    """
 
     def __init__(
         self,
         *,
         loader: Callable[[str | Path], RasterDataset] = load_dataset,
+        spill_directory: Path | None = None,
     ) -> None:
         self._loader = loader
+        self._spill = spill_directory
+        self._code_digest: str | None = None
+        self._spilled_keys: set[str] = set()
+        self.spill_hits = 0
         self._entries: dict[Path, PreparedReplayShard] = {}
         self._raster_kind: str | None = None
         self._resolution: int | None = None
@@ -427,6 +460,15 @@ class ReplayCache:
             return cached
 
         self.misses += 1
+        spill_path = self._spill_path(resolved, signature, preparation_batch_size)
+        if spill_path is not None and spill_path.exists():
+            entry = torch.load(spill_path, weights_only=False)
+            # The key covers content, not where the file sits: refresh the
+            # in-process identity so the memory cache compares like with like.
+            entry = replace(entry, path=resolved, signature=signature)
+            self.spill_hits += 1
+            self._entries[resolved] = entry
+            return entry
         raw = self._loader(resolved)
         digest = signature.manifest_digest or file_sha256(resolved)
         corrected_samples = int(
@@ -469,7 +511,58 @@ class ReplayCache:
             signature=signature,
         )
         self._entries[resolved] = entry
+        if spill_path is not None:
+            # Write then rename, so a killed update never leaves a truncated
+            # file under a valid key.
+            partial_path = spill_path.with_suffix(f".{os.getpid()}.partial")
+            torch.save(entry, partial_path)
+            os.replace(partial_path, spill_path)
         return entry
+
+    def _spill_path(
+        self, path: Path, signature: _FileSignature, preparation_batch_size: int
+    ) -> Path | None:
+        """Where this shard's prepared form lives on disk, keyed by everything that shapes it."""
+        if self._spill is None or signature.manifest_digest is None:
+            # Without a manifest digest the content key would need a full hash
+            # of the shard each time; such shards are not the loop's, so skip.
+            return None
+        if self._code_digest is None:
+            self._code_digest = _preparation_code_digest()
+        key = hashlib.sha256(
+            json.dumps(
+                {
+                    "manifest_digest": signature.manifest_digest,
+                    "size": signature.size,
+                    "modified_ns": signature.modified_ns,
+                    "loader": [self._raster_kind, self._resolution, self._tail_keep, self._history],
+                    "preparation_batch_size": preparation_batch_size,
+                    "code": self._code_digest,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        self._spilled_keys.add(key)
+        self._spill.mkdir(parents=True, exist_ok=True)
+        return self._spill / f"{key}.pt"
+
+    def prune_spill(self) -> int:
+        """Delete spilled shards this process did not ask for.
+
+        The window only slides forward, so a shard that left it never returns;
+        keeping its file would grow the directory by a window's worth a day.
+        Call after the window is loaded. Returns the number of files removed.
+        """
+        if self._spill is None or not self._spill.exists():
+            return 0
+        removed = 0
+        for stale in self._spill.glob("*.pt"):
+            if stale.stem not in self._spilled_keys:
+                stale.unlink(missing_ok=True)
+                removed += 1
+        for leftover in self._spill.glob("*.partial"):
+            leftover.unlink(missing_ok=True)
+        return removed
 
     def window(
         self, paths: Iterable[str | Path], preparation_batch_size: int
@@ -1642,7 +1735,18 @@ class PersistentLearner:
         self.replay_cache.use_raster_kind(
             config.raster_kind, config.resolution, config.tail_keep, config.history_plies
         )
+        spill_hits_before = self.replay_cache.spill_hits
+        window_started = time.perf_counter()
         window = self.replay_cache.window(request.datasets, config.batch_size)
+        window_seconds = time.perf_counter() - window_started
+        pruned = self.replay_cache.prune_spill()
+        self._log(
+            f"[window] {len(request.datasets)} shards in {window_seconds:.1f}s: "
+            f"{self.replay_cache.hits - hits_before} in memory, "
+            f"{self.replay_cache.spill_hits - spill_hits_before} from the spill, "
+            f"{self.replay_cache.misses - misses_before - (self.replay_cache.spill_hits - spill_hits_before)} prepared; "
+            f"{pruned} spilled shards pruned"
+        )
         if config.ownership_weight == 0.0:
             # Release the targets the loss will not read. Done here rather than
             # in the cache because only the config knows the weight, and a
@@ -1951,6 +2055,8 @@ class PersistentLearner:
             "stager_reused": stager_reused,
             "replay_cache_hits": self.replay_cache.hits - hits_before,
             "replay_cache_misses": self.replay_cache.misses - misses_before,
+            "replay_spill_hits": self.replay_cache.spill_hits - spill_hits_before,
+            "window_seconds": window_seconds,
             "value_weight": config.value_weight,
             "policy_target": POLICY_TARGET,
             "policy_denominator": POLICY_DENOMINATOR,

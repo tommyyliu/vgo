@@ -17,7 +17,7 @@ from pathlib import Path
 
 _TRAINING = Path(__file__).resolve().parents[2] / "training"
 sys.path.insert(0, str(_TRAINING))
-from vgo_training.learner import LearnerConfig, LearnerUpdate, PersistentLearner  # noqa: E402
+from vgo_training.learner import LearnerConfig, LearnerUpdate, PersistentLearner, ReplayCache  # noqa: E402
 from vgo_training.window import window_from_games  # noqa: E402
 
 
@@ -36,6 +36,12 @@ def main() -> None:
         "least this many samples.",
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--prepared-cache", type=Path, default=None,
+        help="keep prepared shards here between runs, so the next update loads "
+        "the part of its window this one rendered instead of rendering it "
+        "again. Files for shards outside this run's window are deleted.",
+    )
     parser.add_argument(
         "--initial-checkpoint", type=Path, default=None,
         help="warm start from this checkpoint; omit to train from scratch, in "
@@ -172,7 +178,10 @@ def main() -> None:
     )
 
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
-    learner = PersistentLearner(defaults=config)
+    learner = PersistentLearner(
+        defaults=config,
+        replay_cache=ReplayCache(spill_directory=arguments.prepared_cache),
+    )
     try:
         report = learner.update(
             LearnerUpdate(
