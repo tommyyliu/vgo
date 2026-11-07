@@ -97,7 +97,7 @@
     "title": "Fresh overnight run with the fixes",
     "why": "Replaces forking from update 12: the fixes should help early phases too. Strength rose to about update 12 and then fell about 20 Elo an update, newer windows trained worse nets, and the value head memorized its window.",
     "test": "After value-recipe, random-stop, ratings-fix and naive-stop: start from the naive generator with the new recipe, and watch the rating curve for the rise-then-fall shape.",
-    "progress": "Started 2026-11-04 in artifacts/vgo-128. Check 2026-11-05 17:30 at update 36 (~44 min/update): rose to ~+950 by update 24, then flat around +850-1050 to update 36 (6-game matches, +-150 each); no decline like the old run's. Value head still not memorizing (train MSE 0.756 vs held-out 0.763). Komi is lagging: Black's share went 59% -> 39%, and the 18-unit centre is falling 1 point a refit (the cap) toward even. Paused 2026-11-06 after update 47 for the warm-start test; flat from update 24 to 45 at about +800 (-2.6 Elo/update). Warm since update 48: every rating match won (48 17-1, 51 14-4, 54 15-3, 57 18-0, 60 5-1 so far); check 2026-11-06 15:00 has update 57 at +1719 (18 games, +-160) vs update 45 +735 (30, +-125), about +80 Elo/update. Held-out policy CE 4.465 -> 4.287 (47 -> 60), top-1 13.5% -> 15.6%."
+    "progress": "Started 2026-11-04 in artifacts/vgo-128. Check 2026-11-05 17:30 at update 36 (~44 min/update): rose to ~+950 by update 24, then flat around +850-1050 to update 36 (6-game matches, +-150 each); no decline like the old run's. Value head still not memorizing (train MSE 0.756 vs held-out 0.763). Komi is lagging: Black's share went 59% -> 39%, and the 18-unit centre is falling 1 point a refit (the cap) toward even. Paused 2026-11-06 after update 47 for the warm-start test; flat from update 24 to 45 at about +800 (-2.6 Elo/update). Warm since update 48: every rating match won (48 17-1, 51 14-4, 54 15-3, 57 18-0, 60 5-1 so far); check 2026-11-06 15:00 has update 57 at +1719 (18 games, +-160) vs update 45 +735 (30, +-125), about +80 Elo/update. Held-out policy CE 4.465 -> 4.287 (47 -> 60), top-1 13.5% -> 15.6%. 2026-11-07 04:40: 150 extra games (every third update since 45 vs 3 and 6 back) firm the warm stretch: gain since update 48 is +950 +-260 by update 69 (44 games), about 45 Elo/update; update 75 +1941 (18 games). Paused after update 76 for throughput timings; resumed 05:58 from update 76 with the prepared-shard cache, VGO_UPDATES=123 so it still ends at 199."
   },
   {
     "id": "value-passes",
@@ -129,6 +129,17 @@
     "title": "Wider window at the same passes: a random half of 900k",
     "why": "Spreads each sample's 8 passes over 16 updates instead of 8, for more diverse batches at the same compute and RAM (only the half used is loaded). Cost: older policy targets, from nets several hundred Elo weaker while the run climbs ~80 Elo an update.",
     "test": "Offline warm chain: 450k contiguous vs a random 450k of the last 900k each link. Revisit when Elo flattens."
+  },
+  {
+    "id": "spill-cache",
+    "kind": "task",
+    "status": "Done",
+    "bucket": "Speed",
+    "effort": "S",
+    "title": "Keep prepared training shards on disk between updates",
+    "why": "Each warm update re-rasterized its whole 450k window: 17 of its 22 minutes live (8.6 min on a quiet box), while only about 95k samples were new.",
+    "test": "Spilled shards must load identical to fresh preparation, any change to the shard, settings or preparation code must re-render, and a full update must get faster.",
+    "progress": "2026-11-07 (commit a509f16): train-once.py --prepared-cache, keyed by manifest digest, size, mtime, loader settings and a digest of the preparation code and renderer; stale files pruned each update. 30 real shards reload with 0 of 1,140 fields different; the key test fails when the digest is dropped from it. One full update from update 76: window 515 s cold -> 5 s warm, wall 866 s -> 350 s, identical dataset digests. About 12 GB on disk for the window. Live from update 77."
   },
   {
     "id": "warm-start",
@@ -197,8 +208,9 @@
     "title": "Cut the CPU work inside inference lanes",
     "why": "At 192 the lighter net reads 16.4k positions/s in the generator against a 23k card ceiling, with the CPU 60% idle. Each lane spends 28% of its time packing inputs and materializing outputs, about 1.1 ms a batch, and the card waits. A third lane makes it worse. Applying the board rotation twice per batch also wastes training CPU: the second call only needs the ownership map.",
     "test": "Time `input_packing` and `output_materialization` in broker telemetry before and after, then confirm in the generator.",
-    "held": "Not worth it yet",
-    "revisit": "Before renting: the home box is GPU-bound, but rented boxes have fewer CPUs per GPU."
+    "held": "Not worth it yet: the card is saturated",
+    "revisit": "Before renting: the home box is GPU-bound, but rented boxes have fewer CPUs per GPU.",
+    "progress": "2026-11-07, 128 run net on a quiet box, the loop's exact generator for 7 min each: 2 lanes 36.3k and 36.5k positions/s (12.1 cores), spin-wait instead of blocking sync 37.1k (13.6 cores), 3 lanes 35.9k, 3 lanes spinning 35.5k. Each lane is busy 99% of the time (0.72 in session.run, 0.26 packing and materializing), and a third lane leaves session time per lane unchanged, so the card is the limit, not lane CPU. Live it reads 28-31k only because training shares the card. Pinned-memory IoBinding fails in ORT's TensorRT path (dst_data != src_data) for inputs and outputs, so it was dropped."
   },
   {
     "id": "e0bf7471",
