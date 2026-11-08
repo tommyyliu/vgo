@@ -12,7 +12,7 @@
   .wrap { display:flex; gap:20px; padding:20px; align-items:flex-start; flex-wrap:wrap; }
   #cv { width:700px; max-width:100%; height:auto; aspect-ratio:1; background:#0e1116; border-radius:10px; overflow:hidden; cursor:crosshair; display:block; }
   #cv text { font-family:monospace; }
-  #cv { touch-action:manipulation; }
+  #cv { touch-action:none; }  /* touches drag the proposed stone, not the page */
   .boardCol { display:flex; flex-direction:column; gap:10px; max-width:100%; }
   .confirm { display:flex; gap:10px; align-items:center; justify-content:flex-end; }
   .confirm[hidden] { display:none; }
@@ -72,7 +72,7 @@
   </svg>
   <!-- Touch only: a tap proposes a move and this plays or drops it. -->
   <div id="confirmBar" class="confirm" hidden>
-    <span class="mut">tap again or</span>
+    <span class="mut">drag to adjust, tap it or</span>
     <button id="confirmPlace">Place</button>
     <button id="confirmCancel">Cancel</button>
   </div>
@@ -846,11 +846,16 @@ function updateHover(e) {
 cv.addEventListener('mousemove', e => { updateHover(e); draw(); });
 cv.addEventListener('mouseleave', () => { hover = pending; draw(); });
 /* Touch places in two steps. A fingertip hides the spot it covers and there is
-   no hover to preview with, so a tap only proposes a move: the ghost shows where
-   it would land (after snapping), and Place or a second tap on it plays it. A
-   mouse still plays on the first click. */
+   no hover to preview with, so touching the board proposes a move rather than
+   playing it. The proposed stone floats a little above the finger so it stays
+   visible, and follows the finger while it drags; lifting leaves it there.
+   Grabbing the proposed stone drags it from where it is, without the lift, and
+   tapping it plays it, as does Place. A mouse still plays on the first click. */
+const TOUCH_LIFT_PX = 56;      // how far above the finger the proposed stone floats
+const TAP_SLOP_PX = 10;        // a touch that moves less than this is a tap
 let lastPointer = 'mouse';
 let pending = null;            // the proposed touch move, in the same shape as hover
+let drag = null;               // { id, startX, startY, dx, dy, grabbed, moved }
 const $confirm = document.getElementById('confirmBar');
 function setPending(next) {
   pending = next;
@@ -861,20 +866,50 @@ function playHover() {
   if (hover && hover.legal && placeStone(hover.x, hover.y)) { hover = null; setPending(null); draw(); maybeAutoReply(); return true; }
   return false;
 }
-cv.addEventListener('pointerdown', e => { lastPointer = e.pointerType || 'mouse'; });
-cv.addEventListener('mousemove', () => { if (pending) { hover = pending; draw(); } });
-cv.addEventListener('click', e => {
-  if (lastPointer === 'mouse') { updateHover(e); if (playHover()) updateHover(e), draw(); return; }
-  const previous = pending;
-  updateHover(e);
-  // A second tap within a stone's radius of the proposal confirms it.
-  if (previous && Math.hypot(hover.x - previous.x, hover.y - previous.y) < state.radius) {
-    hover = previous;
-    if (!playHover()) { setPending(previous); draw(); }
+// The finger's point on the board, shifted by the drag's offset, clamped to the
+// board so a stone lifted past the top edge stays on it.
+function dragTarget(e) {
+  const r = cv.getBoundingClientRect();
+  const x = Math.min(r.right - 1, Math.max(r.left, e.clientX + drag.dx * r.width));
+  const y = Math.min(r.bottom - 1, Math.max(r.top, e.clientY + drag.dy * r.height));
+  return { clientX: x, clientY: y };
+}
+cv.addEventListener('pointerdown', e => {
+  lastPointer = e.pointerType || 'mouse';
+  if (lastPointer !== 'touch' || state.phase === 'finished') return;
+  const p = evtToBoard(e), r = cv.getBoundingClientRect();
+  const grabPx = Math.max(state.radius * r.width * 1.5, 24);
+  const grabbed = pending && Math.hypot((p.x - pending.x) * r.width, (p.y - pending.y) * r.height) < grabPx;
+  drag = { id: e.pointerId, startX: e.clientX, startY: e.clientY, grabbed, moved: false,
+           dx: grabbed ? pending.x - p.x : 0, dy: grabbed ? pending.y - p.y : -TOUCH_LIFT_PX / r.height };
+  cv.setPointerCapture(e.pointerId);
+  if (!grabbed) { updateHover(dragTarget(e)); draw(); }
+  e.preventDefault();
+});
+cv.addEventListener('pointermove', e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  if (Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) > TAP_SLOP_PX) drag.moved = true;
+  if (drag.grabbed && !drag.moved) return;
+  updateHover(dragTarget(e));
+  draw();
+});
+cv.addEventListener('pointerup', e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  const { grabbed, moved } = drag;
+  drag = null;
+  if (grabbed && !moved) {       // a tap on the proposed stone plays it
+    hover = pending;
+    if (!playHover()) draw();
     return;
   }
   setPending({ ...hover });
   draw();
+});
+cv.addEventListener('pointercancel', () => { drag = null; hover = pending; draw(); });
+cv.addEventListener('mousemove', () => { if (pending || drag) { hover = pending ?? hover; draw(); } });
+cv.addEventListener('click', e => {
+  if (lastPointer !== 'mouse' && lastPointer !== 'pen') return;   // touch is handled above
+  updateHover(e); if (playHover()) updateHover(e), draw();
 });
 document.getElementById('confirmPlace').onclick = () => { if (pending) { hover = pending; playHover(); } };
 document.getElementById('confirmCancel').onclick = () => { setPending(null); hover = null; draw(); };
