@@ -155,7 +155,7 @@
     <label class="ck"><input type="checkbox" id="ovBounds" checked> cell boundaries</label>
     <label class="ck"><input type="checkbox" id="ovLock" checked> settled (uninteractable) shading</label>
     <label class="ck"><input type="checkbox" id="ovFree"> legal-placement mask</label>
-    <label class="ck" title="a line between every two same-colour stones whose cells share an edge, and each group's size on its central stone"><input type="checkbox" id="ovGroups" checked> connected groups</label>
+    <label class="ck" title="a line between two same-colour stones whose cells share an edge that no single opponent move can cut, and the size of each chain they join on its central stone"><input type="checkbox" id="ovGroups" checked> uncuttable connections</label>
     <label class="ck"><input type="checkbox" id="ovIds"> stone ids</label>
     <label class="ck" title="what the bot's last search actually considered: dots sized by visits, and shading over legal ground it never proposed a move in"><input type="checkbox" id="ovSearch"> bot exploration</label>
     <label class="ck"><input type="checkbox" id="ovSnap" checked> snap to nearest legal spot</label>
@@ -211,6 +211,7 @@
 <script src="./src/engine/model.js"></script>
 <script src="./src/geometry/voronoi.js"></script>
 <script src="./src/geometry/legal-set.js"></script>
+<script src="./src/geometry/connections.js"></script>
 <script src="./src/geometry/settled-contour.js"></script>
 <script src="./src/engine/analysis.js"></script>
 <script src="./src/engine/game.js"></script>
@@ -423,11 +424,12 @@ function renderBoard() {
     if (hard) svg += `<path d="${hard}" fill="none" stroke="rgba(236,239,246,.92)" stroke-width="1.5" ${NSS}/>`;
   }
 
-  // 4. connected groups. A group is the same-colour stones whose cells share an
-  // edge (voronoi.js), so the links are exactly those shared edges, drawn
-  // between the stones. They come from the Delaunay graph and never cross.
+  // 4. uncuttable connections: same-colour stones whose shared cell edge no
+  // single opponent move can remove (connections.js). They come from the
+  // Delaunay graph and never cross.
   const r = state.radius;
-  if (opt('ovGroups')) svg += groupLinksSVG(S, G, r);
+  const solid = opt('ovGroups') ? solidLinks() : null;
+  if (solid) svg += groupLinksSVG(S, solid, r);
 
   // 5. stones (lighter than their territory so they pop)
   for (let i = 0; i < S.length; i++) {
@@ -436,35 +438,42 @@ function renderBoard() {
       svg += `<text x="${f(S[i].x)}" y="${f(S[i].y)}" font-size="0.02" font-family="monospace" text-anchor="middle" dominant-baseline="central" fill="rgba(0,0,0,.8)">${i}</text>`;
   }
 
-  if (opt('ovGroups')) svg += groupSizesSVG(S, G, r);
+  if (solid) svg += groupSizesSVG(S, solid, r);
 
   boardG.innerHTML = svg;
   clearPreview();                                        // any preview described the previous board
   updateHUD();
 }
 
-function groupLinksSVG(S, geometry, r) {
+// The current position's uncuttable links, computed once per position.
+let solidCache = { position:null, links:null };
+function solidLinks() {
+  if (solidCache.position !== state)
+    solidCache = { position:state, links:VGO.connections.classify(state, G, A.legalVertices).solid };
+  return solidCache.links;
+}
+function groupLinksSVG(S, links, r) {
   const paths = { B: '', W: '' };
-  for (let i = 0; i < S.length; i++) for (const j of geometry.adj[i]) {
-    if (j <= i || S[i].c !== S[j].c) continue;
-    paths[S[i].c] += `M${f(S[i].x)} ${f(S[i].y)}L${f(S[j].x)} ${f(S[j].y)}`;
-  }
+  for (const [i, j] of links) paths[S[i].c] += `M${f(S[i].x)} ${f(S[i].y)}L${f(S[j].x)} ${f(S[j].y)}`;
   let svg = '';
   for (const c of ['B', 'W']) if (paths[c])
     svg += `<path d="${paths[c]}" fill="none" stroke="${COLORS[c].stone}" stroke-opacity=".8" ` +
            `stroke-width="${f(0.42 * r)}" stroke-linecap="round"/>`;
   return svg;
 }
-// Each group of two or more stones shows its size on the stone nearest its centre.
-function groupSizesSVG(S, geometry, r) {
-  const members = new Map();
-  for (let i = 0; i < S.length; i++) {
-    const g = geometry.group[i];
-    if (!members.has(g)) members.set(g, []);
-    members.get(g).push(i);
-  }
+// Stones joined by uncuttable links, as lists of indices.
+function solidChains(count, links) {
+  const parent = Array.from({ length: count }, (_, i) => i);
+  const find = i => { while (parent[i] !== i) i = parent[i] = parent[parent[i]]; return i; };
+  for (const [i, j] of links) parent[find(i)] = find(j);
+  const chains = new Map();
+  for (let i = 0; i < count; i++) { const root = find(i); if (!chains.has(root)) chains.set(root, []); chains.get(root).push(i); }
+  return [...chains.values()];
+}
+// Each chain of two or more stones shows its size on the stone nearest its centre.
+function groupSizesSVG(S, links, r) {
   let svg = '';
-  for (const list of members.values()) {
+  for (const list of solidChains(S.length, links)) {
     if (list.length < 2) continue;
     const cx = list.reduce((t, i) => t + S[i].x, 0) / list.length;
     const cy = list.reduce((t, i) => t + S[i].y, 0) / list.length;
@@ -693,19 +702,21 @@ function buildPreview(result) {
      ringing an entire per-stone loop because its total area changed slightly. */
   const settled = contourFor(after, afterA);
 
-  // Links the move would create: same-colour adjacencies after it that are not
-  // links now. Captures only remove links, so these are all new connections.
-  const linked = new Set();
-  for (let i = 0; i < state.stones.length; i++) for (const j of G.adj[i])
-    if (j > i && state.stones[i].c === state.stones[j].c) linked.add(sitePairKey(state.stones[i], state.stones[j]));
+  // Uncuttable links after the move that are not uncuttable now: the stone's
+  // own connections, and existing links the move makes safe. Only computed
+  // when the overlay is on, since it is the costly part of a hover.
   let newLinks = '', joined = 0;
-  const as = after.stones, ag = afterA.geometry;
-  for (let i = 0; i < as.length; i++) for (const j of ag.adj[i]) {
-    if (j <= i || as[i].c !== as[j].c || linked.has(sitePairKey(as[i], as[j]))) continue;
-    newLinks += `M${f(as[i].x)} ${f(as[i].y)}L${f(as[j].x)} ${f(as[j].y)}`;
+  if (opt('ovGroups')) {
+    const linked = new Set(solidLinks().map(([i, j]) => sitePairKey(state.stones[i], state.stones[j])));
+    const as = after.stones;
+    const afterSolid = VGO.connections.classify(after, afterA.geometry, afterA.legalVertices).solid;
+    for (const [i, j] of afterSolid) {
+      if (linked.has(sitePairKey(as[i], as[j]))) continue;
+      newLinks += `M${f(as[i].x)} ${f(as[i].y)}L${f(as[j].x)} ${f(as[j].y)}`;
+    }
+    const placed = as.findIndex(s => s.x === hover.x && s.y === hover.y);
+    if (placed >= 0) joined = solidChains(as.length, afterSolid).find(list => list.includes(placed)).length;
   }
-  const placed = as.findIndex(s => s.x === hover.x && s.y === hover.y);
-  if (placed >= 0) joined = as.filter((s, i) => ag.group[i] === ag.group[placed]).length;
 
   return { newLinks:newLinks, joined:joined, mover:state.toMove, moved:moved, doomed:doomed, selfCaptured:selfCaptured,
            settledLoops:settled.loops, settledRule:settled.fillRule,
@@ -746,7 +757,7 @@ function renderPreview() {
   if (opt('ovGroups') && data.joined > 1)
     svg += `<text x="${f(hover.x)}" y="${f(hover.y - 1.6 * r)}" font-size="${f(0.9 * r)}" font-weight="bold" ` +
            `text-anchor="middle" fill="#e6e9ef" stroke="rgba(10,12,16,.9)" stroke-width="${f(0.22 * r)}" ` +
-           `paint-order="stroke" stroke-linejoin="round" style="pointer-events:none">group of ${data.joined}</text>`;
+           `paint-order="stroke" stroke-linejoin="round" style="pointer-events:none">joins ${data.joined}</text>`;
 
   if (data.moved)
     svg += `<path d="${data.moved}" fill="none" stroke="rgba(120,200,255,.85)" stroke-width="1.5" ` +
