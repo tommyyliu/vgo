@@ -10,9 +10,16 @@
   body { margin:0; background:var(--bg); color:var(--ink);
          font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
   .wrap { display:flex; gap:20px; padding:20px; align-items:flex-start; flex-wrap:wrap; }
-  #cv { width:700px; height:700px; background:#0e1116; border-radius:10px; overflow:hidden; cursor:crosshair; display:block; }
+  #cv { width:700px; max-width:100%; height:auto; aspect-ratio:1; background:#0e1116; border-radius:10px; overflow:hidden; cursor:crosshair; display:block; }
   #cv text { font-family:monospace; }
-  .panel { background:var(--panel); border-radius:10px; padding:14px 16px; width:290px; }
+  #cv { touch-action:manipulation; }
+  .boardCol { display:flex; flex-direction:column; gap:10px; max-width:100%; }
+  .confirm { display:flex; gap:10px; align-items:center; justify-content:flex-end; }
+  .confirm[hidden] { display:none; }
+  @media (max-width: 720px) { .panel { width:100%; } .wrap { gap:14px; } }
+  .confirm button { padding:10px 22px; font-size:16px; }
+  #confirmPlace { background:#2a4a6e; border-color:#5aa2ec; }
+  .panel { background:var(--panel); border-radius:10px; padding:14px 16px; width:290px; max-width:100%; }
   h1 { font-size:15px; margin:0 0 10px; letter-spacing:.5px; }
   .row { display:flex; justify-content:space-between; gap:12px; margin:4px 0; }
   .swatch { display:inline-block; width:11px; height:11px; border-radius:50%; vertical-align:middle; margin-right:6px; }
@@ -51,6 +58,7 @@
 </head>
 <body>
 <div class="wrap">
+  <div class="boardCol">
   <svg id="cv" viewBox="0 0 1 1" preserveAspectRatio="xMidYMid meet">
     <g id="board"></g>
     <g id="preview"></g>
@@ -62,6 +70,13 @@
       <text id="flash" x="0.5" y="0.93" font-size="0.035" text-anchor="middle" fill="#ff8a8a" opacity="0">?</text>
     </g>
   </svg>
+  <!-- Touch only: a tap proposes a move and this plays or drops it. -->
+  <div id="confirmBar" class="confirm" hidden>
+    <span class="mut">tap again or</span>
+    <button id="confirmPlace">Place</button>
+    <button id="confirmCancel">Cancel</button>
+  </div>
+  </div>
   <div class="panel">
     <h1>VORONOI GO — reference</h1>
 
@@ -829,8 +844,40 @@ function updateHover(e) {
   hover = { rawX: p.x, rawY: p.y, x: t.x, y: t.y, legal: t.legal, snapped: t.snapped };
 }
 cv.addEventListener('mousemove', e => { updateHover(e); draw(); });
-cv.addEventListener('mouseleave', () => { hover = null; draw(); });
-cv.addEventListener('click', e => { updateHover(e); if (hover && hover.legal && placeStone(hover.x, hover.y)) { updateHover(e); draw(); maybeAutoReply(); } });
+cv.addEventListener('mouseleave', () => { hover = pending; draw(); });
+/* Touch places in two steps. A fingertip hides the spot it covers and there is
+   no hover to preview with, so a tap only proposes a move: the ghost shows where
+   it would land (after snapping), and Place or a second tap on it plays it. A
+   mouse still plays on the first click. */
+let lastPointer = 'mouse';
+let pending = null;            // the proposed touch move, in the same shape as hover
+const $confirm = document.getElementById('confirmBar');
+function setPending(next) {
+  pending = next;
+  $confirm.hidden = !pending;
+  document.getElementById('confirmPlace').disabled = !(pending && pending.legal);
+}
+function playHover() {
+  if (hover && hover.legal && placeStone(hover.x, hover.y)) { hover = null; setPending(null); draw(); maybeAutoReply(); return true; }
+  return false;
+}
+cv.addEventListener('pointerdown', e => { lastPointer = e.pointerType || 'mouse'; });
+cv.addEventListener('mousemove', () => { if (pending) { hover = pending; draw(); } });
+cv.addEventListener('click', e => {
+  if (lastPointer === 'mouse') { updateHover(e); if (playHover()) updateHover(e), draw(); return; }
+  const previous = pending;
+  updateHover(e);
+  // A second tap within a stone's radius of the proposal confirms it.
+  if (previous && Math.hypot(hover.x - previous.x, hover.y - previous.y) < state.radius) {
+    hover = previous;
+    if (!playHover()) { setPending(previous); draw(); }
+    return;
+  }
+  setPending({ ...hover });
+  draw();
+});
+document.getElementById('confirmPlace').onclick = () => { if (pending) { hover = pending; playHover(); } };
+document.getElementById('confirmCancel').onclick = () => { setPending(null); hover = null; draw(); };
 
 document.getElementById('pass').onclick = () => {
   const before = snapshot();
@@ -1124,7 +1171,13 @@ function renderMoves() {
   });
   $moves.innerHTML = html || '<div class="mv off">no moves yet</div>';
   const now = $moves.querySelector('.now');
-  if (now) now.scrollIntoView({ block: 'nearest' });
+  // Scroll the list only. scrollIntoView also scrolls every ancestor, so each
+  // move dragged the whole page down to wherever the list happened to sit.
+  if (now) {
+    const item = now.getBoundingClientRect(), box = $moves.getBoundingClientRect();
+    if (item.top < box.top) $moves.scrollTop -= box.top - item.top;
+    else if (item.bottom > box.bottom) $moves.scrollTop += item.bottom - box.bottom;
+  }
 
   const siblings = current.parent ? current.parent.children : [];
   $vars.innerHTML = siblings.length > 1
