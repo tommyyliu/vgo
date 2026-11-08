@@ -87,6 +87,7 @@
     <div class="bar"><span id="barB" style="background:var(--stoneB)"></span>
                      <span id="barW" style="background:var(--stoneW)"></span></div>
     <div class="row mut"><span>stones (B / W)</span><span id="counts"></span></div>
+    <div class="row mut"><span>groups (B / W)</span><span id="groupCounts"></span></div>
     <div class="row mut"><span>captured this move</span><span><span id="captured"></span><span id="pvCaptured" class="pv"></span></span></div>
     <!-- The two score rows stay raw area, so the panel always says what is
          actually on the board. Komi only moves the verdict, and this row is
@@ -154,6 +155,7 @@
     <label class="ck"><input type="checkbox" id="ovBounds" checked> cell boundaries</label>
     <label class="ck"><input type="checkbox" id="ovLock" checked> settled (uninteractable) shading</label>
     <label class="ck"><input type="checkbox" id="ovFree"> legal-placement mask</label>
+    <label class="ck" title="a line between every two same-colour stones whose cells share an edge, and each group's size on its central stone"><input type="checkbox" id="ovGroups" checked> connected groups</label>
     <label class="ck"><input type="checkbox" id="ovIds"> stone ids</label>
     <label class="ck" title="what the bot's last search actually considered: dots sized by visits, and shading over legal ground it never proposed a move in"><input type="checkbox" id="ovSearch"> bot exploration</label>
     <label class="ck"><input type="checkbox" id="ovSnap" checked> snap to nearest legal spot</label>
@@ -421,17 +423,57 @@ function renderBoard() {
     if (hard) svg += `<path d="${hard}" fill="none" stroke="rgba(236,239,246,.92)" stroke-width="1.5" ${NSS}/>`;
   }
 
-  // 4. stones (lighter than their territory so they pop)
+  // 4. connected groups. A group is the same-colour stones whose cells share an
+  // edge (voronoi.js), so the links are exactly those shared edges, drawn
+  // between the stones. They come from the Delaunay graph and never cross.
   const r = state.radius;
+  if (opt('ovGroups')) svg += groupLinksSVG(S, G, r);
+
+  // 5. stones (lighter than their territory so they pop)
   for (let i = 0; i < S.length; i++) {
     svg += `<circle cx="${f(S[i].x)}" cy="${f(S[i].y)}" r="${f(r)}" fill="${COLORS[S[i].c].stone}" stroke="rgba(0,0,0,.6)" stroke-width="1.5" ${NSS}/>`;
     if (opt('ovIds'))
       svg += `<text x="${f(S[i].x)}" y="${f(S[i].y)}" font-size="0.02" font-family="monospace" text-anchor="middle" dominant-baseline="central" fill="rgba(0,0,0,.8)">${i}</text>`;
   }
 
+  if (opt('ovGroups')) svg += groupSizesSVG(S, G, r);
+
   boardG.innerHTML = svg;
   clearPreview();                                        // any preview described the previous board
   updateHUD();
+}
+
+function groupLinksSVG(S, geometry, r) {
+  const paths = { B: '', W: '' };
+  for (let i = 0; i < S.length; i++) for (const j of geometry.adj[i]) {
+    if (j <= i || S[i].c !== S[j].c) continue;
+    paths[S[i].c] += `M${f(S[i].x)} ${f(S[i].y)}L${f(S[j].x)} ${f(S[j].y)}`;
+  }
+  let svg = '';
+  for (const c of ['B', 'W']) if (paths[c])
+    svg += `<path d="${paths[c]}" fill="none" stroke="${COLORS[c].stone}" stroke-opacity=".8" ` +
+           `stroke-width="${f(0.42 * r)}" stroke-linecap="round"/>`;
+  return svg;
+}
+// Each group of two or more stones shows its size on the stone nearest its centre.
+function groupSizesSVG(S, geometry, r) {
+  const members = new Map();
+  for (let i = 0; i < S.length; i++) {
+    const g = geometry.group[i];
+    if (!members.has(g)) members.set(g, []);
+    members.get(g).push(i);
+  }
+  let svg = '';
+  for (const list of members.values()) {
+    if (list.length < 2) continue;
+    const cx = list.reduce((t, i) => t + S[i].x, 0) / list.length;
+    const cy = list.reduce((t, i) => t + S[i].y, 0) / list.length;
+    const at = list.reduce((best, i) => Math.hypot(S[i].x - cx, S[i].y - cy) < Math.hypot(S[best].x - cx, S[best].y - cy) ? i : best);
+    svg += `<text x="${f(S[at].x)}" y="${f(S[at].y)}" font-size="${f(r)}" font-weight="bold" ` +
+           `text-anchor="middle" dominant-baseline="central" fill="rgba(10,12,16,.85)" ` +
+           `style="pointer-events:none">${list.length}</text>`;
+  }
+  return svg;
 }
 
 // Legal-placement mask (debug): the one intentionally raster overlay.
@@ -651,7 +693,21 @@ function buildPreview(result) {
      ringing an entire per-stone loop because its total area changed slightly. */
   const settled = contourFor(after, afterA);
 
-  return { moved:moved, doomed:doomed, selfCaptured:selfCaptured,
+  // Links the move would create: same-colour adjacencies after it that are not
+  // links now. Captures only remove links, so these are all new connections.
+  const linked = new Set();
+  for (let i = 0; i < state.stones.length; i++) for (const j of G.adj[i])
+    if (j > i && state.stones[i].c === state.stones[j].c) linked.add(sitePairKey(state.stones[i], state.stones[j]));
+  let newLinks = '', joined = 0;
+  const as = after.stones, ag = afterA.geometry;
+  for (let i = 0; i < as.length; i++) for (const j of ag.adj[i]) {
+    if (j <= i || as[i].c !== as[j].c || linked.has(sitePairKey(as[i], as[j]))) continue;
+    newLinks += `M${f(as[i].x)} ${f(as[i].y)}L${f(as[j].x)} ${f(as[j].y)}`;
+  }
+  const placed = as.findIndex(s => s.x === hover.x && s.y === hover.y);
+  if (placed >= 0) joined = as.filter((s, i) => ag.group[i] === ag.group[placed]).length;
+
+  return { newLinks:newLinks, joined:joined, mover:state.toMove, moved:moved, doomed:doomed, selfCaptured:selfCaptured,
            settledLoops:settled.loops, settledRule:settled.fillRule,
            scores:afterA.scores, captured:result.captured };
 }
@@ -683,6 +739,14 @@ function renderPreview() {
            `fill="rgba(120,200,255,.24)" fill-rule="${data.settledRule}" stroke="none"` +
            (before ? ` mask="url(#previewSettledDelta)"` : '') + '/>';
   }
+
+  if (opt('ovGroups') && data.newLinks)
+    svg += `<path d="${data.newLinks}" fill="none" stroke="${COLORS[data.mover].stone}" stroke-opacity=".9" ` +
+           `stroke-width="${f(0.3 * r)}" stroke-linecap="round" stroke-dasharray="${f(0.6 * r)} ${f(0.5 * r)}"/>`;
+  if (opt('ovGroups') && data.joined > 1)
+    svg += `<text x="${f(hover.x)}" y="${f(hover.y - 1.6 * r)}" font-size="${f(0.9 * r)}" font-weight="bold" ` +
+           `text-anchor="middle" fill="#e6e9ef" stroke="rgba(10,12,16,.9)" stroke-width="${f(0.22 * r)}" ` +
+           `paint-order="stroke" stroke-linejoin="round" style="pointer-events:none">group of ${data.joined}</text>`;
 
   if (data.moved)
     svg += `<path d="${data.moved}" fill="none" stroke="rgba(120,200,255,.85)" stroke-width="1.5" ` +
@@ -720,6 +784,8 @@ function updateHUD() {
   document.getElementById('barW').style.width = (100 * aw) + '%';
   const nb = S.filter(s => s.c === 'B').length;
   document.getElementById('counts').textContent = nb + ' / ' + (S.length - nb);
+  const groupsOf = c => new Set(S.map((s, i) => s.c === c ? G.group[i] : -1).filter(g => g >= 0)).size;
+  document.getElementById('groupCounts').textContent = groupsOf('B') + ' / ' + groupsOf('W');
   document.getElementById('captured').textContent = lastCaptured || '0';
   // Signed so the row reads the same way as the verdict: positive is Black.
   const lead = ab - aw - state.komi;
@@ -1254,7 +1320,7 @@ window.addEventListener('keydown', event => {
   event.preventDefault();
 });
 
-for (const id of ['ovRegions', 'ovBounds', 'ovLock', 'ovFree', 'ovIds', 'ovSearch']) document.getElementById(id).onchange = () => { renderBoard(); draw(); };
+for (const id of ['ovRegions', 'ovBounds', 'ovLock', 'ovFree', 'ovGroups', 'ovIds', 'ovSearch']) document.getElementById(id).onchange = () => { renderBoard(); draw(); };
 /* The overlay draws the *last* search, and candidates are only requested when
    the box is already ticked, so ticking it after a move shows nothing until the
    next one. Say so, rather than rendering an empty board and looking broken. */
