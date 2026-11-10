@@ -3,6 +3,7 @@ members = [
     "crates/vgo-bench",
     "crates/vgo-core",
     "crates/vgo-inference",
+    "crates/vgo-pinned",
     "crates/vgo-raster",
     "crates/vgo-search",
     "crates/vgo-wasm",

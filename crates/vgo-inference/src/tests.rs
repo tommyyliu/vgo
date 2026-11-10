@@ -87,6 +87,40 @@ struct FailingService;
 
 struct StagedService;
 
+/// Leaves slow host work for the broker, and records which thread did it.
+struct DeferringService {
+    finished_on: Arc<Mutex<Option<thread::ThreadId>>>,
+    fail: bool,
+}
+
+impl BatchService for DeferringService {
+    fn contract(&self) -> BatchContract {
+        test_contract(2)
+    }
+
+    fn infer(
+        &mut self,
+        _batch: &[InferenceInput],
+    ) -> Result<Vec<InferenceOutput>, EvaluationError> {
+        unreachable!("the executor calls infer_deferred")
+    }
+
+    fn infer_deferred(&mut self, batch: &[InferenceInput]) -> Result<FinishBatch, EvaluationError> {
+        let ids: Vec<u64> = batch.iter().map(InferenceInput::id).collect();
+        let (finished_on, fail) = (Arc::clone(&self.finished_on), self.fail);
+        Ok(Box::new(move || {
+            thread::sleep(Duration::from_millis(3));
+            *finished_on.lock().unwrap() = Some(thread::current().id());
+            if fail {
+                return Err(EvaluationError::new("synthetic finish failure"));
+            }
+            ids.into_iter()
+                .map(|id| InferenceOutput::new(id, 0.25, vec![0.0; 5]))
+                .collect()
+        }))
+    }
+}
+
 impl BatchService for FailingService {
     fn contract(&self) -> BatchContract {
         test_contract(2)
@@ -513,12 +547,46 @@ fn evaluator_pool_reports_backend_stage_timings() {
     let metrics = pool.metrics();
     assert_eq!(metrics.input_packing_nanoseconds, 11);
     assert_eq!(metrics.session_run_nanoseconds, 13);
-    assert_eq!(metrics.output_materialization_nanoseconds, 17);
+    // The broker adds the time it spends finishing the batch, a few nanoseconds for
+    // a service that finished on its lane.
+    assert!(metrics.output_materialization_nanoseconds >= 17);
     assert!(metrics.inference_nanoseconds >= 41);
     assert_eq!(
         pool.lane_metrics()[0].input_packing_nanoseconds,
         metrics.input_packing_nanoseconds
     );
+}
+
+#[test]
+fn deferred_host_work_runs_off_the_lane_and_is_counted() {
+    let finished_on = Arc::new(Mutex::new(None));
+    let service = DeferringService {
+        finished_on: Arc::clone(&finished_on),
+        fail: false,
+    };
+    let pool = BatchedEvaluatorPool::spawn(broker_config(), vec![service]).unwrap();
+    pool.evaluate(&Position::new(0.1, Vec::new(), Color::Black))
+        .unwrap();
+    let finisher = finished_on.lock().unwrap().expect("the finish ran");
+    assert_ne!(finisher, thread::current().id());
+    let metrics = pool.metrics();
+    assert!(metrics.output_materialization_nanoseconds >= 3_000_000);
+    assert_eq!(metrics.failures, 0);
+}
+
+#[test]
+fn a_failed_deferred_finish_reaches_the_caller() {
+    let service = DeferringService {
+        finished_on: Arc::new(Mutex::new(None)),
+        fail: true,
+    };
+    let pool = BatchedEvaluatorPool::spawn(broker_config(), vec![service]).unwrap();
+    let error = match pool.evaluate(&Position::new(0.1, Vec::new(), Color::Black)) {
+        Ok(_) => panic!("a finish failure should reach the caller"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("synthetic finish failure"));
+    assert_eq!(pool.metrics().failures, 1);
 }
 
 #[test]

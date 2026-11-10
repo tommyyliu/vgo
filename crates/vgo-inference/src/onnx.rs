@@ -2,14 +2,16 @@ use std::{
     fs,
     io::{BufReader, Read, Seek},
     path::{Path, PathBuf},
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
 use half::f16;
 use ort::{
     ep,
-    session::{Session, builder::GraphOptimizationLevel},
-    value::TensorRef,
+    memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType},
+    session::{IoBinding, Session, builder::GraphOptimizationLevel},
+    value::{DynTensorValueType, DynValue, TensorRef},
 };
 use sha2::{Digest, Sha256};
 use vgo_raster::RasterConfig;
@@ -17,8 +19,8 @@ use vgo_raster::packed::{bit_plane_bytes, packed_layout_for};
 use vgo_search::EvaluationError;
 
 use crate::{
-    BatchContract, BatchService, InferenceInput, InferenceOutput, InferenceStageMetrics,
-    InputLayout,
+    BatchContract, BatchService, FinishBatch, InferenceInput, InferenceOutput,
+    InferenceStageMetrics, InputLayout,
 };
 
 const MODEL_SCHEMA: &str = "vgo.raster-policy-value.onnx.v1";
@@ -91,6 +93,85 @@ pub struct OnnxBatchService {
     scalars: Vec<f16>,
     input_layout: InputLayout,
     last_stages: InferenceStageMetrics,
+    /// Page-locked staging and output buffers for a packed model on the GPU;
+    /// `None` copies through ordinary memory.
+    pinned: Option<PinnedIo>,
+}
+
+/// Inputs and outputs through page-locked host memory.
+///
+/// From ordinary memory the driver stages every copy through a buffer of its own,
+/// and the lane thread blocks while the CPU does that second copy. In a live
+/// generator, with the actors using the memory bus, the 2 MB policy copy back ran
+/// at 10 GB/s and the GPU sat idle a quarter of the time waiting on the lanes
+/// (nsys, 2026-11-09). Page-locked memory is copied by DMA, without the CPU.
+///
+/// ONNX Runtime's own pinned allocator can't be used for this: it labels pinned
+/// memory as device memory and then refuses to copy a bound input onto itself. So
+/// the staging vectors are locked in place with the driver, the outputs stay on
+/// the device, and the lane copies them into a pooled locked buffer, which travels
+/// with the deferred finish and comes back to the pool.
+struct PinnedIo {
+    device: i32,
+    binding: IoBinding,
+    /// Locks on `bits`, `halves` and `scalars`, which never reallocate: they are
+    /// sized for the maximum batch at load.
+    _staging: Vec<vgo_pinned::Lock>,
+    pool: (mpsc::Sender<HostOutputs>, mpsc::Receiver<HostOutputs>),
+}
+
+/// One batch's outputs in locked host memory.
+struct HostOutputs {
+    // Declared first so the locks are released before the memory is freed.
+    _locks: [vgo_pinned::Lock; 2],
+    policy: Vec<f32>,
+    values: Vec<f32>,
+}
+
+impl HostOutputs {
+    fn new(device: i32, maximum_batch: usize, policy_size: usize) -> Result<Self, EvaluationError> {
+        let mut policy = vec![0.0f32; maximum_batch * policy_size];
+        let mut values = vec![0.0f32; maximum_batch];
+        let lock = |error: vgo_pinned::Error| EvaluationError::new(error.0);
+        let locks = [
+            vgo_pinned::Lock::new(device, &mut policy).map_err(lock)?,
+            vgo_pinned::Lock::new(device, &mut values).map_err(lock)?,
+        ];
+        Ok(Self {
+            _locks: locks,
+            policy,
+            values,
+        })
+    }
+}
+
+/// Set `VGO_PINNED_IO=0` to copy through ordinary memory instead, for comparison.
+fn pinned_io_wanted() -> bool {
+    std::env::var("VGO_PINNED_IO").map_or(true, |value| value != "0")
+}
+
+fn pinned_io(
+    session: &Session,
+    device: i32,
+    bits: &mut Vec<u8>,
+    halves: &mut Vec<f16>,
+    scalars: &mut Vec<f16>,
+) -> Result<PinnedIo, EvaluationError> {
+    let lock = |error: vgo_pinned::Error| EvaluationError::new(error.0);
+    Ok(PinnedIo {
+        device,
+        binding: session
+            .create_binding()
+            .map_err(|error| evaluation_error("bind pinned ONNX buffers", error))?,
+        // Staging is filled in place each batch and sized for the maximum batch at
+        // load, so it never reallocates.
+        _staging: vec![
+            vgo_pinned::Lock::new(device, bits).map_err(lock)?,
+            vgo_pinned::Lock::new(device, halves).map_err(lock)?,
+            vgo_pinned::Lock::new(device, scalars).map_err(lock)?,
+        ],
+        pool: mpsc::channel(),
+    })
 }
 
 impl OnnxBatchService {
@@ -235,7 +316,7 @@ impl OnnxBatchService {
                 config.raster.kind
             )));
         }
-        let (bits, halves, scalars) = match (input_layout, layout) {
+        let (mut bits, mut halves, mut scalars) = match (input_layout, layout) {
             (InputLayout::Packed, Some(layout)) => (
                 Vec::with_capacity(
                     config.maximum_batch
@@ -253,6 +334,17 @@ impl OnnxBatchService {
             InputLayout::Dense => Vec::with_capacity(state_capacity),
             InputLayout::Packed => Vec::new(),
         };
+        let pinned = (config.provider != OnnxProvider::Cpu
+            && input_layout == InputLayout::Packed
+            && pinned_io_wanted())
+        .then(|| match pinned_io(&session, config.device_id, &mut bits, &mut halves, &mut scalars) {
+            Ok(io) => Some(io),
+            Err(error) => {
+                eprintln!("[inference] pinned host buffers unavailable, staging through ordinary memory: {error}");
+                None
+            }
+        })
+        .flatten();
         Ok(Self {
             description: format!(
                 "model={} provider={} device={}",
@@ -271,6 +363,7 @@ impl OnnxBatchService {
             scalars,
             input_layout,
             last_stages: InferenceStageMetrics::default(),
+            pinned,
         })
     }
 
@@ -290,23 +383,9 @@ impl OnnxBatchService {
     }
 }
 
-impl BatchService for OnnxBatchService {
-    fn fatal_native_failure(&self) -> bool {
-        true
-    }
-    fn description(&self) -> String {
-        self.description.clone()
-    }
-    fn contract(&self) -> BatchContract {
-        BatchContract {
-            raster: self.raster,
-            policy: self.policy,
-            maximum_batch: self.maximum_batch,
-            input_layout: self.input_layout,
-        }
-    }
-
-    fn infer(&mut self, batch: &[InferenceInput]) -> Result<Vec<InferenceOutput>, EvaluationError> {
+impl OnnxBatchService {
+    /// Pack a batch and run it, returning the raw policy and value tensors.
+    fn run_batch(&mut self, batch: &[InferenceInput]) -> Result<RawOutputs, EvaluationError> {
         self.last_stages = InferenceStageMetrics::default();
         if batch.is_empty() || batch.len() > self.maximum_batch {
             return Err(EvaluationError::new(format!(
@@ -385,6 +464,60 @@ impl BatchService for OnnxBatchService {
                     self.scalars.as_slice(),
                 ))
                 .map_err(|error| evaluation_error("construct ONNX scalars tensor", error))?;
+                if let Some(io) = self.pinned.as_mut() {
+                    let ort = |error| evaluation_error("bind pinned ONNX buffers", error);
+                    io.binding.bind_input("bits", &bits).map_err(ort)?;
+                    io.binding.bind_input("dense", &dense).map_err(ort)?;
+                    io.binding.bind_input("scalars", &scalars).map_err(ort)?;
+                    let device_memory = MemoryInfo::new(
+                        AllocationDevice::CUDA,
+                        io.device,
+                        AllocatorType::Device,
+                        MemoryType::Default,
+                    )
+                    .map_err(ort)?;
+                    io.binding
+                        .bind_output_to_device("policy_logits", &device_memory)
+                        .map_err(ort)?;
+                    io.binding
+                        .bind_output_to_device("values", &device_memory)
+                        .map_err(ort)?;
+                    self.last_stages.input_packing_nanoseconds =
+                        packing_started.elapsed().as_nanos() as u64;
+                    let session_started = Instant::now();
+                    let mut outputs = self
+                        .session
+                        .run_binding(&io.binding)
+                        .map_err(|error| evaluation_error("run ONNX inference", error))?;
+                    let size = batch.len();
+                    let policy_size = self.policy.pixels() + 1;
+                    let mut host = match io.pool.1.try_recv() {
+                        Ok(host) => host,
+                        Err(_) => HostOutputs::new(io.device, self.maximum_batch, policy_size)?,
+                    };
+                    for (name, target) in [
+                        ("policy_logits", &mut host.policy[..size * policy_size]),
+                        ("values", &mut host.values[..size]),
+                    ] {
+                        let tensor = outputs
+                            .remove(name)
+                            .ok_or_else(|| {
+                                EvaluationError::new(format!("ONNX output {name} is missing"))
+                            })?
+                            .downcast::<DynTensorValueType>()
+                            .map_err(|error| evaluation_error("read ONNX output", error))?;
+                        vgo_pinned::copy_to_host(io.device, tensor, target)
+                            .map_err(|error| EvaluationError::new(format!("{name}: {error}")))?;
+                    }
+                    self.last_stages.session_run_nanoseconds =
+                        session_started.elapsed().as_nanos() as u64;
+                    return Ok(RawOutputs::Host {
+                        host,
+                        size,
+                        policy_size,
+                        back: io.pool.0.clone(),
+                    });
+                }
                 self.last_stages.input_packing_nanoseconds =
                     packing_started.elapsed().as_nanos() as u64;
                 session_started = Instant::now();
@@ -396,44 +529,121 @@ impl BatchService for OnnxBatchService {
             }
         };
         self.last_stages.session_run_nanoseconds = session_started.elapsed().as_nanos() as u64;
-        let outputs = outputs.map_err(|error| evaluation_error("run ONNX inference", error))?;
+        let mut outputs = outputs.map_err(|error| evaluation_error("run ONNX inference", error))?;
+        let policy = outputs
+            .remove("policy_logits")
+            .ok_or_else(|| EvaluationError::new("ONNX output policy_logits is missing"))?;
+        let values = outputs
+            .remove("values")
+            .ok_or_else(|| EvaluationError::new("ONNX output values is missing"))?;
+        Ok(RawOutputs::Session { policy, values })
+    }
+}
 
-        let materialization_started = Instant::now();
-        let result = (|| {
-            let (policy_shape, policies) = outputs["policy_logits"]
+impl BatchService for OnnxBatchService {
+    fn fatal_native_failure(&self) -> bool {
+        true
+    }
+    fn description(&self) -> String {
+        self.description.clone()
+    }
+    fn contract(&self) -> BatchContract {
+        BatchContract {
+            raster: self.raster,
+            policy: self.policy,
+            maximum_batch: self.maximum_batch,
+            input_layout: self.input_layout,
+        }
+    }
+
+    fn infer(&mut self, batch: &[InferenceInput]) -> Result<Vec<InferenceOutput>, EvaluationError> {
+        let raw = self.run_batch(batch)?;
+        let started = Instant::now();
+        let ids: Vec<u64> = batch.iter().map(InferenceInput::id).collect();
+        let result = materialize(raw, &ids, self.policy.pixels() + 1);
+        self.last_stages.output_materialization_nanoseconds = started.elapsed().as_nanos() as u64;
+        result
+    }
+
+    fn infer_deferred(&mut self, batch: &[InferenceInput]) -> Result<FinishBatch, EvaluationError> {
+        let raw = self.run_batch(batch)?;
+        let ids: Vec<u64> = batch.iter().map(InferenceInput::id).collect();
+        let policy_size = self.policy.pixels() + 1;
+        Ok(Box::new(move || materialize(raw, &ids, policy_size)))
+    }
+
+    fn last_inference_stages(&self) -> InferenceStageMetrics {
+        self.last_stages
+    }
+}
+
+/// A batch's outputs before they are split per position: the session's own
+/// tensors, or a pooled locked buffer that goes back to its lane once read.
+enum RawOutputs {
+    Session {
+        policy: DynValue,
+        values: DynValue,
+    },
+    Host {
+        host: HostOutputs,
+        size: usize,
+        policy_size: usize,
+        back: mpsc::Sender<HostOutputs>,
+    },
+}
+
+/// Split a batch's outputs into one result per position.
+fn materialize(
+    raw: RawOutputs,
+    ids: &[u64],
+    policy_size: usize,
+) -> Result<Vec<InferenceOutput>, EvaluationError> {
+    let split = |policies: &[f32], values: &[f32]| {
+        ids.iter()
+            .enumerate()
+            .map(|(index, &id)| {
+                let start = index * policy_size;
+                InferenceOutput::new(
+                    id,
+                    f64::from(values[index]),
+                    policies[start..start + policy_size].to_vec(),
+                )
+            })
+            .collect()
+    };
+    match raw {
+        RawOutputs::Session { policy, values } => {
+            let (policy_shape, policies) = policy
                 .try_extract_tensor::<f32>()
                 .map_err(|error| evaluation_error("extract ONNX policy output", error))?;
-            let (value_shape, values) = outputs["values"]
+            let (value_shape, values) = values
                 .try_extract_tensor::<f32>()
                 .map_err(|error| evaluation_error("extract ONNX value output", error))?;
-            let policy_size = self.policy.pixels() + 1;
-            if **policy_shape != [batch.len() as i64, policy_size as i64]
-                || **value_shape != [batch.len() as i64]
+            if **policy_shape != [ids.len() as i64, policy_size as i64]
+                || **value_shape != [ids.len() as i64]
             {
                 return Err(EvaluationError::new(format!(
                     "ONNX output shape mismatch: policy={policy_shape}, value={value_shape}"
                 )));
             }
-            batch
-                .iter()
-                .enumerate()
-                .map(|(index, request)| {
-                    let start = index * policy_size;
-                    InferenceOutput::new(
-                        request.id(),
-                        f64::from(values[index]),
-                        policies[start..start + policy_size].to_vec(),
-                    )
-                })
-                .collect()
-        })();
-        self.last_stages.output_materialization_nanoseconds =
-            materialization_started.elapsed().as_nanos() as u64;
-        result
-    }
-
-    fn last_inference_stages(&self) -> InferenceStageMetrics {
-        self.last_stages
+            split(policies, values)
+        }
+        RawOutputs::Host {
+            host,
+            size,
+            policy_size: stored,
+            back,
+        } => {
+            if size != ids.len() || stored != policy_size {
+                return Err(EvaluationError::new(
+                    "pinned ONNX outputs do not match the batch",
+                ));
+            }
+            let result = split(&host.policy[..size * policy_size], &host.values[..size]);
+            // The lane may have stopped; then the buffer is simply freed.
+            let _ = back.send(host);
+            result
+        }
     }
 }
 

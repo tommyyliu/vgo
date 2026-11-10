@@ -8,7 +8,7 @@ use std::{
 
 use vgo_search::EvaluationError;
 
-use crate::{BatchService, InferenceInput, InferenceOutput, InferenceStageMetrics};
+use crate::{BatchService, FinishBatch, InferenceInput, InferenceOutput, InferenceStageMetrics};
 
 #[derive(Debug)]
 pub struct InferenceBatch {
@@ -40,13 +40,22 @@ impl InferenceBatch {
     }
 }
 
-#[derive(Debug)]
 pub struct CompletedBatch {
     sequence: u64,
     slot: usize,
     elapsed: Duration,
     stages: InferenceStageMetrics,
-    outputs: Vec<InferenceOutput>,
+    finish: FinishBatch,
+}
+
+impl std::fmt::Debug for CompletedBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompletedBatch")
+            .field("sequence", &self.sequence)
+            .field("slot", &self.slot)
+            .field("elapsed", &self.elapsed)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CompletedBatch {
@@ -70,14 +79,12 @@ impl CompletedBatch {
         self.stages
     }
 
-    #[must_use]
-    pub fn outputs(&self) -> &[InferenceOutput] {
-        &self.outputs
-    }
-
-    #[must_use]
-    pub fn into_outputs(self) -> Vec<InferenceOutput> {
-        self.outputs
+    /// Do the host work the lane left, on the calling thread, and return the
+    /// outputs with how long that took.
+    pub fn finish(self) -> Result<(Vec<InferenceOutput>, Duration), EvaluationError> {
+        let started = Instant::now();
+        let outputs = (self.finish)()?;
+        Ok((outputs, started.elapsed()))
     }
 }
 
@@ -154,18 +161,18 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
                     while let Ok(batch) = receiver.recv() {
                         let sequence = batch.sequence;
                         let started = Instant::now();
-                        let result = service.infer(&batch.inputs).map_err(|error| {
+                        let result = service.infer_deferred(&batch.inputs).map_err(|error| {
                             EvaluationError::new(format!(
                                 "{worker_description} slot {slot} batch {sequence}: {error}"
                             ))
                         });
                         let stages = service.last_inference_stages();
-                        let completion = result.map(|outputs| CompletedBatch {
+                        let completion = result.map(|finish| CompletedBatch {
                             sequence,
                             slot,
                             elapsed: started.elapsed(),
                             stages,
-                            outputs,
+                            finish,
                         });
                         let failed = completion.is_err();
                         if completions.send(completion).is_err() || failed {
@@ -412,7 +419,7 @@ mod tests {
         let completed = executor.receive().unwrap();
         assert_eq!(completed.sequence(), 7);
         assert_eq!(completed.slot(), 0);
-        assert_eq!(completed.outputs()[0].id(), 11);
+        assert_eq!(completed.finish().unwrap().0[0].id(), 11);
         assert_eq!(executor.in_flight(), 1);
         assert_eq!(executor.receive().unwrap().sequence(), 8);
         assert_eq!(executor.in_flight(), 0);
@@ -431,8 +438,9 @@ mod tests {
 
         let mut completed = [executor.receive().unwrap(), executor.receive().unwrap()];
         completed.sort_by_key(CompletedBatch::sequence);
-        assert_eq!(completed[0].outputs()[0].id(), 11);
-        assert_eq!(completed[1].outputs()[0].id(), 12);
+        let [first, second] = completed;
+        assert_eq!(first.finish().unwrap().0[0].id(), 11);
+        assert_eq!(second.finish().unwrap().0[0].id(), 12);
         assert_eq!(executor.in_flight(), 0);
     }
 }

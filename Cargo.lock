@@ -1097,8 +1097,17 @@ dependencies = [
  "rustix",
  "sha2",
  "vgo-core",
+ "vgo-pinned",
  "vgo-raster",
  "vgo-search",
+]
+
+[[package]]
+name = "vgo-pinned"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "ort",
 ]
 
 [[package]]

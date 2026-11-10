@@ -15,6 +15,8 @@ rust-version.workspace = true
 # is what limits inference. See vgo-raster's `packed` module.
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "std", "ndarray", "tracing", "api-24", "half"] }
 sha2 = "0.10"
+# Page-locked host buffers for the GPU lanes; the unsafe driver calls live there.
+vgo-pinned = { path = "../vgo-pinned" }
 half = "2.7"
 vgo-core = { path = "../vgo-core" }
 vgo-raster = { path = "../vgo-raster" }

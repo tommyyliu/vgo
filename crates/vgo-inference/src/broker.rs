@@ -18,8 +18,8 @@ use vgo_search::EvaluationError;
 
 use crate::metrics::{AtomicMetrics, BatchRecord};
 use crate::{
-    BatchContract, BatchService, BrokerConfig, CompletedBatch, InferenceBatch, InferenceInput,
-    InferenceOutput, ThreadedBatchExecutorPool,
+    BatchContract, BatchService, BrokerConfig, InferenceBatch, InferenceInput, InferenceOutput,
+    ThreadedBatchExecutorPool,
 };
 
 pub(crate) struct Request {
@@ -376,14 +376,20 @@ impl<S: BatchService + 'static> Broker<S> {
         };
         debug_assert_eq!(slot, batch.slot);
         let elapsed = completion.elapsed().as_nanos() as u64;
-        let stages = completion.stages();
+        let mut stages = completion.stages();
+        // The lane hands back its host work; doing it here frees the lane for the
+        // next batch. A service that finished on the lane reports that time itself.
+        let finished = completion.finish();
+        if let Ok((_, took)) = &finished {
+            stages.output_materialization_nanoseconds += took.as_nanos() as u64;
+        }
         for metrics in [&self.metrics, &self.lane_metrics[slot]] {
             metrics
                 .inference_nanoseconds
                 .fetch_add(elapsed, Ordering::Relaxed);
             metrics.record_stages(stages);
         }
-        match validated_outputs(completion, &batch.expected_ids) {
+        match finished.and_then(|(outputs, _)| validated_outputs(outputs, &batch.expected_ids)) {
             Ok(outputs) => {
                 self.deliver(batch.parts, outputs);
                 Ok(())
@@ -438,10 +444,9 @@ impl<S: BatchService + 'static> Broker<S> {
 
 /// A batch's outputs, checked against the request IDs it was sent with.
 fn validated_outputs(
-    completion: CompletedBatch,
+    outputs: Vec<InferenceOutput>,
     expected_ids: &[u64],
 ) -> Result<Vec<InferenceOutput>, EvaluationError> {
-    let outputs = completion.into_outputs();
     if outputs.len() != expected_ids.len() {
         return Err(EvaluationError::new(format!(
             "inference backend returned {} outputs for {} inputs",

@@ -94,6 +94,9 @@ pub struct InferenceStageMetrics {
     pub output_materialization_nanoseconds: u64,
 }
 
+/// Host work left after a batch has run; see [`BatchService::infer_deferred`].
+pub type FinishBatch = Box<dyn FnOnce() -> Result<Vec<InferenceOutput>, EvaluationError> + Send>;
+
 pub trait BatchService: Send {
     /// Arm a final process watchdog after a native failure that may also block
     /// exit handlers. Synthetic services can simply return their errors.
@@ -105,6 +108,16 @@ pub trait BatchService: Send {
     }
     fn contract(&self) -> BatchContract;
     fn infer(&mut self, batch: &[InferenceInput]) -> Result<Vec<InferenceOutput>, EvaluationError>;
+
+    /// Run a batch and return the host-only work left over, such as splitting the
+    /// output tensors into per-position results, for another thread to finish. A lane
+    /// that hands that work off goes straight back to the device: on a fast net the
+    /// split took a fifth of each lane's time, with its GPU slot idle meanwhile.
+    /// The default finishes here.
+    fn infer_deferred(&mut self, batch: &[InferenceInput]) -> Result<FinishBatch, EvaluationError> {
+        let outputs = self.infer(batch)?;
+        Ok(Box::new(move || Ok(outputs)))
+    }
 
     /// Return the stage timings for the most recent `infer` call. Backends
     /// without internal instrumentation leave the call unattributed.
