@@ -70,9 +70,18 @@ gain, live, each A/B over minutes 2-5 of a 5-minute run:
 
 A third lane, spin-waiting, pinning the inference threads to their own cores, and three
 batches per lane instead of two gained nothing. Kernels now run about 64% of the time; an
-isolated benchmark of the same lanes (`lane_bench`) reaches 57k. The gap is not the hand-off
-(batches stay full and queued); actors sharing the CPU and memory are the likely cause, untested. Halving the bytes copied (8-bit dense input,
-fp16 policy output) would save about 80 us of a 1.3 ms batch and changes the model contract.
+isolated benchmark of the same lanes (`lane_bench`) reaches 57k. Halving the bytes copied
+(8-bit dense input, fp16 policy output) would save about 80 us of a 1.3 ms batch and changes
+the model contract.
+
+**Memory bandwidth, 2026-11-10.** The gap to 57k was memory. With the generator running, a
+4-thread copy loop got 23 of its 51 GB/s; while that loop ran, the generator fell from 42.2k to
+26.8k, against 40.0k with 4 spinning threads. Enabling the RAM's EXPO profile (copy bandwidth
+52 to 59 GB/s) took generation from 42.0k to 50.3k (205 W to 241 W), with the lanes in a
+session 97% of the time. `lane_bench` stayed at 57.4k, so the card is now close to the limit.
+On a rented machine, check memory bandwidth as well as cores. Batches of 64 did not help:
+49.2k with 64 actors (lanes idle 40%, too few positions in flight), 49.6k with 96, and 96
+actors at 32 gave 49.4k.
 
 Games store positions, not pictures, so a window played at 128 trains at any resolution.
 
