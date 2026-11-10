@@ -115,6 +115,12 @@ struct Config {
     /// `<swap-file>.failed` holding the error and carries on as it was.
     #[arg(long)]
     swap_file: Option<PathBuf>,
+    /// Read the inference lanes' duty from this file, in percent of full speed:
+    /// at 50 a lane rests after each batch as long as the batch took, which halves
+    /// a GPU-bound generator and its CPU with it. Checked every second; a missing
+    /// file means 100. See `vgo_inference::pace`.
+    #[arg(long)]
+    pace_file: Option<PathBuf>,
     /// Stop after this many games. Zero runs until the stop file appears.
     #[arg(long, default_value_t = 0)]
     maximum_games: u64,
@@ -945,6 +951,41 @@ fn watch_for_swaps(
         .expect("start the swap watcher");
 }
 
+/// Follow the duty in a pace file until the run stops.
+fn watch_pace(path: PathBuf, run: Arc<RunState>) {
+    thread::Builder::new()
+        .name("vgo-pace".into())
+        .spawn(move || {
+            let mut refused = None;
+            while !run.stopping.load(Ordering::Acquire) && !run.cancelled.load(Ordering::Acquire) {
+                let wanted = match fs::read_to_string(&path) {
+                    Ok(text) => text.trim().parse::<u32>().map_err(|_| text),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(100),
+                    Err(error) => Err(error.to_string()),
+                };
+                let set = wanted.and_then(|duty| {
+                    if duty == vgo_inference::pace::duty_percent() {
+                        return Ok(());
+                    }
+                    vgo_inference::pace::set_duty_percent(duty)?;
+                    eprintln!("[pace] inference lanes at {duty}%");
+                    Ok(())
+                });
+                // A bad file keeps the duty as it was, and is reported once.
+                match set {
+                    Ok(()) => refused = None,
+                    Err(message) if refused.as_ref() != Some(&message) => {
+                        eprintln!("[pace] ignoring {}: {}", path.display(), message.trim());
+                        refused = Some(message);
+                    }
+                    Err(_) => {}
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        })
+        .expect("start the pace watcher");
+}
+
 /// The flags and counters every actor shares.
 ///
 /// Two stop signals, not one. `stopping` means take no new games -- the game in
@@ -1169,6 +1210,9 @@ fn main() -> io::Result<()> {
             Arc::clone(&generations),
             Arc::clone(&run),
         );
+    }
+    if let Some(path) = &config.pace_file {
+        watch_pace(path.clone(), Arc::clone(&run));
     }
     let handles = (0..config.actors)
         .map(|index| {

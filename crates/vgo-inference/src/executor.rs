@@ -221,10 +221,11 @@ fn spawn_lane<S: BatchService + 'static>(
                     .infer_deferred(&batch.inputs)
                     .map_err(|error| lane_error(&description, slot, sequence, error));
                 let stages = service.last_inference_stages();
+                let busy = started.elapsed();
                 let completion = result.map(|finish| CompletedBatch {
                     sequence,
                     slot,
-                    elapsed: started.elapsed(),
+                    elapsed: busy,
                     stages,
                     finish,
                 });
@@ -232,9 +233,19 @@ fn spawn_lane<S: BatchService + 'static>(
                 if completions.send(completion).is_err() || failed {
                     break;
                 }
+                rest(busy);
             }
         })
         .map_err(|error| EvaluationError::new(format!("start inference executor {slot}: {error}")))
+}
+
+/// Rest after a batch, at the duty `pace` sets. After the reply is sent, so a
+/// rest delays the lane's next batch, never this one's caller.
+fn rest(busy: Duration) {
+    let rest = crate::pace::rest_after(busy);
+    if !rest.is_zero() {
+        thread::sleep(rest);
+    }
 }
 
 /// A batch the stager has packed, on its way to the lane.
@@ -293,10 +304,11 @@ fn spawn_staged_lane<S: BatchService + 'static>(
                     .map_err(|error| lane_error(&description, slot, sequence, error));
                 let mut stages = service.last_inference_stages();
                 stages.input_packing_nanoseconds += packing_nanoseconds;
+                let busy = started.elapsed();
                 let completion = result.map(|finish| CompletedBatch {
                     sequence,
                     slot,
-                    elapsed: started.elapsed(),
+                    elapsed: busy,
                     stages,
                     finish,
                 });
@@ -304,6 +316,7 @@ fn spawn_staged_lane<S: BatchService + 'static>(
                 if completions.send(completion).is_err() || failed {
                     break;
                 }
+                rest(busy);
             }
         })
         .map_err(|error| EvaluationError::new(format!("start inference executor {slot}: {error}")))

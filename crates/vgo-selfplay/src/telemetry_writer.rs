@@ -202,6 +202,7 @@ impl Reporter {
                     report["unix_seconds"] = json!(unix_seconds());
                     report["elapsed_seconds"] = json!(elapsed);
                     report["interval_seconds"] = json!(interval_seconds);
+                    report["duty_percent"] = json!(vgo_inference::pace::duty_percent());
                     report["totals"] = snapshot.totals.json(elapsed);
                     report["memory"] = memory();
                     report["cancelled"] = json!(cancelled.load(Ordering::Acquire));

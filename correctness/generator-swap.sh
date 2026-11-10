@@ -4,7 +4,9 @@
 # Checks what the loop relies on: a request is answered with `.done`, games go
 # on landing in the new label's directory, a game that spans the swap lists both
 # models, a bad request is refused with `.failed` while generation carries on,
-# and the stop file still ends the process cleanly.
+# and the stop file still ends the process cleanly. Also that the pace file sets
+# the lanes' duty and a bad one is ignored; `tests/pace.rs` in vgo-inference
+# shows the lanes resting at that duty.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 source "$root/scripts/env/ort.sh"
@@ -30,6 +32,7 @@ cat > "$work/tail.json" <<'JSON'
 JSON
 "$root/target/release/vgo-generate-continuous" --output-root "$work/out" --label first \
   --stop-file "$work/stop" --swap-file "$work/swap.json" \
+  --pace-file "$work/pace" \
   --model "$model" --provider cpu --fp16 false --cache-directory "$work/cache" \
   --actors 4 --inference-slots 1 --maximum-batch 8 --delay-ms 1 \
   --simulations 16 --fast-simulations 8 --max-plies 40 --board-mix 1:18 \
@@ -61,6 +64,17 @@ kill -0 "$pid" 2>/dev/null || fail "a refused request stopped the generator"
 before=$(find "$work/out/second" -maxdepth 1 -name 'game-*' | wc -l)
 more () { [ "$(find "$work/out/second" -maxdepth 1 -name 'game-*' | wc -l)" -gt "$before" ]; }
 wait_for 120 more || fail "no games after a refused request"
+
+# The pace file reaches the lanes and the telemetry; a bad one changes nothing.
+echo 50 > "$work/pace"
+paced () { grep -qs '"duty_percent":50' "$work/out/second/performance.jsonl"; }
+wait_for 30 paced || fail "the pace file did not set the duty"
+grep -q '\[pace\] inference lanes at 50%' "$work/log" || fail "the duty change was not logged"
+echo fast > "$work/pace"
+wait_for 30 grep -q '\[pace\] ignoring' "$work/log" || fail "a bad pace file was not reported"
+grep -q '\[pace\] inference lanes at 100%' "$work/log" && fail "a bad pace file changed the duty"
+before=$(find "$work/out/second" -maxdepth 1 -name 'game-*' | wc -l)
+wait_for 120 more || fail "no games while paced"
 
 touch "$work/stop"
 wait_for 120 bash -c "! kill -0 $pid 2>/dev/null" || fail "the stop file did not end the run"

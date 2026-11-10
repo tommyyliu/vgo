@@ -6,6 +6,7 @@ mod evaluator;
 mod executor;
 mod metrics;
 mod onnx;
+pub mod pace;
 mod protocol;
 
 pub use evaluator::BatchedEvaluatorPool;

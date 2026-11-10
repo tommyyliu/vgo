@@ -306,7 +306,7 @@ start_generator () {
   [ -n "$model" ] && search_fraction="$full_search_fraction"
   setsid nohup "$root/target/release/vgo-generate-continuous" \
     --output-root "$games" --label "$label" \
-    --stop-file "$stop_file" --swap-file "$games/$label.swap.json" --first-game "$first_game" \
+    --stop-file "$stop_file" --swap-file "$games/$label.swap.json" --pace-file "$output/pace" --first-game "$first_game" \
     --actors "$actors" --simulations "$budget" \
     --full-search-fraction "$search_fraction" --fast-simulations "$fast_simulations" \
     --telemetry-seconds "$telemetry_seconds" \
