@@ -81,7 +81,9 @@ the model contract.
 session 97% of the time. `lane_bench` stayed at 57.4k, so the card is now close to the limit.
 On a rented machine, check memory bandwidth as well as cores. Batches of 64 did not help:
 49.2k with 64 actors (lanes idle 40%, too few positions in flight), 49.6k with 96, and 96
-actors at 32 gave 49.4k.
+actors at 32 gave 49.4k. Letting each actor copy its own policy out of the shared output buffer,
+instead of the broker copying all of them, cut the broker from 0.57 to 0.09 of a core but lost
+5% (49.2k to 46.5k), so it stays on branch `gpu-feed-lend` until the broker is the limit.
 
 Games store positions, not pictures, so a window played at 128 trains at any resolution.
 
