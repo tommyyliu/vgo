@@ -2,7 +2,6 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -10,10 +9,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use vgo_inference::{BatchedEvaluatorPool, BrokerMetrics};
+use vgo_inference::BrokerMetrics;
 use vgo_selfplay::telemetry::{GenerationTelemetry, Snapshot, broker_json};
 
-use super::Config;
+use super::{Config, Generation, Generations};
 
 pub struct Reporter {
     stop: mpsc::Sender<()>,
@@ -84,6 +83,15 @@ fn configuration(config: &Config) -> Value {
     })
 }
 
+fn open_log(generation: &Generation) -> io::Result<BufWriter<fs::File>> {
+    Ok(BufWriter::new(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(generation.root.join("performance.jsonl"))?,
+    ))
+}
+
 fn write_record(writer: &mut impl Write, value: &Value) -> io::Result<()> {
     serde_json::to_writer(&mut *writer, value)?;
     writeln!(writer)?;
@@ -91,20 +99,20 @@ fn write_record(writer: &mut impl Write, value: &Value) -> io::Result<()> {
 }
 
 impl Reporter {
+    /// Reports go to the current generation's directory. After a swap the
+    /// reporter writes a `swap` record there and carries on; the interval that
+    /// spans a swap counts the actors over all of it, and the broker only from
+    /// the new lanes.
     pub fn start(
         config: &Config,
-        root: &Path,
-        model_sha256: Option<&str>,
+        generations: Arc<Generations>,
         telemetry: Arc<GenerationTelemetry>,
-        broker: Option<BatchedEvaluatorPool>,
         cancelled: Arc<AtomicBool>,
     ) -> io::Result<Self> {
-        let mut writer = BufWriter::new(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(root.join("performance.jsonl"))?,
-        );
+        let mut active = generations.current();
+        let mut writer = open_log(&active)?;
+        let model_sha256 = active.model_sha256.clone();
+        let broker = active.pool.clone();
         let started = Instant::now();
         let pid = std::process::id();
         let run_id = format!("{pid}-{:.6}", unix_seconds());
@@ -149,8 +157,8 @@ impl Reporter {
                 "duration_semantics": "summed search/inference wall times overlap; queue durations are position-weighted; none are CPU time",
             }),
         )?;
+        drop(broker);
         let seconds = config.telemetry_seconds;
-        let label = config.label.clone();
         let (stop, receiver) = mpsc::channel();
         let join = thread::Builder::new().name("vgo-progress".into()).spawn(move || {
             let result = (|| -> io::Result<()> {
@@ -167,6 +175,20 @@ impl Reporter {
                             Err(mpsc::RecvTimeoutError::Timeout) => false,
                         }
                     };
+                    let current = generations.current();
+                    if !Arc::ptr_eq(&current, &active) {
+                        writer = open_log(&current)?;
+                        write_record(&mut writer, &json!({
+                            "schema": "vgo.performance.v1", "kind": "swap", "run_id": run_id,
+                            "pid": pid, "unix_seconds": unix_seconds(),
+                            "label": current.label, "previous_label": active.label,
+                            "model_sha256": current.model_sha256,
+                            "elapsed_seconds": started.elapsed().as_secs_f64(),
+                        }))?;
+                        previous_broker = BrokerMetrics::default();
+                        active = current;
+                    }
+                    let label = active.label.clone();
                     let now = Instant::now();
                     let elapsed = now.duration_since(started).as_secs_f64();
                     let interval_seconds = now.duration_since(previous_time).as_secs_f64();
@@ -183,7 +205,7 @@ impl Reporter {
                     report["totals"] = snapshot.totals.json(elapsed);
                     report["memory"] = memory();
                     report["cancelled"] = json!(cancelled.load(Ordering::Acquire));
-                    if let Some(pool) = &broker {
+                    if let Some(pool) = &active.pool {
                         let metrics = pool.metrics();
                         let capacity = pool.lane_contracts()[0].maximum_batch;
                         report["broker_interval"] = broker_json(metrics.delta_since(previous_broker), capacity);

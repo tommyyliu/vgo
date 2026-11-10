@@ -116,6 +116,11 @@ value_weight="${VGO_VALUE_WEIGHT:-0.0625}"
 updates="${VGO_UPDATES:-200}"
 actors="${VGO_ACTORS:-64}"
 inference_slots="${VGO_INFERENCE_SLOTS:-3}"
+# Move the running generator to each new model in place rather than starting a
+# process and draining the old one, which cost about 4% of generation in the
+# ramp and the drain. VGO_SWAP=0 restores a process per model.
+swap="${VGO_SWAP:-1}"
+swap_timeout="${VGO_SWAP_TIMEOUT:-600}"
 telemetry_seconds="${VGO_TELEMETRY_SECONDS:-30}"
 simulations="${VGO_SIMULATIONS:-1000}"
 full_search_fraction="${VGO_FULL_SEARCH_FRACTION:-1.0}"
@@ -267,6 +272,21 @@ build_komi_schedule () {
     --max-step "$komi_max_step" ${previous:+--previous "$previous"} >&2
 }
 
+# Fit a generation's tail and komi schedules. Sets `tail_path` and `komi_path`
+# (empty without a refit).
+build_schedules () {
+  local label="$1"
+  tail_path="$output/tail-schedules/$label.json"
+  build_tail_schedule "$tail_path" || { echo "[loop] could not build $tail_path" >&2; return 1; }
+  record_event tail_schedule "label=$label" "schedule=$tail_path"
+  komi_path=""
+  if [ "$komi_refit" = 1 ]; then
+    komi_path="$output/komi-schedules/$label.json"
+    build_komi_schedule "$komi_path" || { echo "[loop] could not build $komi_path" >&2; return 1; }
+    record_event komi_schedule "label=$label" "schedule=$komi_path"
+  fi
+}
+
 start_generator () {
   local label="$1" model="$2" first_game="$3"
   local budget="$simulations"
@@ -275,24 +295,18 @@ start_generator () {
   local tail_budget="$tail_simulations"
   [ "$tail_budget" -gt "$budget" ] && tail_budget="$budget"
   local stop_file="$games/$label.stop"
-  rm -f "$stop_file"
-  local schedule="$output/tail-schedules/$label.json"
-  build_tail_schedule "$schedule" || { echo "[loop] could not build $schedule" >&2; return 1; }
-  record_event tail_schedule "label=$label" "schedule=$schedule"
+  rm -f "$stop_file" "$games/$label.swap.json"*
+  build_schedules "$label" || return 1
+  local schedule="$tail_path"
   local komi_flag=()
-  if [ "$komi_refit" = 1 ]; then
-    local komi_schedule="$output/komi-schedules/$label.json"
-    build_komi_schedule "$komi_schedule" || { echo "[loop] could not build $komi_schedule" >&2; return 1; }
-    record_event komi_schedule "label=$label" "schedule=$komi_schedule"
-    komi_flag=(--komi-schedule "$komi_schedule")
-  fi
+  [ -n "$komi_path" ] && komi_flag=(--komi-schedule "$komi_path")
   local model_flag=()
   local search_fraction=1.0
   [ -n "$model" ] && model_flag=(--model "$model")
   [ -n "$model" ] && search_fraction="$full_search_fraction"
   setsid nohup "$root/target/release/vgo-generate-continuous" \
     --output-root "$games" --label "$label" \
-    --stop-file "$stop_file" --first-game "$first_game" \
+    --stop-file "$stop_file" --swap-file "$games/$label.swap.json" --first-game "$first_game" \
     --actors "$actors" --simulations "$budget" \
     --full-search-fraction "$search_fraction" --fast-simulations "$fast_simulations" \
     --telemetry-seconds "$telemetry_seconds" \
@@ -317,6 +331,46 @@ start_generator () {
   echo "$pid"
 }
 
+# Move the running generator to a new model in place: no new process, no ramp,
+# no drain. The generator loads the model beside the old one and switches; games
+# in progress finish on the new model. Returns non-zero when the swap did not
+# happen, and the caller starts a process instead.
+swap_generator () {
+  local label="$1" model="$2"
+  local request="$games/$process_label.swap.json"
+  rm -f "$request.done" "$request.failed"
+  build_schedules "$label" || return 1
+  "$python" - "$request" "$label" "$model" "$tail_path" "$komi_path" <<'PY' || return 1
+import json, os, sys
+path, label, model, tail, komi = sys.argv[1:6]
+with open(path + ".staging", "w", encoding="utf-8") as stream:
+    json.dump({"label": label, "model": model, "tail_schedule": tail, "komi_schedule": komi or None}, stream)
+os.replace(path + ".staging", path)
+PY
+  local waited=0
+  while [ "$waited" -lt "$swap_timeout" ]; do
+    if [ -f "$request.done" ]; then
+      [ "$(cat "$request.done")" = "$label" ] || { echo "[loop] swap answered for $(cat "$request.done"), not $label" >&2; return 1; }
+      record_event generator_swapped "label=$label" "pid=$generator" "model=$model" "process_label=$process_label" "seconds=$waited"
+      return 0
+    fi
+    if [ -f "$request.failed" ]; then
+      echo "[loop] swap to $label refused: $(cat "$request.failed")" >&2
+      record_event generator_swap_failed "label=$label" "pid=$generator"
+      return 1
+    fi
+    kill -0 "$generator" 2>/dev/null || return 1
+    sleep 5
+    waited=$((waited + 5))
+  done
+  # Withdraw a request still waiting. One already being loaded may yet land; its
+  # games then go to the new label's directory beside the replacement process's.
+  rm -f "$request"
+  echo "[loop] swap to $label timed out after ${swap_timeout}s" >&2
+  record_event generator_swap_failed "label=$label" "pid=$generator" "reason=timeout"
+  return 1
+}
+
 
 board_mix_flags=()
 for band in "${board_mix[@]}"; do board_mix_flags+=(--board-mix "$band"); done
@@ -326,7 +380,10 @@ shape_flags=()
 # Anything that ends this script ends the generator it started, which would
 # otherwise keep filling the disk. `label` is whichever generator is current.
 label=""
-trap '[ -n "$label" ] && touch "$games/$label.stop"' EXIT
+# The label the running process started with: its stop and swap files carry
+# that name for its whole life, while `label` follows each swap.
+process_label=""
+trap '[ -n "$process_label" ] && touch "$games/$process_label.stop"' EXIT
 
 model="$seed_model"
 # With no seed and no named anchor, the run's first trained model becomes the
@@ -366,6 +423,7 @@ next_game=$(( 1000000 + first_update * 1000000 ))
 run_tag="$(date '+%m%d%H%M')"
 label="gen-$(printf '%06d' "$generation")-$run_tag-seed"
 generator=$(start_generator "$label" "$model" "$next_game") || exit 1
+process_label="$label"
 echo "[loop] generation $generation started (pid $generator, model ${model:-none})"
 
 baseline=$(count_samples)
@@ -384,9 +442,9 @@ for ((update = first_update; update < first_update + updates; update++)); do
   # on: the first trained model replaces it either way. Left running, it held all
   # 32 threads through the first training, which took 64 minutes against about 9,
   # and wrote 38 GB of games no window used. The stop file drains it instead.
-  if [ -z "$model" ] && [ ! -e "$games/$label.stop" ]; then
-    touch "$games/$label.stop"
-    record_event generator_draining "label=$label" "pid=$generator" "reason=naive_window_full"
+  if [ -z "$model" ] && [ ! -e "$games/$process_label.stop" ]; then
+    touch "$games/$process_label.stop"
+    record_event generator_draining "label=$process_label" "pid=$generator" "reason=naive_window_full"
     echo "[loop] update $update: naive generator stopped; training has its window"
   fi
 
@@ -442,8 +500,10 @@ for ((update = first_update; update < first_update + updates; update++)); do
   ) >> "$output/train.log" 2>&1 || { record_event export_failed "update=$update"; echo "[loop] export failed" >&2; exit 1; }
   record_event export_finished "update=$update" "model=$onnx"
 
-  # Start the successor before stopping the incumbent, so generation never
-  # pauses. `next_game` advances past anything the old process could claim.
+  # Swap the running generator to the new model. Failing that, or from the
+  # naive generator, start the successor before stopping the incumbent, so
+  # generation never pauses. `next_game` advances past anything the old process
+  # could claim; a process that swaps keeps its own count, far below that.
   generation=$((generation + 1))
   next_game=$((next_game + 1000000))
   sha=$("$python" -c "
@@ -452,13 +512,20 @@ print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$onnx")
   previous_label="$label"
   previous_generator="$generator"
   label="gen-$(printf '%06d' "$generation")-$run_tag-$sha"
-  generator=$(start_generator "$label" "$onnx" "$next_game") || { label="$previous_label"; exit 1; }
-  touch "$games/$previous_label.stop"
-  record_event generator_draining "label=$previous_label" "pid=$previous_generator"
+  if [ "$swap" = 1 ] && [ -n "$model" ] && kill -0 "$generator" 2>/dev/null \
+      && swap_generator "$label" "$onnx"; then
+    handoff="pid $generator now generating as $label"
+  else
+    generator=$(start_generator "$label" "$onnx" "$next_game") || { label="$previous_label"; exit 1; }
+    touch "$games/$process_label.stop"
+    record_event generator_draining "label=$process_label" "pid=$previous_generator"
+    handoff="generation $generation started (pid $generator), $process_label draining"
+    process_label="$label"
+  fi
   model="$onnx"
   [ -z "$anchor_model" ] && [ -z "$first_rated" ] && first_rated="$onnx"
   baseline=$(count_samples)
-  echo "[loop] update $update done: generation $generation started (pid $generator), $previous_label draining"
+  echo "[loop] update $update done: $handoff"
 
   # Measurement, not a gate. Adoption already happened above.
   #

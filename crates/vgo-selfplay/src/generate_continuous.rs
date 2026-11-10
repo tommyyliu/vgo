@@ -28,11 +28,10 @@
 //! Output goes to `<root>/<label>/game-000000001/`, where the label names the
 //! model generation. That is not filing for its own sake:
 //!
-//!   * **Handoff needs no coordination.** A new model means a new process
+//!   * **Handoff needs no coordination.** A new model can mean a new process
 //!     writing to its own directory while the old one finishes into its own.
-//!     No shared counter, no name races, no locking -- which was most of what
-//!     made a hot model swap awkward, and this avoids swapping an
-//!     `Arc<dyn Evaluator>` on the per-leaf hot path entirely.
+//!     Or, with `--swap-file`, the running process loads the new model beside
+//!     the old one and switches: see "Swapping models in place" below.
 //!   * **Staleness becomes visible.** A replay window spanning thirty model
 //!     generations currently says so nowhere; here it is a directory listing.
 //!   * **Retirement gets a unit** -- drop a generation, not a file list.
@@ -40,12 +39,30 @@
 //! Each game directory has the same shape as a shard from the old generator, so
 //! the Python loader, the replay cache, komi fitting and retirement all read it
 //! unchanged. A game simply is a shard that happens to hold one game.
+//!
+//! ## Swapping models in place
+//!
+//! Starting a new process for each model cost about 4% of generation in the
+//! loop: for the first few minutes the new process ramps up while the old one
+//! drains, and its dwindling actors send partial batches. With `--swap-file`,
+//! the loop instead writes a request naming the next generation's label, model
+//! and schedules. A watcher thread loads the model beside the current one, then
+//! switches, and every actor moves to it at its next move. Games in progress
+//! finish on the new model.
+//!
+//! The unit of switching is a move, not a leaf: [`SwappingEvaluator`] pins the
+//! current generation when a search begins, so one move's search never mixes
+//! two models. A game lands in the directory of the generation that played its
+//! last move. When more than one model played a game, its manifest lists each
+//! with the ply it took over from (`behavior_models`); `behavior_model_sha256`
+//! names the last. A game with one model is written exactly as before.
 
+use std::cell::RefCell;
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -53,12 +70,13 @@ mod telemetry_writer;
 
 use clap::{ArgAction, Parser};
 use sha2::{Digest, Sha256};
+use vgo_core::Position;
 use vgo_core::Ruleset;
 use vgo_inference::{
     BatchedEvaluatorPool, BrokerConfig, OnnxBatchService, OnnxProvider, OnnxServiceConfig,
 };
 use vgo_raster::{RasterConfig, RasterKind};
-use vgo_search::{Evaluator, NaiveEvaluator};
+use vgo_search::{Evaluation, EvaluationError, Evaluator, NaiveEvaluator};
 use vgo_selfplay::generation::{
     GameRecord, GameSamples, GameSettings, KOMI_AREA_COEFFICIENT, generate_game_observed,
     parse_board_mix, replay_capacity_for,
@@ -89,6 +107,14 @@ struct Config {
     /// checked between games, where stopping is free.
     #[arg(long)]
     stop_file: Option<PathBuf>,
+    /// Watch this path for a request to move to a new model generation. The
+    /// request is JSON: `{"label": ..., "model": ..., "tail_schedule": ...,
+    /// "komi_schedule": ...}`, the last two optional, written whole (rename it
+    /// into place). The generator loads the model beside the current one,
+    /// switches, and answers with `<swap-file>.done` holding the new label, or
+    /// `<swap-file>.failed` holding the error and carries on as it was.
+    #[arg(long)]
+    swap_file: Option<PathBuf>,
     /// Stop after this many games. Zero runs until the stop file appears.
     #[arg(long, default_value_t = 0)]
     maximum_games: u64,
@@ -347,7 +373,10 @@ impl GameWriter {
     /// The directory is built under a temporary name and renamed once the manifest
     /// is in place, so a reader can never observe a game that is missing its
     /// checksum -- the same discipline the shard writer uses, at a finer grain.
-    fn write(&self, game_id: u64, game: GameSamples) -> io::Result<usize> {
+    /// `models` lists the generations that played this game, with the ply each
+    /// took over from; the last is this writer's. Empty means this writer's
+    /// model played every move.
+    fn write(&self, game_id: u64, game: GameSamples, models: &[ModelSpan]) -> io::Result<usize> {
         let name = format!("game-{game_id:09}");
         let staging = self.root.join(format!("{name}.staging"));
         let final_path = self.root.join(&name);
@@ -381,7 +410,7 @@ impl GameWriter {
         stream.write_game(samples)?;
         let published = stream.publish()?;
         write_game_record(&staging.join("games.jsonl"), &record, published.samples)?;
-        self.write_manifest(&staging.join("manifest.json"), &published, &record)?;
+        self.write_manifest(&staging.join("manifest.json"), &published, &record, models)?;
         fs::rename(&staging, &final_path)?;
         Ok(published.samples)
     }
@@ -391,6 +420,7 @@ impl GameWriter {
         path: &Path,
         published: &PublishedReplay,
         record: &GameRecord,
+        models: &[ModelSpan],
     ) -> io::Result<()> {
         let mut writer = BufWriter::new(fs::File::create(path)?);
         writeln!(writer, "{{")?;
@@ -408,6 +438,21 @@ impl GameWriter {
         writeln!(writer, "  \"tail_samples\": {},", record.tail_samples)?;
         if let Some(sha) = &self.model_sha256 {
             writeln!(writer, "  \"behavior_model_sha256\": \"{sha}\",")?;
+        }
+        if models.len() > 1 {
+            let spans: Vec<String> = models
+                .iter()
+                .map(|span| {
+                    format!(
+                        "{{\"from_ply\": {}, \"sha256\": {}}}",
+                        span.from_ply,
+                        span.sha256
+                            .as_ref()
+                            .map_or_else(|| "null".to_owned(), |sha| format!("\"{sha}\""))
+                    )
+                })
+                .collect();
+            writeln!(writer, "  \"behavior_models\": [{}],", spans.join(", "))?;
         }
         writeln!(writer, "  \"dataset_sha256\": \"{}\"", published.sha256)?;
         writeln!(writer, "}}")?;
@@ -641,6 +686,265 @@ fn load_evaluator(
     Ok((Arc::new(pool.clone()), Some(pool)))
 }
 
+/// Which model played a game from which ply on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelSpan {
+    from_ply: u32,
+    sha256: Option<String>,
+}
+
+/// Everything that changes when the model does: the weights, the schedules
+/// fitted for them, and the directory their games land in.
+struct Generation {
+    label: String,
+    root: PathBuf,
+    model_sha256: Option<String>,
+    evaluator: Arc<dyn Evaluator>,
+    pool: Option<BatchedEvaluatorPool>,
+    settings: Arc<GameSettings>,
+    writer: Arc<GameWriter>,
+}
+
+impl Generation {
+    fn load(config: &Config, raster: RasterConfig, policy_size: usize) -> io::Result<Self> {
+        let settings = Arc::new(
+            config
+                .game_settings()
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?,
+        );
+        let root = config.output_root.join(&config.label);
+        fs::create_dir_all(&root)?;
+        let model_sha256 = config.model.as_deref().map(file_sha256).transpose()?;
+        let (evaluator, pool) = load_evaluator(config, raster)?;
+        let writer = Arc::new(GameWriter::new(
+            config,
+            &settings,
+            root.clone(),
+            raster,
+            policy_size,
+            model_sha256.clone(),
+        ));
+        Ok(Self {
+            label: config.label.clone(),
+            root,
+            model_sha256,
+            evaluator,
+            pool,
+            settings,
+            writer,
+        })
+    }
+}
+
+/// The generation new searches use. Swapped whole, never edited.
+struct Generations(RwLock<Arc<Generation>>);
+
+impl Generations {
+    fn new(first: Generation) -> Self {
+        Self(RwLock::new(Arc::new(first)))
+    }
+
+    fn current(&self) -> Arc<Generation> {
+        Arc::clone(&self.0.read().unwrap_or_else(|poison| poison.into_inner()))
+    }
+
+    fn replace(&self, next: Generation) {
+        *self.0.write().unwrap_or_else(|poison| poison.into_inner()) = Arc::new(next);
+    }
+}
+
+thread_local! {
+    /// The generation this thread's current search started with. One process
+    /// holds one `Generations`, so a single slot per thread is enough.
+    static PINNED: RefCell<Option<Arc<Generation>>> = const { RefCell::new(None) };
+}
+
+/// Evaluates with the generation that was current when this thread's search
+/// began, so a move is searched by one model even if a swap lands mid-search.
+/// The old generation, and its lanes, are freed once no thread holds it.
+struct SwappingEvaluator {
+    generations: Arc<Generations>,
+}
+
+impl SwappingEvaluator {
+    /// The generation pinned on this thread, or the current one before any search.
+    fn pinned(&self) -> Arc<Generation> {
+        PINNED.with(|slot| {
+            slot.borrow()
+                .clone()
+                .unwrap_or_else(|| self.generations.current())
+        })
+    }
+
+    fn with_pinned<T>(&self, run: impl FnOnce(&dyn Evaluator) -> T) -> T {
+        PINNED.with(|slot| match &*slot.borrow() {
+            Some(generation) => run(generation.evaluator.as_ref()),
+            None => run(self.generations.current().evaluator.as_ref()),
+        })
+    }
+}
+
+impl Evaluator for SwappingEvaluator {
+    fn begin_search(&self, root: &Position) {
+        let generation = self.generations.current();
+        generation.evaluator.begin_search(root);
+        PINNED.with(|slot| *slot.borrow_mut() = Some(generation));
+    }
+
+    fn evaluate(&self, position: &Position) -> Result<Evaluation, EvaluationError> {
+        self.with_pinned(|evaluator| evaluator.evaluate(position))
+    }
+
+    fn evaluate_batch(&self, positions: &[Position]) -> Result<Vec<Evaluation>, EvaluationError> {
+        self.with_pinned(|evaluator| evaluator.evaluate_batch(positions))
+    }
+}
+
+/// A request to move to the next generation, as the loop writes it.
+#[derive(Debug, PartialEq)]
+struct SwapRequest {
+    label: String,
+    model: Option<PathBuf>,
+    tail_schedule: Option<PathBuf>,
+    komi_schedule: Option<PathBuf>,
+}
+
+impl SwapRequest {
+    /// Unknown fields are refused: a misspelt `komi_schedule` would otherwise
+    /// drop the refit in silence.
+    fn parse(text: &str) -> Result<Self, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|error| error.to_string())?;
+        let object = value.as_object().ok_or("a swap request is a JSON object")?;
+        for key in object.keys() {
+            if !["label", "model", "tail_schedule", "komi_schedule"].contains(&key.as_str()) {
+                return Err(format!("unknown field {key:?} in swap request"));
+            }
+        }
+        let path = |key: &str| -> Result<Option<PathBuf>, String> {
+            match object.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(serde_json::Value::String(text)) => Ok(Some(PathBuf::from(text))),
+                Some(_) => Err(format!("{key} must be a path")),
+            }
+        };
+        Ok(Self {
+            label: object
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("a swap request needs a label")?
+                .to_owned(),
+            model: path("model")?,
+            tail_schedule: path("tail_schedule")?,
+            komi_schedule: path("komi_schedule")?,
+        })
+    }
+
+    /// The process's configuration with this request's generation in place.
+    fn apply(&self, config: &Config) -> Result<Config, String> {
+        if self.label.is_empty() || self.label.contains('/') || self.label == config.label {
+            return Err(format!(
+                "swap label {:?} is not a new directory name",
+                self.label
+            ));
+        }
+        if config.model.is_some() != self.model.is_some() {
+            // A naive generator searches on a different budget; the loop starts a
+            // process for that change instead.
+            return Err("a swap cannot move between the naive evaluator and a model".into());
+        }
+        let mut next = config.clone();
+        next.label.clone_from(&self.label);
+        next.model.clone_from(&self.model);
+        next.tail_schedule.clone_from(&self.tail_schedule);
+        next.komi_schedule.clone_from(&self.komi_schedule);
+        Ok(next)
+    }
+}
+
+/// Write `text` to `path` whole, so a reader never sees half of it.
+fn write_whole(path: &Path, text: &str) -> io::Result<()> {
+    let staging = path.with_extension("staging");
+    fs::write(&staging, text)?;
+    fs::rename(&staging, path)
+}
+
+fn answer_path(request: &Path, suffix: &str) -> PathBuf {
+    let mut name = request.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Load the requested generation and make it current. The request is removed
+/// before the answer appears, so the loop can never see a stale request and a
+/// fresh answer together.
+fn take_swap(
+    path: &Path,
+    config: &Config,
+    current_label: &str,
+    raster: RasterConfig,
+    policy_size: usize,
+    generations: &Generations,
+) -> Result<String, String> {
+    let text =
+        fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let request =
+        SwapRequest::parse(&text).map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if request.label == current_label {
+        return Err(format!("already generating as {current_label}"));
+    }
+    let next_config = request.apply(config)?;
+    let started = Instant::now();
+    let next =
+        Generation::load(&next_config, raster, policy_size).map_err(|error| error.to_string())?;
+    generations.replace(next);
+    eprintln!(
+        "[swap] now {} with {} after {:.1}s loading",
+        request.label,
+        request.model.as_ref().map_or_else(
+            || "the naive evaluator".into(),
+            |model| model.display().to_string()
+        ),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(request.label)
+}
+
+/// Poll for swap requests until the run stops.
+fn watch_for_swaps(
+    path: PathBuf,
+    config: Config,
+    raster: RasterConfig,
+    policy_size: usize,
+    generations: Arc<Generations>,
+    run: Arc<RunState>,
+) {
+    thread::Builder::new()
+        .name("vgo-swap".into())
+        .spawn(move || {
+            while !run.stopping.load(Ordering::Acquire) && !run.cancelled.load(Ordering::Acquire) {
+                if path.exists() {
+                    let label = generations.current().label.clone();
+                    let outcome =
+                        take_swap(&path, &config, &label, raster, policy_size, &generations);
+                    let _ = fs::remove_file(&path);
+                    let answer = match &outcome {
+                        Ok(label) => write_whole(&answer_path(&path, ".done"), label),
+                        Err(message) => {
+                            eprintln!("[swap] refused: {message}");
+                            write_whole(&answer_path(&path, ".failed"), message)
+                        }
+                    };
+                    if let Err(error) = answer {
+                        eprintln!("[swap] could not answer {}: {error}", path.display());
+                    }
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+        })
+        .expect("start the swap watcher");
+}
+
 /// The flags and counters every actor shares.
 ///
 /// Two stop signals, not one. `stopping` means take no new games -- the game in
@@ -665,9 +969,7 @@ struct Actor {
     index: usize,
     stop_file: Option<PathBuf>,
     maximum_games: u64,
-    evaluator: Arc<dyn Evaluator>,
-    settings: Arc<GameSettings>,
-    writer: Arc<GameWriter>,
+    evaluator: Arc<SwappingEvaluator>,
     telemetry: Arc<GenerationTelemetry>,
     run: Arc<RunState>,
 }
@@ -703,12 +1005,25 @@ impl Actor {
         while !self.should_stop() {
             let index = run.next_game.fetch_add(1, Ordering::Relaxed);
             telemetry.phase(actor, "playing");
+            // Settings come from the generation current as the game starts: komi
+            // is drawn once, and the tail schedule stays the one it began under.
+            let settings = Arc::clone(&self.evaluator.generations.current().settings);
+            let mut played: Vec<(u32, Arc<Generation>)> = Vec::new();
             let game = match generate_game_observed(
-                &self.settings,
+                &settings,
                 self.evaluator.as_ref(),
                 index,
                 &run.cancelled,
-                |progress| telemetry.searched(actor, progress),
+                |progress| {
+                    let generation = self.evaluator.pinned();
+                    if played
+                        .last()
+                        .is_none_or(|(_, last)| !Arc::ptr_eq(last, &generation))
+                    {
+                        played.push((progress.ply, generation));
+                    }
+                    telemetry.searched(actor, progress);
+                },
             ) {
                 Ok(game) => game,
                 Err(error) => {
@@ -729,7 +1044,24 @@ impl Actor {
             let reached_tail = !game.record.tail_spans.is_empty();
             telemetry.phase(actor, "writing");
             let writing_started = Instant::now();
-            let written = self.writer.write(index, game)?;
+            let (writer, models) = match played.last() {
+                Some((_, last)) => (
+                    Arc::clone(&last.writer),
+                    played
+                        .iter()
+                        .map(|(ply, generation)| ModelSpan {
+                            from_ply: *ply,
+                            sha256: generation.model_sha256.clone(),
+                        })
+                        .collect(),
+                ),
+                None => (
+                    Arc::clone(&self.evaluator.generations.current().writer),
+                    Vec::new(),
+                ),
+            };
+            drop(played);
+            let written = writer.write(index, game, &models)?;
             telemetry.published(
                 actor,
                 radius,
@@ -789,11 +1121,10 @@ fn main() -> io::Result<()> {
             "--actors must be positive",
         ));
     }
-    let settings = Arc::new(
-        config
-            .game_settings()
-            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?,
-    );
+    // Fail on bad settings before touching CUDA.
+    config
+        .game_settings()
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     // Before anything touches CUDA: the driver refuses to change this flag once
     // the primary context is active, and ONNX Runtime retains that same
     // context when the first session is built.
@@ -808,11 +1139,14 @@ fn main() -> io::Result<()> {
     let profiler = start_profiler(config.profile_output.as_deref())?;
     let raster = RasterConfig::square_of(config.resolution, config.raster_kind);
     let policy_size = RasterConfig::square(config.policy_resolution).pixels() + 1;
-    let root = config.output_root.join(&config.label);
-    fs::create_dir_all(&root)?;
-
-    let model_sha256 = config.model.as_deref().map(file_sha256).transpose()?;
-    let (evaluator, broker) = load_evaluator(&config, raster)?;
+    let generations = Arc::new(Generations::new(Generation::load(
+        &config,
+        raster,
+        policy_size,
+    )?));
+    let evaluator = Arc::new(SwappingEvaluator {
+        generations: Arc::clone(&generations),
+    });
 
     let run = Arc::new(RunState {
         next_game: AtomicU64::new(config.first_game),
@@ -822,21 +1156,20 @@ fn main() -> io::Result<()> {
     let telemetry = Arc::new(GenerationTelemetry::new(config.actors));
     let reporter = telemetry_writer::Reporter::start(
         &config,
-        &root,
-        model_sha256.as_deref(),
+        Arc::clone(&generations),
         Arc::clone(&telemetry),
-        broker,
         Arc::clone(&run.cancelled),
     )?;
-
-    let writer = Arc::new(GameWriter::new(
-        &config,
-        &settings,
-        root,
-        raster,
-        policy_size,
-        model_sha256,
-    ));
+    if let Some(path) = &config.swap_file {
+        watch_for_swaps(
+            path.clone(),
+            config.clone(),
+            raster,
+            policy_size,
+            Arc::clone(&generations),
+            Arc::clone(&run),
+        );
+    }
     let handles = (0..config.actors)
         .map(|index| {
             let actor = Actor {
@@ -844,8 +1177,6 @@ fn main() -> io::Result<()> {
                 stop_file: config.stop_file.clone(),
                 maximum_games: config.maximum_games,
                 evaluator: Arc::clone(&evaluator),
-                settings: Arc::clone(&settings),
-                writer: Arc::clone(&writer),
                 telemetry: Arc::clone(&telemetry),
                 run: Arc::clone(&run),
             };
@@ -858,7 +1189,7 @@ fn main() -> io::Result<()> {
     finish_profiler(profiler, config.profile_output.as_deref())?;
     match failure {
         Some(error) => Err(error),
-        None => print_summary(&config.label, &run),
+        None => print_summary(&generations.current().label, &run),
     }
 }
 
@@ -866,6 +1197,187 @@ fn main() -> io::Result<()> {
 mod tests {
     use super::*;
     use vgo_selfplay::generation::generate_game;
+
+    fn tiny_config(label: &str, output_root: &Path) -> Config {
+        Config::parse_from([
+            "generator",
+            "--output-root",
+            output_root.to_str().unwrap(),
+            "--label",
+            label,
+            "--simulations",
+            "8",
+            "--max-plies",
+            "9",
+            "--policy-resolution",
+            "16",
+        ])
+    }
+
+    /// Counts its calls, so a test can tell which generation answered.
+    #[derive(Default)]
+    struct Counting(std::sync::atomic::AtomicUsize);
+
+    impl Evaluator for Counting {
+        fn evaluate(&self, position: &Position) -> Result<Evaluation, EvaluationError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            NaiveEvaluator.evaluate(position)
+        }
+    }
+
+    fn generation_with(label: &str, evaluator: Arc<dyn Evaluator>, root: &Path) -> Generation {
+        let config = tiny_config(label, root);
+        let settings = Arc::new(config.game_settings().unwrap());
+        let raster = RasterConfig::square_of(config.resolution, config.raster_kind);
+        let writer = Arc::new(GameWriter::new(
+            &config,
+            &settings,
+            root.join(label),
+            raster,
+            RasterConfig::square(16).pixels() + 1,
+            Some(format!("sha-{label}")),
+        ));
+        Generation {
+            label: label.into(),
+            root: root.join(label),
+            model_sha256: Some(format!("sha-{label}")),
+            evaluator,
+            pool: None,
+            settings,
+            writer,
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("vgo-swap-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_search_keeps_the_generation_it_began_with_and_the_old_one_is_freed() {
+        let root = scratch("pin");
+        let (first, second) = (Arc::new(Counting::default()), Arc::new(Counting::default()));
+        let generations = Arc::new(Generations::new(generation_with("a", first.clone(), &root)));
+        let evaluator = SwappingEvaluator {
+            generations: Arc::clone(&generations),
+        };
+        let position = Position::new(1.0 / 6.0, Vec::new(), vgo_core::Color::Black);
+        evaluator.begin_search(&position);
+        let old = Arc::downgrade(&generations.current());
+        generations.replace(generation_with("b", second.clone(), &root));
+        evaluator.evaluate(&position).unwrap();
+        evaluator
+            .evaluate_batch(&[position.clone(), position.clone()])
+            .unwrap();
+        assert_eq!(
+            (
+                first.0.load(Ordering::SeqCst),
+                second.0.load(Ordering::SeqCst)
+            ),
+            (3, 0)
+        );
+        assert_eq!(evaluator.pinned().label, "a");
+        assert!(
+            old.upgrade().is_some(),
+            "a search in progress holds its generation"
+        );
+        evaluator.begin_search(&position);
+        evaluator.evaluate(&position).unwrap();
+        assert_eq!(
+            (
+                first.0.load(Ordering::SeqCst),
+                second.0.load(Ordering::SeqCst)
+            ),
+            (3, 1)
+        );
+        assert_eq!(evaluator.pinned().label, "b");
+        assert!(
+            old.upgrade().is_none(),
+            "nothing holds the old generation once searches move on"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_swap_request_names_a_new_generation_and_nothing_else() {
+        let request = SwapRequest::parse(
+            r#"{"label": "gen-2", "model": "m.onnx", "tail_schedule": "t.json", "komi_schedule": null}"#,
+        )
+        .unwrap();
+        assert_eq!(request.model, Some(PathBuf::from("m.onnx")));
+        assert_eq!(request.komi_schedule, None);
+        assert!(
+            SwapRequest::parse(r#"{"label": "x", "komi_shedule": "k.json"}"#)
+                .unwrap_err()
+                .contains("komi_shedule")
+        );
+        assert!(SwapRequest::parse(r#"{"model": "m.onnx"}"#).is_err());
+        assert!(SwapRequest::parse(r#"{"label": "x", "model": 3}"#).is_err());
+
+        let mut config = tiny_config("gen-1", Path::new("unused"));
+        config.model = Some("old.onnx".into());
+        let next = request.apply(&config).unwrap();
+        assert_eq!(
+            (next.label.as_str(), next.model),
+            ("gen-2", Some("m.onnx".into()))
+        );
+        assert_eq!(next.tail_schedule, Some("t.json".into()));
+        assert_eq!(next.komi_schedule, None);
+        assert_eq!(next.simulations, config.simulations);
+        let refuse = |text: &str| SwapRequest::parse(text).unwrap().apply(&config).is_err();
+        assert!(refuse(r#"{"label": "gen-1", "model": "m.onnx"}"#));
+        assert!(refuse(r#"{"label": "a/b", "model": "m.onnx"}"#));
+        assert!(
+            refuse(r#"{"label": "gen-2"}"#),
+            "a model generator cannot go naive"
+        );
+    }
+
+    #[test]
+    fn only_a_game_played_by_two_models_lists_them() {
+        let root = scratch("manifest");
+        let generation = generation_with("a", Arc::new(NaiveEvaluator), &root);
+        fs::create_dir_all(&generation.root).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let play = |index| {
+            generate_game(&generation.settings, &NaiveEvaluator, index, &cancelled).unwrap()
+        };
+        let manifest = |index: u64| {
+            fs::read_to_string(
+                generation
+                    .root
+                    .join(format!("game-{index:09}/manifest.json")),
+            )
+            .unwrap()
+        };
+        let one = [ModelSpan {
+            from_ply: 0,
+            sha256: Some("sha-a".into()),
+        }];
+        generation.writer.write(1, play(1), &[]).unwrap();
+        generation.writer.write(2, play(2), &one).unwrap();
+        assert!(!manifest(1).contains("behavior_models"));
+        assert!(!manifest(2).contains("behavior_models"));
+        let two = [
+            ModelSpan {
+                from_ply: 0,
+                sha256: Some("sha-x".into()),
+            },
+            ModelSpan {
+                from_ply: 4,
+                sha256: Some("sha-a".into()),
+            },
+        ];
+        generation.writer.write(3, play(3), &two).unwrap();
+        let text = manifest(3);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["behavior_model_sha256"], "sha-a");
+        assert_eq!(value["behavior_models"][0]["sha256"], "sha-x");
+        assert_eq!(value["behavior_models"][1]["from_ply"], 4);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn timed_run_does_not_require_a_profile_and_uses_the_earlier_deadline() {

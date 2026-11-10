@@ -35,4 +35,5 @@ if [[ "$mode" == --update-golden ]]; then
 else
   diff correctness/golden.txt <(digests)
 fi
+correctness/generator-swap.sh
 echo "check passed"
