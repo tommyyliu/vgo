@@ -97,6 +97,13 @@ pub struct InferenceStageMetrics {
 /// Host work left after a batch has run; see [`BatchService::infer_deferred`].
 pub type FinishBatch = Box<dyn FnOnce() -> Result<Vec<InferenceOutput>, EvaluationError> + Send>;
 
+/// A batch's inputs packed ahead of its run; only the service that made the
+/// stager knows what is inside.
+pub type StagedBatch = Box<dyn std::any::Any + Send>;
+
+/// Packs batches for [`BatchService::infer_staged`]; see [`BatchService::stager`].
+pub type Stager = Box<dyn FnMut(&[InferenceInput]) -> Result<StagedBatch, EvaluationError> + Send>;
+
 pub trait BatchService: Send {
     /// Arm a final process watchdog after a native failure that may also block
     /// exit handlers. Synthetic services can simply return their errors.
@@ -117,6 +124,22 @@ pub trait BatchService: Send {
     fn infer_deferred(&mut self, batch: &[InferenceInput]) -> Result<FinishBatch, EvaluationError> {
         let outputs = self.infer(batch)?;
         Ok(Box::new(move || Ok(outputs)))
+    }
+
+    /// A packer that runs on its own thread, so a lane packs its next batch while
+    /// the current one is on the device. Packing was 18% of a lane's time on a fast
+    /// net, with its GPU slot idle meanwhile. `None` packs inside `infer`.
+    fn stager(&mut self) -> Option<Stager> {
+        None
+    }
+
+    /// Run a batch the stager packed. `ids` are the batch's request ids in order.
+    fn infer_staged(
+        &mut self,
+        _staged: StagedBatch,
+        _ids: Vec<u64>,
+    ) -> Result<FinishBatch, EvaluationError> {
+        Err(EvaluationError::new("this inference service has no stager"))
     }
 
     /// Return the stage timings for the most recent `infer` call. Backends

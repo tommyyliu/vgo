@@ -8,7 +8,10 @@ use std::{
 
 use vgo_search::EvaluationError;
 
-use crate::{BatchService, FinishBatch, InferenceInput, InferenceOutput, InferenceStageMetrics};
+use crate::{
+    BatchService, FinishBatch, InferenceInput, InferenceOutput, InferenceStageMetrics, StagedBatch,
+    Stager,
+};
 
 #[derive(Debug)]
 pub struct InferenceBatch {
@@ -155,34 +158,17 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
             let worker_description = description.clone();
             let (sender, receiver) = mpsc::sync_channel::<InferenceBatch>(1);
             let completions = completion_sender.clone();
-            let join = thread::Builder::new()
-                .name(format!("vgo-inference-executor-{slot}"))
-                .spawn(move || {
-                    while let Ok(batch) = receiver.recv() {
-                        let sequence = batch.sequence;
-                        let started = Instant::now();
-                        let result = service.infer_deferred(&batch.inputs).map_err(|error| {
-                            EvaluationError::new(format!(
-                                "{worker_description} slot {slot} batch {sequence}: {error}"
-                            ))
-                        });
-                        let stages = service.last_inference_stages();
-                        let completion = result.map(|finish| CompletedBatch {
-                            sequence,
-                            slot,
-                            elapsed: started.elapsed(),
-                            stages,
-                            finish,
-                        });
-                        let failed = completion.is_err();
-                        if completions.send(completion).is_err() || failed {
-                            break;
-                        }
-                    }
-                })
-                .map_err(|error| {
-                    EvaluationError::new(format!("start inference executor {slot}: {error}"))
-                })?;
+            let join = match service.stager() {
+                None => spawn_lane(slot, worker_description, service, receiver, completions),
+                Some(stager) => spawn_staged_lane(
+                    slot,
+                    worker_description,
+                    service,
+                    stager,
+                    receiver,
+                    completions,
+                ),
+            }?;
             workers.push(ServiceWorker {
                 sender: Some(sender),
                 join: Some(join),
@@ -202,6 +188,125 @@ impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {
             pending: HashMap::new(),
         })
     }
+}
+
+type Completions = mpsc::Sender<Result<CompletedBatch, EvaluationError>>;
+
+fn lane_error(
+    description: &str,
+    slot: usize,
+    sequence: u64,
+    error: EvaluationError,
+) -> EvaluationError {
+    EvaluationError::new(format!(
+        "{description} slot {slot} batch {sequence}: {error}"
+    ))
+}
+
+/// A lane that packs, runs and returns each batch on one thread.
+fn spawn_lane<S: BatchService + 'static>(
+    slot: usize,
+    description: String,
+    mut service: S,
+    receiver: Receiver<InferenceBatch>,
+    completions: Completions,
+) -> Result<JoinHandle<()>, EvaluationError> {
+    thread::Builder::new()
+        .name(format!("vgo-inference-executor-{slot}"))
+        .spawn(move || {
+            while let Ok(batch) = receiver.recv() {
+                let sequence = batch.sequence;
+                let started = Instant::now();
+                let result = service
+                    .infer_deferred(&batch.inputs)
+                    .map_err(|error| lane_error(&description, slot, sequence, error));
+                let stages = service.last_inference_stages();
+                let completion = result.map(|finish| CompletedBatch {
+                    sequence,
+                    slot,
+                    elapsed: started.elapsed(),
+                    stages,
+                    finish,
+                });
+                let failed = completion.is_err();
+                if completions.send(completion).is_err() || failed {
+                    break;
+                }
+            }
+        })
+        .map_err(|error| EvaluationError::new(format!("start inference executor {slot}: {error}")))
+}
+
+/// A batch the stager has packed, on its way to the lane.
+struct Staged {
+    sequence: u64,
+    ids: Vec<u64>,
+    packing_nanoseconds: u64,
+    staged: Result<StagedBatch, EvaluationError>,
+}
+
+/// A lane whose packing runs on a thread of its own, one batch ahead of the run.
+///
+/// The hand-off is a rendezvous, so the stager packs at most one batch ahead and
+/// holds it until the lane is free. A slot holds at most `SLOT_DEPTH` batches, so
+/// the stager is never more than one batch behind either.
+fn spawn_staged_lane<S: BatchService + 'static>(
+    slot: usize,
+    description: String,
+    mut service: S,
+    mut stager: Stager,
+    receiver: Receiver<InferenceBatch>,
+    completions: Completions,
+) -> Result<JoinHandle<()>, EvaluationError> {
+    let (staged_sender, staged_receiver) = mpsc::sync_channel::<Staged>(0);
+    thread::Builder::new()
+        .name(format!("vgo-inference-stager-{slot}"))
+        .spawn(move || {
+            while let Ok(batch) = receiver.recv() {
+                let started = Instant::now();
+                let staged = stager(&batch.inputs);
+                let staged = Staged {
+                    sequence: batch.sequence,
+                    ids: batch.inputs.iter().map(InferenceInput::id).collect(),
+                    packing_nanoseconds: started.elapsed().as_nanos() as u64,
+                    staged,
+                };
+                if staged_sender.send(staged).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|error| EvaluationError::new(format!("start inference stager {slot}: {error}")))?;
+    thread::Builder::new()
+        .name(format!("vgo-inference-executor-{slot}"))
+        .spawn(move || {
+            while let Ok(Staged {
+                sequence,
+                ids,
+                packing_nanoseconds,
+                staged,
+            }) = staged_receiver.recv()
+            {
+                let started = Instant::now();
+                let result = staged
+                    .and_then(|staged| service.infer_staged(staged, ids))
+                    .map_err(|error| lane_error(&description, slot, sequence, error));
+                let mut stages = service.last_inference_stages();
+                stages.input_packing_nanoseconds += packing_nanoseconds;
+                let completion = result.map(|finish| CompletedBatch {
+                    sequence,
+                    slot,
+                    elapsed: started.elapsed(),
+                    stages,
+                    finish,
+                });
+                let failed = completion.is_err();
+                if completions.send(completion).is_err() || failed {
+                    break;
+                }
+            }
+        })
+        .map_err(|error| EvaluationError::new(format!("start inference executor {slot}: {error}")))
 }
 
 impl<S: BatchService + 'static> ThreadedBatchExecutorPool<S> {

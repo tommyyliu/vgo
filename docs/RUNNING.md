@@ -56,6 +56,24 @@ unless memory is short: they cost 7.7 GB of host memory against 5.2 GB at 32, an
 broker's queue runs dry on fewer cores. `vgo-bench --scaling 1,16,32` measures the CPU side
 on a new machine.
 
+**Inference lanes, 2026-11-09.** With the vgo-128 net alone on the card, generation went from
+35.2k to 42.0k positions/s (178 W to 205 W). nsys showed the GPU idle a quarter of the time
+with batches full and queued: the lanes were blocked on host copies, not starved. In order of
+gain, live, each A/B over minutes 2-5 of a 5-minute run:
+
+| Change | Positions/s | Off switch |
+|---|---|---|
+| Page-locked input and output buffers | 35.2k to 39.5k | `VGO_PINNED_IO=0` |
+| Packing on a stager thread, one batch ahead | 39.9k to 40.6k | `VGO_STAGED_PACKING=0` |
+| CUDA graph replay | 40.6k to 41.6k | `VGO_CUDA_GRAPH=0` |
+| Copies on a lane stream, not the legacy default stream | 41.6k to 42.0k | none |
+
+A third lane, spin-waiting, pinning the inference threads to their own cores, and three
+batches per lane instead of two gained nothing. Kernels now run about 64% of the time; an
+isolated benchmark of the same lanes (`lane_bench`) reaches 57k. The gap is not the hand-off
+(batches stay full and queued); actors sharing the CPU and memory are the likely cause, untested. Halving the bytes copied (8-bit dense input,
+fp16 policy output) would save about 80 us of a 1.3 ms batch and changes the model contract.
+
 Games store positions, not pictures, so a window played at 128 trains at any resolution.
 
 What the machine needs: an NVIDIA **driver** (the wheels carry their own CUDA

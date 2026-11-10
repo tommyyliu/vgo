@@ -5,6 +5,10 @@
 //!     source scripts/env/ort.sh
 //!     cargo run --release -p vgo-inference --example lane_bench -- MODEL LANES SECONDS [deferred]
 //!
+//! With `pool`, the lanes run in the generator's executor pool, packing on a stager
+//! thread unless `VGO_STAGED_PACKING=0`, and outputs are split on the main thread
+//! as the broker does.
+//!
 //! With `deferred`, each lane hands its outputs to one shared thread to split, as the
 //! broker does in the generator.
 use std::{
@@ -70,6 +74,9 @@ fn main() {
     let raster = RasterConfig::square_of(128, RasterKind::CompactRadius);
     if args.get(4).is_some_and(|a| a == "check") {
         return check(&model, raster);
+    }
+    if args.get(4).is_some_and(|a| a == "pool") {
+        return pool(&model, raster, lanes, seconds);
     }
     let inputs: Vec<InferenceInput> = positions(0)
         .iter()
@@ -156,6 +163,69 @@ fn main() {
     );
 }
 
+fn load(model: &std::path::Path, raster: RasterConfig) -> OnnxBatchService {
+    OnnxBatchService::load(&OnnxServiceConfig {
+        model: model.to_path_buf(),
+        raster,
+        policy: Some(RasterConfig::square(128)),
+        maximum_batch: BATCH,
+        provider: OnnxProvider::TensorRt,
+        device_id: 0,
+        fp16: true,
+        cache_directory: PathBuf::from("artifacts/onnx-cache"),
+    })
+    .expect("load")
+}
+
+/// The generator's executor pool, kept full: two batches per lane, as the broker does.
+fn pool(model: &std::path::Path, raster: RasterConfig, lanes: usize, seconds: f64) {
+    use vgo_inference::{InferenceBatch, ThreadedBatchExecutorPool};
+    let inputs: Vec<InferenceInput> = positions(0)
+        .iter()
+        .enumerate()
+        .map(|(i, p)| InferenceInput::packed(i as u64, rasterize_packed(p, raster)))
+        .collect();
+    let services: Vec<_> = (0..lanes).map(|_| load(model, raster)).collect();
+    let mut pool = ThreadedBatchExecutorPool::spawn(services).expect("pool");
+    let mut sequence = 0u64;
+    let mut run = |pool: &mut ThreadedBatchExecutorPool<OnnxBatchService>, until: Instant| {
+        let (mut batches, mut pack, mut session, mut lane, mut split) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
+        while Instant::now() < until {
+            while pool.in_flight() < pool.capacity() {
+                pool.submit(InferenceBatch::new(sequence, inputs.clone()).expect("batch"))
+                    .expect("submit");
+                sequence += 1;
+            }
+            let done = pool.receive().expect("receive");
+            let stages = done.stages();
+            pack += stages.input_packing_nanoseconds;
+            session += stages.session_run_nanoseconds;
+            lane += done.elapsed().as_nanos() as u64;
+            let (outputs, took) = done.finish().expect("finish");
+            assert_eq!(outputs.len(), BATCH);
+            split += took.as_nanos() as u64;
+            batches += 1;
+        }
+        (batches, pack, session, lane, split)
+    };
+    run(&mut pool, Instant::now() + Duration::from_secs(5));
+    let started = Instant::now();
+    let (batches, pack, session, lane, split) =
+        run(&mut pool, started + Duration::from_secs_f64(seconds));
+    let elapsed = started.elapsed().as_secs_f64();
+    let ms = |total: u64| total as f64 / batches as f64 / 1e6;
+    println!(
+        "pool lanes {lanes} staged={}: {:.0} positions/s | per batch: pack {:.3} ms, session {:.3} ms, lane busy {:.3} ms, split {:.3} ms",
+        std::env::var("VGO_STAGED_PACKING").unwrap_or_else(|_| "1".into()),
+        batches as f64 * BATCH as f64 / elapsed,
+        ms(pack),
+        ms(session),
+        ms(lane),
+        ms(split),
+    );
+}
+
 /// The pinned path against the ordinary one: same inputs, outputs must match.
 fn check(model: &std::path::Path, raster: RasterConfig) {
     let load = |pinned: bool| {
@@ -175,6 +245,9 @@ fn check(model: &std::path::Path, raster: RasterConfig) {
     };
     let mut plain = load(false);
     let mut pinned = load(true);
+    let mut stager = pinned
+        .stager()
+        .expect("a pinned packed service has a stager");
     let mut worst = (0.0f32, 0.0f64);
     for (seed, size) in [(1, 32), (2, 32), (3, 7), (4, 32), (5, 1), (6, 32), (7, 32)] {
         let inputs: Vec<InferenceInput> = positions(seed)[..size]
@@ -185,20 +258,25 @@ fn check(model: &std::path::Path, raster: RasterConfig) {
             })
             .collect();
         let expected = plain.infer(&inputs).expect("plain");
-        let got = pinned.infer_deferred(&inputs).expect("pinned")().expect("finish");
-        assert_eq!(got.len(), expected.len());
-        for (a, b) in got.iter().zip(&expected) {
-            assert_eq!(a.id(), b.id());
-            let policy = a
-                .policy()
-                .iter()
-                .zip(b.policy())
-                .map(|(x, y)| (x - y).abs())
-                .fold(0.0, f32::max);
-            worst = (
-                worst.0.max(policy),
-                worst.1.max((a.current_value() - b.current_value()).abs()),
-            );
+        let deferred = pinned.infer_deferred(&inputs).expect("pinned")().expect("finish");
+        let ids = inputs.iter().map(InferenceInput::id).collect();
+        let staged_inputs = stager(&inputs).expect("stage");
+        let staged = pinned.infer_staged(staged_inputs, ids).expect("staged")().expect("finish");
+        for got in [&deferred, &staged] {
+            assert_eq!(got.len(), expected.len());
+            for (a, b) in got.iter().zip(&expected) {
+                assert_eq!(a.id(), b.id());
+                let policy = a
+                    .policy()
+                    .iter()
+                    .zip(b.policy())
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0, f32::max);
+                worst = (
+                    worst.0.max(policy),
+                    worst.1.max((a.current_value() - b.current_value()).abs()),
+                );
+            }
         }
         println!(
             "seed {seed} batch {size}: worst policy diff so far {:.2e}, value {:.2e}",
@@ -209,5 +287,5 @@ fn check(model: &std::path::Path, raster: RasterConfig) {
         worst.0 < 1e-3 && worst.1 < 1e-3,
         "pinned outputs differ: {worst:?}"
     );
-    println!("pinned path matches");
+    println!("pinned and staged paths match");
 }

@@ -121,6 +121,54 @@ impl BatchService for DeferringService {
     }
 }
 
+/// Packs on the stager and checks, on the lane, that the packed batch is the one it
+/// was given: each output's value is the packed copy of its id.
+struct PackingService {
+    threads: Arc<Mutex<(Option<thread::ThreadId>, Option<thread::ThreadId>)>>,
+    fail: bool,
+}
+
+impl BatchService for PackingService {
+    fn contract(&self) -> BatchContract {
+        test_contract(2)
+    }
+
+    fn infer(
+        &mut self,
+        _batch: &[InferenceInput],
+    ) -> Result<Vec<InferenceOutput>, EvaluationError> {
+        unreachable!("the executor calls infer_staged")
+    }
+
+    fn stager(&mut self) -> Option<crate::Stager> {
+        let (threads, fail) = (Arc::clone(&self.threads), self.fail);
+        Some(Box::new(move |batch: &[InferenceInput]| {
+            thread::sleep(Duration::from_millis(2));
+            threads.lock().unwrap().0 = Some(thread::current().id());
+            if fail {
+                return Err(EvaluationError::new("synthetic packing failure"));
+            }
+            let packed: Vec<u64> = batch.iter().map(InferenceInput::id).collect();
+            Ok(Box::new(packed) as crate::StagedBatch)
+        }))
+    }
+
+    fn infer_staged(
+        &mut self,
+        staged: crate::StagedBatch,
+        ids: Vec<u64>,
+    ) -> Result<FinishBatch, EvaluationError> {
+        self.threads.lock().unwrap().1 = Some(thread::current().id());
+        let packed = *staged.downcast::<Vec<u64>>().unwrap();
+        Ok(Box::new(move || {
+            ids.iter()
+                .zip(&packed)
+                .map(|(&id, &value)| InferenceOutput::new(id, value as f64 / 1e6, vec![0.0; 5]))
+                .collect()
+        }))
+    }
+}
+
 impl BatchService for FailingService {
     fn contract(&self) -> BatchContract {
         test_contract(2)
@@ -572,6 +620,41 @@ fn deferred_host_work_runs_off_the_lane_and_is_counted() {
     let metrics = pool.metrics();
     assert!(metrics.output_materialization_nanoseconds >= 3_000_000);
     assert_eq!(metrics.failures, 0);
+}
+
+#[test]
+fn staged_packing_runs_on_its_own_thread_and_is_counted() {
+    let threads = Arc::new(Mutex::new((None, None)));
+    let service = PackingService {
+        threads: Arc::clone(&threads),
+        fail: false,
+    };
+    let pool = BatchedEvaluatorPool::spawn(broker_config(), vec![service]).unwrap();
+    for _ in 0..3 {
+        pool.evaluate(&Position::new(0.1, Vec::new(), Color::Black))
+            .unwrap();
+    }
+    let (packer, lane) = *threads.lock().unwrap();
+    let (packer, lane) = (packer.expect("packed"), lane.expect("ran"));
+    assert_ne!(packer, lane);
+    assert_ne!(packer, thread::current().id());
+    let metrics = pool.metrics();
+    assert!(metrics.input_packing_nanoseconds >= 3 * 2_000_000);
+    assert_eq!(metrics.failures, 0);
+}
+
+#[test]
+fn a_failed_staging_reaches_the_caller() {
+    let service = PackingService {
+        threads: Arc::new(Mutex::new((None, None))),
+        fail: true,
+    };
+    let pool = BatchedEvaluatorPool::spawn(broker_config(), vec![service]).unwrap();
+    let error = match pool.evaluate(&Position::new(0.1, Vec::new(), Color::Black)) {
+        Ok(_) => panic!("a packing failure should reach the caller"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("synthetic packing failure"));
 }
 
 #[test]

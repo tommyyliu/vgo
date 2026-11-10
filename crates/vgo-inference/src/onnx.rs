@@ -9,9 +9,11 @@ use std::{
 use half::f16;
 use ort::{
     ep,
+    memory::Allocator,
     memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType},
     session::{IoBinding, Session, builder::GraphOptimizationLevel},
-    value::{DynTensorValueType, DynValue, TensorRef},
+    value::TensorElementType,
+    value::{DynTensor, DynTensorValueType, DynValue, TensorRef},
 };
 use sha2::{Digest, Sha256};
 use vgo_raster::RasterConfig;
@@ -20,7 +22,7 @@ use vgo_search::EvaluationError;
 
 use crate::{
     BatchContract, BatchService, FinishBatch, InferenceInput, InferenceOutput,
-    InferenceStageMetrics, InputLayout,
+    InferenceStageMetrics, InputLayout, StagedBatch, Stager,
 };
 
 const MODEL_SCHEMA: &str = "vgo.raster-policy-value.onnx.v1";
@@ -118,6 +120,49 @@ struct PinnedIo {
     /// sized for the maximum batch at load.
     _staging: Vec<vgo_pinned::Lock>,
     pool: (mpsc::Sender<HostOutputs>, mpsc::Receiver<HostOutputs>),
+    /// This lane's copies, off the legacy default stream; see `vgo_pinned::CopyStream`.
+    stream: vgo_pinned::CopyStream,
+    /// Fixed device inputs for a session that replays a CUDA graph.
+    graph: Option<GraphInputs>,
+}
+
+/// Device inputs at fixed addresses, bound once, with the outputs likewise bound
+/// once to tensors of the full batch.
+///
+/// TensorRT's CUDA-graph mode records the first run's kernels with their buffer
+/// addresses and replays them, so every run must read the same buffers at the same
+/// shape. Each batch is copied into these and short batches run padded to the
+/// maximum: rows are independent, the stale rows past the batch are never read,
+/// and nearly every live batch is full anyway. A replay launches the whole net in
+/// one call instead of one launch per kernel.
+struct GraphInputs {
+    bits: DynTensor,
+    dense: DynTensor,
+    scalars: DynTensor,
+    _allocator: Allocator,
+    /// Runs so far, to know when this session is still recording its graph.
+    runs: u32,
+}
+
+/// Runs a session makes before its graph is surely recorded. ONNX Runtime records
+/// on an early run; the margin costs only a few exclusive runs at start.
+const RECORDING_RUNS: u32 = 4;
+
+/// Held shared by every graph-mode run and exclusively by a session that may be
+/// recording. While a stream records, CUDA rejects synchronous calls from any
+/// thread, so another lane's copies broke the recording ("operation not permitted
+/// when stream is capturing") and crashed about one start in two with two lanes.
+static RECORDING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// A lane's hold on [`RECORDING`] for one run.
+enum RecordingGuard {
+    Exclusive(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>),
+    Shared(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>),
+}
+
+/// Set `VGO_CUDA_GRAPH=0` to launch kernels one by one instead, for comparison.
+fn cuda_graph_wanted() -> bool {
+    std::env::var("VGO_CUDA_GRAPH").map_or(true, |value| value != "0")
 }
 
 /// One batch's outputs in locked host memory.
@@ -152,17 +197,67 @@ fn pinned_io_wanted() -> bool {
 
 fn pinned_io(
     session: &Session,
-    device: i32,
+    config: &OnnxServiceConfig,
+    graph: bool,
     bits: &mut Vec<u8>,
     halves: &mut Vec<f16>,
     scalars: &mut Vec<f16>,
 ) -> Result<PinnedIo, EvaluationError> {
+    let device = config.device_id;
     let lock = |error: vgo_pinned::Error| EvaluationError::new(error.0);
+    let ort = |error| evaluation_error("bind pinned ONNX buffers", error);
+    let mut binding = session.create_binding().map_err(ort)?;
+    let graph = if graph {
+        let allocator = Allocator::new(
+            session,
+            MemoryInfo::new(
+                AllocationDevice::CUDA,
+                device,
+                AllocatorType::Device,
+                MemoryType::Default,
+            )
+            .map_err(ort)?,
+        )
+        .map_err(ort)?;
+        let layout = packed_layout_for(config.raster.kind)
+            .expect("checked at load that the raster kind has a packed layout");
+        let (raster, batch) = (config.raster, config.maximum_batch);
+        let policy_size = config.policy.unwrap_or(config.raster).pixels() + 1;
+        let tensor = |kind, shape: Vec<usize>| DynTensor::new(&allocator, kind, shape).map_err(ort);
+        let bits = tensor(
+            TensorElementType::Uint8,
+            vec![batch, layout.binary.len(), bit_plane_bytes(raster.pixels())],
+        )?;
+        let dense = tensor(
+            TensorElementType::Float16,
+            vec![batch, layout.continuous.len(), raster.height, raster.width],
+        )?;
+        let scalars = tensor(TensorElementType::Float16, vec![batch, layout.scalar.len()])?;
+        let policy = tensor(TensorElementType::Float32, vec![batch, policy_size])?;
+        let values = tensor(TensorElementType::Float32, vec![batch])?;
+        let inputs = GraphInputs {
+            bits,
+            dense,
+            scalars,
+            _allocator: allocator,
+            runs: 0,
+        };
+        binding.bind_input("bits", &inputs.bits).map_err(ort)?;
+        binding.bind_input("dense", &inputs.dense).map_err(ort)?;
+        binding
+            .bind_input("scalars", &inputs.scalars)
+            .map_err(ort)?;
+        binding.bind_output("policy_logits", policy).map_err(ort)?;
+        binding.bind_output("values", values).map_err(ort)?;
+        Some(inputs)
+    } else {
+        None
+    };
     Ok(PinnedIo {
         device,
-        binding: session
-            .create_binding()
-            .map_err(|error| evaluation_error("bind pinned ONNX buffers", error))?,
+        stream: vgo_pinned::CopyStream::new(device).map_err(lock)?,
+        binding,
+        graph,
         // Staging is filled in place each batch and sized for the maximum batch at
         // load, so it never reallocates.
         _staging: vec![
@@ -231,6 +326,12 @@ impl OnnxBatchService {
             .with_intra_threads(1)
             .map_err(|error| evaluation_error("configure ONNX threads", error))?;
 
+        // A graph replays fixed buffers, so it needs the pinned path's bound inputs,
+        // which only a packed model has.
+        let graph = config.provider == OnnxProvider::TensorRt
+            && file_declares_packed_input(&model)
+            && pinned_io_wanted()
+            && cuda_graph_wanted();
         builder = match config.provider {
             OnnxProvider::Cpu => builder,
             OnnxProvider::Cuda => builder
@@ -255,6 +356,7 @@ impl OnnxBatchService {
                 let cache = path_text(&cache_directory)?;
                 let timing_cache = path_text(&timing_directory)?;
                 let tensorrt = ep::TensorRT::default()
+                    .with_cuda_graph(graph)
                     .with_device_id(config.device_id)
                     .with_fp16(config.fp16)
                     .with_engine_cache(true)
@@ -282,14 +384,10 @@ impl OnnxBatchService {
                 // 40 s, with the card at 100% and 60 W, until the watchdog ended it.
                 // The cause is not known, so keep to two.
                 //
-                // trt_cuda_graph_enable is deliberately absent. It panics here
-                // ("expected typeinfo_ptr to not be null") because ORT's
-                // CUDA-graph mode needs outputs bound to pre-allocated device
-                // buffers, while this path calls Run() and lets the allocator
-                // produce them. Using it means IoBinding plus a fixed batch
-                // shape; the upside is bounded by launch overhead, which
-                // batch-1 throughput puts at roughly 0.5ms of the 2.7ms
-                // batch-32 inference.
+                // trt_cuda_graph_enable is set when the pinned path runs: it needs
+                // outputs bound to pre-allocated device buffers and a fixed shape
+                // (see `GraphInputs`). Through plain Run() it panics ("expected
+                // typeinfo_ptr to not be null").
                 builder
                     .with_execution_providers([
                         tensorrt.build().error_on_failure(),
@@ -316,19 +414,16 @@ impl OnnxBatchService {
                 config.raster.kind
             )));
         }
-        let (mut bits, mut halves, mut scalars) = match (input_layout, layout) {
-            (InputLayout::Packed, Some(layout)) => (
-                Vec::with_capacity(
-                    config.maximum_batch
-                        * layout.binary.len()
-                        * bit_plane_bytes(config.raster.pixels()),
-                ),
-                Vec::with_capacity(
-                    config.maximum_batch * layout.continuous.len() * config.raster.pixels(),
-                ),
-                Vec::with_capacity(config.maximum_batch * layout.scalar.len()),
-            ),
-            _ => (Vec::new(), Vec::new(), Vec::new()),
+        let (mut bits, mut halves, mut scalars) = match input_layout {
+            InputLayout::Packed => {
+                let (bits, halves, scalars) = staging_sizes(config.raster, config.maximum_batch);
+                (
+                    Vec::with_capacity(bits),
+                    Vec::with_capacity(halves),
+                    Vec::with_capacity(scalars),
+                )
+            }
+            InputLayout::Dense => (Vec::new(), Vec::new(), Vec::new()),
         };
         let states = match input_layout {
             InputLayout::Dense => Vec::with_capacity(state_capacity),
@@ -337,7 +432,7 @@ impl OnnxBatchService {
         let pinned = (config.provider != OnnxProvider::Cpu
             && input_layout == InputLayout::Packed
             && pinned_io_wanted())
-        .then(|| match pinned_io(&session, config.device_id, &mut bits, &mut halves, &mut scalars) {
+        .then(|| match pinned_io(&session, config, graph, &mut bits, &mut halves, &mut scalars) {
             Ok(io) => Some(io),
             Err(error) => {
                 eprintln!("[inference] pinned host buffers unavailable, staging through ordinary memory: {error}");
@@ -345,6 +440,12 @@ impl OnnxBatchService {
             }
         })
         .flatten();
+        if graph && pinned.is_none() {
+            // The session would replay its first run's buffers on every call.
+            return Err(EvaluationError::new(
+                "CUDA graph mode needs pinned buffers; set VGO_CUDA_GRAPH=0",
+            ));
+        }
         Ok(Self {
             description: format!(
                 "model={} provider={} device={}",
@@ -427,97 +528,31 @@ impl OnnxBatchService {
                 self.session.run(ort::inputs! {"states" => input})
             }
             InputLayout::Packed => {
-                let layout = packed_layout_for(self.raster.kind)
-                    .expect("checked at load that the raster kind has a packed layout");
-                self.bits.clear();
-                self.halves.clear();
-                self.scalars.clear();
-                for input in batch {
-                    let raster = input.packed_raster().ok_or_else(|| {
-                        EvaluationError::new(
-                            "packed model received a dense raster; the generator and the \
-                             model disagree about the input layout",
-                        )
-                    })?;
-                    self.bits.extend_from_slice(raster.bits());
-                    self.halves.extend_from_slice(raster.dense());
-                    self.scalars.extend_from_slice(raster.scalars());
-                }
-                let pixels = self.raster.pixels();
-                let bits = TensorRef::from_array_view((
-                    [batch.len(), layout.binary.len(), bit_plane_bytes(pixels)],
-                    self.bits.as_slice(),
-                ))
-                .map_err(|error| evaluation_error("construct ONNX bits tensor", error))?;
-                let dense = TensorRef::from_array_view((
-                    [
-                        batch.len(),
-                        layout.continuous.len(),
-                        self.raster.height,
-                        self.raster.width,
-                    ],
-                    self.halves.as_slice(),
-                ))
-                .map_err(|error| evaluation_error("construct ONNX dense tensor", error))?;
-                let scalars = TensorRef::from_array_view((
-                    [batch.len(), layout.scalar.len()],
-                    self.scalars.as_slice(),
-                ))
-                .map_err(|error| evaluation_error("construct ONNX scalars tensor", error))?;
+                pack(batch, &mut self.bits, &mut self.halves, &mut self.scalars)?;
                 if let Some(io) = self.pinned.as_mut() {
-                    let ort = |error| evaluation_error("bind pinned ONNX buffers", error);
-                    io.binding.bind_input("bits", &bits).map_err(ort)?;
-                    io.binding.bind_input("dense", &dense).map_err(ort)?;
-                    io.binding.bind_input("scalars", &scalars).map_err(ort)?;
-                    let device_memory = MemoryInfo::new(
-                        AllocationDevice::CUDA,
-                        io.device,
-                        AllocatorType::Device,
-                        MemoryType::Default,
-                    )
-                    .map_err(ort)?;
-                    io.binding
-                        .bind_output_to_device("policy_logits", &device_memory)
-                        .map_err(ort)?;
-                    io.binding
-                        .bind_output_to_device("values", &device_memory)
-                        .map_err(ort)?;
                     self.last_stages.input_packing_nanoseconds =
                         packing_started.elapsed().as_nanos() as u64;
                     let session_started = Instant::now();
-                    let mut outputs = self
-                        .session
-                        .run_binding(&io.binding)
-                        .map_err(|error| evaluation_error("run ONNX inference", error))?;
-                    let size = batch.len();
-                    let policy_size = self.policy.pixels() + 1;
-                    let mut host = match io.pool.1.try_recv() {
-                        Ok(host) => host,
-                        Err(_) => HostOutputs::new(io.device, self.maximum_batch, policy_size)?,
-                    };
-                    for (name, target) in [
-                        ("policy_logits", &mut host.policy[..size * policy_size]),
-                        ("values", &mut host.values[..size]),
-                    ] {
-                        let tensor = outputs
-                            .remove(name)
-                            .ok_or_else(|| {
-                                EvaluationError::new(format!("ONNX output {name} is missing"))
-                            })?
-                            .downcast::<DynTensorValueType>()
-                            .map_err(|error| evaluation_error("read ONNX output", error))?;
-                        vgo_pinned::copy_to_host(io.device, tensor, target)
-                            .map_err(|error| EvaluationError::new(format!("{name}: {error}")))?;
-                    }
+                    let raw = run_pinned(
+                        &mut self.session,
+                        io,
+                        self.raster,
+                        (&self.bits, &self.halves, &self.scalars),
+                        batch.len(),
+                        self.maximum_batch,
+                        self.policy.pixels() + 1,
+                    );
                     self.last_stages.session_run_nanoseconds =
                         session_started.elapsed().as_nanos() as u64;
-                    return Ok(RawOutputs::Host {
-                        host,
-                        size,
-                        policy_size,
-                        back: io.pool.0.clone(),
-                    });
+                    return raw;
                 }
+                let (bits, dense, scalars) = packed_tensors(
+                    self.raster,
+                    batch.len(),
+                    &self.bits,
+                    &self.halves,
+                    &self.scalars,
+                )?;
                 self.last_stages.input_packing_nanoseconds =
                     packing_started.elapsed().as_nanos() as u64;
                 session_started = Instant::now();
@@ -538,6 +573,203 @@ impl OnnxBatchService {
             .ok_or_else(|| EvaluationError::new("ONNX output values is missing"))?;
         Ok(RawOutputs::Session { policy, values })
     }
+}
+
+/// Elements of packed staging for a full batch: bit bytes, dense halves, scalars.
+fn staging_sizes(raster: RasterConfig, maximum_batch: usize) -> (usize, usize, usize) {
+    let layout = packed_layout_for(raster.kind)
+        .expect("checked at load that the raster kind has a packed layout");
+    (
+        maximum_batch * layout.binary.len() * bit_plane_bytes(raster.pixels()),
+        maximum_batch * layout.continuous.len() * raster.pixels(),
+        maximum_batch * layout.scalar.len(),
+    )
+}
+
+/// Pack a batch's rasters end to end into the staging vectors.
+fn pack(
+    batch: &[InferenceInput],
+    bits: &mut Vec<u8>,
+    halves: &mut Vec<f16>,
+    scalars: &mut Vec<f16>,
+) -> Result<(), EvaluationError> {
+    bits.clear();
+    halves.clear();
+    scalars.clear();
+    for input in batch {
+        let raster = input.packed_raster().ok_or_else(|| {
+            EvaluationError::new(
+                "packed model received a dense raster; the generator and the \
+                 model disagree about the input layout",
+            )
+        })?;
+        bits.extend_from_slice(raster.bits());
+        halves.extend_from_slice(raster.dense());
+        scalars.extend_from_slice(raster.scalars());
+    }
+    Ok(())
+}
+
+type PackedTensors<'a> = (TensorRef<'a, u8>, TensorRef<'a, f16>, TensorRef<'a, f16>);
+
+/// Views of packed staging as the model's three inputs.
+fn packed_tensors<'a>(
+    raster: RasterConfig,
+    size: usize,
+    bits: &'a [u8],
+    halves: &'a [f16],
+    scalars: &'a [f16],
+) -> Result<PackedTensors<'a>, EvaluationError> {
+    let layout = packed_layout_for(raster.kind)
+        .expect("checked at load that the raster kind has a packed layout");
+    let bits = TensorRef::from_array_view((
+        [size, layout.binary.len(), bit_plane_bytes(raster.pixels())],
+        bits,
+    ))
+    .map_err(|error| evaluation_error("construct ONNX bits tensor", error))?;
+    let dense = TensorRef::from_array_view((
+        [size, layout.continuous.len(), raster.height, raster.width],
+        halves,
+    ))
+    .map_err(|error| evaluation_error("construct ONNX dense tensor", error))?;
+    let scalars = TensorRef::from_array_view(([size, layout.scalar.len()], scalars))
+        .map_err(|error| evaluation_error("construct ONNX scalars tensor", error))?;
+    Ok((bits, dense, scalars))
+}
+
+/// Run packed inputs from locked staging and copy the outputs into a pooled
+/// locked buffer.
+#[allow(clippy::too_many_arguments)]
+fn run_pinned(
+    session: &mut Session,
+    io: &mut PinnedIo,
+    raster: RasterConfig,
+    (bits, halves, scalars): (&[u8], &[f16], &[f16]),
+    size: usize,
+    maximum_batch: usize,
+    policy_size: usize,
+) -> Result<RawOutputs, EvaluationError> {
+    let ort = |error| evaluation_error("bind pinned ONNX buffers", error);
+    // Held until the outputs are copied back: those copies are synchronous too.
+    let _recording = io.graph.as_mut().map(|graph| {
+        graph.runs = graph.runs.saturating_add(1);
+        if graph.runs <= RECORDING_RUNS {
+            RecordingGuard::Exclusive(RECORDING.write().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            RecordingGuard::Shared(RECORDING.read().unwrap_or_else(|e| e.into_inner()))
+        }
+    });
+    if let Some(graph) = io.graph.as_mut() {
+        // Bound once at load; only the contents change.
+        for result in [
+            vgo_pinned::copy_to_device(&io.stream, bits, &mut graph.bits),
+            vgo_pinned::copy_to_device(&io.stream, halves, &mut graph.dense),
+            vgo_pinned::copy_to_device(&io.stream, scalars, &mut graph.scalars),
+        ] {
+            result.map_err(|error| EvaluationError::new(error.0))?;
+        }
+    } else {
+        let (bits, dense, scalars) = packed_tensors(raster, size, bits, halves, scalars)?;
+        io.binding.bind_input("bits", &bits).map_err(ort)?;
+        io.binding.bind_input("dense", &dense).map_err(ort)?;
+        io.binding.bind_input("scalars", &scalars).map_err(ort)?;
+        // MemoryInfo isn't Send, so it can't be kept in the service.
+        let device_memory = MemoryInfo::new(
+            AllocationDevice::CUDA,
+            io.device,
+            AllocatorType::Device,
+            MemoryType::Default,
+        )
+        .map_err(ort)?;
+        io.binding
+            .bind_output_to_device("policy_logits", &device_memory)
+            .map_err(ort)?;
+        io.binding
+            .bind_output_to_device("values", &device_memory)
+            .map_err(ort)?;
+    }
+    let mut outputs = session
+        .run_binding(&io.binding)
+        .map_err(|error| evaluation_error("run ONNX inference", error))?;
+    let mut host = match io.pool.1.try_recv() {
+        Ok(host) => host,
+        Err(_) => HostOutputs::new(io.device, maximum_batch, policy_size)?,
+    };
+    for (name, target) in [
+        ("policy_logits", &mut host.policy[..size * policy_size]),
+        ("values", &mut host.values[..size]),
+    ] {
+        let tensor = outputs
+            .remove(name)
+            .ok_or_else(|| EvaluationError::new(format!("ONNX output {name} is missing")))?
+            .downcast::<DynTensorValueType>()
+            .map_err(|error| evaluation_error("read ONNX output", error))?;
+        // A graph runs the full batch; otherwise the run is exactly this batch.
+        let rows = if io.graph.is_some() {
+            maximum_batch
+        } else {
+            size
+        };
+        let shape = tensor.shape();
+        if shape.first().copied() != Some(rows as i64) {
+            return Err(EvaluationError::new(format!(
+                "ONNX output {name} has shape {shape}, expected {rows} rows"
+            )));
+        }
+        vgo_pinned::copy_to_host(&io.stream, tensor, target)
+            .map_err(|error| EvaluationError::new(format!("{name}: {error}")))?;
+    }
+    Ok(RawOutputs::Host {
+        host,
+        size,
+        policy_size,
+        back: io.pool.0.clone(),
+    })
+}
+
+/// One batch's packed inputs in locked memory, filled by the stager thread and
+/// returned to its pool once the lane has run them.
+struct StagedInputs {
+    // Declared first so the locks are released before the memory is freed.
+    _locks: [vgo_pinned::Lock; 3],
+    bits: Vec<u8>,
+    halves: Vec<f16>,
+    scalars: Vec<f16>,
+    size: usize,
+    back: mpsc::Sender<StagedInputs>,
+}
+
+impl StagedInputs {
+    fn new(
+        device: i32,
+        raster: RasterConfig,
+        maximum_batch: usize,
+        back: mpsc::Sender<Self>,
+    ) -> Result<Self, EvaluationError> {
+        let (bits_size, halves_size, scalars_size) = staging_sizes(raster, maximum_batch);
+        let mut bits = Vec::with_capacity(bits_size);
+        let mut halves = Vec::with_capacity(halves_size);
+        let mut scalars = Vec::with_capacity(scalars_size);
+        let lock = |error: vgo_pinned::Error| EvaluationError::new(error.0);
+        let locks = [
+            vgo_pinned::Lock::new(device, &mut bits).map_err(lock)?,
+            vgo_pinned::Lock::new(device, &mut halves).map_err(lock)?,
+            vgo_pinned::Lock::new(device, &mut scalars).map_err(lock)?,
+        ];
+        Ok(Self {
+            _locks: locks,
+            bits,
+            halves,
+            scalars,
+            size: 0,
+            back,
+        })
+    }
+}
+
+/// Set `VGO_STAGED_PACKING=0` to pack on the lane instead, for comparison.
+fn staged_packing_wanted() -> bool {
+    std::env::var("VGO_STAGED_PACKING").map_or(true, |value| value != "0")
 }
 
 impl BatchService for OnnxBatchService {
@@ -569,6 +801,73 @@ impl BatchService for OnnxBatchService {
         let raw = self.run_batch(batch)?;
         let ids: Vec<u64> = batch.iter().map(InferenceInput::id).collect();
         let policy_size = self.policy.pixels() + 1;
+        Ok(Box::new(move || materialize(raw, &ids, policy_size)))
+    }
+
+    fn stager(&mut self) -> Option<Stager> {
+        let device = self.pinned.as_ref()?.device;
+        if self.input_layout != InputLayout::Packed || !staged_packing_wanted() {
+            return None;
+        }
+        let (raster, maximum_batch) = (self.raster, self.maximum_batch);
+        let (back, pool) = mpsc::channel::<StagedInputs>();
+        Some(Box::new(move |batch: &[InferenceInput]| {
+            if batch.is_empty() || batch.len() > maximum_batch {
+                return Err(EvaluationError::new(format!(
+                    "ONNX batch size {} is outside supported range 1..{maximum_batch}",
+                    batch.len()
+                )));
+            }
+            if batch.iter().any(|input| input.config() != raster) {
+                return Err(EvaluationError::new("ONNX batch raster shape mismatch"));
+            }
+            let mut staged = match pool.try_recv() {
+                Ok(staged) => staged,
+                Err(_) => StagedInputs::new(device, raster, maximum_batch, back.clone())?,
+            };
+            pack(
+                batch,
+                &mut staged.bits,
+                &mut staged.halves,
+                &mut staged.scalars,
+            )?;
+            staged.size = batch.len();
+            Ok(Box::new(staged) as StagedBatch)
+        }))
+    }
+
+    fn infer_staged(
+        &mut self,
+        staged: StagedBatch,
+        ids: Vec<u64>,
+    ) -> Result<FinishBatch, EvaluationError> {
+        self.last_stages = InferenceStageMetrics::default();
+        let staged = staged
+            .downcast::<StagedInputs>()
+            .map_err(|_| EvaluationError::new("staged batch is not from this service"))?;
+        let io = self
+            .pinned
+            .as_mut()
+            .ok_or_else(|| EvaluationError::new("staged batch without pinned buffers"))?;
+        if staged.size != ids.len() {
+            return Err(EvaluationError::new("staged batch does not match its ids"));
+        }
+        let policy_size = self.policy.pixels() + 1;
+        let started = Instant::now();
+        let raw = run_pinned(
+            &mut self.session,
+            io,
+            self.raster,
+            (&staged.bits, &staged.halves, &staged.scalars),
+            staged.size,
+            self.maximum_batch,
+            policy_size,
+        );
+        self.last_stages.session_run_nanoseconds = started.elapsed().as_nanos() as u64;
+        // The run has finished with the inputs; the stager may refill them.
+        let back = staged.back.clone();
+        let _ = back.send(*staged);
+        let raw = raw?;
         Ok(Box::new(move || materialize(raw, &ids, policy_size)))
     }
 

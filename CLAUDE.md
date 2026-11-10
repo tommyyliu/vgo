@@ -70,5 +70,8 @@ needs about 7 minutes before games finish.
 `nvidia-smi` utilization and busy cores can both sit below 100% with work queued, which means a
 hand-off is stalling, not that a resource is short. Broker telemetry shows which: look for
 `completion_wait_seconds` near 1 with positions in the channel and the lanes not busy.
+When the card is below full use with batches queued, trace it with `nsys profile --trace=cuda,osrt
+--cuda-graph-trace=node` before guessing: copies through pageable memory and on the legacy
+default stream cost 19% that no other measurement showed. See "Inference lanes" in `docs/RUNNING.md`.
 
 Bigger nets are closed in `docs/FINDINGS.md`. Tree reuse is parked in `dashboard/ideas.json`.
