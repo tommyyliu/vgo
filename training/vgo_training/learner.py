@@ -687,18 +687,21 @@ class ReplayView:
             shard_ids = shard_ids[order]
             rows = rows[order]
 
+        # Group each batch by shard with one stable sort: parts in shard order,
+        # rows within a part in batch order. Scanning every shard per batch did
+        # the same in batches x shards tensor ops -- 1e8 at a 900k window (about
+        # a tenth of an update) and 1e9 at 3M, called three times an update.
         batches: list[BatchSpec] = []
         for start in range(0, rows.numel(), batch_size):
             stop = min(start + batch_size, rows.numel())
             batch_shards = shard_ids[start:stop]
-            batch_rows = rows[start:stop]
+            order = torch.argsort(batch_shards, stable=True)
+            present, counts = torch.unique_consecutive(batch_shards[order], return_counts=True)
             parts = tuple(
-                BatchPart(
-                    selection.shard,
-                    batch_rows[batch_shards == index],
+                BatchPart(self.selections[index].shard, part_rows)
+                for index, part_rows in zip(
+                    present.tolist(), torch.split(rows[start:stop][order], counts.tolist())
                 )
-                for index, selection in enumerate(self.selections)
-                if bool((batch_shards == index).any())
             )
             transform = (
                 int(

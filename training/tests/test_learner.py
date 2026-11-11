@@ -84,6 +84,73 @@ def cache_fixture(directory: Path) -> tuple[ReplayCache, Path, list[int]]:
     return ReplayCache(loader=load), path, loads
 
 
+def scanned_batches(view, batch_size, *, shuffle, generator=None, augment=False):
+    """`ReplayView.batches` as it was: every shard scanned for every batch.
+
+    Kept as the reference the grouped version must reproduce exactly. It costs
+    batches x shards tensor ops, which is why it was replaced.
+    """
+    from vgo_training.learner import DIHEDRAL_TRANSFORMS, BatchPart, BatchSpec
+
+    shard_ids = torch.cat([
+        torch.full((selection.rows.numel(),), index, dtype=torch.int64)
+        for index, selection in enumerate(view.selections)
+    ])
+    rows = torch.cat([selection.rows for selection in view.selections])
+    if shuffle and rows.numel() > 1:
+        order = torch.randperm(rows.numel(), generator=generator)
+        shard_ids, rows = shard_ids[order], rows[order]
+    batches = []
+    for start in range(0, rows.numel(), batch_size):
+        batch_shards, batch_rows = shard_ids[start:start + batch_size], rows[start:start + batch_size]
+        parts = tuple(
+            BatchPart(selection.shard, batch_rows[batch_shards == index])
+            for index, selection in enumerate(view.selections)
+            if bool((batch_shards == index).any())
+        )
+        transform = (
+            int(torch.randint(len(DIHEDRAL_TRANSFORMS), (1,), generator=generator).item())
+            if augment else 0
+        )
+        batches.append(BatchSpec(parts, transform))
+    return batches
+
+
+class ReplayViewBatchTests(unittest.TestCase):
+    def test_batches_match_the_per_shard_scan(self) -> None:
+        from vgo_training.learner import ReplayView, ShardSelection
+
+        sizes = torch.Generator().manual_seed(7)
+        for case in range(40):
+            shards = int(torch.randint(1, 30, (1,), generator=sizes).item())
+            selections = tuple(
+                # Distinct objects stand in for shards: batches() only carries them.
+                ShardSelection(object(), torch.randperm(50, generator=sizes)[
+                    : int(torch.randint(0, 12, (1,), generator=sizes).item())
+                ])
+                for _ in range(shards)
+            )
+            view = ReplayView(selections)
+            for batch_size in (1, 5, 64):
+                for shuffle, augment in ((False, False), (True, False), (True, True)):
+                    seed = 1000 * case + batch_size
+                    expected = scanned_batches(
+                        view, batch_size, shuffle=shuffle, augment=augment,
+                        generator=torch.Generator().manual_seed(seed),
+                    )
+                    actual = view.batches(
+                        batch_size, shuffle=shuffle, augment=augment,
+                        generator=torch.Generator().manual_seed(seed),
+                    )
+                    self.assertEqual(len(actual), len(expected))
+                    for got, want in zip(actual, expected):
+                        self.assertEqual(got.transform, want.transform)
+                        self.assertEqual(len(got.parts), len(want.parts))
+                        for a, b in zip(got.parts, want.parts):
+                            self.assertIs(a.shard, b.shard)
+                            self.assertTrue(torch.equal(a.rows, b.rows))
+
+
 class ReplayCacheTests(unittest.TestCase):
     def test_spilled_shard_loads_identical_in_a_new_process_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
