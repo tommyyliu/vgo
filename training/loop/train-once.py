@@ -43,6 +43,11 @@ def main() -> None:
         "again. Files for shards outside this run's window are deleted.",
     )
     parser.add_argument(
+        "--map-cache", action="store_true",
+        help="hold the window as memory maps of --prepared-cache files rather "
+        "than in RAM, for a window larger than memory.",
+    )
+    parser.add_argument(
         "--initial-checkpoint", type=Path, default=None,
         help="warm start from this checkpoint; omit to train from scratch, in "
         "which case --model-width/--blocks/--norm-groups take "
@@ -180,7 +185,9 @@ def main() -> None:
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     learner = PersistentLearner(
         defaults=config,
-        replay_cache=ReplayCache(spill_directory=arguments.prepared_cache),
+        replay_cache=ReplayCache(
+            spill_directory=arguments.prepared_cache, map_spill=arguments.map_cache
+        ),
     )
     try:
         report = learner.update(

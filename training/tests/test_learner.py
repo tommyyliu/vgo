@@ -123,6 +123,57 @@ class ReplayCacheTests(unittest.TestCase):
             self.assertEqual(pruner.prune_spill(), 1)
             self.assertEqual(len(list(spill.glob("*.pt"))), 1)
 
+    def test_mapped_spill_holds_shards_as_file_maps(self) -> None:
+        # Both a shard this process renders and one it finds spilled must be
+        # backed by the spill file, or a window larger than RAM still loads
+        # into RAM: the rendered ones are most of a new window.
+        # Storages loaded with mmap=True report no filename, so ask the kernel:
+        # a mapped tensor's memory lies in a range /proc/self/maps names a
+        # spill file for.
+        def mapped(tensor: torch.Tensor) -> bool:
+            address = tensor.data_ptr()
+            for line in Path("/proc/self/maps").read_text().splitlines():
+                fields = line.split(maxsplit=5)
+                if len(fields) < 6 or not fields[5].startswith(str(spill)):
+                    continue
+                low, high = (int(bound, 16) for bound in fields[0].split("-"))
+                if low <= address < high:
+                    return True
+            return False
+
+        def file_backed(dataset) -> bool:
+            return all(mapped(getattr(dataset, field)) for field in ("states", "values"))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, path, loads = cache_fixture(root)
+            spill = root / "spill"
+
+            def load(_: str | Path) -> RasterDataset:
+                loads.append(1)
+                return raw_fixture()
+
+            plain = ReplayCache(loader=load).window([path], 4).shards[0]
+            rendered = ReplayCache(
+                loader=load, spill_directory=spill, map_spill=True
+            ).window([path], 4).shards[0]
+            reloaded = ReplayCache(
+                loader=load, spill_directory=spill, map_spill=True
+            ).window([path], 4).shards[0]
+            self.assertEqual(len(loads), 2)  # the plain cache and the first mapped one
+            for shard in (rendered, reloaded):
+                self.assertTrue(file_backed(shard.dataset))
+                self.assertTrue(mapped(shard.split_hashes))
+                self.assertTrue(torch.equal(shard.split_hashes, plain.split_hashes))
+                for field in ("values", "policies", "policy_masks"):
+                    self.assertTrue(
+                        torch.equal(getattr(shard.dataset, field), getattr(plain.dataset, field))
+                    )
+            self.assertFalse(file_backed(plain.dataset))
+
+        with self.assertRaises(ValueError):
+            ReplayCache(map_spill=True)
+
     def test_unchanged_shard_is_prepared_once_and_reused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             cache, path, loads = cache_fixture(Path(temporary))

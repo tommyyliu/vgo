@@ -398,6 +398,12 @@ class ReplayCache:
     update -- loads the 7/8 of its window the last update already prepared
     instead of rendering it again. Rendering is about 3 ms a sample, most of a
     450k update's wall time; loading a spilled shard is a file read.
+
+    `map_spill` keeps every shard as a memory map of its spill file instead of
+    in process memory, so a window larger than RAM still trains: the page cache
+    holds what fits and the rest is read back as batches touch it, about 30 MB/s
+    at training's rate. A 900k window is 24 GB resident; 3M is about 80 GB on a
+    60 GB machine. Shards rendered by this process are mapped too, once written.
     """
 
     def __init__(
@@ -405,9 +411,13 @@ class ReplayCache:
         *,
         loader: Callable[[str | Path], RasterDataset] = load_dataset,
         spill_directory: Path | None = None,
+        map_spill: bool = False,
     ) -> None:
+        if map_spill and spill_directory is None:
+            raise ValueError("map_spill needs a spill_directory to map")
         self._loader = loader
         self._spill = spill_directory
+        self._map_spill = map_spill
         self._code_digest: str | None = None
         self._spilled_keys: set[str] = set()
         self.spill_hits = 0
@@ -462,7 +472,7 @@ class ReplayCache:
         self.misses += 1
         spill_path = self._spill_path(resolved, signature, preparation_batch_size)
         if spill_path is not None and spill_path.exists():
-            entry = torch.load(spill_path, weights_only=False)
+            entry = torch.load(spill_path, weights_only=False, mmap=self._map_spill)
             # The key covers content, not where the file sits: refresh the
             # in-process identity so the memory cache compares like with like.
             entry = replace(entry, path=resolved, signature=signature)
@@ -517,6 +527,10 @@ class ReplayCache:
             partial_path = spill_path.with_suffix(f".{os.getpid()}.partial")
             torch.save(entry, partial_path)
             os.replace(partial_path, spill_path)
+            if self._map_spill:
+                mapped = torch.load(spill_path, weights_only=False, mmap=True)
+                entry = replace(mapped, path=resolved, signature=signature)
+                self._entries[resolved] = entry
         return entry
 
     def _spill_path(
