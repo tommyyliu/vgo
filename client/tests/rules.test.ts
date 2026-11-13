@@ -62,7 +62,7 @@ describe("the replay check fails when the record is wrong", () => {
     const second = nthMove(text, 1);
     const wrong = second[1] === "B" ? "W" : "B";
     const doubled = text.slice(0, second.index) + `;${wrong}[${second[2]}]` + text.slice(second.index + second[0].length);
-    expect(replayRecord(rules, doubled).problems[0]).toContain("was to move");
+    expect(replayRecord(rules, doubled).problems[0]).toContain("out of turn");
   });
 
   test("a coordinate rounded to 5 decimals can make a recorded move illegal", () => {

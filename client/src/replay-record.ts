@@ -1,9 +1,10 @@
-// Replays a recorded game's main line through the rules door and says whether the
-// rules agree with the record: every move legal, by the side to move, ending the game,
-// with the recorded result.
+// Replays a recorded game's main line through the rules and says whether the rules agree
+// with the record: every move legal and by the side to move, with the recorded result.
 
-import { isStep, type Rules, type Step } from "./rules";
-import { moveOf, parse, resultOf, setupOf, type SgfNode } from "./sgf";
+import { createReplay, Refused } from "./replay";
+import type { Rules, Step } from "./rules";
+import { resultOf, parse } from "./sgf";
+import { fromSgf, line, setupPosition } from "./tree";
 
 export interface ReplayReport {
   readonly moves: number;
@@ -15,39 +16,33 @@ export interface ReplayReport {
 }
 
 export function replayRecord(rules: Rules, text: string): ReplayReport {
-  const problems: string[] = [];
+  const { tree, problems: unread } = fromSgf(text);
+  const problems = [...unread];
+  const replay = createReplay(rules);
+  const ids = line(tree, tree.root).slice(1);
   const steps: Step[] = [];
-  const root = parse(text);
-  let position = setupOf(root);
-  let moves = 0;
-  for (let node: SgfNode | undefined = root.children[0]; node; node = node.children[0]) {
-    const move = moveOf(node);
-    if (!move) continue;
-    moves++;
-    if (move.color !== position.toMove) {
-      problems.push(`move ${moves}: ${move.color} played but ${position.toMove} was to move`);
+  for (const [k, id] of ids.entries()) {
+    try {
+      steps.push(replay.step(tree, id)!);
+    } catch (error) {
+      if (!(error instanceof Refused)) throw error;
+      problems.push(error.reason === "wrong-colour" ? `move ${k + 1}: played out of turn` : `move ${k + 1}: refused (${error.reason})`);
       break;
     }
-    const result = rules.play(position, move);
-    if (!isStep(result)) {
-      problems.push(`move ${moves}: refused (${result.refused})`);
-      break;
-    }
-    steps.push(result);
-    position = result.after;
   }
-  if (!problems.length) {
-    const recorded = resultOf(root);
-    const last = steps.at(-1);
-    if (recorded && last) {
-      const { winner, margin } = last.analysis;
-      if (winner !== recorded.winner || Math.abs(margin - recorded.margin) > 0.0005 + 1e-9) {
-        problems.push(`result ${winner ?? "tie"}+${margin.toFixed(3)}, recorded ${recorded.winner ?? "tie"}+${recorded.margin}`);
-      }
+  const last = steps.at(-1);
+  if (!problems.length && last) {
+    const recorded = resultOf(parse(text));
+    const { winner, margin } = last.analysis;
+    if (recorded && (winner !== recorded.winner || Math.abs(margin - recorded.margin) > 0.0005 + 1e-9)) {
+      problems.push(`result ${winner ?? "tie"}+${margin.toFixed(3)}, recorded ${recorded.winner ?? "tie"}+${recorded.margin}`);
     }
-    for (const step of steps) {
-      if (step.analysis.unclassifiedEdges) problems.push(`unclassified edges after a ${step.move.color} move`);
-    }
+    if (steps.some((step) => step.analysis.unclassifiedEdges)) problems.push("the geometry left an edge unclassified");
   }
-  return { moves, steps, finished: position.finished, problems };
+  return {
+    moves: ids.length,
+    steps,
+    finished: (last?.after ?? setupPosition(tree.setup)).finished,
+    problems,
+  };
 }

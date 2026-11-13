@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { boardModel, frontSegments, joinSegments } from "../src/model";
+import { settledLoops } from "../src/settled";
 import { paintBoard } from "../src/paint";
 import { wood } from "../src/looks";
 import { replayRecord } from "../src/replay-record";
@@ -83,5 +84,41 @@ describe("paint", () => {
     const first = ids(paintBoard(model, wood, { px: 720 })), second = ids(paintBoard(model, wood, { px: 720 }));
     expect(first.length).toBeGreaterThan(0);
     expect(first.some((id) => second.includes(id))).toBe(false);
+  });
+});
+
+describe("settled shape port", () => {
+  // The port must draw what js-app/src/geometry/settled-contour.js draws. Given the same
+  // legal-set corners and the original's tolerance, every loop should match point for point.
+  const root = new URL("../../js-app/src/", import.meta.url).pathname;
+  const files = ["engine/numeric.js", "engine/model.js", "geometry/voronoi.js", "geometry/legal-set.js", "geometry/settled-contour.js"];
+  const g = globalThis as unknown as { VGO?: Record<string, any> };
+  const saved = g.VGO;
+  g.VGO = undefined;
+  (0, eval)(files.map((f) => readFileSync(join(root, f), "utf8")).join("\n"));
+  const original = g.VGO!;
+  g.VGO = saved;
+
+  test("matches the original on recorded positions", () => {
+    let points = 0;
+    for (const step of steps) {
+      const p = step.after;
+      const vertices = step.analysis.legalVertices;
+      const ported = settledLoops(p, step.analysis, false, original.settledContour.TOLERANCE);
+      const js = original.settledContour.compute(
+        original.model.createPosition({ radius: p.radius, stones: p.stones, toMove: p.toMove, komi: p.komi }),
+        vertices.map((v) => [v.x, v.y]),
+      ).loops as number[][][];
+      expect(ported.length).toBe(js.length);
+      ported.forEach((loop, i) => {
+        expect(loop.length).toBe(js[i]!.length);
+        loop.forEach((q, k) => {
+          expect(Math.abs(q[0] - js[i]![k]![0]!)).toBeLessThan(1e-12);
+          expect(Math.abs(q[1] - js[i]![k]![1]!)).toBeLessThan(1e-12);
+          points++;
+        });
+      });
+    }
+    expect(points).toBeGreaterThan(10000);
   });
 });

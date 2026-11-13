@@ -47,7 +47,7 @@ function fits(position: Position, x: number, y: number): boolean {
  * Closed loops whose union (nonzero fill) is the settled region. `legalSetEmpty` must
  * come from the rules: when no stone fits anywhere, every point is settled.
  */
-export function settledLoops(position: Position, analysis: Analysis, legalSetEmpty: boolean): Loop[] {
+export function settledLoops(position: Position, analysis: Analysis, legalSetEmpty: boolean, tolerance = TOLERANCE): Loop[] {
   if (position.ruleset !== "vgo") throw new Error(`no settled shape for the ${position.ruleset} ruleset yet`);
   const stones = position.stones, count = stones.length;
   if (!count) return [];
@@ -148,7 +148,7 @@ export function settledLoops(position: Position, analysis: Analysis, legalSetEmp
     const chordX = originX + 0.5 * (tA * ax + tB * bx);
     const chordY = originY + 0.5 * (tA * ay + tB * by);
     const deviation = Math.hypot(originX + tMiddle * ux - chordX, originY + tMiddle * uy - chordY);
-    if (depth >= MAX_DEPTH || deviation <= TOLERANCE) {
+    if (depth >= MAX_DEPTH || deviation <= tolerance) {
       loop.push(point(tMiddle, ux, uy), point(tB, bx, by));
       return;
     }

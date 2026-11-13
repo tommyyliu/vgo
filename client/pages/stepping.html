@@ -2,8 +2,8 @@
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap">
 <style>
-  /* Layout: the board leads at its real 720 px with the move controls pinned above it; the two
-     choices sit beside the controls, notes last. The wood carries the colour; the page stays quiet. */
+  /* Layout: the board leads at its real 720 px with the move controls pinned above it.
+     The wood carries the colour; the page stays quiet. */
   :root {
     --page: #f4f4f1; --surface: #ffffff; --ink: #1f1d1a; --mut: #625d55; --line: #dcd9d2;
     --accent: #3b2a1d; --on-accent: #fbf6ea;
@@ -31,15 +31,13 @@
   body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--page); }
   .row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
   .row > .label { font-size: 14px; color: var(--mut); min-width: 84px; }
-  .nav button, .seg button, #captures button {
+  .nav button, #captures button {
     font: 500 15px var(--body); color: var(--ink); background: var(--surface); border: 1px solid var(--line);
     border-radius: 999px; padding: 6px 13px; cursor: pointer; }
   .nav button { min-width: 42px; }
-  .seg { display: flex; flex-wrap: wrap; gap: 6px; }
-  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
   #move { flex: 1; min-width: 140px; accent-color: var(--accent); }
   #move-label { font-size: 14px; font-variant-numeric: tabular-nums; color: var(--mut); min-width: 110px; text-align: right; }
-  button:focus-visible, textarea:focus-visible, input:focus-visible, #board:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:focus-visible, input:focus-visible, #board:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
   .stage { display: flex; flex-direction: column; gap: 10px; }
   #board { width: 720px; max-width: 100%; aspect-ratio: 1; border-radius: 4px; overflow: hidden; box-shadow: 0 0 0 1px var(--line); }
@@ -54,25 +52,13 @@
   @keyframes vgo-fade { to { opacity: 0; } }
   @media (prefers-reduced-motion: reduce) { .vgo-fade { animation-duration: 1ms; } }
 
-  form { display: flex; flex-direction: column; gap: 18px; }
-  fieldset { border: 0; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
-  legend { font-weight: 600; padding: 0; margin-bottom: 4px; }
-  .picks { display: flex; flex-wrap: wrap; gap: 8px 20px; }
-  .picks label { display: inline-flex; gap: 8px; align-items: center; cursor: pointer; }
-  .picks input { accent-color: var(--accent); width: 17px; height: 17px; }
-  textarea { font: 15px/1.5 var(--body); color: var(--ink); background: var(--surface); border: 1px solid var(--line);
-             border-radius: 6px; padding: 9px 11px; resize: vertical; min-height: 4.5em; width: 100%; box-sizing: border-box; }
-  textarea::placeholder { color: var(--mut); }
-  .note { display: flex; flex-direction: column; gap: 4px; }
-  .note label { font-size: 14px; font-weight: 500; }
-  #notes-status { font-size: 14px; color: var(--mut); min-height: 1.5em; }
 </style>
 
 <main>
   <header>
-    <span class="eyebrow">Voronoi Go board · review 2</span>
+    <span class="eyebrow">Voronoi Go board · after review 2</span>
     <h1>Stepping through a game</h1>
-    <p class="mut">A recorded game between the trained nets, replayed through the Rust rules as you step. Walk it with <kbd>←</kbd> <kbd>→</kbd> (or <kbd>Home</kbd> and <kbd>End</kbd>), and try each way of marking the last move and of showing a capture. The front is the 5 px gap you chose.</p>
+    <p class="mut">A recorded game between the trained nets, replayed through the Rust rules as you step. Walk it with <kbd>←</kbd> <kbd>→</kbd> (or <kbd>Home</kbd> and <kbd>End</kbd>). The last move carries a ring, and captured stones fade out as you step onto the capture.</p>
   </header>
 
   <div class="controls">
@@ -84,20 +70,6 @@
       <input type="range" id="move" min="0" max="0" value="0" step="1" aria-label="Move number">
       <span id="move-label"></span>
     </div>
-    <div class="row"><span class="label">Last move</span>
-      <div class="seg" data-group="last" role="group" aria-label="Last move mark">
-        <button type="button" data-value="dot" aria-pressed="true">Dot</button>
-        <button type="button" data-value="ring" aria-pressed="false">Ring</button>
-        <button type="button" data-value="none" aria-pressed="false">None</button>
-      </div>
-    </div>
-    <div class="row"><span class="label">Captures</span>
-      <div class="seg" data-group="capture" role="group" aria-label="How captured stones show">
-        <button type="button" data-value="fade" aria-pressed="true">Fade out</button>
-        <button type="button" data-value="outline" aria-pressed="false">Leave an outline</button>
-        <button type="button" data-value="instant" aria-pressed="false">Vanish</button>
-      </div>
-    </div>
   </div>
 
   <section class="stage" aria-label="The board">
@@ -108,31 +80,6 @@
     <p class="source">res-ab-game028-candB-natural.sgf: an arena game at radius 1/18, Black the candidate net.</p>
   </section>
 
-  <section aria-labelledby="notes-h">
-    <h2 id="notes-h">Your verdict</h2>
-    <form id="notes" autocomplete="off">
-      <fieldset>
-        <legend>Which last-move mark?</legend>
-        <div class="picks">
-          <label><input type="radio" name="last" id="pick-last-dot" value="dot"> Dot</label>
-          <label><input type="radio" name="last" id="pick-last-ring" value="ring"> Ring</label>
-          <label><input type="radio" name="last" id="pick-last-none" value="none"> None</label>
-        </div>
-      </fieldset>
-      <fieldset>
-        <legend>How should a capture show?</legend>
-        <div class="picks">
-          <label><input type="radio" name="capture" id="pick-capture-fade" value="fade"> Fade out</label>
-          <label><input type="radio" name="capture" id="pick-capture-outline" value="outline"> Leave an outline</label>
-          <label><input type="radio" name="capture" id="pick-capture-instant" value="instant"> Vanish</label>
-        </div>
-      </fieldset>
-      <div class="note"><label for="note-last">On the last-move mark</label><textarea id="note-last" data-key="last" placeholder="Size, colour, ring width"></textarea></div>
-      <div class="note"><label for="note-capture">On captures</label><textarea id="note-capture" data-key="capture" placeholder="Speed, what you lose track of"></textarea></div>
-      <div class="note"><label for="note-general">Anything else</label><textarea id="note-general" data-key="general" placeholder="Stepping, the status line, the game"></textarea></div>
-      <p id="notes-status" aria-live="polite">Connecting…</p>
-    </form>
-  </section>
 </main>
 <!--DATA-->
 <!--SCRIPT-->

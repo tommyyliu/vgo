@@ -1,11 +1,10 @@
-// Review 2: walk a recorded game, and choose the last-move mark and how captures show.
+// A recorded game, walked a move at a time. Review 2 chose its last-move ring and capture fade.
 
 import { wood } from "../src/looks";
 import { boardModel, type BoardModel } from "../src/model";
 import { pageData, pageRules } from "../src/page";
-import { paintBoard, paintLastMove, paintRemoved, type CaptureStyle, type LastMoveStyle } from "../src/paint";
+import { paintBoard, paintLastMove, paintRemoved } from "../src/paint";
 import { checkTree, createReplay } from "../src/replay";
-import { connectNotes } from "../src/review-notes";
 import type { Color, Step } from "../src/rules";
 import { fromSgf, line, type NodeId } from "../src/tree";
 
@@ -21,8 +20,6 @@ const board = $<HTMLDivElement>("board"), svg = board.querySelector("svg")!;
 const slider = $<HTMLInputElement>("move"), label = $("move-label"), status = $("status-line"), areas = $("areas");
 
 let at = 0;
-let lastStyle: LastMoveStyle = "dot";
-let captureStyle: CaptureStyle = "fade";
 
 const models = new Map<NodeId, BoardModel>();
 function modelAt(index: number): BoardModel {
@@ -57,7 +54,7 @@ function describe(step: Step | null, index: number): string {
 function render(animate: boolean) {
   const model = modelAt(at);
   const view = { px: board.clientWidth || 720 };
-  svg.innerHTML = paintBoard(model, wood, view) + paintRemoved(model, wood, view, captureStyle) + paintLastMove(model, wood, view, lastStyle);
+  svg.innerHTML = paintBoard(model, wood, view) + paintRemoved(model, wood, view) + paintLastMove(model, wood, view);
   if (!animate) svg.querySelectorAll(".vgo-fade").forEach((g) => g.remove());
   slider.value = String(at);
   label.textContent = `Move ${at} of ${ids.length - 1}`;
@@ -92,17 +89,6 @@ document.addEventListener("keydown", (e) => {
   go(to());
 });
 
-function segmented(group: string, onChoose: (value: string) => void) {
-  const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>(`[data-group="${group}"] button`));
-  const choose = (value: string) => {
-    for (const b of buttons) b.setAttribute("aria-pressed", String(b.dataset.value === value));
-    onChoose(value);
-  };
-  buttons.forEach((b) => b.addEventListener("click", () => choose(b.dataset.value!)));
-}
-segmented("last", (v) => { lastStyle = v as LastMoveStyle; render(false); });
-segmented("capture", (v) => { captureStyle = v as CaptureStyle; render(false); });
-
 // Every capture on the main line, as a jump to the move before it.
 const jumps = $("captures");
 ids.forEach((id, index) => {
@@ -117,7 +103,6 @@ ids.forEach((id, index) => {
 });
 
 new ResizeObserver(() => render(false)).observe(board);
-connectNotes($<HTMLFormElement>("notes"), $("notes-status"), "feedback/stepping");
 // #move-40 opens at move 40, so a position can be linked.
 const fromHash = () => {
   const match = /^#move-(\d+)$/.exec(location.hash);

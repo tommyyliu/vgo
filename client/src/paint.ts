@@ -75,37 +75,25 @@ export function svgFile(body: string, px: number, label = "Voronoi Go board"): s
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1" width="${px}" height="${px}" role="img" aria-label="${label}">${body}</svg>`;
 }
 
-/** How the stone just played is marked. Review 2 picks one. */
-export type LastMoveStyle = "dot" | "ring" | "none";
-
-export function paintLastMove(model: BoardModel, look: Look, view: View, style: LastMoveStyle): string {
+/** A ring on the stone just played, in that side's mark colour. Chosen at review 2 over a dot and nothing. */
+export function paintLastMove(model: BoardModel, look: Look, view: View): string {
   const last = model.last;
-  if (style === "none" || !last || last.move.kind !== "place") return "";
+  if (!last || last.move.kind !== "place") return "";
   const { x, y, color } = last.move;
   // A stone that died on arrival is not on the board to mark.
   if (!model.position.stones.some((s) => s.x === x && s.y === y)) return "";
-  const r = model.position.radius, mark = side(look, color).mark;
-  if (style === "dot") return `<circle cx="${f(x)}" cy="${f(y)}" r="${f(0.3 * r)}" fill="${mark}"/>`;
-  const w = 2 / view.px;
-  return `<circle cx="${f(x)}" cy="${f(y)}" r="${f(0.55 * r)}" fill="none" stroke="${mark}" stroke-width="${f(w)}"/>`;
+  return `<circle cx="${f(x)}" cy="${f(y)}" r="${f(0.55 * model.position.radius)}" fill="none" stroke="${side(look, color).mark}" stroke-width="${f(2 / view.px)}"/>`;
 }
 
-/** How stones the last move removed are shown. Review 2 picks one. */
-export type CaptureStyle = "instant" | "fade" | "outline";
-
 /**
- * The removed stones, drawn over the board after the move. "fade" draws them whole in a
- * group with class `vgo-fade` for the page to animate out; "outline" leaves a dashed ring
- * where each stood while the move is current.
+ * The stones the last move removed, drawn whole over the board after it, in a group with
+ * class `vgo-fade` for the page to fade out. Chosen at review 2 over a lingering dashed
+ * outline and vanishing at once. A page showing a position it jumped to removes the group.
  */
-export function paintRemoved(model: BoardModel, look: Look, view: View, style: CaptureStyle): string {
+export function paintRemoved(model: BoardModel, look: Look, view: View): string {
   const removed = model.last?.removed ?? [];
-  if (style === "instant" || !removed.length) return "";
+  if (!removed.length) return "";
   const r = model.position.radius, w = look.rimWidth / view.px;
-  if (style === "fade") {
-    const stones = removed.map((s) => `<circle cx="${f(s.x)}" cy="${f(s.y)}" r="${f(r - w / 2)}" fill="${side(look, s.c).stone}" stroke="${side(look, s.c).rim}" stroke-width="${f(w)}"/>`);
-    return `<g class="vgo-fade">${stones.join("")}</g>`;
-  }
-  const dash = `${f(4 / view.px)} ${f(3 / view.px)}`, ring = 1.5 / view.px;
-  return removed.map((s) => `<circle cx="${f(s.x)}" cy="${f(s.y)}" r="${f(r - ring / 2)}" fill="none" stroke="${side(look, s.c).rim}" stroke-width="${f(ring)}" stroke-dasharray="${dash}"/>`).join("");
+  const stones = removed.map((s) => `<circle cx="${f(s.x)}" cy="${f(s.y)}" r="${f(r - w / 2)}" fill="${side(look, s.c).stone}" stroke="${side(look, s.c).rim}" stroke-width="${f(w)}"/>`);
+  return `<g class="vgo-fade">${stones.join("")}</g>`;
 }
