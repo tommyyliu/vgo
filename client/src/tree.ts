@@ -7,7 +7,7 @@
 //   - the tree knows no rules: replay.ts applies them.
 
 import type { Color, PlayedMove, Position, Ruleset, Stone } from "./rules";
-import { moveOf, parse, setupOf, SgfError, type SgfNode } from "./sgf";
+import { moveOf, parse, setupOf, type SgfNode } from "./sgf";
 
 export type NodeId = number;
 
@@ -196,4 +196,3 @@ export function toSgf(tree: GameTree): string {
   return `(${head}${children(node(tree, tree.root))})`;
 }
 
-export { SgfError };
