@@ -17,10 +17,8 @@ export interface Position {
   readonly komi: number;
   readonly stones: readonly Stone[];
   readonly toMove: Color;
-  /** Consecutive passes so far. Rust derives the game's end from it. */
+  /** Consecutive passes so far. Whether that ends the game is Rust's call: see `Step.finished`. */
   readonly passes: number;
-  /** Reported by Rust; ignored on the way in. */
-  readonly finished: boolean;
 }
 
 export interface Edge {
@@ -53,6 +51,8 @@ export interface Analysis {
   readonly margin: number;
   /** Edges the geometry could not classify. Zero on every sound position. */
   readonly unclassifiedEdges: number;
+  /** No stone fits anywhere, so every point is settled. */
+  readonly legalSetEmpty: boolean;
 }
 
 export type Move = { readonly kind: "place"; readonly x: number; readonly y: number } | { readonly kind: "pass" };
@@ -62,7 +62,9 @@ export interface Step {
   readonly before: Position;
   readonly after: Position;
   readonly move: PlayedMove;
-  /** Every stone the move took off, the mover's own included. */
+  /** Whether the move ended the game. */
+  readonly finished: boolean;
+  /** Every stone the move took off: the opponent's first, then the mover's own. */
   readonly removed: readonly Stone[];
   /** Of `after`. */
   readonly analysis: Analysis;
@@ -78,12 +80,13 @@ export interface Rules {
 }
 
 export function emptyPosition(radius: number, komi: number, ruleset: Ruleset = "vgo"): Position {
-  return { ruleset, radius, komi, stones: [], toMove: "B", passes: 0, finished: false };
+  return { ruleset, radius, komi, stones: [], toMove: "B", passes: 0 };
 }
 
 interface PlayIo {
   refused?: Refusal;
   after?: Position;
+  finished: boolean;
   removed: Stone[];
   analysis?: Analysis & { winner?: Color };
 }
@@ -106,6 +109,7 @@ export function loadRules(wasm: BufferSource): Rules {
         before: position,
         after: io.after,
         move: { ...move, color: position.toMove },
+        finished: io.finished,
         removed: io.removed,
         analysis: analysisFrom(io.analysis),
       };

@@ -28,7 +28,7 @@ function modelAt(index: number): BoardModel {
   if (!model) {
     const step = replay.step(tree, id);
     const position = replay.position(tree, id);
-    model = step ? boardModel(rules, step) : boardModel(rules, { position, analysis: rules.analyze(position) });
+    model = step ? boardModel(step) : boardModel({ position, analysis: rules.analyze(position) });
     models.set(id, model);
   }
   return model;
@@ -44,7 +44,7 @@ function describe(step: Step | null, index: number): string {
   const taken = step.removed.filter((s) => s.c !== mover).length, lost = step.removed.length - taken;
   if (taken) text += ` ${name(mover)} took ${taken} stone${taken > 1 ? "s" : ""}.`;
   if (lost) text += ` ${lost} of ${name(mover)}'s own stone${lost > 1 ? "s" : ""} died with it.`;
-  if (step.after.finished) {
+  if (step.finished) {
     const { winner, margin } = step.analysis;
     text += winner ? ` The game is over: ${name(winner)} wins by ${percent(margin)} of the board.` : " The game is over: a tie.";
   }
@@ -54,8 +54,7 @@ function describe(step: Step | null, index: number): string {
 function render(animate: boolean) {
   const model = modelAt(at);
   const view = { px: board.clientWidth || 720 };
-  svg.innerHTML = paintBoard(model, wood, view) + paintRemoved(model, wood, view) + paintLastMove(model, wood, view);
-  if (!animate) svg.querySelectorAll(".vgo-fade").forEach((g) => g.remove());
+  svg.innerHTML = paintBoard(model, wood, view) + (animate ? paintRemoved(model, wood, view) : "") + paintLastMove(model, wood, view);
   slider.value = String(at);
   label.textContent = `Move ${at} of ${ids.length - 1}`;
   status.textContent = describe(replay.step(tree, ids[at]!), at);

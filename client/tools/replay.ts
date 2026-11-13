@@ -6,7 +6,7 @@
 
 import { readdirSync, readFileSync, statSync } from "fs";
 import { join } from "path";
-import { replayRecord } from "../src/replay-record";
+import { checkRecord } from "../src/check-record";
 import { loadRules } from "../src/rules";
 
 const wasm = readFileSync(new URL("../vendor/vgo_wasm_bg.wasm", import.meta.url));
@@ -28,7 +28,7 @@ const started = performance.now();
 for (const path of paths) {
   games++;
   try {
-    const report = replayRecord(rules, readFileSync(path, "utf8"));
+    const report = checkRecord(rules, readFileSync(path, "utf8"));
     moves += report.moves;
     if (!report.finished) capped++;
     for (const step of report.steps) {
@@ -50,10 +50,10 @@ for (const path of paths) {
   const count = (text.match(/;[BW]\[/g) ?? []).length;
   if (count > worst.moves) worst = { text, moves: count };
 }
-const late = replayRecord(rules, worst.text).steps.at(-3)?.after;
+const late = checkRecord(rules, worst.text).steps.at(-3)?.after;
 let hoverMs = NaN;
 if (late) {
-  const position = { ...late, passes: 0, finished: false };
+  const position = { ...late, passes: 0 };
   const rounds = 200;
   const t0 = performance.now();
   for (let k = 0; k < rounds; k++) {

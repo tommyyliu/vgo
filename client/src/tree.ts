@@ -39,7 +39,7 @@ export interface GameTree {
 }
 
 export function setupPosition(setup: Setup): Position {
-  return { ...setup, passes: 0, finished: false };
+  return { ...setup, passes: 0 };
 }
 
 export function create(setup: Setup, props: Node["props"] = {}): GameTree {

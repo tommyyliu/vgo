@@ -126,7 +126,6 @@ export function setupOf(root: SgfNode): Position {
     stones,
     toMove,
     passes: 0,
-    finished: false,
   };
 }
 

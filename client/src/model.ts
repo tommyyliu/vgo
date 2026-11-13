@@ -1,7 +1,7 @@
 // The board model: everything paint reads, reshaped from the rules door's output.
 // It decides nothing.
 
-import type { Analysis, Color, PlayedMove, Position, Rules, Stone, Step } from "./rules";
+import type { Analysis, Color, PlayedMove, Position, Stone, Step } from "./rules";
 import { settledLoops, type Loop } from "./settled";
 
 export type Polyline = readonly (readonly [number, number])[];
@@ -63,11 +63,10 @@ export function frontSegments(position: Position, analysis: Analysis) {
   return out;
 }
 
-export function boardModel(rules: Rules, source: Step | { readonly position: Position; readonly analysis: Analysis }): BoardModel {
+export function boardModel(source: Step | { readonly position: Position; readonly analysis: Analysis }): BoardModel {
   const isStep = "after" in source;
   const position = isStep ? source.after : source.position;
   const analysis = source.analysis;
-  const legalSetEmpty = position.stones.length > 0 && rules.snap(position, position.stones[0]!) === null;
   const land: Record<Color, Polyline[]> = { B: [], W: [] };
   analysis.cells.forEach((cell, i) => {
     land[position.stones[i]!.c].push(cell.polygon.map((p) => [p.x, p.y] as const));
@@ -76,7 +75,7 @@ export function boardModel(rules: Rules, source: Step | { readonly position: Pos
     position,
     analysis,
     front: joinSegments(frontSegments(position, analysis)),
-    settled: settledLoops(position, analysis, legalSetEmpty),
+    settled: settledLoops(position, analysis, analysis.legalSetEmpty),
     land,
     last: isStep ? { move: source.move, removed: source.removed } : null,
   };

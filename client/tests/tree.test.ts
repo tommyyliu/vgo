@@ -2,11 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { checkTree, createReplay } from "../src/replay";
-import { replayRecord } from "../src/replay-record";
-import { loadRules } from "../src/rules";
+import { checkRecord } from "../src/check-record";
+import { testRules } from "./wasm";
 import { add, create, fromSgf, line, node, path, ply, promote, remove, sibling, toSgf, type GameTree } from "../src/tree";
 
-const rules = loadRules(readFileSync(new URL("../vendor/vgo_wasm_bg.wasm", import.meta.url)));
+const rules = testRules();
 const dir = new URL("./fixtures/", import.meta.url).pathname;
 const records = readdirSync(dir).filter((n) => n.endsWith(".sgf")).map((n) => readFileSync(join(dir, n), "utf8").trim());
 const setup = { ruleset: "vgo" as const, radius: 1 / 18, komi: 0.1, stones: [], toMove: "B" as const };
@@ -34,8 +34,8 @@ describe("records", () => {
       const { tree } = fromSgf(text);
       const replay = createReplay(rules);
       const end = line(tree, tree.root).at(-1)!;
-      expect(replay.position(tree, end).stones).toEqual(replayRecord(rules, text).steps.at(-1)!.after.stones);
-      expect(ply(tree, end)).toBe(replayRecord(rules, text).moves);
+      expect(replay.position(tree, end).stones).toEqual(checkRecord(rules, text).steps.at(-1)!.after.stones);
+      expect(ply(tree, end)).toBe(checkRecord(rules, text).moves);
     }
   });
 

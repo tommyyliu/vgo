@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 use vgo_core::{
     Analysis, Color, EdgeSource, MoveError, Phase, Point, Position, Ruleset, Stone,
-    nearest_legal_placement, pass, place,
+    nearest_legal_placement, nearest_legal_placement_with, pass, place,
 };
 use wasm_bindgen::prelude::*;
 
@@ -40,11 +40,9 @@ pub struct PositionIo {
     pub komi: f64,
     pub stones: Vec<StoneIo>,
     pub to_move: String,
-    /// Consecutive passes so far. Two end the game, so `finished` is derived
-    /// from this on the way in and reported from the phase on the way out.
+    /// Consecutive passes so far. Whether that ends the game is the rules'
+    /// call, reported as `finished` on a played move, never sent in.
     pub passes: u32,
-    #[serde(default)]
-    pub finished: bool,
 }
 
 #[derive(Serialize)]
@@ -84,6 +82,8 @@ pub struct AnalysisIo {
     pub winner: Option<String>,
     pub margin: f64,
     pub unclassified_edges: usize,
+    /// No stone fits anywhere, so every point is settled.
+    pub legal_set_empty: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -100,8 +100,10 @@ pub struct PlayIo {
     /// "illegal-placement", "self-capture" when it was refused.
     pub refused: Option<String>,
     pub after: Option<PositionIo>,
-    /// Every stone the move took off, the mover's own included, in board
-    /// order. Stones are named by value: indices shift once stones go.
+    /// Whether the move ended the game.
+    pub finished: bool,
+    /// Every stone the move took off, the opponent's first, then the mover's
+    /// own. Stones are named by value: indices shift once stones go.
     pub removed: Vec<StoneIo>,
     pub analysis: Option<AnalysisIo>,
 }
@@ -172,7 +174,6 @@ fn position_to(position: &Position) -> PositionIo {
         stones: position.stones().iter().map(stone_to).collect(),
         to_move: colour_to(position.to_move()),
         passes: position.consecutive_passes(),
-        finished: position.phase() != Phase::Playing,
     }
 }
 
@@ -183,7 +184,7 @@ fn point_to(point: Point) -> PointIo {
     }
 }
 
-fn analysis_to(analysis: &Analysis) -> AnalysisIo {
+fn analysis_to(position: &Position, analysis: &Analysis) -> AnalysisIo {
     let mut settled: Vec<usize> = analysis.settled_groups.iter().copied().collect();
     settled.sort_unstable();
     let cells = analysis
@@ -225,29 +226,20 @@ fn analysis_to(analysis: &Analysis) -> AnalysisIo {
         winner: analysis.outcome.winner.map(colour_to),
         margin: analysis.outcome.margin,
         unclassified_edges: analysis.geometry.diagnostics.unclassified_edges,
+        legal_set_empty: !nearest_legal_placement_with(
+            position,
+            Point::new(0.5, 0.5),
+            Some(&analysis.legal_vertices),
+        )
+        .legal,
     }
-}
-
-/// The stones of `before` (plus `placed`, appended last) that are missing from
-/// `after`. Removal keeps board order, so one walk finds them.
-fn removed_stones(before: &[Stone], placed: Option<Stone>, after: &[Stone]) -> Vec<StoneIo> {
-    let mut removed = Vec::new();
-    let mut kept = after.iter().peekable();
-    for stone in before.iter().copied().chain(placed) {
-        if kept.peek() == Some(&&stone) {
-            kept.next();
-        } else {
-            removed.push(stone_to(&stone));
-        }
-    }
-    debug_assert!(kept.next().is_none(), "after holds a stone before did not");
-    removed
 }
 
 fn refused(reason: &str) -> PlayIo {
     PlayIo {
         refused: Some(reason.to_string()),
         after: None,
+        finished: false,
         removed: Vec::new(),
         analysis: None,
     }
@@ -258,7 +250,8 @@ fn refused(reason: &str) -> PlayIo {
 pub fn rules_analyze(position: JsValue) -> Result<JsValue, JsValue> {
     let io: PositionIo = serde_wasm_bindgen::from_value(position).map_err(js_error)?;
     let position = position_from(&io)?;
-    serde_wasm_bindgen::to_value(&analysis_to(&Analysis::new(&position))).map_err(js_error)
+    serde_wasm_bindgen::to_value(&analysis_to(&position, &Analysis::new(&position)))
+        .map_err(js_error)
 }
 
 /// The legal stone centre nearest `(x, y)`, or null when no stone fits
@@ -284,10 +277,6 @@ pub fn rules_play(position: JsValue, chosen: JsValue) -> Result<JsValue, JsValue
     // `place` checks this only in debug builds; a record or a setup from
     // outside can hold overlapping stones, so the door checks it every time.
     let result = if position.validate().is_playable() {
-        let placed = match chosen {
-            MoveIo::Place { x, y } => Some(Stone::new(x, y, position.to_move())),
-            MoveIo::Pass => None,
-        };
         let outcome = match chosen {
             MoveIo::Place { x, y } => place(&position, x, y),
             MoveIo::Pass => pass(&position),
@@ -295,9 +284,10 @@ pub fn rules_play(position: JsValue, chosen: JsValue) -> Result<JsValue, JsValue
         match outcome {
             Ok(result) => PlayIo {
                 refused: None,
-                removed: removed_stones(position.stones(), placed, result.position.stones()),
+                finished: result.position.phase() != Phase::Playing,
+                removed: result.removed.iter().map(stone_to).collect(),
+                analysis: Some(analysis_to(&result.position, &result.analysis)),
                 after: Some(position_to(&result.position)),
-                analysis: Some(analysis_to(&result.analysis)),
             },
             Err(MoveError::Finished) => refused("finished"),
             Err(MoveError::InvalidPosition) => refused("invalid-position"),
@@ -314,46 +304,24 @@ pub fn rules_play(position: JsValue, chosen: JsValue) -> Result<JsValue, JsValue
 mod tests {
     use super::*;
 
-    fn stone(x: f64, y: f64, colour: Color) -> Stone {
-        Stone::new(x, y, colour)
-    }
-
-    #[test]
-    fn removed_stones_names_what_left_in_board_order() {
-        let before = [
-            stone(0.2, 0.2, Color::Black),
-            stone(0.4, 0.4, Color::White),
-            stone(0.6, 0.6, Color::Black),
-        ];
-        let placed = stone(0.8, 0.8, Color::White);
-        let after = [before[0], before[2], placed];
-        let removed = removed_stones(&before, Some(placed), &after);
-        assert_eq!(removed.len(), 1);
-        assert_eq!(
-            (removed[0].x, removed[0].y, removed[0].c.as_str()),
-            (0.4, 0.4, "W")
-        );
-    }
-
-    #[test]
-    fn removed_stones_includes_a_placed_stone_that_died() {
-        let before = [stone(0.2, 0.2, Color::Black)];
-        let placed = stone(0.5, 0.5, Color::White);
-        let removed = removed_stones(&before, Some(placed), &before);
-        assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].c, "W");
-    }
-
     #[test]
     fn positions_round_trip_through_the_plain_shape() {
-        let position = Position::new(0.05, vec![stone(0.3, 0.7, Color::White)], Color::Black)
+        let position = Position::new(0.05, vec![Stone::new(0.3, 0.7, Color::White)], Color::Black)
             .with_ruleset(Ruleset::Official)
             .with_komi(0.1)
             .with_passes(1);
-        let io = position_to(&position);
-        let back = position_from(&io).unwrap_or_else(|_| panic!("round trip failed"));
+        let back =
+            position_from(&position_to(&position)).unwrap_or_else(|_| panic!("round trip failed"));
         assert_eq!(back, position);
-        assert!(!io.finished);
-        assert!(position_to(&position.with_passes(2)).finished);
+    }
+
+    #[test]
+    fn a_full_board_has_no_legal_spot_left() {
+        let open = Position::new(0.05, vec![Stone::new(0.5, 0.5, Color::Black)], Color::White);
+        assert!(!analysis_to(&open, &Analysis::new(&open)).legal_set_empty);
+        // Radius 0.3 on a unit board: one stone at the centre leaves no centre 0.6 away
+        // inside the inset square [0.3, 0.7].
+        let full = Position::new(0.3, vec![Stone::new(0.5, 0.5, Color::Black)], Color::White);
+        assert!(analysis_to(&full, &Analysis::new(&full)).legal_set_empty);
     }
 }

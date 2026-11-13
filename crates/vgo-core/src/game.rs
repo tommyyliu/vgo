@@ -33,6 +33,23 @@ pub struct MoveResult {
     pub analysis: Analysis,
     pub events: Vec<GameEvent>,
     pub captured: usize,
+    /// Every stone the move took off: the opponent's first, then the mover's own,
+    /// each in board order. Empty for a pass, and without allocating when nothing
+    /// was taken, so the search pays nothing for it.
+    pub removed: Vec<Stone>,
+}
+
+/// The stones of `position` at `doomed`, in board order.
+fn doomed_stones(position: &Position, doomed: &HashSet<usize>) -> Vec<Stone> {
+    if doomed.is_empty() {
+        return Vec::new();
+    }
+    let mut indices: Vec<usize> = doomed.iter().copied().collect();
+    indices.sort_unstable();
+    indices
+        .into_iter()
+        .map(|index| position.stones()[index])
+        .collect()
 }
 
 /// Returns the surviving position and the indices removed from `position`.
@@ -112,6 +129,7 @@ pub fn place(position: &Position, x: f64, y: f64) -> Result<MoveResult, MoveErro
     let (after_enemy, enemy_doomed) =
         remove_settled(&provisional, &current_settlement, mover.other());
     let enemy_count = enemy_doomed.len();
+    let mut removed = doomed_stones(&provisional, &enemy_doomed);
     provisional = after_enemy;
     if valid {
         provisional.mark_valid();
@@ -125,6 +143,7 @@ pub fn place(position: &Position, x: f64, y: f64) -> Result<MoveResult, MoveErro
     let placed_index = provisional.stones().len() - 1;
     let (after_self, self_doomed) = remove_settled(&provisional, &current_settlement, mover);
     let self_count = self_doomed.len();
+    removed.extend(doomed_stones(&provisional, &self_doomed));
     // A placement that leaves the board exactly as it was is a pass, not a
     // move, or it would be a better stall than passing: two passes end the
     // game and score it, two no-op suicides end nothing, and both sides
@@ -188,6 +207,7 @@ pub fn place(position: &Position, x: f64, y: f64) -> Result<MoveResult, MoveErro
         analysis,
         events,
         captured: enemy_count + self_count,
+        removed,
     })
 }
 
@@ -214,6 +234,7 @@ pub fn pass(position: &Position) -> Result<MoveResult, MoveError> {
         analysis,
         events: vec![event],
         captured: 0,
+        removed: Vec::new(),
     })
 }
 
@@ -651,6 +672,19 @@ mod tests {
         .with_ruleset(Ruleset::Official);
         let result = place(&position, 0.5296197406710788, 0.3899047283676407)
             .expect("taking enemy stones keeps the move legal");
+        // `removed` lists the opponent's stones before the mover's own.
+        assert_eq!(result.removed.len(), result.captured);
+        let first_own = result
+            .removed
+            .iter()
+            .position(|stone| stone.color == Color::White)
+            .expect("the mover lost stones too");
+        assert!(first_own > 0);
+        assert!(
+            result.removed[first_own..]
+                .iter()
+                .all(|s| s.color == Color::White)
+        );
         assert!(
             result
                 .events
@@ -854,6 +888,59 @@ mod validity {
         }
         assert!(moves > 500, "{moves} moves is too few to mean anything");
         assert!(captured > 0, "no capture was exercised in {moves} moves");
+    }
+
+    /// `removed` names exactly the stones that left: the old stones and the
+    /// placed one, minus the new board, as a multiset, and as many as `captured`.
+    #[test]
+    fn removed_names_exactly_the_stones_that_left() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        let key = |s: &Stone| (s.x.to_bits(), s.y.to_bits(), s.color == Color::Black);
+        let empty = Position::new(1.0 / 12.0, Vec::new(), Color::Black);
+        let mut position = empty.clone();
+        let (mut checked, mut taken, mut misses) = (0, 0, 0);
+        for _ in 0..20_000 {
+            let (x, y) = (next(), next());
+            let Ok(result) = place(&position, x, y) else {
+                misses += 1;
+                if misses == 200 {
+                    (position, misses) = (empty.clone(), 0);
+                }
+                continue;
+            };
+            let mut before: Vec<_> = position.stones().iter().map(key).collect();
+            before.push(key(&Stone::new(x, y, position.to_move())));
+            let mut left = before;
+            for stone in result.position.stones() {
+                let at = left
+                    .iter()
+                    .position(|k| *k == key(stone))
+                    .expect("a stone appeared");
+                left.swap_remove(at);
+            }
+            let mut named: Vec<_> = result.removed.iter().map(key).collect();
+            left.sort_unstable();
+            named.sort_unstable();
+            assert_eq!(named, left);
+            assert_eq!(result.removed.len(), result.captured);
+            checked += 1;
+            taken += result.removed.len();
+            misses = 0;
+            position = result.position;
+            if position.phase() == Phase::Finished {
+                position = empty.clone();
+            }
+        }
+        assert!(
+            checked > 500 && taken > 0,
+            "{checked} moves, {taken} stones taken"
+        );
     }
 
     /// [E13]: extending the parent's index must give the full enumeration, in the

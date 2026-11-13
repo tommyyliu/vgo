@@ -4,9 +4,9 @@
 import { createReplay, Refused } from "./replay";
 import type { Rules, Step } from "./rules";
 import { resultOf, parse } from "./sgf";
-import { fromSgf, line, setupPosition } from "./tree";
+import { fromSgf, line } from "./tree";
 
-export interface ReplayReport {
+export interface RecordCheck {
   readonly moves: number;
   readonly steps: readonly Step[];
   /** False for a game stopped at a move cap rather than ended by two passes. */
@@ -15,7 +15,7 @@ export interface ReplayReport {
   readonly problems: readonly string[];
 }
 
-export function replayRecord(rules: Rules, text: string): ReplayReport {
+export function checkRecord(rules: Rules, text: string): RecordCheck {
   const { tree, problems: unread } = fromSgf(text);
   const problems = [...unread];
   const replay = createReplay(rules);
@@ -42,7 +42,7 @@ export function replayRecord(rules: Rules, text: string): ReplayReport {
   return {
     moves: ids.length,
     steps,
-    finished: (last?.after ?? setupPosition(tree.setup)).finished,
+    finished: last?.finished ?? false,
     problems,
   };
 }

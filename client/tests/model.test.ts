@@ -8,13 +8,14 @@ import { boardModel, frontSegments, joinSegments } from "../src/model";
 import { settledLoops } from "../src/settled";
 import { paintBoard } from "../src/paint";
 import { wood } from "../src/looks";
-import { replayRecord } from "../src/replay-record";
-import { loadRules, type Step } from "../src/rules";
+import { checkRecord } from "../src/check-record";
+import type { Step } from "../src/rules";
+import { testRules } from "./wasm";
 
-const rules = loadRules(readFileSync(new URL("../vendor/vgo_wasm_bg.wasm", import.meta.url)));
+const rules = testRules();
 const dir = new URL("./fixtures/", import.meta.url).pathname;
 const steps: Step[] = readdirSync(dir).filter((n) => n.endsWith(".sgf")).flatMap((name) => {
-  const all = replayRecord(rules, readFileSync(join(dir, name), "utf8")).steps;
+  const all = checkRecord(rules, readFileSync(join(dir, name), "utf8")).steps;
   return [all[Math.floor(all.length / 3)]!, all[Math.floor((2 * all.length) / 3)]!];
 });
 const length = (line: readonly (readonly [number, number])[]) =>
@@ -65,7 +66,7 @@ describe("settled shape", () => {
   test("every stone's own loop contains the stone", () => {
     // R_s always contains the disc of radius r around s: no legal centre is nearer than 2r.
     for (const step of steps) {
-      const model = boardModel(rules, step);
+      const model = boardModel(step);
       const { stones, radius } = step.after;
       expect(model.settled.length).toBe(stones.length);
       model.settled.forEach((loop, i) => {
@@ -79,7 +80,7 @@ describe("settled shape", () => {
 
 describe("paint", () => {
   test("ids differ between boards painted into one page", () => {
-    const model = boardModel(rules, steps[0]!);
+    const model = boardModel(steps[0]!);
     const ids = (svg: string) => [...svg.matchAll(/id="([^"]+)"/g)].map((m) => m[1]);
     const first = ids(paintBoard(model, wood, { px: 720 })), second = ids(paintBoard(model, wood, { px: 720 }));
     expect(first.length).toBeGreaterThan(0);

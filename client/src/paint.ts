@@ -88,7 +88,8 @@ export function paintLastMove(model: BoardModel, look: Look, view: View): string
 /**
  * The stones the last move removed, drawn whole over the board after it, in a group with
  * class `vgo-fade` for the page to fade out. Chosen at review 2 over a lingering dashed
- * outline and vanishing at once. A page showing a position it jumped to removes the group.
+ * outline and vanishing at once. Draw it only when arriving by playing or stepping onto
+ * the move; a position reached by a jump shows the board as it stands.
  */
 export function paintRemoved(model: BoardModel, look: Look, view: View): string {
   const removed = model.last?.removed ?? [];
