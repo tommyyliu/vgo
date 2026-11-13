@@ -37,6 +37,8 @@
 //! prior worth speaking of -- but it is the weakest possible difficulty and a
 //! way to exercise the engine with nothing else present.
 
+pub mod rules;
+
 use vgo_core::{Analysis, Color, Phase, Position, Stone, is_legal_placement, pass, place};
 use vgo_raster::{DensePolicy, RasterConfig, RasterKind, rasterize_any_into};
 use vgo_search::{Action, Evaluation, NaiveEvaluator, SearchConfig, SteppedSearch, search_at_ply};

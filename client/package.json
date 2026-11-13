@@ -1,0 +1,16 @@
+{
+  "name": "vgo-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A Voronoi Go board built on the Rust rules, compiled to WebAssembly.",
+  "scripts": {
+    "build:wasm": "cargo build -p vgo-wasm --profile wasm-release --target wasm32-unknown-unknown && wasm-bindgen --target web --out-dir vendor ../target/wasm32-unknown-unknown/wasm-release/vgo_wasm.wasm",
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.1",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,4 @@
+node_modules/
+# Built from crates/vgo-wasm by `bun run build:wasm`.
+vendor/
+dist/
