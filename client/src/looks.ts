@@ -14,6 +14,7 @@ export interface SideColors {
   readonly mark: string;
 }
 
+/** The line where the two sides' land meets. Any colour works; width 0 draws none. */
 export interface FrontStyle {
   readonly color: string;
   readonly width: number;
@@ -36,7 +37,10 @@ export function side(look: Look, c: Color): SideColors {
   return c === "B" ? look.B : look.W;
 }
 
-/** The wooden board: walnut for Black's land, maple for White's. The default. */
+/**
+ * The wooden board: walnut for Black's land, maple for White's. The default.
+ * Its front is a 5 px pale gap, chosen at review 1 over a dark line and a gap with a core.
+ */
 export const wood: Look = {
   name: "wood",
   page: "#f3eee4",
@@ -45,11 +49,4 @@ export const wood: Look = {
   rimWidth: 1.5,
   B: { stone: "#1c1a18", rim: "rgba(20,16,10,.75)", open: "#b88a5c", settled: "#7d5535", mark: "#fbf6ea" },
   W: { stone: "#fffdf8", rim: "rgba(20,16,10,.75)", open: "#f4e4c0", settled: "#dfbf80", mark: "#1c1a18" },
-};
-
-/** The three fronts step 1 compares, on the wooden look. */
-export const frontChoices: Readonly<Record<"gap" | "ink" | "core", { readonly label: string; readonly about: string; readonly front: FrontStyle }>> = {
-  gap: { label: "Gap", about: "A band in a pale paper colour between the two lands.", front: { color: "#fbf6ea", width: 5 } },
-  ink: { label: "Ink", about: "A dark line where the lands meet.", front: { color: "#1c1a18", width: 2.25 } },
-  core: { label: "Gap with a core", about: "The pale band with a thin dark line down its middle.", front: { color: "#fbf6ea", width: 6, core: { color: "#1c1a18", width: 1.25 } } },
 };
