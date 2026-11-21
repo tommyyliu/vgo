@@ -266,6 +266,8 @@ fn move_json(result: &vgo_search::SearchResult, to_move: Color) -> String {
     // ground got no candidate at all, and a truncated list makes explored
     // regions look unexplored. Around ninety entries in the opening, a few
     // kilobytes, on a local development route.
+    // Use round-trippable placement coordinates. Rounding a tangent move
+    // can push it inside the exclusion radius when the client plays it.
     let candidates = children
         .iter()
         .map(|child| match child.action {
@@ -276,7 +278,7 @@ fn move_json(result: &vgo_search::SearchResult, to_move: Color) -> String {
                 child.prior
             ),
             Action::Place(point) => format!(
-                "{{\"pass\":false,\"x\":{:.6},\"y\":{:.6},\"visits\":{},\"value\":{:.4},\"prior\":{:.5},\"proposals\":{}}}",
+                "{{\"pass\":false,\"x\":{},\"y\":{},\"visits\":{},\"value\":{:.4},\"prior\":{:.5},\"proposals\":{}}}",
                 point.x,
                 point.y,
                 child.visits,
@@ -293,7 +295,7 @@ fn move_json(result: &vgo_search::SearchResult, to_move: Color) -> String {
             chosen.0, chosen.1
         ),
         Action::Place(point) => format!(
-            "{{\"pass\":false,\"x\":{:.6},\"y\":{:.6},\"visits\":{},\"value\":{:.4},\"candidates\":[{candidates}]}}",
+            "{{\"pass\":false,\"x\":{},\"y\":{},\"visits\":{},\"value\":{:.4},\"candidates\":[{candidates}]}}",
             point.x, point.y, chosen.0, chosen.1
         ),
     }
@@ -530,6 +532,46 @@ mod tests {
         let stones = parse_stones(r#"{"stones":[{"x":0.5,"c":"B"},{"x":0.1,"y":0.2,"c":"W"}]}"#);
         assert_eq!(stones.len(), 1);
         assert_eq!(stones[0].color, Color::White);
+    }
+
+    #[test]
+    fn a_boundary_placement_survives_the_http_reply() {
+        use super::move_json;
+        use vgo_core::{Point, Position, Stone, place};
+        use vgo_search::{Action, CandidateSource, ChildSummary, SearchResult, SearchStats};
+
+        let radius = 1.0 / 26.0;
+        let stone = Stone::new(0.8471428571428572, 0.2914285714285714, Color::Black);
+        let point = Point::new(stone.x - 2.0 * radius, stone.y);
+        let position = Position::new(radius, vec![stone], Color::White);
+        assert!(place(&position, point.x, point.y).is_ok());
+
+        let child = ChildSummary {
+            action: Action::Place(point),
+            source: CandidateSource::AreaSequence,
+            prior: 1.0,
+            visits: 1,
+            black_value: 0.0,
+            proposal_count: 1,
+            beta: None,
+        };
+        let search = SearchResult::from_children(
+            child.action,
+            vec![child],
+            SearchStats::default(),
+            Color::White,
+        );
+        let reply: serde_json::Value =
+            serde_json::from_str(&move_json(&search, Color::White)).expect("valid move JSON");
+        for placement in [&reply, &reply["candidates"][0]] {
+            let x = placement["x"].as_f64().expect("x coordinate");
+            let y = placement["y"].as_f64().expect("y coordinate");
+            assert!(
+                place(&position, x, y).is_ok(),
+                "HTTP placement {x},{y} was rejected"
+            );
+            assert_eq!(Point::new(x, y), point);
+        }
     }
 
     #[test]
