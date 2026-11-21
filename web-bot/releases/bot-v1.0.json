@@ -1,0 +1,82 @@
+{
+  "schema": "vgo.bot-release.v1",
+  "tag": "bot-v1.0",
+  "version": "1.0",
+  "raster_kind": "compact-radius",
+  "download": "https://github.com/tommyyliu/vgo/releases/download/bot-v1.0/",
+  "bundle_commit": "b71d6d70ff989372659770fced201e6e865d3fb9",
+  "onnxruntime_web": "1.20.1",
+  "model": {
+    "checkpoint_sha256": "480e102bbc67cec314733440751d0ce596a7ff05eaf0186179ae55f6e70353f3",
+    "opset": 20,
+    "input": {
+      "name": "states",
+      "dtype": "float32",
+      "shape": [
+        "batch",
+        7,
+        128,
+        128
+      ],
+      "minimum_batch": 1,
+      "maximum_batch": 8
+    },
+    "outputs": [
+      {
+        "name": "policy_logits",
+        "dtype": "float32",
+        "shape": [
+          "batch",
+          16385
+        ]
+      },
+      {
+        "name": "values",
+        "dtype": "float32",
+        "shape": [
+          "batch"
+        ]
+      }
+    ],
+    "model": {
+      "architecture": "ddrnet",
+      "raster_kind": "compact-radius",
+      "width": 64,
+      "blocks": 16,
+      "norms_per_block": 1,
+      "parameters": 4455914
+    }
+  },
+  "files": [
+    {
+      "name": "vgo-bot-30786b16.js",
+      "role": "bundle",
+      "size": 463277,
+      "sha256": "30786b161d6807d15b50941f94cf66492086e529533424725f4194180511c5bb"
+    },
+    {
+      "name": "model-e5affd23.onnx",
+      "role": "model",
+      "size": 17129032,
+      "sha256": "e5affd23b4ac96abcbae2c3de126506e7f0e9114b25577e61ec90a9474ca1fae"
+    },
+    {
+      "name": "ort.all.min.mjs",
+      "role": "onnxruntime",
+      "size": 731232,
+      "sha256": "0c1e76607139b7876c39cbcd3b86e6202b55581d17cfc079282f98fcfdbe11be"
+    },
+    {
+      "name": "ort-wasm-simd-threaded.jsep.mjs",
+      "role": "onnxruntime",
+      "size": 46839,
+      "sha256": "2fb14505d39926e4c544de8c57fe59a2f2bc74caba6f71890be9afecc5046758"
+    },
+    {
+      "name": "ort-wasm-simd-threaded.jsep.wasm",
+      "role": "onnxruntime",
+      "size": 21663894,
+      "sha256": "185b0861a6cd6cbdfb057289338090436483cc59e10a7bc83bd167b15531a51b"
+    }
+  ]
+}
