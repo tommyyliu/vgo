@@ -79,6 +79,31 @@ that cannot set `Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp` still gets full-speed WebGPU and a
 slower fallback. `serve.js` sets both, for development.
 
+## Releases
+
+A bot ships as a GitHub release of this repo, not as files committed to a site's
+repository. The website (`voronoi_go`) names a release and each file's sha256 in
+`client/bot-assets.json`, and fetches the files at build time from
+`https://github.com/tommyyliu/vgo/releases/download/<tag>/<name>`.
+
+- **The tag is a version:** `bot-v<major>.<minor>`. A major release needs the site
+  to change code to use it: the bundle's API, the model's inputs or outputs
+  (raster kind, planes, policy shape), the onnxruntime files, or the rules the
+  bot plays. A minor release is a drop-in under the same contract, a new model or
+  search, taken by pointing the site at the new tag.
+- **A release is flat and never changes.** The bundle (`vgo-bot-<sha8>.js`), the
+  model (`model-<sha8>.onnx`) and onnxruntime-web's three files are uploaded under
+  their own names, with `manifest.json` (version, raster kind, every file's
+  hash) and `SHA256SUMS`. A new bot is a new tag. The hashes in the file names
+  are what let a site cache the files forever.
+- **`scripts/package-bot-release.py` builds one.** It checks the names against
+  the files' hashes, checks the model's export manifest describes the same
+  model, and writes the manifest, the checksums and the release description into
+  `artifacts/bot-release-v<version>/`. Upload what it lists through GitHub's release
+  page or `gh release create`.
+- `releases/` keeps each published release's `manifest.json`, so the record
+  survives in git.
+
 ## `createBot(options)`
 
 | option | default | what it does |
